@@ -6,7 +6,14 @@ from unittest import mock
 from pathlib import Path
 
 from server.manage import update_private_env
-from server.settings import PROJECT_DIR, Settings, account_usernames, api_origin, url_origin
+from server.settings import (
+    PROJECT_DIR,
+    Settings,
+    account_usernames,
+    api_origin,
+    mindlogic_gateway_base_url,
+    url_origin,
+)
 
 
 class UrlValidationTests(unittest.TestCase):
@@ -102,6 +109,35 @@ class UrlValidationTests(unittest.TestCase):
             {"MAX_UPLOAD_BYTES": "64000", "ACCOUNT_USERNAMES": "user-alpha,user-beta"},
         ):
             self.assertEqual(Settings.from_env().max_upload_bytes, 480 * 1024)
+
+    def test_mindlogic_bearer_is_pinned_to_the_official_gateway(self):
+        self.assertEqual(
+            mindlogic_gateway_base_url(
+                "https://factchat-cloud.mindlogic.ai/v1/gateway/"
+            ),
+            "https://factchat-cloud.mindlogic.ai/v1/gateway",
+        )
+        invalid = [
+            "http://factchat-cloud.mindlogic.ai/v1/gateway",
+            "https://attacker.example/v1/gateway",
+            "https://factchat-cloud.mindlogic.ai/v1/gateway/../other",
+            "https://factchat-cloud.mindlogic.ai/v1/gateway?next=evil",
+            "https://user:pass@factchat-cloud.mindlogic.ai/v1/gateway",
+        ]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                mindlogic_gateway_base_url(value)
+
+    def test_api_key_is_not_represented_and_public_example_keeps_it_blank(self):
+        secret = "test-only-secret-that-must-not-appear"
+        settings = Settings(
+            data_dir=Path("/tmp/test-data"),
+            model_cache_dir=Path("/tmp/test-models"),
+            mindlogic_api_key=secret,
+        )
+        self.assertNotIn(secret, repr(settings))
+        content = (PROJECT_DIR / "server" / "env.example").read_text(encoding="utf-8")
+        self.assertIn("MINDLOGIC_API_KEY=\n", content)
 
 
 if __name__ == "__main__":

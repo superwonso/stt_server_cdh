@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import math
 import os
@@ -33,6 +34,7 @@ from .recordings import (
     RecordingCorruptError,
     RecordingStore,
 )
+from .postprocessor import MindlogicPostprocessor, PostprocessingError
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
 from .settings import Settings
 from .transcriber import LocalTranscriber
@@ -209,12 +211,13 @@ def decode_wav(payload: bytes) -> tuple[np.ndarray, float, bytes]:
     return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0, frames / 16000, pcm
 
 
-def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
+def create_app(settings: Settings | None = None, transcriber=None, postprocessor=None) -> FastAPI:
     settings = settings or Settings.from_env()
     accounts = frozenset(settings.accounts)
     database = Database(settings.database_path, settings.accounts)
     database.initialize()
     engine = transcriber or LocalTranscriber(settings)
+    correction_engine = postprocessor or MindlogicPostprocessor(settings)
     limiter = RateLimiter()
     inference_lock = threading.Lock()
     capacity = threading.BoundedSemaphore(settings.max_pending_chunks)
@@ -248,6 +251,10 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
     import_current_lock = threading.Lock()
     import_current_id: str | None = None
     import_current_cancel: threading.Event | None = None
+    correction_worker_lock = threading.Lock()
+    correction_worker_wake = threading.Event()
+    correction_worker_shutdown = threading.Event()
+    correction_worker_thread: threading.Thread | None = None
 
     @asynccontextmanager
     async def lifespan(application):
@@ -257,18 +264,29 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
             connection.execute("DELETE FROM chunks WHERE status = 'pending'")
         recover_lecture_deletions()
         recover_import_jobs()
+        recover_correction_jobs()
         if settings.model_warmup and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
         ensure_import_worker()
+        ensure_correction_worker()
         try:
             yield
         finally:
-            stop_import_worker()
+            # Signal both workers before joining either one. Their bounded
+            # waits share one deadline inside stop.sh's process grace time.
+            request_correction_worker_shutdown()
+            request_import_worker_shutdown()
+            shutdown_deadline = time.monotonic() + 18
+            correction_stopped = stop_correction_worker(timeout=8)
+            stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
+            if correction_stopped and hasattr(correction_engine, "close"):
+                correction_engine.close()
 
     app = FastAPI(title="Classroom Transcription", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings = settings
     app.state.database = database
     app.state.transcriber = engine
+    app.state.postprocessor = correction_engine
     app.state.recording_store = recording_store
 
     @app.exception_handler(RequestValidationError)
@@ -409,7 +427,12 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
 
     @app.get("/status")
     def status(user: dict = Depends(identity)):
-        return engine.status()
+        result = dict(engine.status())
+        result["postprocessing"] = {
+            "configured": correction_configured(),
+            "model": getattr(correction_engine, "model", settings.mindlogic_model),
+        }
+        return result
 
     @app.get("/lectures")
     def list_lectures(user: dict = Depends(identity)):
@@ -484,6 +507,177 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                 "SELECT id, start, end, text FROM segments WHERE lecture_id = ? ORDER BY start, end, id", (lecture_id,)
             ).fetchall()]
         return lecture_result(lecture, segments=segments)
+
+    def correction_configured() -> bool:
+        # Injected test/local implementations need not expose this property.
+        return bool(getattr(correction_engine, "configured", True))
+
+    def transcript_revision(segments: list[dict]) -> str:
+        canonical = [
+            {
+                "id": segment["id"],
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": segment["text"],
+            }
+            for segment in segments
+        ]
+        return hashlib.sha256(
+            json.dumps(canonical, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def raw_segments(connection, lecture_id: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT id, start, end, text FROM segments "
+                "WHERE lecture_id = ? ORDER BY start, end, id",
+                (lecture_id,),
+            ).fetchall()
+        ]
+
+    def correction_result(row: dict) -> dict:
+        result = {
+            "lecture_id": row["lecture_id"],
+            "status": row["status"],
+            "raw_revision": row["raw_revision"],
+            "model": row["model"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        if row["status"] == "completed":
+            try:
+                corrected_segments = json.loads(row["corrected_segments"])
+                uncertain_terms = json.loads(row["uncertain_terms"])
+                if not isinstance(corrected_segments, list) or not isinstance(uncertain_terms, list):
+                    raise ValueError("stored correction is not a list")
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                log.exception("Stored correction is invalid for lecture %s", row["lecture_id"])
+                raise HTTPException(503, "저장된 후보정 결과를 읽지 못했습니다.") from error
+            result.update(
+                {
+                    "corrected_segments": corrected_segments,
+                    "corrected_text": row["corrected_text"],
+                    "uncertain_terms": uncertain_terms,
+                    "completed_at": row["completed_at"],
+                }
+            )
+        elif row["status"] == "failed":
+            result.update({"error_code": row["error_code"], "error": row["error"]})
+        return result
+
+    def get_correction_row(lecture_id: str) -> dict | None:
+        with database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM transcript_corrections WHERE lecture_id = ?",
+                (lecture_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    @app.get("/lectures/{lecture_id}/correction")
+    def get_correction(lecture_id: str, user: dict = Depends(identity)):
+        lecture = owned_lecture(lecture_id, user["username"])
+        row = get_correction_row(lecture["id"])
+        if row is None:
+            raise HTTPException(404, "이 수업에는 후보정 작업이 없습니다.")
+        return correction_result(row)
+
+    @app.post("/lectures/{lecture_id}/correction")
+    def start_correction(lecture_id: str, user: dict = Depends(identity)):
+        # Validate ownership before configuration so another account cannot use
+        # this endpoint to learn whether an arbitrary lecture ID exists.
+        lecture = owned_lecture(lecture_id, user["username"])
+        if not lecture["recording_finalized"]:
+            raise HTTPException(409, "수업 녹음과 받아쓰기가 끝난 뒤 후보정해 주세요.")
+        if not correction_configured():
+            raise HTTPException(503, "후보정 API 키가 서버에 설정되지 않았습니다.")
+
+        created = now_text()
+        should_wake = False
+        with database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current_lecture = connection.execute(
+                "SELECT id FROM lectures WHERE id = ? AND username = ? "
+                "AND deleting = 0 AND recording_finalized = 1",
+                (lecture["id"], user["username"]),
+            ).fetchone()
+            if current_lecture is None:
+                raise HTTPException(409, "수업 상태가 바뀌었습니다. 목록을 새로 확인해 주세요.")
+            segments = raw_segments(connection, lecture["id"])
+            if not segments:
+                raise HTTPException(409, "후보정할 받아쓰기 내용이 없습니다.")
+            revision = transcript_revision(segments)
+            configured_model = getattr(correction_engine, "model", settings.mindlogic_model)
+            existing = connection.execute(
+                "SELECT * FROM transcript_corrections WHERE lecture_id = ?",
+                (lecture["id"],),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["raw_revision"] == revision
+                and existing["model"] == configured_model
+                and existing["status"] in {"queued", "processing", "completed"}
+            ):
+                row = dict(existing)
+            else:
+                if not limiter.allow(("correction", user["username"]), 10, 3600) or not limiter.allow(
+                    ("correction", "all-accounts"), 16, 3600
+                ):
+                    raise HTTPException(
+                        429,
+                        "후보정 요청이 많습니다. 잠시 후 다시 시도해 주세요.",
+                        headers={"Retry-After": "3600"},
+                    )
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO transcript_corrections(lecture_id, raw_revision, status, model, created_at, updated_at) "
+                    "VALUES (?, ?, 'queued', ?, ?, ?)",
+                    (
+                        lecture["id"],
+                        revision,
+                        configured_model,
+                        created,
+                        created,
+                    ),
+                )
+                row = dict(
+                    connection.execute(
+                        "SELECT * FROM transcript_corrections WHERE lecture_id = ?",
+                        (lecture["id"],),
+                    ).fetchone()
+                )
+                should_wake = True
+            elif not (
+                existing["raw_revision"] == revision
+                and existing["model"] == configured_model
+                and existing["status"] in {"queued", "processing", "completed"}
+            ):
+                # POST is a safe retry after a failed job. A changed source is
+                # also treated as a new revision, while the raw transcript is
+                # never updated or removed.
+                connection.execute(
+                    "UPDATE transcript_corrections SET raw_revision = ?, status = 'queued', model = ?, "
+                    "corrected_text = NULL, corrected_segments = NULL, uncertain_terms = NULL, "
+                    "error_code = NULL, error = NULL, updated_at = ?, completed_at = NULL "
+                    "WHERE lecture_id = ?",
+                    (
+                        revision,
+                        configured_model,
+                        created,
+                        lecture["id"],
+                    ),
+                )
+                row = dict(
+                    connection.execute(
+                        "SELECT * FROM transcript_corrections WHERE lecture_id = ?",
+                        (lecture["id"],),
+                    ).fetchone()
+                )
+                should_wake = True
+        if should_wake or row["status"] == "queued":
+            ensure_correction_worker()
+            correction_worker_wake.set()
+        return correction_result(row)
 
     def clear_expired_download_tickets(now: float) -> None:
         for token_hash, ticket in tuple(download_tickets.items()):
@@ -990,6 +1184,11 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                     "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
                     (lecture["id"],),
                 ).fetchone()
+                correcting = connection.execute(
+                    "SELECT 1 FROM transcript_corrections "
+                    "WHERE lecture_id = ? AND status = 'processing'",
+                    (lecture["id"],),
+                ).fetchone()
                 terminal_jobs = [
                     dict(row)
                     for row in connection.execute(
@@ -997,8 +1196,8 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                         (lecture["id"],),
                     ).fetchall()
                 ]
-            if active is not None or pending is not None:
-                raise HTTPException(409, "진행 중인 음성 처리가 끝난 뒤 수업을 삭제하세요.")
+            if active is not None or pending is not None or correcting is not None:
+                raise HTTPException(409, "진행 중인 음성 처리나 후보정이 끝난 뒤 수업을 삭제하세요.")
             for job in terminal_jobs:
                 if not remove_private_upload(job):
                     raise HTTPException(503, "업로드 원본 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
@@ -1021,8 +1220,21 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                         "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
                         (lecture["id"],),
                     ).fetchone()
-                    if active is not None or pending is not None:
-                        raise HTTPException(409, "진행 중인 음성 처리가 끝난 뒤 수업을 삭제하세요.")
+                    correcting = connection.execute(
+                        "SELECT 1 FROM transcript_corrections "
+                        "WHERE lecture_id = ? AND status = 'processing'",
+                        (lecture["id"],),
+                    ).fetchone()
+                    if active is not None or pending is not None or correcting is not None:
+                        raise HTTPException(409, "진행 중인 음성 처리나 후보정이 끝난 뒤 수업을 삭제하세요.")
+                    # A queued correction has not sent anything yet. Removing
+                    # it in this same transaction wins atomically against the
+                    # worker's queued->processing claim.
+                    connection.execute(
+                        "DELETE FROM transcript_corrections "
+                        "WHERE lecture_id = ? AND status = 'queued'",
+                        (lecture["id"],),
+                    )
                     connection.execute("DELETE FROM imports WHERE lecture_id = ?", (lecture["id"],))
                     connection.execute("UPDATE lectures SET deleting = 1 WHERE id = ?", (lecture["id"],))
             purge_download_tickets(lecture["id"])
@@ -1337,9 +1549,12 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
             )
             import_worker_thread.start()
 
-    def stop_import_worker() -> None:
+    def request_import_worker_shutdown() -> None:
         import_worker_shutdown.set()
         import_worker_wake.set()
+
+    def stop_import_worker(*, timeout: float = 15) -> None:
+        request_import_worker_shutdown()
         with import_worker_lock:
             worker = import_worker_thread
         if worker and worker.is_alive():
@@ -1347,11 +1562,257 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
             # SIGKILL fallback. Leave a margin for uvicorn to close sockets and
             # logs; a still-running job remains `processing` with its raw file
             # and is reset to `queued` on the next startup.
-            worker.join(timeout=15)
+            worker.join(timeout=timeout)
             if worker.is_alive():
-                log.warning("File import worker did not stop within 15 seconds; its raw upload is retained")
+                log.warning("File import worker did not stop before shutdown; its raw upload is retained")
 
     app.state.stop_import_worker = stop_import_worker
+
+    def recover_correction_jobs() -> None:
+        # A request interrupted by server shutdown is safe to replay: the
+        # source revision and target segment IDs are persisted and checked
+        # again before any result is committed.
+        with database.connect() as connection:
+            if correction_configured():
+                connection.execute(
+                    "UPDATE transcript_corrections SET status = 'queued', error_code = NULL, error = NULL, "
+                    "model = ?, updated_at = ? WHERE status IN ('queued', 'processing')",
+                    (getattr(correction_engine, "model", settings.mindlogic_model), now_text()),
+                )
+            else:
+                connection.execute(
+                    "UPDATE transcript_corrections SET status = 'failed', "
+                    "error_code = 'not_configured', error = ?, updated_at = ? "
+                    "WHERE status IN ('queued', 'processing')",
+                    ("후보정 API 키가 서버에 설정되지 않았습니다.", now_text()),
+                )
+
+    def fail_correction(lecture_id: str, attempt: int, error: PostprocessingError) -> None:
+        allowed_codes = {
+            "authentication_failed",
+            "credit_exhausted",
+            "empty_transcript",
+            "gateway_unavailable",
+            "invalid_response",
+            "invalid_source",
+            "not_configured",
+            "privacy_placeholder_changed",
+            "protected_content_changed",
+            "rate_limited",
+            "source_too_large",
+        }
+        code = error.code if error.code in allowed_codes else "gateway_unavailable"
+        messages = {
+            "authentication_failed": "후보정 API 인증을 확인해 주세요.",
+            "credit_exhausted": "후보정 크레딧이 부족합니다. 원본 받아쓰기는 그대로 보관되어 있습니다.",
+            "empty_transcript": "후보정할 받아쓰기 내용이 없습니다.",
+            "gateway_unavailable": "후보정 서버에 연결하지 못했습니다. 원본 받아쓰기는 그대로 보관되어 있습니다.",
+            "invalid_response": "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
+            "invalid_source": "원문 구간을 후보정할 수 없는 상태입니다.",
+            "not_configured": "후보정 API 키가 서버에 설정되지 않았습니다.",
+            "privacy_placeholder_changed": "개인정보 보호 표시가 바뀐 후보정 결과는 저장하지 않았습니다.",
+            "protected_content_changed": "숫자가 바뀐 후보정 결과는 저장하지 않았습니다.",
+            "rate_limited": "후보정 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+            "source_too_large": "받아쓰기 내용이 후보정 허용 크기를 초과했습니다.",
+        }
+        with database.connect() as connection:
+            connection.execute(
+                "UPDATE transcript_corrections SET status = 'failed', error_code = ?, error = ?, "
+                "updated_at = ? WHERE lecture_id = ? AND status = 'processing' AND attempts = ?",
+                (code, messages[code], now_text(), lecture_id, attempt),
+            )
+
+    def run_correction_job(job: dict) -> None:
+        lecture_id = job["lecture_id"]
+        try:
+            with database.connect() as connection:
+                lecture = connection.execute(
+                    "SELECT id, username, title, language, recording_finalized, deleting "
+                    "FROM lectures WHERE id = ?",
+                    (lecture_id,),
+                ).fetchone()
+                segments = raw_segments(connection, lecture_id) if lecture is not None else []
+            if lecture is None:
+                return
+            if lecture["deleting"] or not lecture["recording_finalized"] or not segments:
+                raise PostprocessingError(
+                    "invalid_source",
+                    "원문 구간을 후보정할 수 없는 상태입니다.",
+                )
+            if transcript_revision(segments) != job["raw_revision"]:
+                raise PostprocessingError(
+                    "invalid_source",
+                    "원문 구간을 후보정할 수 없는 상태입니다.",
+                )
+
+            corrected = correction_engine.correct(
+                title=lecture["title"],
+                language=lecture["language"],
+                segments=segments,
+                interrupted=correction_worker_shutdown.is_set,
+            )
+            corrected_segments = corrected.segments
+            uncertain_terms = corrected.uncertain_terms
+            if (
+                not isinstance(corrected_segments, list)
+                or any(not isinstance(segment, dict) for segment in corrected_segments)
+                or [segment.get("id") for segment in corrected_segments]
+                != [segment["id"] for segment in segments]
+                or not isinstance(uncertain_terms, list)
+            ):
+                raise PostprocessingError(
+                    "invalid_response",
+                    "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
+                )
+            clean_segments: list[dict] = []
+            for source, result in zip(segments, corrected_segments, strict=True):
+                if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+                    raise PostprocessingError(
+                        "invalid_response",
+                        "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
+                    )
+                text = result["text"].strip()
+                if not text or len(text) > max(1000, len(source["text"]) * 4 + 500):
+                    raise PostprocessingError(
+                        "invalid_response",
+                        "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
+                    )
+                clean_segments.append(
+                    {
+                        "id": source["id"],
+                        "start": source["start"],
+                        "end": source["end"],
+                        "text": text,
+                    }
+                )
+            if (
+                len(uncertain_terms) > 1000
+                or any(not isinstance(term, str) or len(term) > 200 for term in uncertain_terms)
+            ):
+                raise PostprocessingError(
+                    "invalid_response",
+                    "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
+                )
+            clean_uncertain = [term.strip() for term in uncertain_terms if term.strip()]
+            corrected_text = "\n".join(segment["text"] for segment in clean_segments)
+            finished = now_text()
+            with database.connect() as connection:
+                changed = connection.execute(
+                    "UPDATE transcript_corrections SET status = 'completed', corrected_text = ?, "
+                    "corrected_segments = ?, uncertain_terms = ?, error_code = NULL, error = NULL, "
+                    "updated_at = ?, completed_at = ? "
+                    "WHERE lecture_id = ? AND raw_revision = ? AND status = 'processing' AND attempts = ?",
+                    (
+                        corrected_text,
+                        json.dumps(clean_segments, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(clean_uncertain, ensure_ascii=False, separators=(",", ":")),
+                        finished,
+                        finished,
+                        lecture_id,
+                        job["raw_revision"],
+                        job["attempts"],
+                    ),
+                ).rowcount
+            if changed != 1:
+                log.warning("Discarded a stale correction result for lecture %s", lecture_id)
+        except PostprocessingError as error:
+            if error.code == "interrupted" and correction_worker_shutdown.is_set():
+                with database.connect() as connection:
+                    connection.execute(
+                        "UPDATE transcript_corrections SET status = 'queued', updated_at = ? "
+                        "WHERE lecture_id = ? AND status = 'processing' AND attempts = ?",
+                        (now_text(), lecture_id, job["attempts"]),
+                    )
+            else:
+                fail_correction(lecture_id, job["attempts"], error)
+        except Exception:
+            # Do not include exception text or a traceback here: third-party
+            # client errors can embed request data, including private transcript
+            # text. The persisted/user-visible failure is deliberately generic.
+            log.error("Unexpected transcript correction failure for lecture %s", lecture_id)
+            fail_correction(
+                lecture_id,
+                job["attempts"],
+                PostprocessingError(
+                    "gateway_unavailable",
+                    "후보정 서버에 연결하지 못했습니다.",
+                ),
+            )
+
+    def correction_worker_main() -> None:
+        while not correction_worker_shutdown.is_set():
+            row = None
+            try:
+                correction_worker_wake.clear()
+                with database.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    candidate = connection.execute(
+                        "SELECT c.* FROM transcript_corrections c "
+                        "JOIN lectures l ON l.id = c.lecture_id "
+                        "WHERE c.status = 'queued' AND l.deleting = 0 "
+                        "ORDER BY c.created_at, c.lecture_id LIMIT 1"
+                    ).fetchone()
+                    if candidate is not None:
+                        claimed = connection.execute(
+                            "UPDATE transcript_corrections SET status = 'processing', attempts = attempts + 1, "
+                            "updated_at = ? WHERE lecture_id = ? AND status = 'queued'",
+                            (now_text(), candidate["lecture_id"]),
+                        ).rowcount
+                        row = dict(candidate) if claimed == 1 else None
+                        if row is not None:
+                            row["attempts"] = candidate["attempts"] + 1
+                if row is None:
+                    correction_worker_wake.wait(1.0)
+                    continue
+                run_correction_job(row)
+            except Exception:
+                # Avoid exception details because a database/client exception
+                # can carry private values. A claimed job is made retryable.
+                log.error("Transcript correction worker loop failed; retrying")
+                if row is not None:
+                    try:
+                        with database.connect() as connection:
+                            connection.execute(
+                                "UPDATE transcript_corrections SET status = 'queued', updated_at = ? "
+                                "WHERE lecture_id = ? AND status = 'processing' AND attempts = ?",
+                                (now_text(), row["lecture_id"], row["attempts"]),
+                            )
+                    except Exception:
+                        log.error("Could not requeue an interrupted transcript correction")
+                correction_worker_wake.wait(1.0)
+
+    def ensure_correction_worker() -> None:
+        nonlocal correction_worker_thread
+        if not correction_configured():
+            return
+        with correction_worker_lock:
+            if correction_worker_shutdown.is_set() or (
+                correction_worker_thread is not None and correction_worker_thread.is_alive()
+            ):
+                return
+            correction_worker_thread = threading.Thread(
+                target=correction_worker_main,
+                name="transcript-correction-worker",
+                daemon=True,
+            )
+            correction_worker_thread.start()
+
+    def request_correction_worker_shutdown() -> None:
+        correction_worker_shutdown.set()
+        correction_worker_wake.set()
+
+    def stop_correction_worker(*, timeout: float = 10) -> bool:
+        request_correction_worker_shutdown()
+        with correction_worker_lock:
+            worker = correction_worker_thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=timeout)
+            if worker.is_alive():
+                log.warning("Transcript correction worker did not stop before shutdown")
+                return False
+        return True
+
+    app.state.stop_correction_worker = stop_correction_worker
 
     @app.post("/imports", status_code=201)
     def create_import(

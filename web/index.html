@@ -231,6 +231,21 @@
             </div>
             <span><strong id="segment-count">0</strong>개 문장</span>
           </header>
+          <div id="transcript-versions" class="transcript-versions" role="group" aria-label="표시할 받아쓰기 버전" hidden>
+            <button id="transcript-raw" class="active" type="button" aria-pressed="true">받아쓴 원문</button>
+            <button id="transcript-corrected" type="button" aria-pressed="false" disabled>AI 후보정본</button>
+          </div>
+          <div id="correction-panel" class="correction-panel" data-state="idle" hidden>
+            <div class="correction-copy">
+              <span class="correction-symbol" aria-hidden="true">✦</span>
+              <div>
+                <strong id="correction-state">AI 후보정</strong>
+                <p id="correction-detail" role="status" aria-live="polite" aria-atomic="true">받아쓴 원문은 그대로 두고 별도의 후보정본을 만듭니다.</p>
+                <small class="correction-privacy">후보정 시 받아쓴 텍스트만 NOVA(Mindlogic)로 전송하고 오디오는 보내지 않습니다. 모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호는 이 PC에서 먼저 가리지만, 이름 등 다른 정보는 포함될 수 있습니다.</small>
+              </div>
+            </div>
+            <button id="correct-transcript" class="secondary-button correction-button" type="button" disabled>AI 후보정 만들기</button>
+          </div>
           <div id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text"></div>
         </section>
       </div>
@@ -268,7 +283,7 @@
         </div>
         <button id="delete-close" class="dialog-close" type="button" aria-label="삭제 확인 닫기">×</button>
       </div>
-      <p id="delete-description"><strong id="delete-lecture-title">선택한 수업</strong>의 받아쓴 내용과 저장된 녹음을 서버에서 삭제합니다. 이 작업은 되돌릴 수 없습니다.</p>
+      <p id="delete-description"><strong id="delete-lecture-title">선택한 수업</strong>의 받아쓴 원문, AI 후보정본과 저장된 녹음을 서버에서 삭제합니다. 이 작업은 되돌릴 수 없습니다.</p>
       <div class="delete-dialog-actions">
         <button id="delete-cancel" class="secondary-button" type="button">취소</button>
         <button id="delete-confirm" class="danger-button solid" type="button">수업 영구 삭제</button>

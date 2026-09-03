@@ -64,5 +64,17 @@ test('history, export, recording, and destructive controls are explicit and acce
   assert.match(html, /<option value="text" selected>일반 텍스트 \(\.txt\)<\/option>/);
   assert.match(html, /<div\b[^>]*\bclass="note-actions"[^>]*\brole="group"[^>]*\baria-label="현재 수업 작업"/i);
   assert.match(html, /<dialog\b[^>]*\bid="delete-dialog"[^>]*\baria-labelledby="delete-title"[^>]*\baria-describedby="delete-description"/i);
+  assert.match(html, /받아쓴 원문, AI 후보정본과 저장된 녹음/);
   assert.match(html, /이 작업은 되돌릴 수 없습니다/);
+});
+
+test('AI correction controls keep raw and corrected transcripts explicit without exposing credentials', () => {
+  assert.match(html, /<div\b[^>]*\bid="transcript-versions"[^>]*\brole="group"[^>]*\baria-label="표시할 받아쓰기 버전"[^>]*\bhidden/i);
+  assert.match(html, /<button\b[^>]*\bid="transcript-raw"[^>]*\baria-pressed="true"/i);
+  assert.match(html, /<button\b[^>]*\bid="transcript-corrected"[^>]*\baria-pressed="false"[^>]*\bdisabled/i);
+  assert.match(html, /<p\b[^>]*\bid="correction-detail"[^>]*\brole="status"[^>]*\baria-live="polite"/i);
+  assert.match(html, /<button\b[^>]*\bid="correct-transcript"[^>]*\btype="button"[^>]*\bdisabled/i);
+  assert.match(html, /텍스트만 NOVA\(Mindlogic\)로 전송하고 오디오는 보내지 않습니다/);
+  assert.match(html, /모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호는 이 PC에서 먼저 가리지만/);
+  assert.doesNotMatch(html, /MINDLOGIC_API_KEY|OPENAI_API_KEY|Bearer\s+[A-Za-z0-9_-]/i);
 });

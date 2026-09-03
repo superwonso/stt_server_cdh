@@ -86,10 +86,15 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             with database.connect() as connection:
                 migrated = connection.execute(
-                    "SELECT overlap_seconds, final_chunk FROM chunks WHERE lecture_id = ? AND chunk_id = ?",
+                    "SELECT c.overlap_seconds, c.final_chunk, l.recording_finalized "
+                    "FROM chunks c JOIN lectures l ON l.id = c.lecture_id "
+                    "WHERE c.lecture_id = ? AND c.chunk_id = ?",
                     (lecture_id, chunk_id),
                 ).fetchone()
-            self.assertEqual(dict(migrated), {"overlap_seconds": 0.0, "final_chunk": 1})
+            self.assertEqual(
+                dict(migrated),
+                {"overlap_seconds": 0.0, "final_chunk": 1, "recording_finalized": 1},
+            )
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
@@ -110,13 +115,18 @@ class DatabaseTests(unittest.TestCase):
                     "final_chunk, status) VALUES (?, ?, 'payload', 0, 0, 0, 'done')",
                     (lecture_id, chunk_id),
                 )
+                connection.execute("PRAGMA user_version = 3")
             database.initialize()
             with database.connect() as connection:
-                final_chunk = connection.execute(
-                    "SELECT final_chunk FROM chunks WHERE lecture_id = ? AND chunk_id = ?",
+                state = connection.execute(
+                    "SELECT c.final_chunk, l.recording_finalized "
+                    "FROM chunks c JOIN lectures l ON l.id = c.lecture_id "
+                    "WHERE c.lecture_id = ? AND c.chunk_id = ?",
                     (lecture_id, chunk_id),
-                ).fetchone()[0]
-            self.assertEqual(final_chunk, 0)
+                ).fetchone()
+                schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(tuple(state), (0, 0))
+            self.assertEqual(schema_version, 4)
 
     def test_accounts_are_data_not_hardcoded_in_the_users_schema(self):
         with tempfile.TemporaryDirectory() as temporary:

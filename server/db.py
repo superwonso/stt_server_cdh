@@ -183,6 +183,36 @@ class Database:
                 CREATE INDEX IF NOT EXISTS imports_user_recent ON imports(username, created_at DESC);
                 CREATE UNIQUE INDEX IF NOT EXISTS imports_one_active_user ON imports(username)
                     WHERE status IN ('uploading', 'queued', 'processing');
+                CREATE TABLE IF NOT EXISTS transcript_corrections (
+                    lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
+                    raw_revision TEXT NOT NULL CHECK (
+                        length(raw_revision) = 64 AND raw_revision = lower(raw_revision)
+                    ),
+                    status TEXT NOT NULL CHECK (
+                        status IN ('queued', 'processing', 'completed', 'failed')
+                    ),
+                    model TEXT NOT NULL,
+                    corrected_text TEXT,
+                    corrected_segments TEXT,
+                    uncertain_terms TEXT,
+                    error_code TEXT,
+                    error TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    CHECK (
+                        (status = 'completed' AND corrected_text IS NOT NULL
+                            AND corrected_segments IS NOT NULL AND uncertain_terms IS NOT NULL
+                            AND error_code IS NULL AND error IS NULL AND completed_at IS NOT NULL)
+                        OR
+                        (status != 'completed' AND corrected_text IS NULL
+                            AND corrected_segments IS NULL AND uncertain_terms IS NULL
+                            AND completed_at IS NULL)
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS transcript_corrections_queue
+                    ON transcript_corrections(status, created_at);
             """)
             chunk_columns = {row[1] for row in connection.execute("PRAGMA table_info(chunks)")}
             lecture_columns = {row[1] for row in connection.execute("PRAGMA table_info(lectures)")}
@@ -223,6 +253,21 @@ class Database:
                     "ALTER TABLE imports ADD COLUMN raw_deleted INTEGER NOT NULL DEFAULT 0 "
                     "CHECK (raw_deleted IN (0, 1))"
                 )
+            if schema_version < 4:
+                # Before retained WAV recordings existed, completed text-only
+                # lectures had no lecture-level final flag and all old chunks
+                # were migrated as final. Promote only that unambiguous legacy
+                # shape. A current/incomplete recording has a non-final or
+                # pending chunk (or no completed chunk) and remains untouched.
+                connection.execute(
+                    "UPDATE lectures SET recording_finalized = 1 "
+                    "WHERE recording_finalized = 0 "
+                    "AND EXISTS (SELECT 1 FROM chunks c "
+                    "WHERE c.lecture_id = lectures.id AND c.status = 'done') "
+                    "AND NOT EXISTS (SELECT 1 FROM chunks c "
+                    "WHERE c.lecture_id = lectures.id "
+                    "AND (c.status != 'done' OR c.final_chunk = 0))"
+                )
             existing_accounts = {
                 row[0] for row in connection.execute("SELECT username FROM users").fetchall()
             }
@@ -235,5 +280,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 2:
-                connection.execute("PRAGMA user_version = 2")
+            if schema_version < 4:
+                connection.execute("PRAGMA user_version = 4")

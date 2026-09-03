@@ -1,10 +1,12 @@
 # 개발 인수인계
 
-기준일: 2026-09-03 (Asia/Seoul)
+기준일: 2026-09-04 (Asia/Seoul)
 
 ## 현재 결론
 
 현재 기본 엔진은 `Qwen/Qwen3-ASR-1.7B`의 Transformers 경로(`qwen-asr==0.0.6`, BF16, SDPA)와 `Qwen3-ForcedAligner-0.6B`다. 브라우저 마이크와 `getDisplayMedia`의 오디오 트랙은 16 kHz 모노 PCM을 모아 새 음성이 8초 이상이고 최근 0.24초가 조용하면 자르며, 조용한 지점이 없으면 전체 WAV 15초에서 자른다. 첫 조각 뒤에는 이전 3초를 겹쳐 보낸다. 업로드 파일도 PyAV로 스트리밍 디코딩한 뒤 같은 분할 규칙을 쓴다. 서버는 0.6초 stability guard와 단어 정렬 시각으로 각 조각에서 확정할 범위를 정한다. Qwen의 vLLM 네이티브 스트리밍은 현재 코드에서 사용하지 않는다.
+
+정확도 보조 기능으로 완료된 원문을 충북대 NOVA Gateway의 `solar-pro4`에 보내는 명시적 opt-in 후보정을 추가했다. Qwen 모델은 바꾸지 않았고 음성은 후보정 제공자에게 보내지 않는다. 원문과 후보정본은 분리 저장하며 화면은 원문을 기본으로 연다. 문장 ID·순서·개수, 기존 숫자, 개인정보 임시 표식과 응답 크기가 맞지 않으면 후보정본을 저장하지 않고, 새 숫자 표기가 생기면 원문 비교 경고를 붙인다. 따라서 이 기능은 원문을 대체하는 정답 생성기가 아니라 검토 가능한 별도 초안이다.
 
 이 선택은 “Qwen이 언제나 가장 정확하다”는 결론이 아니다. 대상 Radeon/ROCm에서 실제 한국어 음성을 실시간보다 빠르게 처리했고, 현재 3초 겹침 경로가 짧은 낭독 시험에서 CER 4.03%, 마지막 기준 25자 완전 일치, 탐지된 텍스트 중복 0건을 낸 점과 요청 단위 복구가 단순하다는 운영상 이유로 정한 보수적 기본값이다. 서로 독립적으로 인식한 청크의 정렬 시각은 흔들릴 수 있으므로 실제 수업에서 exactly-once를 수학적으로 보장하지 않는다.
 
@@ -47,6 +49,26 @@ VibeVoice-ASR-Streaming-7B는 이 PC에서도 BF16/SDPA로 실제 로드되고 �
 - 3초 겹침과 정렬은 경계 문제를 줄이지만 이전 음성·텍스트 state를 모델 내부에 유지하지 않는다. 실제 교실 음성에서 누락·의미적 중복이 전혀 없다는 보장은 아직 없다.
 
 향후 Qwen 네이티브 스트리밍을 붙일 경우 `state.text`는 누적·수정 가능한 전체 가설로 취급하고, 화면의 interim 영역을 교체해야 한다. 확정된 prefix만 DB에 append하고 종료 시 `finish` flush를 반드시 호출해야 한다. 현재 API처럼 모든 응답을 새 확정 문장으로 append하면 중복 기록이 생긴다.
+
+## NOVA AI 후보정
+
+사용자가 제공한 충북대 계정 키로 [NOVA API Gateway](https://docs.mindlogic.ai/docs/cbnu-ac/api-gateway/getting-started/overview)를 검토하고 실제 인증을 확인했다. OpenAI 호환 base URL은 `https://factchat-cloud.mindlogic.ai/v1/gateway`, 사용 endpoint는 `POST /chat/completions/`다. `GET /models/?type=llm`은 2026-09-04에 200과 34개 모델을 반환했고 `solar-pro4`가 있었으며, `GET /credits/`도 200이었다. 키와 credits 응답 본문은 로그·문서에 남기지 않았다.
+
+현재 기본 후보정 모델은 `solar-pro4`다. 한국어를 공식 지원하고 NOVA 표의 1K input/output당 0.3/1.2 credits로 당시 후보군 중 비용이 낮으며, 수업 원문을 보수적으로 교정하는 용도에 먼저 시험하기 적절하다고 판단했다. 이는 공개 모델명이나 context 크기만으로 품질을 보장한 선택이 아니다. [NOVA 모델 목록](https://docs.mindlogic.ai/docs/cbnu-ac/api-gateway/getting-started/models), [모델별 크레딧](https://docs.mindlogic.ai/docs/cbnu-ac/factchat/product/model-credits), [Solar Pro 4](https://www.upstage.ai/blog/en/solar-pro-4)
+
+구현 계약:
+
+- `server/.env`의 `MINDLOGIC_API_KEY`만 서버에서 읽는다. `Settings` repr과 `/status`에는 키가 없고, base URL은 공식 HTTPS host/path/443로 고정한다. redirect와 환경 proxy 신뢰도 끈다.
+- `POST /lectures/{id}/correction`은 로그인·소유권·`recording_finalized`를 두 번 확인한 뒤 현재 원문의 SHA-256 revision과 모델을 기준으로 idempotent job을 만든다. `GET`도 같은 소유자만 상태/결과를 읽는다.
+- 작업 상태는 `queued/processing/completed/failed`이며 별도 `transcript_corrections` 행에 저장한다. 단일 background worker와 attempt/revision/status CAS가 늦게 끝난 결과를 버리고, 재시작 때 `processing`을 안전하게 다시 `queued`로 돌린다.
+- 기본 6,000자 target 묶음에 앞뒤 2개 segment를 `target=false` 문맥으로 보낸다. 응답은 strict JSON Schema로 같은 target ID를 한 번씩 같은 순서로 돌려받아 문맥 겹침이 출력 중복으로 들어오지 않게 한다.
+- payload는 전사 텍스트, `language`, 무작위 내부 segment UUID뿐이다. 오디오, 수업 제목, 로그인 ID는 보내지 않는다. 이메일·전화·주민/카드번호·긴 숫자는 형식 기반으로 가리고, 모든 아라비아 숫자도 보호 표식으로 바꾼다. 응답에서 placeholder의 순서·개수를 검사해 한 번만 복원하지만 의미적 위치까지 증명하지는 못한다. 이름·주소·드문 형식은 가려지지 않을 수 있으므로 익명화라고 표현하지 않는다.
+- 기존 숫자가 있는 문장은 결과 숫자열 전체가 정확히 같아야 하므로 삭제·치환·추가를 fail-closed한다. 숫자가 없던 문장에 새로운 숫자 표기만 생긴 경우에는 결과와 함께 로컬 경고를 넣는다. 모델에게 한글 수사를 숫자로 바꾸지 말라고 지시해도 실제 Solar가 `제 이법칙`을 `제2법칙`으로 고쳤기 때문에 이 별도 정책이 필요했다.
+- provider 오류 본문과 exception 문자열은 로그나 DB에 반사하지 않는다. 401/403, 402, 429, 5xx/timeout은 정제된 코드로 바꾸고 transient 오류만 제한 재시도한다. 요청 1 MiB, 응답 2 MiB, 원문 250,000자, segment/개수/누적 출력에 별도 상한이 있다.
+- 새 외부 작업은 계정당 10건/시간, 전체 16건/시간으로 제한한다. 긴 수업 한 건은 여러 provider call을 사용하며 외부 API가 idempotency key를 지원한다는 확인이 없어서, 응답 중 강제 종료 뒤 같은 묶음이 다시 전송·과금될 가능성은 남는다.
+- 후보정 처리 중 수업 삭제는 `409`다. 대기 중 작업 삭제와 lecture의 durable deleting 전환은 한 SQLite `BEGIN IMMEDIATE` 안에서 처리해 worker claim과 경쟁하지 않는다.
+
+실제 비개인 한국어 3문장으로 NOVA strict JSON Schema 응답을 확인했다. Solar는 문장 ID·기존 숫자 `15`·가린 테스트 이메일을 보존하고 띄어쓰기를 고쳤으며, `제 이법칙`을 `제2법칙`으로 바꿨다. 최종 정책은 이를 저장하되 `AI가 원문에 없던 숫자 표기를 추가했습니다. 원문과 비교하세요.`를 함께 반환했다. 이는 연결·형식·보호 로직 검증이지 실제 수업 품질 벤치마크가 아니다.
 
 ## Qwen 실측
 
@@ -141,7 +163,8 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 결정적 import chunk UUID와 기존 chunk idempotency로 정상 종료 뒤 재시작 시 완료 청크를 재사용한다. 단일 background worker는 loop 예외를 재시도하고 GET/list가 죽은 worker를 다시 확인한다.
 - 완료·취소·실패 DB 상태와 별도로 `raw_deleted`를 기록한다. unlink 실패를 삭제 성공으로 표시하지 않으며 60초 maintenance/list 조회에서 재시도한다. 7일간 멈춘 업로드는 서버를 재시작하지 않아도 정리한다.
 - 녹음 다운로드는 소유권·완료 상태를 확인한 인증 POST가 60초짜리 무작위 전용 경로를 발급하고, 네이티브 파일 응답은 세션 Bearer를 URL에 넣지 않는다. 짧은 Wi-Fi 중단 뒤 Range 재개를 위해 최대 16회만 재사용하며, 경로는 UUID에서만 계산하고 다운로드 시 열린 `O_NOFOLLOW` descriptor의 WAV 구조와 일반 파일 여부를 다시 검사한다.
-- 수업 삭제는 진행 중 import나 pending chunk가 있으면 `409`로 거절한다. 연결된 import metadata를 지우고 durable `deleting` 상태를 먼저 기록한 뒤 WAV와 lecture cascade 데이터를 제거하며, 중간 파일 삭제 실패는 성공으로 표시하지 않고 재시작 때 다시 처리한다.
+- `MindlogicPostprocessor`는 공식 Gateway로만 나가는 bounded HTTP client, strict schema/문장 매핑 검증, 개인정보 형식 가림과 숫자 보호를 담당한다. 후보정 endpoint는 owner/final 상태와 원문 revision을 확인하고 단일 background worker가 별도 correction 행을 처리한다. `/status`에는 key가 아니라 configured/model만 보인다.
+- 수업 삭제는 진행 중 import, pending chunk, processing correction이 있으면 `409`로 거절한다. queued correction은 같은 transaction에서 먼저 지운다. 연결된 import metadata를 지우고 durable `deleting` 상태를 먼저 기록한 뒤 WAV와 lecture cascade 데이터를 제거하며, 중간 파일 삭제 실패는 성공으로 표시하지 않고 재시작 때 다시 처리한다.
 - `MODEL_WARMUP=1`이면 lifespan 중 모델을 로드하고 첫 경로를 실행한다.
 
 ### 웹
@@ -165,7 +188,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - import polling delay의 abort listener는 매 회 제거한다. 로그아웃/탭 이탈은 watcher만 detach하고 서버 작업을 취소하지 않으며, 취소/완료 경쟁과 오래된 lecture/list 응답은 terminal 상태·generation/sequence로 판별한다.
 - 지난 수업을 `Asia/Seoul` 날짜로 묶고 단일 날짜를 필터링한다. 상세 기록은 UTF-8 TXT 또는 Markdown으로 내보내며 Markdown 제어문자와 파일명 문자를 정리한다.
 - 녹음 WAV 버튼은 `recording_available`인 수업에만 열린다. 미확정 WAV는 owner-only idempotent finalize POST로 받은 범위까지 먼저 닫고, 로그인 Bearer로 ticket을 받은 뒤 같은 API origin의 상대 경로만 세션 토큰 없이 브라우저 네이티브 다운로드로 연다.
-- 수업 삭제 확인창은 제목과 텍스트·녹음 삭제 범위를 보여 준다. 삭제·다운로드·녹음·파일 변환 중 동작을 상호 잠그고 generation/sequence로 늦게 도착한 이전 수업·계정 응답을 버린다.
+- 후보정 버튼은 final transcript에서만 열고 `queued/processing`을 2.5초마다 확인한다. 원문/AI 후보정본을 명시적으로 전환하고 현재 선택한 버전만 TXT/Markdown으로 내보낸다. 완료 뒤에도 원문이 기본이며 `uncertain_terms`를 최대 5개와 나머지 개수로 표시한다. 수업·계정 전환은 poll timer와 늦은 결과를 generation/sequence로 폐기한다.
+- 후보정 패널은 텍스트만 NOVA로 가고 오디오는 가지 않으며 형식 기반 가림이 이름 등을 보호하지 못한다는 opt-in 안내를 항상 표시한다. 결과는 모두 `textContent`로 렌더링한다.
+- 수업 삭제 확인창은 제목과 원문·후보정본·녹음 삭제 범위를 보여 준다. 삭제·다운로드·녹음·파일 변환 중 동작을 상호 잠그고 generation/sequence로 늦게 도착한 이전 수업·계정 응답을 버린다.
 
 ### 운영 스크립트
 
@@ -198,8 +223,10 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 위 7:52 실험에서 2/4/6분/종료의 KV 1,702/3,368/5,034/6,574, allocated 16.324/16.412/16.501/16.585 GiB, reserved 16.586/17.887/19.820/22.193 GiB, 최근 10청크 평균 연산 2.149/2.398/3.018/3.253초를 기록했다. peak allocated는 16.957 GiB, 최대 연속 backlog 청크는 3개였다.
 - VibeVoice 짧은 종료 처리에서 존재하지 않는 `Speaker 1: 그치.`와, 이미 lookahead로 처리한 0.14초를 공식 flush loop가 다시 넣어 `[Silence]`를 덧붙이는 현상을 재현했다. 7:52 반복 실험은 기대한 42개 발화 라벨을 한 번씩 냈고 마지막 flush는 빈 문자열이어서 발화 단위 누락·중복은 보이지 않았지만, 이는 반복 낭독 음성에 한정된 결과다.
 - VibeVoice 벤치마크 종료 후 별도 프로세스에서 PyTorch allocated/reserved 0과 free 46.80/47.47 GiB를 확인했다.
+- 실제 NOVA key로 `/models/?type=llm` 200·`solar-pro4` 존재·`/credits/` 200을 확인했다. 모든 아라비아 숫자를 보호 표식으로 바꾸는 최종 코드에서도 비개인 한국어 3문장을 strict JSON Schema로 실제 후보정해 같은 문장 ID/순서, 기존 숫자 `15`, 이메일 placeholder 복원, 띄어쓰기 교정과 새 숫자 표기 로컬 경고를 확인했다. key와 credits 본문은 출력·로그에 남기지 않았다.
+- mocked Gateway에서 청크 문맥이 target 결과에 중복되지 않는지, 한국어 조사에 붙은 이메일/전화·주민·카드·모든 아라비아 숫자 가림과 단일 복원, placeholder/ID/숫자 훼손 거절, 기존 수치를 바꾼 뒤 원래 수치를 덧붙이는 우회 거절, 새 숫자 경고, HTTP 408/425/429/5xx·network transient retry와 402 무재시도, 요청·응답 상한을 검증했다. correction API에서 owner-only, raw 불변, idempotent retry, final gate, processing 중 DELETE 거절, safe status/error를 검증했다.
 - 코드 검토로 확인한 방어선: ignored 환경설정 기반 서버 측 계정 allow-list·DB exact-set 검사·소유권 검사, exact-origin 제한, chunked body 제한, 계정별 녹음 권한·UUID 경로·WAV 검증, import 원본 권한/삭제 상태, 동일 lecture/chunk/import UUID의 idempotent 응답, 초대 링크의 API 주소 배제, 계정 전체 주소 합산 로그인 제한
-- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장·Pages 런타임 설정 69개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID 비공개 설정 검증, legacy DB 계정 제약 제거와 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정 전환의 오래된 UI 응답, system-audio track 분리도 포함한다.
+- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장·후보정·Pages 런타임 설정 80개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID/키 비공개 설정 검증, legacy DB 계정 제약 제거와 텍스트 전용 수업 완료 승격, 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정·수업 전환의 오래된 UI 응답, system-audio track 분리도 포함한다.
 - 녹음 전용 시험은 overlap PCM 제거, byte-identical retry, bounded silence gap, quota 실패 시 기존 파일 불변, 부분 write rollback, symlink 거부/안전 삭제, 전송 중단 fd close, 60초 ticket Range 재개·만료, 명시적 final 복구, 다른 계정 불변, DELETE/inference 경합과 응답 유실 idempotency를 포함한다.
 - 웹 시험은 KST 자정 경계 날짜 그룹, TXT/Markdown 내용·이스케이프·안전 파일명, 동일 API origin ticket 제한, 마지막 실패 조각 확정과 WAV 없음의 정확한 안내, 507 수동 복구, 다운로드·삭제·계정 전환의 stale 응답 방어를 포함한다. 자동 주소의 익명 health 선행, stale 저장 주소 차단, 24시간 lease 만료 뒤 Bearer·비밀번호·음성 본문 차단, 새 tunnel에서 같은 계정 재로그인 후 큐 재개도 검증했다. Python source `py_compile`, JavaScript `--check`, `git diff --check`도 통과했다.
 - GitHub Actions Pages 배포 성공 후 공개 URL의 `index.html`, `app.js`, `audio.js`, `file-import.js`, `pcm-worklet.js`, `style.css`가 로컬 배포본과 byte-for-byte 일치하고 HTTPS 200임을 확인했다.
@@ -222,14 +249,17 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 기능 추가 전에 만든 과거 수업에는 원본 음성이 남아 있지 않으므로 녹음 다운로드를 제공할 수 없음
 - 두 사용자 본인이 일회용 링크를 열어 비밀번호를 설정하는 단계
 - VibeVoice를 8분보다 긴 하나의 state 또는 실제 45~90분 수업으로 운용했을 때의 품질·메모리·처리량. 이번 실험은 공식 목표에 가까운 7:52에서 끝났고 반복 낭독 음성을 사용했다.
+- 실제 5~10분 이상 한국어 교실 원문에서 `solar-pro4` 후보정 전후 CER, 고유명사·전문용어·수식 보존, 의미 왜곡, 처리 시간과 credits 사용량. 현재 실제 Gateway 검증은 비개인 합성 텍스트 3문장뿐이다.
+- NOVA/Mindlogic proxy 자체의 요청 보관·삭제 세부 정책과 외부 요청의 idempotency key 지원. 확인 전에는 완전한 비보관·비학습이나 exactly-once 과금이라고 주장하지 않는다.
 
 실제 수업 음성 샘플이 제공되면 원본은 `.samples/`에만 두고 다음 순서로 검증한다.
 
 1. 5~10분 익명화 구간으로 Qwen/Vibe/Voxtral/Whisper의 누락·고유명사·문장 경계를 수동 비교한다.
 2. 같은 파일을 60~90분 길이로 반복 또는 연속 구성해 RSS, `torch.cuda.memory_allocated/reserved`, RTF를 청크마다 기록한다.
-3. 중간에 tunnel을 끊고 복구해 DB chunk 수, segment 순서, 중복 텍스트를 확인한다.
-4. 녹음 종료·마이크 강제 중단·화면 잠금으로 final tail을 각각 검증한다.
-5. 두 계정으로 같은 lecture UUID 접근을 시도해 404와 기록 분리를 재확인한다.
+3. 같은 기준문으로 Qwen 원문과 Solar 후보정본의 CER 및 숫자·수식·고유명사 의미 왜곡을 비교한다.
+4. 중간에 tunnel을 끊고 복구해 DB chunk 수, segment 순서, 중복 텍스트를 확인한다.
+5. 녹음 종료·마이크 강제 중단·화면 잠금으로 final tail을 각각 검증한다.
+6. 두 계정으로 같은 lecture UUID 접근을 시도해 404와 기록 분리를 재확인한다.
 
 ## 복구 이력
 
@@ -252,7 +282,7 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 사용자가 지정한 원격은 <https://github.com/superwonso/stt_server_cdh>이고 Pages 주소는 <https://superwonso.github.io/stt_server_cdh/>다. `superwonso` GitHub 인증을 연결해 공개 앱을 `main`에 push했고, Pages source는 GitHub Actions로 설정됐다. `Deploy classroom to GitHub Pages` 실행과 공개 자산 비교가 성공했다.
 
-2026-09-03 로컬 Qwen API와 Quick Tunnel을 실제로 시작해 외부 health/CORS를 확인한 뒤 사용자의 요청대로 둘 다 종료했다. 동적 주소는 Git 커밋에 고정하지 않고 실행 중에는 `.data/tunnel-url.txt`와 공개 Pages 런타임 설정에만 둔다. 두 계정의 7일짜리 초대는 `.data/invitations.txt`에 생성됐지만 둘 다 아직 비밀번호를 설정하지 않았다. 따라서 정적 화면과 서버 연결 코드는 배포됐지만, 실제 계정 사용 완료로 표시하면 안 된다.
+2026-09-04 새 후보정 코드로 로컬 Qwen API를 재시작해 warmup·health와 DB v4 migration/integrity/FK를 확인했고, 기존 Quick Tunnel도 외부 HTTPS health가 정상인 상태다. 동적 주소는 Git 커밋에 고정하지 않고 실행 중에는 `.data/tunnel-url.txt`와 공개 Pages 런타임 설정에만 둔다. 두 계정 중 한 계정은 비밀번호 설정을 완료했고, 나머지 한 계정에는 아직 유효한 일회용 초대가 있다. 따라서 두 사용자 설정이 모두 끝났다고 표시하면 안 된다.
 
 푸시 전에 반드시 확인할 것:
 
@@ -264,10 +294,10 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 ## 다음 단계 우선순위
 
-1. 서버와 터널을 시작해 Pages 자동 주소 게시 완료를 확인한 뒤 각 사용자에게 `.data/invitations.txt`의 본인 초대 링크만 전달한다. 사용자가 직접 링크를 열고 비밀번호를 정해야 완료된다.
-2. 활성화 뒤 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 두 계정 격리를 확인한다.
+1. 새 정적 자산의 Pages 배포와 현재 Quick Tunnel 자동 주소 게시를 확인한다. 아직 미활성인 한 사용자에게 `.data/invitations.txt`의 본인 초대 링크만 전달하고 사용자가 직접 비밀번호를 정해야 두 계정 설정이 완료된다.
+2. 두 계정 활성화 뒤 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 두 계정 격리를 확인한다.
 3. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
-4. 사용자에게 개인정보를 제거한 실제 한국어 수업 음성 5~10분 샘플을 요청해 품질과 경계 누락·중복을 검증한다.
+4. 사용자에게 개인정보를 제거한 실제 한국어 수업 음성 5~10분 샘플과 가능하면 교정문을 요청해 Qwen 원문 품질·경계 누락/중복과 Solar 후보정 전후 CER·의미 보존을 함께 검증한다.
 5. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
 
 ## 재현 명령
@@ -299,6 +329,7 @@ server/.env
 *.wav *.webm *.m4a *.mp3 *.flac *.ogg *.oga *.opus *.mp4 *.mkv *.mov
 *.aif *.aiff *.ape *.asf *.wma *.au
 GitHub token, 비밀번호, 초대 링크
+Mindlogic/NOVA API key, provider 요청·응답 원문
 ```
 
 `.gitignore`는 사고를 줄이는 장치일 뿐이다. push 직전 staging 목록을 사람이 다시 확인해야 한다.

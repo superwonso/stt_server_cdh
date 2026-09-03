@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -13,6 +13,8 @@ LOCAL_API_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 QUICK_TUNNEL_SUFFIX = ".trycloudflare.com"
 QUICK_TUNNEL_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 ACCOUNT_USERNAME = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,30}[a-z0-9])?")
+MINDLOGIC_GATEWAY_HOST = "factchat-cloud.mindlogic.ai"
+MINDLOGIC_GATEWAY_PATH = "/v1/gateway"
 
 
 def account_usernames(value: str | None) -> tuple[str, ...]:
@@ -70,6 +72,27 @@ def api_origin(value: str) -> str:
     return origin
 
 
+def mindlogic_gateway_base_url(value: str) -> str:
+    """Keep the bearer credential pinned to the documented NOVA gateway."""
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("MINDLOGIC_BASE_URL has an invalid port") from error
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != MINDLOGIC_GATEWAY_HOST
+        or port not in (None, 443)
+        or parsed.username
+        or parsed.password
+        or parsed.path.rstrip("/") != MINDLOGIC_GATEWAY_PATH
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("MINDLOGIC_BASE_URL must be the official HTTPS NOVA gateway")
+    return f"https://{MINDLOGIC_GATEWAY_HOST}{MINDLOGIC_GATEWAY_PATH}"
+
+
 def _path(value: str) -> Path:
     candidate = Path(value).expanduser()
     return candidate if candidate.is_absolute() else PROJECT_DIR / candidate
@@ -96,10 +119,22 @@ class Settings:
     max_import_seconds: int = 4 * 60 * 60
     max_recordings_bytes: int = 20 * 1024 * 1024 * 1024
     recording_free_reserve_bytes: int = 1024 * 1024 * 1024
+    mindlogic_api_key: str | None = field(default=None, repr=False)
+    mindlogic_base_url: str = f"https://{MINDLOGIC_GATEWAY_HOST}{MINDLOGIC_GATEWAY_PATH}"
+    mindlogic_model: str = "solar-pro4"
+    correction_chunk_chars: int = 6000
+    correction_overlap_segments: int = 2
+    correction_connect_timeout_seconds: float = 10.0
+    correction_read_timeout_seconds: float = 90.0
+    correction_max_retries: int = 2
+    correction_retry_base_seconds: float = 1.0
+    correction_max_response_bytes: int = 2 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if account_usernames(",".join(self.accounts)) != self.accounts:
             raise ValueError("Settings.accounts must contain two normalized account IDs")
+        normalized_gateway = mindlogic_gateway_base_url(self.mindlogic_base_url)
+        object.__setattr__(self, "mindlogic_base_url", normalized_gateway)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -140,6 +175,32 @@ class Settings:
             recording_free_reserve_bytes=max(
                 256 * 1024 * 1024,
                 min(int(os.getenv("RECORDING_FREE_RESERVE_BYTES", str(1024 * 1024 * 1024))), 20 * 1024 * 1024 * 1024),
+            ),
+            mindlogic_api_key=(os.getenv("MINDLOGIC_API_KEY") or "").strip() or None,
+            mindlogic_base_url=mindlogic_gateway_base_url(
+                os.getenv(
+                    "MINDLOGIC_BASE_URL",
+                    f"https://{MINDLOGIC_GATEWAY_HOST}{MINDLOGIC_GATEWAY_PATH}",
+                )
+            ),
+            mindlogic_model=(os.getenv("MINDLOGIC_MODEL", "solar-pro4").strip() or "solar-pro4"),
+            correction_chunk_chars=max(1000, min(int(os.getenv("CORRECTION_CHUNK_CHARS", "6000")), 24000)),
+            correction_overlap_segments=max(
+                0, min(int(os.getenv("CORRECTION_OVERLAP_SEGMENTS", "2")), 5)
+            ),
+            correction_connect_timeout_seconds=max(
+                1.0, min(float(os.getenv("CORRECTION_CONNECT_TIMEOUT_SECONDS", "10")), 30.0)
+            ),
+            correction_read_timeout_seconds=max(
+                10.0, min(float(os.getenv("CORRECTION_READ_TIMEOUT_SECONDS", "90")), 180.0)
+            ),
+            correction_max_retries=max(0, min(int(os.getenv("CORRECTION_MAX_RETRIES", "2")), 3)),
+            correction_retry_base_seconds=max(
+                0.0, min(float(os.getenv("CORRECTION_RETRY_BASE_SECONDS", "1")), 5.0)
+            ),
+            correction_max_response_bytes=max(
+                64 * 1024,
+                min(int(os.getenv("CORRECTION_MAX_RESPONSE_BYTES", str(2 * 1024 * 1024))), 2 * 1024 * 1024),
             ),
         )
 

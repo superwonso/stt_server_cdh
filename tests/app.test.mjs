@@ -393,6 +393,135 @@ test('Markdown and plain-text exports preserve content safely and lock during au
   }
 });
 
+test('AI correction stays raw by default, polls to completion, and exports only the selected version', async () => {
+  const requests = [];
+  let reads = 0;
+  const app = setup(async (url, options = {}) => {
+    requests.push({url,method:options.method || 'GET'});
+    if (options.method === 'POST') {
+      return response({lecture_id:'lesson',status:'queued',raw_revision:'a'.repeat(64)});
+    }
+    reads += 1;
+    if (reads === 1) return response({lecture_id:'lesson',status:'processing',raw_revision:'a'.repeat(64)});
+    return response({
+      lecture_id:'lesson',status:'completed',raw_revision:'a'.repeat(64),corrected_text:'교정된 전체 문장',
+      corrected_segments:[{id:'s1',start:0,end:4,text:'교정된 첫 문장입니다.'},{id:'s2',start:4,end:8,text:'교정된 둘째 문장입니다.'}],
+      uncertain_terms:['전문용어'],
+    });
+  });
+  app.run(`
+    current={id:'lesson',title:'한국어 수업',language:'ko',created_at:'2026-01-01T16:00:00Z',
+      recording_available:true,recording_finalized:true,
+      segments:[{id:'s1',start:0,end:4,text:'원문 첫 문장'},{id:'s2',start:4,end:8,text:'원문 둘째 문장'}]};
+    renderCurrent();
+  `);
+  assert.equal(app.element('correction-panel').hidden, false);
+  assert.equal(app.element('correct-transcript').disabled, false);
+  assert.equal(app.element('transcript-raw')['aria-pressed'], 'true');
+  assert.equal(app.element('transcript-corrected').disabled, true);
+
+  app.element('correct-transcript').onclick();
+  await tick(); await tick();
+  assert.deepEqual(requests.map(item => item.method), ['POST']);
+  assert.equal(app.run('correction.status'), 'queued');
+  assert.equal(app.run('correctionView'), 'raw');
+  assert.match(app.element('correction-state').textContent, /대기/);
+  assert.equal(app.element('transcript').children[0].children[1].textContent, '원문 첫 문장');
+
+  await app.runTimeout(2500);
+  assert.equal(app.run('correction.status'), 'processing');
+  assert.equal(app.run('correctionView'), 'raw');
+  await app.runTimeout(2500);
+  assert.equal(app.run('correction.status'), 'completed');
+  assert.equal(app.run('correctionView'), 'raw', 'a model result must never replace the raw view automatically');
+  assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 2500));
+  assert.match(app.element('notice').textContent, /후보정본을 만들었어요/);
+  assert.equal(app.element('transcript-corrected').disabled, false);
+  assert.match(app.element('correction-detail').textContent, /확인이 필요한 표현: 전문용어/);
+  assert.equal(app.element('transcript').children[0].children[1].textContent, '원문 첫 문장');
+
+  app.element('transcript-corrected').onclick();
+  assert.equal(app.run('correctionView'), 'corrected');
+  assert.equal(app.element('transcript-corrected')['aria-pressed'], 'true');
+  assert.equal(app.element('transcript').children[0].children[1].textContent, '교정된 첫 문장입니다.');
+  assert.equal(app.element('segment-count').textContent, 2);
+
+  app.element('export-format').value = 'markdown';
+  app.element('download').onclick();
+  const correctedLink = app.created('a');
+  const correctedMarkdown = await app.objectUrlBlob(correctedLink.href).text();
+  assert.equal(correctedLink.download, '한국어 수업_AI후보정.md');
+  assert.match(correctedMarkdown, /버전: AI 후보정본/);
+  assert.match(correctedMarkdown, /교정된 첫 문장입니다/);
+  assert.doesNotMatch(correctedMarkdown, /원문 첫 문장/);
+
+  app.element('transcript-raw').onclick();
+  app.element('export-format').value = 'text';
+  app.element('download').onclick();
+  const rawLink = app.created('a');
+  const rawText = await app.objectUrlBlob(rawLink.href).text();
+  assert.equal(rawLink.download, '한국어 수업.txt');
+  assert.match(rawText, /원문 첫 문장/);
+  assert.doesNotMatch(rawText, /교정된 첫 문장입니다/);
+});
+
+test('AI correction is blocked until the lecture is finalized and reports exhausted credits without hiding raw text', async () => {
+  let requests = 0;
+  const app = setup(async () => {
+    requests += 1;
+    return response({detail:'사용 가능한 크레딧이 부족합니다.',error_code:'credit_exhausted'},402);
+  });
+  app.run(`
+    current={id:'unfinished',title:'진행 중',created_at:'2026-01-01T00:00:00Z',recording_finalized:false,
+      segments:[{id:'raw',start:0,text:'보존할 원문'}]}; renderCurrent();
+  `);
+  assert.equal(app.element('correct-transcript').disabled, true);
+  assert.equal(app.element('correction-panel')['data-state'], 'unfinished');
+  app.element('correct-transcript').onclick();
+  await tick();
+  assert.equal(requests, 0);
+
+  app.run('current.recording_finalized=true; renderCurrent()');
+  assert.equal(app.element('correct-transcript').disabled, false);
+  app.element('correct-transcript').onclick();
+  await tick(); await tick();
+  assert.equal(requests, 1);
+  assert.equal(app.element('correction-panel')['data-state'], 'credit-exhausted');
+  assert.match(app.element('correction-state').textContent, /크레딧/);
+  assert.equal(app.run('correctionView'), 'raw');
+  assert.equal(app.element('transcript').children[0].children[1].textContent, '보존할 원문');
+});
+
+test('late AI correction responses and polling timers cannot cross lecture boundaries', async () => {
+  const late = deferred();
+  const app = setup(() => late.promise);
+  app.run(`
+    current={id:'old',title:'이전 수업',created_at:'2026-01-01T00:00:00Z',recording_finalized:true,
+      segments:[{id:'old-raw',start:0,text:'이전 원문'}]}; renderCurrent();
+  `);
+  const loading = app.run("loadCorrection('old')");
+  await tick();
+  app.run(`
+    current={id:'new',title:'새 수업',created_at:'2026-01-02T00:00:00Z',recording_finalized:true,
+      segments:[{id:'new-raw',start:0,text:'새 원문'}]}; renderCurrent();
+  `);
+  late.resolve(response({status:'completed',corrected_text:'노출되면 안 되는 이전 후보정'}));
+  await loading;
+  assert.equal(app.run('current.id'), 'new');
+  assert.equal(app.run('correction'), null);
+  assert.equal(app.run('correctionView'), 'raw');
+  assert.equal(app.element('transcript').children[0].children[1].textContent, '새 원문');
+
+  app.run(`
+    correction={status:'processing',corrected_text:'',corrected_segments:[]};
+    scheduleCorrectionPoll('new');
+  `);
+  assert.ok([...app.timeouts.values()].some(timer => timer.delay === 2500));
+  app.run('resetNewNote()');
+  assert.equal(app.run('correctionPollTimer'), null);
+  assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 2500));
+});
+
 test('recording download exchanges bearer auth for a same-origin native ticket link', async () => {
   const ticket = deferred();
   const ticketPath = `/recording-downloads/${'a'.repeat(43)}`;

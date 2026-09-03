@@ -15,6 +15,9 @@ let lectureRefreshGeneration = 0, importLectureSequence = 0;
 let lectureDateFilter = '', recordingDownloadPending = false, recordingFinalizePending = false;
 let deletingLecture = false, deleteTarget = null;
 let noteActionSequence = 0;
+let correction = null, correctionView = 'raw', correctionLectureId = '';
+let correctionLoading = false, correctionStarting = false, correctionError = '', correctionCreditExhausted = false;
+let correctionSequence = 0, correctionPollTimer = null;
 let connectionState = 'unverified', verifiedApiUrl = '', verifiedApiExpiresAt = 0;
 let connectionGeneration = 0, connectionController = null, connectionLeaseTimer = null, leaseRefreshPromise = null;
 const MAX_PENDING = 8;
@@ -27,6 +30,7 @@ const UPLOAD_TIMEOUT_MS = 60000;
 const CONFIG_TIMEOUT_MS = 8000;
 const RUNTIME_CONFIG_TTL_MS = 24 * 60 * 60 * 1000;
 const CONFIG_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const CORRECTION_POLL_MS = 2500;
 const fmt = seconds => { const n = Math.max(0, Math.floor(seconds || 0)); return `${Math.floor(n / 60).toString().padStart(2, '0')}:${(n % 60).toString().padStart(2, '0')}`; };
 const KST_DATE_FORMATTER = new Intl.DateTimeFormat('ko-KR', {timeZone:'Asia/Seoul',year:'numeric',month:'long',day:'numeric'});
 const KST_DATE_PARTS = new Intl.DateTimeFormat('en', {timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'});
@@ -46,14 +50,22 @@ function escapeMarkdown(value) {
     .replace(/[\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E]/g, character => `\\${character}`)
     .replace(/\n/g,'  \n');
 }
+const hasSegmentStart = segment => segment?.start !== null && segment?.start !== undefined
+  && segment.start !== '' && Number.isFinite(Number(segment.start));
 function exportText(lecture, format) {
   const segments = lecture?.segments || [];
+  const corrected = lecture?.transcript_version === 'corrected';
+  const versionLine = corrected ? 'AI 후보정본 · 받아쓴 원문은 서버에 별도 보관\n' : '';
   if (format === 'text') {
-    return `${lecture.title}\n${dateLabel(lecture.created_at)}\n\n${segments.map(segment => `[${fmt(segment.start)}] ${segment.text}`).join('\n\n')}\n`;
+    const body = segments.map(segment => hasSegmentStart(segment)
+      ? `[${fmt(segment.start)}] ${segment.text}` : segment.text).join('\n\n');
+    return `${lecture.title}\n${dateLabel(lecture.created_at)}\n${versionLine}\n${body}\n`;
   }
   const language = ({ko:'한국어',en:'영어'})[lecture.language] || '자동 감지';
-  const body = segments.map(segment => `**\\[${fmt(segment.start)}\\]** ${escapeMarkdown(segment.text)}`).join('\n\n');
-  return `# ${escapeMarkdown(lecture.title)}\n\n- 날짜: ${dateLabel(lecture.created_at)}\n- 언어: ${language}\n\n## 받아쓴 내용\n\n${body}\n`;
+  const body = segments.map(segment => hasSegmentStart(segment)
+    ? `**\\[${fmt(segment.start)}\\]** ${escapeMarkdown(segment.text)}` : escapeMarkdown(segment.text)).join('\n\n');
+  const version = corrected ? '\n- 버전: AI 후보정본 (받아쓴 원문 별도 보관)' : '';
+  return `# ${escapeMarkdown(lecture.title)}\n\n- 날짜: ${dateLabel(lecture.created_at)}\n- 언어: ${language}${version}\n\n## ${corrected ? 'AI 후보정본' : '받아쓴 원문'}\n\n${body}\n`;
 }
 const storage = { get() { try { return localStorage.getItem('yeobaek-server') || ''; } catch { return ''; } }, set(value) { try { localStorage.setItem('yeobaek-server', value); } catch {} } };
 function notice(message) { $('notice').textContent = message; $('notice').hidden = false; clearTimeout(noticeTimer); noticeTimer = setTimeout(() => $('notice').hidden = true, 6000); }
@@ -120,6 +132,7 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
       let message = typeof data?.detail === 'string' ? data.detail : `요청을 처리하지 못했습니다 (${response.status}).`;
       if (response.status === 401 && requestToken && token === requestToken && apiUrl === requestServer) { message = '로그인이 만료됐어요. 같은 계정으로 다시 로그인해 주세요.'; token = ''; showLogin(false); }
       const error = new Error(message); error.status = response.status;
+      error.code = typeof data?.error_code === 'string' ? data.error_code : typeof data?.code === 'string' ? data.code : '';
       const retryAfterHeader = response.headers?.get?.('Retry-After');
       const retryAfter = retryAfterHeader === null || retryAfterHeader === undefined || retryAfterHeader.trim() === ''
         ? Number.NaN : Number(retryAfterHeader);
@@ -457,6 +470,7 @@ function showLogin(clear = true) {
   detachImportWatcher();
   $('workspace').hidden = true; $('auth-screen').hidden = false; clearInterval(statusTimer);
   if (clear) { user = ''; current = null; lectures = []; lectureDateFilter = ''; }
+  resetCorrectionState(current?.id || '');
   setActivation(false);
 }
 $('auth-toggle').onclick = () => setActivation(!activation);
@@ -551,7 +565,9 @@ $('auth-form').onsubmit = async event => {
     if (!token) return;
     $('auth-screen').hidden = true; $('workspace').hidden = false; $('current-user').textContent = user;
     document.querySelector('.user-avatar').textContent = user[0].toUpperCase();
-    renderCurrent(); void updateStatus(); clearInterval(statusTimer); statusTimer = setInterval(updateStatus, 20000);
+    renderCurrent();
+    if (current?.id && current.recording_finalized === true && current.segments?.length) void loadCorrection(current.id);
+    void updateStatus(); clearInterval(statusTimer); statusTimer = setInterval(updateStatus, 20000);
     if (pending.length || draft) { sendError = ''; void retryPending(); }
   } catch (error) { $('auth-error').textContent = errorText(error); $('auth-error').hidden = false; }
   finally { authenticating = false; updateAuthControls(); updateControls(); }
@@ -767,19 +783,229 @@ function renderHistory() {
       if (current?.id === lecture.id) button.setAttribute('aria-current','page');
       const title = document.createElement('strong'); title.textContent = lecture.title;
       const date = document.createElement('span'); date.textContent = dateLabel(lecture.created_at); button.append(title,date);
-      button.onclick = async () => { if (isBusy()) return; selectImportLecture = false; ++importLectureSequence; const generation = ++requestGeneration; try { const note = await api(`/lectures/${lecture.id}`); if (generation !== requestGeneration || isBusy()) return; current = note; renderCurrent(); renderHistory(); } catch (error) { notice(errorText(error)); } };
+      button.onclick = async () => { if (isBusy()) return; selectImportLecture = false; ++importLectureSequence; const generation = ++requestGeneration; try { const note = await api(`/lectures/${lecture.id}`); if (generation !== requestGeneration || isBusy()) return; current = note; renderCurrent(); renderHistory(); if (note.recording_finalized === true && note.segments?.length) void loadCorrection(note.id); } catch (error) { notice(errorText(error)); } };
       items.append(button);
     }
     group.append(heading,items); list.append(group);
   }
 }
 $('lecture-date').onchange = () => { lectureDateFilter = $('lecture-date').value; renderHistory(); updateControls(); };
+function clearCorrectionPoll() {
+  if (correctionPollTimer !== null) clearTimeout(correctionPollTimer);
+  correctionPollTimer = null;
+}
+function resetCorrectionState(lectureId = '') {
+  ++correctionSequence;
+  clearCorrectionPoll();
+  correction = null; correctionView = 'raw'; correctionLectureId = lectureId;
+  correctionLoading = false; correctionStarting = false; correctionError = ''; correctionCreditExhausted = false;
+}
+function correctionPayload(value) {
+  const payload = value?.correction && typeof value.correction === 'object' ? value.correction : value;
+  if (!payload || typeof payload !== 'object') return null;
+  const aliases = {pending:'queued',running:'processing',done:'completed',error:'failed'};
+  const status = aliases[payload.status] || payload.status;
+  return {
+    ...payload,
+    status: ['queued','processing','completed','failed'].includes(status) ? status : 'failed',
+    corrected_text: typeof payload.corrected_text === 'string' ? payload.corrected_text
+      : typeof payload.result?.corrected_text === 'string' ? payload.result.corrected_text : '',
+    corrected_segments: Array.isArray(payload.corrected_segments) ? payload.corrected_segments
+      : Array.isArray(payload.result?.corrected_segments) ? payload.result.corrected_segments : [],
+    error: typeof payload.error === 'string' ? payload.error
+      : typeof payload.detail === 'string' ? payload.detail : '',
+    error_code: typeof payload.error_code === 'string' ? payload.error_code
+      : typeof payload.code === 'string' ? payload.code : '',
+  };
+}
+function normalizedCorrectedSegments(value = correction) {
+  const segments = (value?.corrected_segments || []).flatMap((segment,index) => {
+    if (!segment || typeof segment.text !== 'string' || !segment.text.trim()) return [];
+    const start = segment.start !== null && segment.start !== undefined && segment.start !== '' ? Number(segment.start) : Number.NaN;
+    const end = segment.end !== null && segment.end !== undefined && segment.end !== '' ? Number(segment.end) : Number.NaN;
+    return [{
+      id:String(segment.id || segment.segment_id || `corrected-${index}`),
+      start:Number.isFinite(start) ? start : null,
+      end:Number.isFinite(end) ? end : null,
+      text:segment.text.trim(),
+    }];
+  });
+  if (segments.length) return segments;
+  const text = String(value?.corrected_text || '').trim();
+  return text ? [{id:'corrected-text',start:null,end:null,text}] : [];
+}
+function correctionIsReady() {
+  return correction?.status === 'completed' && normalizedCorrectedSegments().length > 0;
+}
+function displayedTranscriptSegments() {
+  return correctionView === 'corrected' && correctionIsReady()
+    ? normalizedCorrectedSegments() : current?.segments || [];
+}
+function selectedTranscriptLecture() {
+  return {
+    ...current,
+    segments:displayedTranscriptSegments(),
+    transcript_version:correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw',
+  };
+}
+function isCreditExhaustion(value) {
+  const code = String(value?.error_code || value?.code || '').toLowerCase();
+  const message = String(value?.error || value?.message || value?.detail || '');
+  return value?.status === 402 || ['credit_exhausted','credits_exhausted','quota_exhausted'].includes(code)
+    || /(?:credit|quota|크레딧).*(?:exhaust|insufficient|부족|소진)/i.test(message);
+}
+function correctionStatus() {
+  if (correctionStarting) return 'starting';
+  if (correctionLoading && !correction) return 'loading';
+  if (correctionCreditExhausted) return 'credit-exhausted';
+  if (correctionError) return 'failed';
+  if (current?.segments?.length && current.recording_finalized !== true && !correctionIsReady()) return 'unfinished';
+  return correction?.status || 'idle';
+}
+function updateCorrectionControls(noteToolsBusy = isBusy() || importIsActive() || importStarting || importCancelling) {
+  const hasTranscript = !!current?.segments?.length;
+  const ready = correctionIsReady();
+  const status = correctionStatus();
+  const running = ['loading','starting','queued','processing'].includes(status);
+  $('transcript-versions').hidden = !hasTranscript;
+  $('transcript-raw').disabled = !hasTranscript;
+  $('transcript-corrected').disabled = !hasTranscript || !ready;
+  $('correct-transcript').disabled = !hasTranscript || current?.recording_finalized !== true
+    || noteToolsBusy || running || ready;
+}
+function renderCorrection() {
+  const hasTranscript = !!current?.segments?.length;
+  const ready = correctionIsReady();
+  if (!ready && correctionView === 'corrected') correctionView = 'raw';
+  const corrected = correctionView === 'corrected' && ready;
+  $('transcript-raw').classList.toggle('active', !corrected);
+  $('transcript-corrected').classList.toggle('active', corrected);
+  $('transcript-raw').setAttribute('aria-pressed',String(!corrected));
+  $('transcript-corrected').setAttribute('aria-pressed',String(corrected));
+  $('correction-panel').hidden = !hasTranscript;
+  const status = correctionStatus();
+  $('correction-panel').setAttribute('data-state',status);
+  $('correction-panel').setAttribute('aria-busy',String(['loading','starting','queued','processing'].includes(status)));
+  const copies = {
+    idle:['AI 후보정','받아쓴 원문은 그대로 두고, 전사 텍스트만 학교 AI 서버에 보내 별도의 후보정본을 만듭니다.','AI 후보정 만들기'],
+    unfinished:['수업 기록을 마무리해 주세요','마지막 음성 저장이 끝난 뒤 AI 후보정을 시작할 수 있습니다. 받아쓴 원문은 지금도 내려받을 수 있어요.','마무리 후 사용'],
+    loading:['후보정 확인 중','이 수업에 저장된 후보정본이 있는지 확인하고 있어요.','확인하는 중…'],
+    starting:['후보정 요청 중','원문을 보존한 채 후보정 작업을 요청하고 있어요.','요청하는 중…'],
+    queued:['후보정 대기 중','학교 AI 서버의 처리 순서를 기다리고 있어요. 이 화면을 벗어나도 서버에서 계속됩니다.','대기 중…'],
+    processing:['AI가 후보정 중','문장과 문맥을 확인하고 있어요. 원문은 변경되지 않습니다.','후보정 중…'],
+    completed:['AI 후보정 완료','후보정본을 별도로 저장했어요. 위에서 원문과 후보정본을 바꿔 볼 수 있습니다.','후보정 완료'],
+    failed:['후보정을 마치지 못했어요',correctionError || correction?.error || '받아쓴 원문은 안전하게 남아 있습니다. 잠시 후 다시 시도해 주세요.','다시 시도'],
+    'credit-exhausted':['AI 크레딧이 부족해요','후보정만 중단됐으며 받아쓴 원문은 안전하게 남아 있습니다. 크레딧을 확인한 뒤 다시 시도해 주세요.','다시 확인'],
+  };
+  let [title,detail,action] = copies[status] || copies.failed;
+  const allUncertain = Array.isArray(correction?.uncertain_terms)
+    ? correction.uncertain_terms.filter(term => typeof term === 'string' && term.trim()) : [];
+  const uncertain = allUncertain.slice(0,5);
+  if (status === 'completed' && uncertain.length) {
+    const remaining = allUncertain.length - uncertain.length;
+    detail += ` 확인이 필요한 표현: ${uncertain.join(', ')}${remaining ? ` 외 ${remaining}개` : ''}`;
+  }
+  $('correction-state').textContent = title;
+  $('correction-detail').textContent = detail;
+  $('correction-detail').setAttribute('role',['failed','credit-exhausted'].includes(status) ? 'alert' : 'status');
+  $('correct-transcript').textContent = action;
+  updateCorrectionControls();
+}
+function applyCorrectionResponse(value, lectureId) {
+  const previousStatus = correction?.status;
+  const next = correctionPayload(value);
+  correction = next;
+  correctionError = next?.status === 'failed' ? next.error || '후보정 작업을 완료하지 못했습니다.' : '';
+  correctionCreditExhausted = isCreditExhaustion(next);
+  if (correctionCreditExhausted) correctionError = '';
+  if (next?.status === 'completed' && !normalizedCorrectedSegments(next).length) {
+    correctionError = '서버가 비어 있는 후보정 결과를 보냈습니다. 원문을 이용해 주세요.';
+    correction = {...next,status:'failed'};
+  }
+  if (['queued','processing'].includes(correction?.status)) scheduleCorrectionPoll(lectureId);
+  return ['queued','processing'].includes(previousStatus) && correctionIsReady();
+}
+function scheduleCorrectionPoll(lectureId) {
+  clearCorrectionPoll();
+  const sequence = correctionSequence;
+  correctionPollTimer = setTimeout(() => {
+    correctionPollTimer = null;
+    if (sequence === correctionSequence && current?.id === lectureId && token) void loadCorrection(lectureId,{quiet:true});
+  },CORRECTION_POLL_MS);
+}
+async function loadCorrection(lectureId, {quiet = false} = {}) {
+  if (!lectureId || current?.id !== lectureId || !token) return;
+  clearCorrectionPoll();
+  const owner = user, sessionToken = token, server = apiUrl;
+  const sequence = ++correctionSequence;
+  const operationIsCurrent = () => sequence === correctionSequence && current?.id === lectureId
+    && owner === user && sessionToken === token && server === apiUrl;
+  if (!quiet) { correctionLoading = true; correctionError = ''; correctionCreditExhausted = false; renderCorrection(); }
+  try {
+    const result = await api(`/lectures/${encodeURIComponent(lectureId)}/correction`);
+    if (!operationIsCurrent()) return;
+    const completedWhilePolling = applyCorrectionResponse(result,lectureId);
+    if (completedWhilePolling) notice('AI 후보정본을 만들었어요. 원문과 비교해 보세요.');
+  } catch (error) {
+    if (!operationIsCurrent()) return;
+    if (error?.status === 404) {
+      correction = null; correctionError = ''; correctionCreditExhausted = false;
+    } else {
+      correctionError = errorText(error); correctionCreditExhausted = isCreditExhaustion(error);
+    }
+  } finally {
+    if (operationIsCurrent()) { correctionLoading = false; renderCurrent(); }
+  }
+}
+async function requestCorrection() {
+  if (!current?.id || !current.segments?.length || correctionStarting || correctionIsReady()
+      || current.recording_finalized !== true || isBusy() || importIsActive() || importStarting) return;
+  if (['queued','processing'].includes(correction?.status)) {
+    if (correctionError || correctionCreditExhausted) {
+      correctionError = ''; correctionCreditExhausted = false;
+      void loadCorrection(current.id);
+    }
+    return;
+  }
+  const lectureId = current.id, owner = user, sessionToken = token, server = apiUrl;
+  clearCorrectionPoll();
+  const sequence = ++correctionSequence;
+  const operationIsCurrent = () => sequence === correctionSequence && current?.id === lectureId
+    && owner === user && sessionToken === token && server === apiUrl;
+  correctionStarting = true; correctionError = ''; correctionCreditExhausted = false; renderCorrection();
+  try {
+    const result = await api(`/lectures/${encodeURIComponent(lectureId)}/correction`,{method:'POST'},30000);
+    if (!operationIsCurrent()) return;
+    applyCorrectionResponse(result,lectureId);
+    if (correction?.status === 'completed') notice('AI 후보정본을 만들었어요. 원문과 비교해 보세요.');
+  } catch (error) {
+    if (!operationIsCurrent()) return;
+    correctionError = errorText(error); correctionCreditExhausted = isCreditExhaustion(error);
+  } finally {
+    if (operationIsCurrent()) { correctionStarting = false; renderCurrent(); }
+  }
+}
+$('transcript-raw').onclick = () => {
+  if (correctionView === 'raw') return;
+  correctionView = 'raw'; renderCurrent();
+};
+$('transcript-corrected').onclick = () => {
+  if (!correctionIsReady() || correctionView === 'corrected') return;
+  correctionView = 'corrected'; renderCurrent();
+};
+$('correct-transcript').onclick = () => { void requestCorrection(); };
 function renderCurrent() {
+  const lectureId = current?.id || '';
+  if (lectureId !== correctionLectureId) {
+    resetCorrectionState(lectureId);
+    if (current?.correction) correction = correctionPayload(current.correction);
+  }
   $('note-date').textContent = dateLabel(current?.created_at || new Date());
   $('view-label').textContent = current?.title || '새 수업';
   document.querySelector('.note-heading h1').textContent = current?.title || '오늘의 배움을 담아보세요.';
   if (current) { $('lecture-title').value = current.title; $('language').value = current.language || 'auto'; }
-  const segments = current?.segments || [];
+  renderCorrection();
+  const segments = displayedTranscriptSegments();
   const transcript = $('transcript'); transcript.replaceChildren();
   if (!segments.length) {
     const empty = document.createElement('div'); empty.className = 'empty-note';
@@ -787,9 +1013,18 @@ function renderCurrent() {
     const heading = document.createElement('h3'); heading.textContent = current && !recording && !starting ? '아직 받아쓴 내용이 없어요.' : '첫 문장을 기다리고 있어요.';
     const text = document.createElement('p'); text.textContent = recording || starting ? '목소리가 들어오면 이곳에 글이 나타나요.' : '수업 이름을 적고 받아쓰기를 시작해 보세요.'; empty.append(mark,heading,text); transcript.append(empty);
   } else {
-    for (const segment of segments) { const row = document.createElement('div'); row.className = 'segment'; const time = document.createElement('time'); time.textContent = fmt(segment.start); const text = document.createElement('p'); text.textContent = segment.text; row.append(time,text); transcript.append(row); }
+    for (const segment of segments) {
+      const row = document.createElement('div');
+      const timed = hasSegmentStart(segment);
+      row.className = `segment${timed ? '' : ' without-time'}`;
+      const text = document.createElement('p'); text.textContent = segment.text;
+      if (timed) { const time = document.createElement('time'); time.textContent = fmt(segment.start); row.append(time,text); }
+      else row.append(text);
+      transcript.append(row);
+    }
   }
   $('segment-count').textContent = segments.length;
+  $('transcript-title').textContent = correctionView === 'corrected' && correctionIsReady() ? 'AI 후보정본' : '받아쓴 원문';
   updateControls();
 }
 function selectedCaptureSource() { return $('audio-source').value === 'system' ? 'system' : 'microphone'; }
@@ -864,7 +1099,7 @@ function updateControls() {
   $('recording-download').textContent = !current ? '↓ 녹음 WAV'
     : !current.recording_available ? '저장된 녹음 없음'
       : current.recording_finalized ? '↓ 녹음 WAV' : '녹음 WAV 마무리';
-  $('delete-lecture').disabled = noteToolsBusy || !current;
+  $('delete-lecture').disabled = noteToolsBusy || correctionLoading || correctionStarting || !current;
   $('delete-close').disabled = deletingLecture;
   $('delete-cancel').disabled = deletingLecture;
   $('delete-confirm').disabled = deletingLecture;
@@ -891,6 +1126,7 @@ function updateControls() {
   $('import-button').disabled = liveAudioBusy || importStarting || (activeImport && !canResumeImport) || !$('recording-file').files?.length;
   $('import-button').textContent = canResumeImport ? '같은 파일 이어 올리기' : '파일 올려 변환';
   for (const button of $('lecture-list').querySelectorAll('button')) button.disabled = busy;
+  updateCorrectionControls(noteToolsBusy);
   renderImportStatus();
 }
 $('recording-file').onchange = () => {
@@ -1260,8 +1496,10 @@ $('download').onclick = () => {
   const format = $('export-format').value === 'text' ? 'text' : 'markdown';
   const extension = format === 'text' ? 'txt' : 'md';
   const type = format === 'text' ? 'text/plain;charset=utf-8' : 'text/markdown;charset=utf-8';
-  const url = URL.createObjectURL(new Blob(['\uFEFF',exportText(current,format)],{type}));
-  const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(current.title)}.${extension}`;
+  const displayed = selectedTranscriptLecture();
+  const url = URL.createObjectURL(new Blob(['\uFEFF',exportText(displayed,format)],{type}));
+  const suffix = displayed.transcript_version === 'corrected' ? '_AI후보정' : '';
+  const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(current.title)}${suffix}.${extension}`;
   link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
 };
 async function downloadRecording() {
@@ -1340,6 +1578,7 @@ $('delete-confirm').onclick = async () => {
   }
   const generation = ++requestGeneration, sequence = ++noteActionSequence;
   ++lectureRefreshGeneration;
+  ++correctionSequence; clearCorrectionPoll();
   deletingLecture = true; updateControls();
   const operationIsCurrent = () => sequence === noteActionSequence && generation === requestGeneration
     && target.owner === user && target.sessionToken === token && target.server === apiUrl
@@ -1355,7 +1594,13 @@ $('delete-confirm').onclick = async () => {
       notice(`수업을 삭제하지 못했습니다. ${errorText(error)}`);
     }
   } finally {
-    if (sequence === noteActionSequence) { deletingLecture = false; updateControls(); }
+    if (sequence === noteActionSequence) {
+      deletingLecture = false;
+      if (current?.id === target.id && ['queued','processing'].includes(correction?.status)) {
+        scheduleCorrectionPoll(target.id);
+      }
+      updateControls();
+    }
   }
 };
 $('logout').onclick = async () => {
