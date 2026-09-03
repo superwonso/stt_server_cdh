@@ -25,11 +25,11 @@
         <small>수업 받아쓰기</small>
       </span>
     </a>
-    <button id="connection-open" class="connection-button" type="button" aria-haspopup="dialog" aria-controls="connection-dialog">
+    <button id="connection-open" class="connection-button" type="button" data-state="discovering" aria-label="서버 찾는 중, 연결 설정 열기" aria-busy="true" aria-haspopup="dialog" aria-controls="connection-dialog">
       <span class="connection-pulse" aria-hidden="true"></span>
       <span class="connection-copy">
         <small>내 서버</small>
-        <strong id="server-label">연결 설정 필요</strong>
+        <strong id="server-label">서버 찾는 중…</strong>
       </span>
       <span aria-hidden="true">⌄</span>
     </button>
@@ -52,12 +52,17 @@
       </div>
     </section>
 
-    <section class="auth-panel" aria-describedby="auth-description">
+    <section class="auth-panel" aria-describedby="auth-description auth-server-status">
       <div class="auth-heading">
         <span class="auth-symbol" aria-hidden="true">✦</span>
         <p class="eyebrow">나만의 수업 노트</p>
         <h2 id="auth-title">다시 만나 반가워요.</h2>
         <p id="auth-description">내 계정으로 로그인해 수업을 기록하세요.</p>
+      </div>
+
+      <div class="auth-server-state">
+        <p id="auth-server-status" role="status" aria-live="polite" aria-atomic="true">현재 서버 주소를 자동으로 찾고 있어요.</p>
+        <button id="auth-server-open" class="inline-button" type="button" aria-haspopup="dialog" aria-controls="connection-dialog">서버 주소 직접 입력</button>
       </div>
 
       <form id="auth-form" class="auth-form">
@@ -79,7 +84,7 @@
           <input id="password-confirm" name="password-confirm" type="password" minlength="4" maxlength="128" autocomplete="new-password" autocapitalize="none" enterkeyhint="go" spellcheck="false">
         </div>
         <p id="auth-error" class="form-error" role="alert" hidden></p>
-        <button id="login-button" class="primary-button" type="submit">로그인 ↗</button>
+        <button id="login-button" class="primary-button" type="submit" disabled>로그인 ↗</button>
       </form>
 
       <button id="auth-toggle" class="text-button" type="button">처음이라면 · 비밀번호 설정하기</button>
@@ -233,7 +238,7 @@
   </div>
   </div>
 
-  <dialog id="connection-dialog" class="connection-dialog" aria-labelledby="connection-title" aria-describedby="connection-description">
+  <dialog id="connection-dialog" class="connection-dialog" aria-labelledby="connection-title" aria-describedby="connection-description connection-status">
     <form id="connection-form" class="connection-form">
       <div class="dialog-heading">
         <div>
@@ -243,11 +248,12 @@
         <button id="connection-close" class="dialog-close" type="button" aria-label="연결 설정 닫기">×</button>
       </div>
       <p id="connection-description">서버 컴퓨터에서 표시된 Cloudflare HTTPS 주소를 입력하세요. 다시 시작하면 주소가 바뀔 수 있습니다.</p>
+      <p id="connection-status" class="connection-status" role="status" aria-live="polite" aria-atomic="true">현재 서버 주소를 자동으로 찾고 있어요.</p>
       <div class="field">
         <label for="api-url">서버 주소</label>
-        <input id="api-url" name="api-url" type="url" required inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" placeholder="https://…trycloudflare.com">
+        <input id="api-url" name="api-url" type="url" required inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" aria-describedby="connection-description connection-privacy connection-error" placeholder="https://…trycloudflare.com">
       </div>
-      <p class="connection-privacy">주소만 이 기기에 저장됩니다. 비밀번호, 초대 코드, 음성은 브라우저 저장소에 보관하지 않습니다.</p>
+      <p id="connection-privacy" class="connection-privacy">주소만 이 기기에 저장됩니다. 비밀번호, 초대 코드, 음성은 브라우저 저장소에 보관하지 않습니다.</p>
       <p id="connection-error" class="form-error" role="alert" hidden></p>
       <button id="connection-save" class="primary-button" type="submit">연결 확인하고 저장</button>
     </form>

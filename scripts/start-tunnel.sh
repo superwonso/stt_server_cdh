@@ -11,6 +11,7 @@ LOG_FILE="$DATA_DIR/tunnel.log"
 PREVIOUS_LOG_FILE="$DATA_DIR/tunnel.previous.log"
 LOCK_FILE="$DATA_DIR/tunnel-start.lock"
 URL_FILE="$DATA_DIR/tunnel-url.txt"
+PUBLISH_SCRIPT="$SCRIPT_DIR/publish-api-url.sh"
 PORT=${PORT:-8765}
 TUNNEL_TIMEOUT=${TUNNEL_TIMEOUT:-60}
 CLOUDFLARED=${CLOUDFLARED_BIN:-}
@@ -23,7 +24,8 @@ usage() {
 Usage: scripts/start-tunnel.sh [options]
 
 Start a free temporary Cloudflare HTTPS tunnel in the background. The public
-URL changes whenever a new quick tunnel is created.
+URL changes whenever a new quick tunnel is created. After health verification,
+publish that URL through GitHub Actions and wait for the Pages runtime config.
 
 Options:
   --port PORT             Local API port (default: 8765, or PORT)
@@ -32,6 +34,7 @@ Options:
   -h, --help              Show this help
 
 Lookup order: --cloudflared, CLOUDFLARED_BIN, .tools/cloudflared, PATH.
+GitHub publication uses GH_BIN, PATH gh, or .tools/gh-*/bin/gh.
 EOF
 }
 
@@ -188,6 +191,25 @@ pid_is_live() {
     [[ "$state" != "Z" && "$state" != "X" ]]
 }
 
+publish_public_url() {
+    local public_url=$1
+    if ! printf '%s\n' "$public_url" | "$PUBLISH_SCRIPT" --stdin --no-wait; then
+        printf '터널은 계속 실행 중이지만 Pages 자동 연결 설정을 게시하지 못했습니다.\n' >&2
+        printf 'GitHub 로그인을 확인한 뒤 이 명령을 다시 실행하세요. 필요하면 위 공개 주소를 화면의 내 서버에 직접 입력할 수 있습니다.\n' >&2
+        return 1
+    fi
+    # GitHub now knows the desired online state. Release the lifecycle lock
+    # before CDN polling so stop.sh can serialize a newer OFFLINE state.
+    flock -u 9
+    exec 9>&-
+    if printf '%s\n' "$public_url" | "$PUBLISH_SCRIPT" --wait-only --stdin; then
+        return
+    fi
+    printf 'Pages 자동 연결 설정의 배포를 확인하지 못했습니다.\n' >&2
+    printf 'scripts/status.sh와 Actions 상태를 확인하세요. 터널이 실행 중이면 필요할 때 위 공개 주소를 화면의 내 서버에 직접 입력할 수 있습니다.\n' >&2
+    return 1
+}
+
 command -v flock >/dev/null 2>&1 || die "시작 동시 실행을 막는 flock 명령을 찾을 수 없습니다. util-linux를 확인하세요."
 command -v setsid >/dev/null 2>&1 || die "터미널 종료 뒤에도 터널을 유지하는 setsid 명령을 찾을 수 없습니다. util-linux를 확인하세요."
 exec 9>"$LOCK_FILE"
@@ -223,6 +245,7 @@ if [[ -s "$PID_FILE" ]]; then
             chmod 0600 "$URL_FILE"
             printf 'Cloudflare 임시 HTTPS 터널이 이미 준비되어 있습니다 (PID %s).\n' "$previous_pid"
             printf '공개 주소: %s\n' "$public_url"
+            publish_public_url "$public_url"
             exit 0
         fi
         printf '기존 터널(PID %s)의 대상 포트, 공개 주소 또는 외부 health를 확인하지 못해 안전하게 다시 시작합니다.\n' "$previous_pid" >&2
@@ -330,6 +353,7 @@ while ((SECONDS < deadline)); do
         printf 'Cloudflare 임시 HTTPS 터널 시작 완료 (PID %s).\n' "$TUNNEL_PID"
         printf '공개 주소: %s\n' "$public_url"
         printf '이 주소는 터널을 다시 시작하면 바뀝니다. 로그: %s\n' "$LOG_FILE"
+        publish_public_url "$public_url"
         exit 0
     fi
     sleep 1

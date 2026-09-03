@@ -32,7 +32,7 @@
 - 비밀번호는 Argon2 해시로, 로그인 세션과 초대 코드는 해시로 저장합니다. 로그인 토큰은 브라우저 메모리에만 두므로 탭을 닫으면 사라집니다.
 - 두 로그인 ID는 Git에서 제외된 `server/.env`와 로컬 DB에만 둡니다. 공개 예시의 `ACCOUNT_USERNAMES`는 의도적으로 비어 있으며, 설정이 없거나 기존 DB의 계정과 다르면 서버는 계정을 임의로 추가하지 않고 시작을 중단합니다.
 - 모든 수업 조회·업로드·녹음 다운로드 티켓 발급·삭제에 서버 측 소유권 검사를 적용합니다. 다운로드 주소에는 로그인 토큰을 넣지 않고, 인증 후 발급한 60초짜리 녹음 전용 주소만 사용합니다. Wi-Fi가 잠깐 끊긴 Range 재개를 위해 유효 시간 안에서 최대 16회만 사용할 수 있습니다.
-- 웹 코드에는 계정 목록, 비밀번호, 초대 코드가 없습니다. 브라우저 `localStorage`에는 현재 API 주소만 저장됩니다.
+- 웹 코드에는 계정 목록, 비밀번호, 초대 코드가 없습니다. 현재 Quick Tunnel 주소만 GitHub Pages의 공개 런타임 설정에 게시되므로 페이지를 연 누구나 그 주소는 볼 수 있습니다. 주소 자체를 비밀로 삼지 않고 로그인 제한·비밀번호 검증·서버 측 소유권 검사를 보안 경계로 사용합니다. 브라우저 `localStorage`에도 마지막으로 확인된 API 주소만 저장됩니다.
 - GitHub Pages의 같은 계정 아래 프로젝트들은 `https://superwonso.github.io`라는 웹 출처를 공유합니다. 이 앱을 쓰는 동안 `superwonso` 계정의 다른 Pages 저장소도 신뢰할 수 있어야 합니다. 강한 출처 격리가 필요하면 향후 전용 Pages 계정이나 전용 도메인으로 옮겨야 합니다.
 - `.data/`, `server/.env`, `.models/`, `.samples/`, 지원하는 음성·영상 컨테이너 확장자, 로그는 `.gitignore`에 포함됩니다. 그래도 푸시 전 `git status`에서 개인 파일이 없는지 반드시 확인하세요. `git add -f`로 강제로 추가하지 마세요.
 
@@ -67,9 +67,17 @@ GPU가 보이는지 확인하려면 다음을 실행합니다.
 
 ## GitHub Pages 배포
 
-저장소의 `main` 브랜치에 푸시하면 `.github/workflows/pages.yml`이 `web/` 폴더만 Pages 아티팩트로 배포합니다. GitHub 저장소의 **Settings → Pages → Build and deployment → Source**에서 **GitHub Actions**를 선택하고, Actions의 `Deploy classroom to GitHub Pages` 작업이 성공했는지 확인합니다.
+저장소의 `main` 브랜치에 푸시하면 `.github/workflows/pages.yml`이 `web/`의 공개 파일을 격리된 staging 폴더에 복사하고, 여기에 런타임 `config.json` 하나만 생성해 Pages 아티팩트로 배포합니다. GitHub 저장소의 **Settings → Pages → Build and deployment → Source**에서 **GitHub Actions**를 선택하고, Actions의 `Deploy classroom to GitHub Pages` 작업이 성공했는지 확인합니다.
 
-배포 후 <https://superwonso.github.io/stt_server_cdh/>를 열어 화면이 나오는지 확인하세요. `web/config.json`의 `apiUrl`은 비워 두는 것이 정상입니다. Quick Tunnel 주소는 매번 바뀌므로 페이지의 **내 서버** 버튼에서 현재 주소를 입력합니다.
+저장소 안의 `web/config.json`은 계속 빈 설정으로 두는 것이 정상입니다. `start-tunnel.sh`가 현재 Quick Tunnel 주소와 공개 상태·게시/만료 시각만 GitHub Actions 저장소 변수에 넣고 새 Pages 배포를 요청하며, 워크플로가 이를 24시간짜리 런타임 `config.json`으로 만듭니다. 따라서 주소가 커밋 기록에 남지 않고 일반 코드 배포도 원래 만료 시각을 임의로 연장하지 않습니다. 계정 ID나 인증 정보는 이 과정에서 읽거나 게시하지 않습니다.
+
+자동 게시에는 이 저장소에 접근할 수 있도록 로그인된 GitHub CLI가 필요합니다. 이 컴퓨터에서는 PATH의 `gh` 또는 Git에서 제외된 `.tools/gh-*/bin/gh`를 자동으로 찾습니다. 인증 상태는 실제 토큰을 출력하지 않는 다음 명령으로 확인할 수 있습니다.
+
+```bash
+.tools/gh-2.99.0/bin/gh auth status
+```
+
+배포 후 <https://superwonso.github.io/stt_server_cdh/>를 열면 브라우저가 같은 출처의 설정을 읽고, 로그인 정보 없이 `/health`를 확인한 뒤 서버 주소를 자동 적용합니다. 저장된 예전 주소보다 새 배포 설정을 우선하며, 설정이 오프라인·만료·잘못된 상태이면 로그인 정보를 전송하지 않습니다. 상단 **내 서버** 입력창은 자동 게시 장애 때만 사용하는 수동 복구 수단입니다.
 
 GitHub에 올리기 전에는 최소한 다음을 확인합니다.
 
@@ -91,7 +99,7 @@ cd /home/wonso/stt_server
 ./scripts/status.sh
 ```
 
-`status.sh`가 보여 준 `https://….trycloudflare.com` 주소를 아래의 `--api-url` 값에 그대로 넣습니다.
+`start-tunnel.sh`가 **GitHub Pages 자동 서버 연결 설정이 준비됐습니다**라고 표시하는지 확인합니다. `status.sh`가 보여 준 `https://….trycloudflare.com` 주소는 아래의 로컬 관리 명령에만 넣습니다.
 
 ```bash
 ./.venv/bin/python -m server.manage init \
@@ -116,14 +124,11 @@ cd /home/wonso/stt_server
 ./scripts/start-server.sh
 ```
 
-이 PC에서 `.data/invitations.txt`를 열고 각 사용자에게 다음 두 항목을 서로 구분해 직접 전달합니다.
+이 PC에서 `.data/invitations.txt`를 열고 각 사람에게 본인에게만 해당하는 Pages 초대 링크만 직접 전달합니다. 현재 서버 주소는 페이지가 자동으로 찾습니다.
 
-1. 현재 `https://….trycloudflare.com` 서버 주소
-2. 본인에게만 해당하는 Pages 초대 링크
+링크를 받은 사람은 서버를 켜고 자동 게시까지 끝난 뒤 본인 초대 링크를 엽니다. 화면에 **현재 서버를 자동으로 찾아 연결을 확인했어요**가 표시되면 4자 이상의 새 비밀번호를 두 번 입력합니다. 4자도 허용하지만 공개된 로그인 주소를 상대로 추측하기 쉬우므로 가능하면 훨씬 더 길게 정하고, 4자리 숫자·흔한 단어는 피하세요. 브라우저는 초대 링크의 `username`과 `setup_code`만 복원하며, 링크에 `api=`가 위조돼 있어도 무시합니다. 성공한 링크는 다시 사용할 수 없습니다. 두 사람의 설정이 끝나면 초대 파일은 이 PC 밖으로 백업하지 말고 보관하거나 직접 삭제하세요.
 
-링크를 받은 사람은 **먼저 일반 Pages 화면을 열고 `내 서버`에 전달받은 서버 주소를 입력해 연결을 확인한 다음**, 본인 초대 링크를 엽니다. 그 뒤 4자 이상의 새 비밀번호를 두 번 입력합니다. 4자도 허용하지만 추측하기 쉬우므로 가능하면 더 길게 정하고, 4자리 숫자·흔한 단어는 피하세요. 브라우저는 초대 링크의 `username`과 `setup_code`만 복원하며, 링크에 `api=`가 위조돼 있어도 무시합니다. 성공한 링크는 다시 사용할 수 없습니다. 두 사람의 설정이 끝나면 초대 파일은 이 PC 밖으로 백업하지 말고 보관하거나 직접 삭제하세요.
-
-한 사람만 설정하기 전에 터널 주소가 바뀌었다면 **초대 링크는 그대로 두고 새 서버 주소만** 별도로 알려 주세요. 초대 링크는 터널 주소를 포함하지 않으므로 `init`을 다시 실행할 필요가 없습니다. `init`을 다시 실행하면 아직 활성화되지 않은 계정의 초대 코드가 새것으로 교체되어 이전 링크가 무효가 됩니다.
+한 사람만 설정하기 전에 터널 주소가 바뀌어도 초대 링크는 그대로 사용할 수 있습니다. 새 터널을 시작해 Pages 자동 게시만 완료하면 되며 `init`을 다시 실행할 필요가 없습니다. `init`을 다시 실행하면 아직 활성화되지 않은 계정의 초대 코드가 새것으로 교체되어 이전 링크가 무효가 됩니다.
 
 ## 수업 전 켜기
 
@@ -136,12 +141,12 @@ cd /home/wonso/stt_server
 ./scripts/status.sh
 ```
 
-`start-server.sh`는 모델을 미리 불러오고 첫 추론 경로를 준비합니다. 첫 준비는 몇 분 걸릴 수 있으며 최대 10분을 기다립니다. 터널은 로컬 서버가 정상일 때만 시작합니다.
+`start-server.sh`는 모델을 미리 불러오고 첫 추론 경로를 준비합니다. 첫 준비는 몇 분 걸릴 수 있으며 최대 10분을 기다립니다. 터널은 로컬 서버가 정상일 때만 시작합니다. `start-tunnel.sh`는 외부 health를 확인한 뒤 GitHub Pages 설정까지 게시하고, 배포가 확인될 때까지 진행 상황을 표시합니다. 게시만 실패하면 터널은 사용할 수 있게 남겨 두고 오류로 끝나므로 GitHub 로그인을 고친 뒤 같은 명령을 다시 실행하면 됩니다.
 
 그다음 사용자 기기에서 다음 순서로 확인합니다.
 
 1. <https://superwonso.github.io/stt_server_cdh/>를 엽니다.
-2. 상단 **내 서버**를 눌러 `status.sh`의 새 HTTPS 주소를 붙여 넣습니다.
+2. **현재 서버를 자동으로 찾아 연결을 확인했어요** 표시를 확인합니다. 주소를 따로 입력할 필요는 없습니다.
 3. 본인 아이디와 비밀번호로 로그인합니다.
 4. 새 수업 이름과 언어를 고릅니다.
 5. 아래의 마이크·컴퓨터 소리·녹음 파일 중 원하는 입력을 사용합니다.
@@ -191,7 +196,7 @@ cd /home/wonso/stt_server
 ./scripts/status.sh
 ```
 
-종료 스크립트는 먼저 외부 터널을 닫고 API 서버를 정상 종료합니다. 종료 후 기존 텍스트 기록과 아직 끝나지 않은 파일 작업 상태는 `.data/`에 남습니다.
+종료 스크립트는 외부 터널을 먼저 닫고 API 서버를 정상 종료한 뒤 Pages 설정을 오프라인으로 바꾸는 배포를 짧게 요청합니다. GitHub가 일시적으로 응답하지 않아 오프라인 게시가 실패해도 로컬 종료 결과는 유지되며, 브라우저의 익명 health 확인이 죽은 주소로 로그인 정보를 보내지 않게 막습니다. 종료 후 기존 텍스트 기록과 아직 끝나지 않은 파일 작업 상태는 `.data/`에 남습니다.
 
 ## 백업
 
@@ -223,7 +228,14 @@ tail -n 80 .data/tunnel.log
 ./scripts/start-tunnel.sh
 ```
 
-Quick Tunnel을 다시 시작하면 주소가 바뀝니다. 이전 주소가 기기에 저장되어 있으면 Pages 화면의 **내 서버**에서 새 주소로 교체해야 합니다. Cloudflare의 [Quick Tunnel 공식 문서](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)도 이를 테스트·개발용 기능으로 설명하므로, 중요한 수업 전에는 반드시 학교 네트워크의 실제 기기에서 `/health` 연결과 짧은 받아쓰기를 확인하세요.
+Quick Tunnel을 다시 시작하면 주소가 바뀌지만 정상적으로는 새 주소가 Pages에 자동 반영되므로 직접 교체하지 않습니다. `start-tunnel.sh`가 자동 게시 오류로 끝났다면 다음을 확인한 뒤 명령을 다시 실행하세요. 이미 정상인 터널은 종료하지 않고 게시만 다시 시도합니다.
+
+```bash
+.tools/gh-2.99.0/bin/gh auth status
+./scripts/start-tunnel.sh
+```
+
+그래도 게시할 수 없을 때만 `status.sh`의 현재 주소를 상단 **내 서버**에 직접 입력합니다. 자동 설정에는 24시간 만료와 익명 health 검사가 있으므로, 오래된 주소만 남아 있으면 로그인 버튼이 열리지 않습니다. Cloudflare의 [Quick Tunnel 공식 문서](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)도 이를 테스트·개발용 기능으로 설명하므로, 중요한 수업 전에는 반드시 학교 네트워크의 실제 기기에서 연결 표시와 짧은 받아쓰기를 확인하세요.
 
 전송 대기 음성이 남은 상태에서 주소가 바뀌어도, 현재 전송 시도가 끝난 뒤 **내 서버**에서 새 주소를 확인할 수 있습니다. 앱은 대기 WAV와 조각 ID, 기존 사용자를 메모리에 유지합니다. 반드시 같은 계정으로 다시 로그인하면 새 터널을 통해 이어서 전송합니다. 다른 계정은 남은 큐를 가져갈 수 없습니다.
 
@@ -242,7 +254,7 @@ SITE_ORIGINS=https://superwonso.github.io
 - 초대 링크는 7일, 1회만 유효합니다.
 - 새 비밀번호는 4~128자입니다. 가능하면 더 길게 정하고 4자리 숫자·흔한 단어는 피하세요.
 - 반복 실패에는 IP·IP+계정 기준 5분 제한과, 여러 주소를 합산한 계정별 30분 창(최대 50회)이 적용됩니다.
-- Quick Tunnel 주소가 달라졌다면 먼저 **내 서버**의 주소를 바꾸세요.
+- Quick Tunnel 주소가 달라졌다면 `./scripts/start-tunnel.sh`를 다시 실행해 자동 게시를 확인하세요. 자동 게시를 끝내 고칠 수 없을 때만 **내 서버**에 현재 주소를 직접 입력합니다.
 
 ### 받아쓰기 지연 또는 전송 대기
 

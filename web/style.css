@@ -187,8 +187,25 @@ button {
   height: 9px;
   flex: 0 0 auto;
   border-radius: 50%;
+  background: #8b918e;
+  box-shadow: 0 0 0 4px rgba(102, 113, 108, 0.13);
+}
+
+.connection-button[data-state="connected"] .connection-pulse {
   background: #76a58d;
   box-shadow: 0 0 0 4px rgba(118, 165, 141, 0.14);
+}
+
+.connection-button[data-state="discovering"] .connection-pulse,
+.connection-button[data-state="checking"] .connection-pulse {
+  background: #c7893f;
+  box-shadow: 0 0 0 4px rgba(199, 137, 63, 0.15);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.connection-button[data-state="manual-needed"] .connection-pulse {
+  background: var(--danger);
+  box-shadow: 0 0 0 4px rgba(163, 62, 62, 0.12);
 }
 
 .connection-copy {
@@ -338,6 +355,42 @@ button {
   margin: 8px 0 0;
   color: var(--muted);
   font-size: 14px;
+}
+
+.auth-server-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -11px 0 22px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-muted);
+}
+
+.auth-server-state p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.inline-button {
+  min-height: 40px;
+  flex: 0 0 auto;
+  padding: 7px 9px;
+  border: 0;
+  color: var(--forest-700);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 750;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.inline-button:hover {
+  color: var(--forest-950);
 }
 
 .auth-form {
@@ -1247,6 +1300,13 @@ button {
   font-size: 13px;
 }
 
+.connection-form .connection-status {
+  padding: 10px 12px;
+  border-left: 3px solid var(--forest-600);
+  border-radius: 5px 9px 9px 5px;
+  background: var(--forest-100);
+}
+
 .connection-form .connection-privacy {
   padding: 11px 13px;
   border-radius: 9px;
@@ -1473,6 +1533,16 @@ button {
   .auth-panel {
     padding: 26px 20px;
     border-radius: 18px;
+  }
+
+  .auth-server-state {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .inline-button {
+    align-self: flex-start;
   }
 
   .note-heading {

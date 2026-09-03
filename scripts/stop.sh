@@ -6,6 +6,7 @@ umask 077
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 DATA_DIR="$PROJECT_ROOT/.data"
+TUNNEL_LOCK_FILE="$DATA_DIR/tunnel-start.lock"
 STOP_SERVER=1
 STOP_TUNNEL=1
 STOP_TIMEOUT=${STOP_TIMEOUT:-20}
@@ -16,6 +17,8 @@ Usage: scripts/stop.sh [options]
 
 Stop the tunnel first and then the API server. Each process receives SIGTERM
 and is given time for a safe shutdown before SIGKILL is used as a last resort.
+When the tunnel is stopped, request an OFFLINE Pages config without waiting for
+the deployment; publication failure does not undo the local shutdown.
 
 Options:
   --server-only      Stop only the API server
@@ -59,6 +62,15 @@ done
 
 if [[ ! "$STOP_TIMEOUT" =~ ^[0-9]+$ ]] || ((STOP_TIMEOUT < 1 || STOP_TIMEOUT > 300)); then
     die "대기 시간은 1~300초여야 합니다."
+fi
+
+if ((STOP_TUNNEL == 1)); then
+    mkdir -p -- "$DATA_DIR"
+    chmod 0700 "$DATA_DIR"
+    command -v flock >/dev/null 2>&1 || die "터널 수명주기 잠금에 필요한 flock을 찾을 수 없습니다."
+    exec 8>"$TUNNEL_LOCK_FILE"
+    chmod 0600 "$TUNNEL_LOCK_FILE"
+    flock 8
 fi
 
 process_matches() {
@@ -126,4 +138,18 @@ if ((STOP_TUNNEL == 1)); then
 fi
 if ((STOP_SERVER == 1)); then
     stop_one server "로컬 API 서버" "$DATA_DIR/server.pid"
+fi
+if ((STOP_TUNNEL == 1)); then
+    # Finish the desired-state update before returning so an immediate next
+    # start cannot be overwritten by a late background OFFLINE request. The
+    # deployment itself remains asynchronous and failure never blocks shutdown.
+    if command -v timeout >/dev/null 2>&1 \
+        && timeout --signal=TERM --kill-after=3 15 \
+            "$SCRIPT_DIR/publish-api-url.sh" --offline --no-wait 8>&- >/dev/null 2>&1; then
+        printf 'Pages에 서버 오프라인 상태를 게시하도록 요청했습니다.\n'
+    else
+        printf 'Pages 오프라인 상태를 게시하지 못했습니다. 서버와 터널은 정상적으로 종료됐습니다.\n' >&2
+    fi
+    flock -u 8
+    exec 8>&-
 fi

@@ -6,6 +6,10 @@ on:
     paths:
       - web/**
       - tests/*.test.mjs
+      - tests/test_publish_api_url.py
+      - tests/test_runtime_config.py
+      - scripts/publish-api-url.sh
+      - scripts/runtime_config.py
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -16,7 +20,7 @@ permissions:
 
 concurrency:
   group: github-pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   deploy:
@@ -31,12 +35,20 @@ jobs:
           persist-credentials: false
       - name: Test microphone queue and static privacy boundaries
         run: node --test tests/*.test.mjs
+      - name: Test and stage public runtime configuration
+        env:
+          CLASSROOM_API_CONFIG: ${{ vars.CLASSROOM_API_CONFIG }}
+        run: |
+          python3 -m unittest tests/test_runtime_config.py tests/test_publish_api_url.py -v
+          mkdir pages-artifact
+          cp -a web/. pages-artifact/
+          python3 scripts/runtime_config.py render pages-artifact/config.json
       - name: Configure Pages
         uses: actions/configure-pages@v5
       - name: Upload only static website files
         uses: actions/upload-pages-artifact@v4
         with:
-          path: web
+          path: pages-artifact
       - name: Deploy to Pages
         id: deployment
         uses: actions/deploy-pages@v4

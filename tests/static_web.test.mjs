@@ -47,6 +47,16 @@ test('secrets use bounded password fields with appropriate autofill hints', () =
   assert.match(input('setup-code'), /\bautocomplete="one-time-code"/i);
 });
 
+test('automatic server discovery has a locked login and an accessible manual fallback', () => {
+  assert.match(html, /<button\b[^>]*\bid="connection-open"[^>]*\bdata-state="discovering"[^>]*\baria-busy="true"[^>]*\baria-controls="connection-dialog"/i);
+  assert.match(html, /<p\b[^>]*\bid="auth-server-status"[^>]*\brole="status"[^>]*\baria-live="polite"/i);
+  assert.match(html, /<button\b[^>]*\bid="auth-server-open"[^>]*\baria-haspopup="dialog"[^>]*\baria-controls="connection-dialog"/i);
+  assert.match(html, /<button\b[^>]*\bid="login-button"[^>]*\btype="submit"[^>]*\bdisabled(?:\s|>)/i);
+  assert.match(html, /<dialog\b[^>]*\bid="connection-dialog"[^>]*\baria-describedby="connection-description connection-status"/i);
+  assert.match(html, /<p\b[^>]*\bid="connection-status"[^>]*\brole="status"[^>]*\baria-live="polite"/i);
+  assert.match(html, /<input\b[^>]*\bid="api-url"[^>]*\baria-describedby="connection-description connection-privacy connection-error"/i);
+});
+
 test('history, export, recording, and destructive controls are explicit and accessible', () => {
   assert.match(html, /<select\b[^>]*\bid="lecture-date"[^>]*\baria-label="수업 날짜별 보기"/i);
   assert.match(html, /<option value="">전체 날짜<\/option>/);

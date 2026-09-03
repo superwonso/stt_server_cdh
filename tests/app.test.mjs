@@ -22,11 +22,16 @@ const chunk = (startSeconds, durationSeconds = 8, overlapSeconds = 0, final = fa
   blob:encodeWav(new Float32Array(Math.max(1, Math.round(durationSeconds * 16000))).fill(0.25)),
   startSeconds,durationSeconds,overlapSeconds,final,
 });
+const isoSeconds = milliseconds => new Date(Math.floor(milliseconds / 1000) * 1000).toISOString().replace('.000Z','Z');
+function runtimeConfig({state = 'online', apiUrl = 'https://fresh-tunnel.trycloudflare.com', publishedMs = Date.now() - 60000, expiresMs = publishedMs + 86400000} = {}) {
+  return {version:1,state,apiUrl,publishedAt:isoSeconds(publishedMs),expiresAt:isoSeconds(expiresMs)};
+}
 function deferred() { let resolve, reject; const promise = new Promise((yes,no) => { resolve = yes; reject = no; }); return {promise,resolve,reject}; }
-function setup(fetch, { FileUploader = class { detach() {} } } = {}) {
+function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' } = {}) {
   const elements = new Map(), createdElements = new Map(), intervals = new Set(), timeouts = new Map(), objectUrls = new Map();
   const location = {hash:'',hostname:'student.github.io',pathname:'/classroom/',search:''};
   const historyCalls = [];
+  let storedServerValue = storedServer;
   let id = 0, mic;
   const makeElement = (name, value = '') => ({
     name,tagName:name.toUpperCase(),value,style:{},children:[],open:false,
@@ -73,7 +78,10 @@ function setup(fetch, { FileUploader = class { detach() {} } } = {}) {
     document:{getElementById:element,querySelector:element,createElement,addEventListener(){}},
     window:{addEventListener(){}}, performance:{now:() => 0},
     location,history:{replaceState(...args){historyCalls.push(args);}},
-    localStorage:{getItem(){return '';},setItem(){}},
+    localStorage:{
+      getItem(key){ return key === 'yeobaek-server' ? storedServerValue : ''; },
+      setItem(key,value){ if (key === 'yeobaek-server') storedServerValue = String(value); },
+    },
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },
     clearTimeout:value => timeouts.delete(value),
     setInterval:() => { const value = ++id; intervals.add(value); return value; },clearInterval:value => intervals.delete(value),
@@ -92,7 +100,7 @@ function setup(fetch, { FileUploader = class { detach() {} } } = {}) {
   });
   vm.runInContext(source, context);
   const run = code => vm.runInContext(code, context);
-  run("apiUrl='https://classroom.example'; token='old-token'; user='user-alpha';");
+  run("apiUrl='https://classroom.example'; verifiedApiUrl=apiUrl; verifiedApiExpiresAt=0; connectionState='connected'; token='old-token'; user='user-alpha'; setConnectionState('connected');");
   const runTimeout = async delay => {
     const entry = [...timeouts].find(([, timer]) => timer.delay === delay);
     assert.ok(entry, `missing ${delay} ms timer`);
@@ -101,7 +109,7 @@ function setup(fetch, { FileUploader = class { detach() {} } } = {}) {
   const created = tag => createdElements.get(tag)?.at(-1);
   const createdAll = tag => createdElements.get(tag) || [];
   const objectUrlBlob = value => objectUrls.get(value);
-  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,location,historyCalls,microphone:() => mic};
+  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,location,historyCalls,storedServer:() => storedServerValue,microphone:() => mic};
 }
 
 test('activation presents and enforces the four-character minimum in the browser', () => {
@@ -851,6 +859,281 @@ test('server URL accepts only Cloudflare Quick Tunnels and local development', (
   ]) {
     assert.throws(() => app.run(`normalizeUrl(${JSON.stringify(value)})`));
   }
+});
+
+test('a fresh Pages config overrides a stale saved tunnel only after anonymous health verification', async () => {
+  const freshUrl = 'https://fresh-classroom.trycloudflare.com';
+  const staleUrl = 'https://stale-classroom.trycloudflare.com';
+  const health = deferred(), requests = [];
+  const app = setup((url, options = {}) => {
+    requests.push({url,options});
+    if (url.startsWith('./config.json?')) return response(runtimeConfig({apiUrl:freshUrl}));
+    if (url === `${freshUrl}/health`) return health.promise;
+    throw new Error(`unexpected request: ${url}`);
+  }, {storedServer:staleUrl});
+  app.run("apiUrl=''; verifiedApiUrl=''; connectionState='unverified'; token=''; user=''; setConnectionState('unverified')");
+
+  const initializing = app.run('init()');
+  await tick(); await tick();
+  assert.equal(app.run('apiUrl'), '', 'an unverified config must not become the active API origin');
+  assert.equal(app.storedServer(), staleUrl, 'the stored fallback is not overwritten before health succeeds');
+  assert.equal(app.element('login-button').disabled, true);
+  assert.equal(app.element('connection-open')['data-state'], 'discovering');
+  assert.equal(app.element('connection-open')['aria-busy'], 'true');
+  assert.match(requests[0].url, /^\.\/config\.json\?v=\d+$/);
+  assert.notEqual(requests[0].url, './config.json', 'the runtime lookup must bypass an old Pages/CDN object');
+  assert.equal(requests[0].options.cache, 'no-store');
+  assert.equal(requests[0].options.credentials, 'omit');
+  assert.equal(requests[0].options.referrerPolicy, 'no-referrer');
+  assert.equal(requests[0].options.body, undefined);
+  assert.equal(requests[1].options.credentials, 'omit');
+  assert.equal(requests[1].options.headers.get('Authorization'), null);
+  assert.equal(requests[1].options.body, undefined);
+
+  health.resolve(response({status:'ok'}));
+  await initializing;
+  assert.equal(app.run('apiUrl'), freshUrl);
+  assert.equal(app.run('verifiedApiUrl'), freshUrl);
+  assert.equal(app.storedServer(), freshUrl);
+  assert.equal(app.element('login-button').disabled, false);
+  assert.equal(app.element('connection-open')['data-state'], 'connected');
+  assert.equal(app.element('connection-open')['aria-busy'], undefined);
+});
+
+test('offline, expired, and malformed Pages configs fail closed without trying a saved tunnel', async () => {
+  const now = Date.now();
+  const cases = [
+    ['offline',runtimeConfig({state:'offline',apiUrl:'',publishedMs:now - 60000,expiresMs:now - 60000}),/꺼져/],
+    ['expired',runtimeConfig({publishedMs:now - 25 * 60 * 60 * 1000,expiresMs:now - 60 * 60 * 1000}),/만료/],
+    ['malformed',{apiUrl:''},/확인하지 못했/],
+  ];
+  for (const [name,config,message] of cases) {
+    const requests = [];
+    const app = setup((url, options = {}) => {
+      requests.push({url,options});
+      return response(config);
+    }, {storedServer:'https://saved-fallback.trycloudflare.com'});
+    app.run("apiUrl='https://unverified-stale.trycloudflare.com'; verifiedApiUrl=''; connectionState='unverified'; token=''; user=''; setConnectionState('unverified')");
+    await app.run('init()');
+    assert.equal(requests.length, 1, `${name} must not fall back to a stale saved origin`);
+    assert.match(requests[0].url, /^\.\/config\.json\?v=/);
+    assert.equal(app.run('connectionState'), 'manual-needed');
+    assert.equal(app.run('verifiedApiUrl'), '');
+    assert.equal(app.element('login-button').disabled, true);
+    assert.match(app.element('auth-server-status').textContent, message);
+  }
+});
+
+test('a transient Pages config failure stays locked and leaves the saved tunnel as manual prefill only', async () => {
+  const savedUrl = 'https://saved-fallback.trycloudflare.com';
+  const requests = [];
+  const app = setup((url, options = {}) => {
+    requests.push({url,options});
+    if (url.startsWith('./config.json?')) throw new TypeError('temporary Pages failure');
+    throw new Error(`unexpected request: ${url}`);
+  }, {storedServer:savedUrl});
+  app.run("apiUrl=''; verifiedApiUrl=''; connectionState='unverified'; token=''; user=''; setConnectionState('unverified')");
+  await app.run('init()');
+  assert.equal(requests.length, 1, 'a stored Quick Tunnel must not bypass the same-origin runtime lease');
+  assert.match(requests[0].url, /^\.\/config\.json\?v=/);
+  assert.equal(app.run('apiUrl'), '');
+  assert.equal(app.run('verifiedApiUrl'), '');
+  assert.equal(app.run('connectionState'), 'manual-needed');
+  assert.equal(app.element('login-button').disabled, true);
+  assert.equal(app.element('api-url').value, savedUrl);
+});
+
+test('an authoritative config health failure never falls back to the stale saved origin', async () => {
+  const freshUrl = 'https://published-but-dead.trycloudflare.com';
+  const savedUrl = 'https://saved-but-stale.trycloudflare.com';
+  const requests = [];
+  const app = setup((url, options = {}) => {
+    requests.push({url,options});
+    if (url.startsWith('./config.json?')) return response(runtimeConfig({apiUrl:freshUrl}));
+    if (url === `${freshUrl}/health`) throw new TypeError('tunnel stopped');
+    if (url === `${savedUrl}/health`) return response({status:'ok'});
+    throw new Error(`unexpected request: ${url}`);
+  }, {storedServer:savedUrl});
+  app.run("apiUrl=''; verifiedApiUrl=''; connectionState='unverified'; token=''; user=''; setConnectionState('unverified')");
+  await app.run('init()');
+  assert.deepEqual(requests.map(request => request.url), [requests[0].url,`${freshUrl}/health`]);
+  assert.equal(app.run('connectionState'), 'manual-needed');
+  assert.equal(app.run('apiUrl'), '');
+  assert.equal(app.element('login-button').disabled, true);
+});
+
+test('an expired automatic lease blocks bearer, password, and audio bodies before any old-origin request', async () => {
+  const oldUrl = 'https://expired-origin.trycloudflare.com';
+  const publishedMs = Date.now() - 60000;
+  const requests = [];
+  const app = setup((url, options = {}) => {
+    requests.push({url,options});
+    if (url.startsWith('./config.json?')) {
+      return response(runtimeConfig({state:'offline',apiUrl:'',publishedMs,expiresMs:publishedMs}));
+    }
+    throw new Error(`unexpected request: ${url}`);
+  });
+  app.run(`
+    apiUrl=${JSON.stringify(oldUrl)}; verifiedApiUrl=apiUrl; verifiedApiExpiresAt=Date.now()-1;
+    connectionState='connected'; token='secret-bearer'; user='user-alpha'; setConnectionState('connected');
+  `);
+  const credentials = app.run(`api('/auth/login', {
+    method:'POST',body:JSON.stringify({username:'private-user',password:'private-password'})
+  })`);
+  const audio = app.run(`api('/lectures/lesson/chunks', {
+    method:'POST',body:new Blob([new Uint8Array(1644)],{type:'audio/wav'})
+  })`);
+  const results = await Promise.allSettled([credentials,audio]);
+
+  assert.ok(results.every(result => result.status === 'rejected'));
+  assert.ok(results.every(result => result.reason.connectionLeaseExpired));
+  assert.equal(requests.length, 1, 'only same-origin config may be requested after lease expiry');
+  assert.match(requests[0].url, /^\.\/config\.json\?v=/);
+  assert.equal(requests[0].options.body, undefined);
+  assert.equal(requests[0].options.credentials, 'omit');
+  assert.equal(requests.some(request => request.url.startsWith(oldUrl)), false);
+  assert.equal(app.run('token'), '');
+  assert.equal(app.run('verifiedApiUrl'), '');
+  assert.equal(app.run('connectionState'), 'manual-needed');
+  assert.equal(app.element('login-button').disabled, true);
+});
+
+test('an expired lease renews from Pages and sends queued audio only after anonymous health succeeds', async () => {
+  const server = 'https://renewed-origin.trycloudflare.com';
+  const requests = [];
+  const app = setup((url, options = {}) => {
+    requests.push({url,options});
+    if (url.startsWith('./config.json?')) return response(runtimeConfig({apiUrl:server}));
+    if (url === `${server}/health`) return response({status:'ok'});
+    if (url === `${server}/lectures/lesson/chunks`) return response({segments:[]});
+    throw new Error(`unexpected request: ${url}`);
+  });
+  app.run(`
+    apiUrl=${JSON.stringify(server)}; verifiedApiUrl=apiUrl; verifiedApiExpiresAt=Date.now()-1;
+    connectionState='connected'; token='secret-bearer'; user='user-alpha'; setConnectionState('connected');
+  `);
+  await app.run(`api('/lectures/lesson/chunks', {
+    method:'POST',body:new Blob([new Uint8Array(1644)],{type:'audio/wav'})
+  })`);
+
+  assert.deepEqual(requests.map(request => request.url), [
+    requests[0].url,`${server}/health`,`${server}/lectures/lesson/chunks`,
+  ]);
+  assert.match(requests[0].url, /^\.\/config\.json\?v=/);
+  assert.equal(requests[0].options.body, undefined);
+  assert.equal(requests[1].options.headers.get('Authorization'), null);
+  assert.equal(requests[1].options.body, undefined);
+  assert.equal(requests[2].options.headers.get('Authorization'), 'Bearer secret-bearer');
+  assert.ok(requests[2].options.body instanceof Blob);
+  assert.ok(app.run('verifiedApiExpiresAt > Date.now()'));
+  assert.equal(app.run('connectionState'), 'connected');
+  assert.equal(app.run('token'), 'secret-bearer');
+});
+
+test('a renewed lease with a new tunnel preserves queued-audio ownership until same-account login', async () => {
+  const oldUrl = 'https://old-lease.trycloudflare.com';
+  const newUrl = 'https://new-lease.trycloudflare.com';
+  const requests = [];
+  const app = setup((url, options = {}) => {
+    requests.push({url,options});
+    if (url.startsWith('./config.json?')) return response(runtimeConfig({apiUrl:newUrl}));
+    if (url === `${newUrl}/health`) return response({status:'ok'});
+    if (url === `${newUrl}/auth/login`) return response({token:'new-token',user:{username:'user-alpha'}});
+    if (url === `${newUrl}/lectures` || url === `${newUrl}/imports`) return response([]);
+    if (url === `${newUrl}/status`) return response({model_state:'ready'});
+    if (url === `${newUrl}/lectures/lesson/chunks`) return response({segments:[],recording_available:true,recording_finalized:false});
+    throw new Error(`unexpected request: ${url}`);
+  });
+  app.run(`
+    apiUrl=${JSON.stringify(oldUrl)}; verifiedApiUrl=apiUrl; verifiedApiExpiresAt=Date.now()-1;
+    connectionState='connected'; token='old-token'; user='user-alpha';
+    current={id:'lesson',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[]}; lectures=[current];
+    pending=[{blob:new Blob([new Uint8Array(1644)],{type:'audio/wav'}),startSeconds:0,durationSeconds:0.05,overlapSeconds:0,final:false,id:'stable-id',lectureId:'lesson'}];
+    setConnectionState('connected'); renderCurrent();
+  `);
+  await app.run('drain()');
+
+  assert.equal(requests.some(request => request.url.startsWith(oldUrl)), false);
+  assert.deepEqual(requests.map(request => request.url), [requests[0].url,`${newUrl}/health`]);
+  assert.equal(app.run('apiUrl'), newUrl);
+  assert.equal(app.run('token'), '');
+  assert.equal(app.run('user'), 'user-alpha');
+  assert.equal(app.run('pending[0].id'), 'stable-id');
+  assert.equal(app.element('username').value, 'user-alpha');
+
+  app.element('username').value = 'user-alpha';
+  app.element('password').value = 'same-account-password';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  for (let index = 0; index < 4; index += 1) await tick();
+  const loginRequest = requests.find(request => request.url === `${newUrl}/auth/login`);
+  const audioRequest = requests.find(request => request.url === `${newUrl}/lectures/lesson/chunks`);
+  assert.ok(loginRequest);
+  assert.match(String(loginRequest.options.body), /same-account-password/);
+  assert.ok(audioRequest);
+  assert.equal(audioRequest.options.headers.get('Authorization'), 'Bearer new-token');
+  assert.ok(audioRequest.options.body instanceof Blob);
+  assert.equal(app.run('pending.length'), 0);
+  assert.equal(requests.some(request => request.url.startsWith(oldUrl)), false);
+});
+
+test('manual connection cancels a late automatic discovery before it can replace the chosen origin', async () => {
+  const lateConfig = deferred();
+  const automaticUrl = 'https://late-automatic.trycloudflare.com';
+  const manualUrl = 'https://chosen-manually.trycloudflare.com';
+  const requests = [];
+  const app = setup((url, options = {}) => {
+    requests.push({url,options});
+    if (url.startsWith('./config.json?')) return lateConfig.promise;
+    if (url === `${manualUrl}/health`) return response({status:'ok'});
+    if (url === `${automaticUrl}/health`) return response({status:'ok'});
+    throw new Error(`unexpected request: ${url}`);
+  });
+  app.run("apiUrl=''; verifiedApiUrl=''; connectionState='unverified'; token=''; user=''; setConnectionState('unverified')");
+  const initializing = app.run('init()');
+  await tick();
+
+  app.element('auth-server-open').onclick();
+  assert.equal(app.element('connection-dialog').open, true);
+  assert.equal(app.element('api-url').focused, true);
+  app.element('api-url').value = manualUrl;
+  await app.element('connection-form').onsubmit({preventDefault(){}});
+  assert.equal(app.run('apiUrl'), manualUrl);
+  assert.equal(app.run('connectionState'), 'connected');
+
+  lateConfig.resolve(response(runtimeConfig({apiUrl:automaticUrl})));
+  await initializing;
+  assert.equal(app.run('apiUrl'), manualUrl);
+  assert.equal(app.run('verifiedApiUrl'), manualUrl);
+  assert.equal(requests.filter(request => request.url === `${automaticUrl}/health`).length, 0);
+});
+
+test('a manual health error stays accessible and cannot unlock login with an unverified URL', async () => {
+  const app = setup((url) => url.endsWith('/health')
+    ? response({detail:'서버 준비 중'},503) : response({}));
+  app.run("apiUrl=''; verifiedApiUrl=''; connectionState='manual-needed'; token=''; user=''; setConnectionState('manual-needed')");
+  app.element('api-url').value = 'https://not-ready.trycloudflare.com';
+  await app.element('connection-form').onsubmit({preventDefault(){}});
+  assert.equal(app.run('connectionState'), 'manual-needed');
+  assert.equal(app.run('verifiedApiUrl'), '');
+  assert.equal(app.element('login-button').disabled, true);
+  assert.equal(app.element('api-url')['aria-invalid'], 'true');
+  assert.equal(app.element('api-url').focused, true);
+  assert.equal(app.element('connection-error').hidden, false);
+  assert.match(app.element('connection-error').textContent, /서버 준비 중/);
+});
+
+test('a programmatic login submit cannot send credentials to an unverified origin', async () => {
+  let requests = 0;
+  const app = setup(async () => { requests += 1; return response({}); });
+  app.run("apiUrl='https://unverified.trycloudflare.com'; verifiedApiUrl=''; connectionState='connected'; token=''; user=''; updateAuthControls() ");
+  app.element('username').value = 'private-user';
+  app.element('password').value = 'private-password';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  assert.equal(requests, 0);
+  assert.equal(app.element('login-button').disabled, true);
+  assert.equal(app.element('auth-error').hidden, false);
+  assert.match(app.element('auth-error').textContent, /연결을 먼저 확인/);
+  assert.equal(app.element('auth-server-open').focused, true);
 });
 
 test('a forged invitation cannot choose even an otherwise-valid Quick Tunnel', async () => {

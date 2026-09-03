@@ -146,10 +146,12 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 ### 웹
 
-- GitHub Pages에는 `web/`만 배포하며 외부 스크립트·폰트·분석 코드를 쓰지 않는다.
+- GitHub Pages에는 `web/`에서 복사한 공개 파일과 Actions가 생성한 런타임 `config.json`만 격리 staging을 거쳐 배포하며, 외부 스크립트·폰트·분석 코드를 쓰지 않는다.
 - 클라이언트에는 계정 allow-list가 없다. 초대 링크의 opaque `username`/`setup_code`만 폼에 복원한 직후 URL fragment에서 지운다. 초대 링크의 `api=` 값은 무시한다.
 - 서버 주소 변경 폼은 후보 주소의 anonymous health를 먼저 확인하고, 성공하기 전에는 기존 API 주소와 token을 섞어 쓰지 않는다. 로그인 요청 중에는 변경을 막고, 늦은 인증 응답은 요청 당시 origin/generation이 달라졌으면 폐기한다.
 - 로그인 token은 JS 메모리에만 있고 API origin만 localStorage에 저장한다.
+- Quick Tunnel이 준비되면 운영 스크립트가 `version/state/apiUrl/publishedAt/expiresAt`으로 된 정확한 공개 JSON 전체를 GitHub Actions 저장소 변수에 원자적으로 넣고 Pages를 다시 배포한다. Git의 `web/config.json`은 비어 있으며 ID·초대 코드·비밀번호·token·수업 정보는 게시기가 읽지 않는다.
+- 웹은 로그인 전에 같은 Pages 출처의 런타임 설정을 엄격히 검사하고 Bearer 없는 `/health`를 통과한 origin만 설치한다. 새 유효 설정은 stale localStorage보다 우선하며, offline·만료·잘못된 설정은 fail closed 한다. 수동 입력은 자동 게시 장애 복구용으로만 남긴다.
 - GitHub Pages 프로젝트들은 `https://superwonso.github.io` 출처를 공유하므로 다른 Pages 저장소까지 신뢰해야 하는 구조적 한계가 있다. 전용 Pages 계정/도메인 없이는 완전 격리할 수 없다.
 - AudioWorklet → 스트리밍 resampler → 16 kHz PCM16 WAV 경로다.
 - 입력 소스는 마이크와 `getDisplayMedia`의 공유 오디오다. 브라우저가 요구하는 video track은 종료 감지만 하고 오디오 그래프·WAV·네트워크에 연결하지 않는다. 화면/시스템 오디오는 지원 여부가 브라우저·OS·선택 표면·DRM에 달려 있으며 알림/다른 앱 소리 포함 위험을 UI에 표시한다.
@@ -169,7 +171,8 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 - `scripts/setup.sh`: ROCm Python을 system-site-packages로 재사용하는 venv, Qwen 모델, cloudflared 설치/검증
 - `scripts/start-server.sh`: import-time 운영 DB 접근을 피하는 Uvicorn factory, 단일 worker, loopback bind, 기본 warmup, PID·로그 관리
-- `scripts/start-tunnel.sh`: 서버 health 확인 후 Quick Tunnel 생성, URL 파일 기록
+- `scripts/start-tunnel.sh`: 서버 health 확인 후 Quick Tunnel 생성, URL 파일 기록, GitHub Pages 런타임 주소 게시와 배포 확인. 게시 실패 시 health-checked 터널은 남겨 재게시나 수동 복구가 가능하지만 명령은 성공으로 표시하지 않음
+- `scripts/publish-api-url.sh`와 `scripts/runtime_config.py`: 공개 tunnel origin 또는 `OFFLINE` 입력을 정확한 상태·주소·게시/만료 시각 JSON으로 만들고, 로그인된 GitHub CLI로 그 JSON 전체를 Actions 변수에 저장해 Pages workflow를 실행한다. URL·스키마·만료를 엄격히 검사하며 Git 커밋에는 동적 주소를 쓰지 않음
 - `scripts/status.sh`: PID 소유권, 로컬 health, 실행 중인 tunnel URL과 외부 HTTPS health 표시. 죽은 터널의 마지막 URL은 현재 주소와 구분
 - `scripts/stop.sh`: tunnel 먼저, 서버 다음으로 SIGTERM 종료; PID가 다른 프로세스를 가리키면 건드리지 않음
 - `scripts/backup.sh`: SQLite online backup으로 WAL의 최신 커밋까지 일관된 스냅샷 생성; 기존 대상은 덮어쓰지 않음. 보존 WAV는 포함하지 않으므로 음성 백업은 서버를 끈 상태에서 `.data/recordings/`를 같은 암호화 저장소에 별도로 복사해야 함
@@ -196,9 +199,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - VibeVoice 짧은 종료 처리에서 존재하지 않는 `Speaker 1: 그치.`와, 이미 lookahead로 처리한 0.14초를 공식 flush loop가 다시 넣어 `[Silence]`를 덧붙이는 현상을 재현했다. 7:52 반복 실험은 기대한 42개 발화 라벨을 한 번씩 냈고 마지막 flush는 빈 문자열이어서 발화 단위 누락·중복은 보이지 않았지만, 이는 반복 낭독 음성에 한정된 결과다.
 - VibeVoice 벤치마크 종료 후 별도 프로세스에서 PyTorch allocated/reserved 0과 free 46.80/47.47 GiB를 확인했다.
 - 코드 검토로 확인한 방어선: ignored 환경설정 기반 서버 측 계정 allow-list·DB exact-set 검사·소유권 검사, exact-origin 제한, chunked body 제한, 계정별 녹음 권한·UUID 경로·WAV 검증, import 원본 권한/삭제 상태, 동일 lecture/chunk/import UUID의 idempotent 응답, 초대 링크의 API 주소 배제, 계정 전체 주소 합산 로그인 제한
-- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장 57개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID 비공개 설정 검증, legacy DB 계정 제약 제거와 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정 전환의 오래된 UI 응답, system-audio track 분리도 포함한다.
+- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장·Pages 런타임 설정 69개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID 비공개 설정 검증, legacy DB 계정 제약 제거와 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정 전환의 오래된 UI 응답, system-audio track 분리도 포함한다.
 - 녹음 전용 시험은 overlap PCM 제거, byte-identical retry, bounded silence gap, quota 실패 시 기존 파일 불변, 부분 write rollback, symlink 거부/안전 삭제, 전송 중단 fd close, 60초 ticket Range 재개·만료, 명시적 final 복구, 다른 계정 불변, DELETE/inference 경합과 응답 유실 idempotency를 포함한다.
-- 웹 시험은 KST 자정 경계 날짜 그룹, TXT/Markdown 내용·이스케이프·안전 파일명, 동일 API origin ticket 제한, 마지막 실패 조각 확정과 WAV 없음의 정확한 안내, 507 수동 복구, 다운로드·삭제·계정 전환의 stale 응답 방어를 포함한다. Python source `py_compile`, JavaScript `--check`, `git diff --check`도 통과했다.
+- 웹 시험은 KST 자정 경계 날짜 그룹, TXT/Markdown 내용·이스케이프·안전 파일명, 동일 API origin ticket 제한, 마지막 실패 조각 확정과 WAV 없음의 정확한 안내, 507 수동 복구, 다운로드·삭제·계정 전환의 stale 응답 방어를 포함한다. 자동 주소의 익명 health 선행, stale 저장 주소 차단, 24시간 lease 만료 뒤 Bearer·비밀번호·음성 본문 차단, 새 tunnel에서 같은 계정 재로그인 후 큐 재개도 검증했다. Python source `py_compile`, JavaScript `--check`, `git diff --check`도 통과했다.
 - GitHub Actions Pages 배포 성공 후 공개 URL의 `index.html`, `app.js`, `audio.js`, `file-import.js`, `pcm-worklet.js`, `style.css`가 로컬 배포본과 byte-for-byte 일치하고 HTTPS 200임을 확인했다.
 - 실제 Quick Tunnel edge를 통해 `/health` 200, Pages Origin의 CORS 헤더와 새 파일 조각 `PUT` preflight를 확인했고, 허용하지 않은 Origin은 서버 경계에서 403으로 거절됐다. cloudflared의 DNS·UDP/QUIC·TCP·Cloudflare API 사전 점검도 모두 PASS였다.
 
@@ -249,19 +252,19 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 사용자가 지정한 원격은 <https://github.com/superwonso/stt_server_cdh>이고 Pages 주소는 <https://superwonso.github.io/stt_server_cdh/>다. `superwonso` GitHub 인증을 연결해 공개 앱을 `main`에 push했고, Pages source는 GitHub Actions로 설정됐다. `Deploy classroom to GitHub Pages` 실행과 공개 자산 비교가 성공했다.
 
-2026-09-03 현재 로컬 Qwen API와 Quick Tunnel을 실제로 시작해 외부 health/CORS를 확인했다. 임시 주소는 재시작할 때 바뀌므로 공개 문서에 고정하지 않고 `.data/tunnel-url.txt`에만 둔다. 두 계정의 7일짜리 초대는 `.data/invitations.txt`에 생성됐지만 둘 다 아직 비밀번호를 설정하지 않았다. 따라서 정적 화면과 서버 연결은 배포됐지만, 실제 계정 사용 완료로 표시하면 안 된다.
+2026-09-03 로컬 Qwen API와 Quick Tunnel을 실제로 시작해 외부 health/CORS를 확인한 뒤 사용자의 요청대로 둘 다 종료했다. 동적 주소는 Git 커밋에 고정하지 않고 실행 중에는 `.data/tunnel-url.txt`와 공개 Pages 런타임 설정에만 둔다. 두 계정의 7일짜리 초대는 `.data/invitations.txt`에 생성됐지만 둘 다 아직 비밀번호를 설정하지 않았다. 따라서 정적 화면과 서버 연결 코드는 배포됐지만, 실제 계정 사용 완료로 표시하면 안 된다.
 
 푸시 전에 반드시 확인할 것:
 
 - 평탄화 잔여 루트 파일이 staging에 없음
 - `server/.env`, `.data/`, `.models/`, `.samples/`, 지원 미디어 확장자(WAV/M4A/MP3/FLAC/OGG/OGA/Opus/WebM/MP4/MKV/MOV/AIFF/APE/ASF/WMA/AU), 로그/PID가 staging에 없음
-- workflow가 `web/`만 Pages 아티팩트로 업로드함
-- `web/config.json`에 Quick Tunnel URL, 계정, 초대 코드가 없음
+- workflow가 `web/` 복사본과 생성된 런타임 `config.json`만 담은 격리 staging을 Pages 아티팩트로 업로드함
+- Git의 `web/config.json`에 Quick Tunnel URL, 계정, 초대 코드가 없음. Actions가 만든 공개 산출물에는 현재 Quick Tunnel origin과 상태·시각만 있음
 - Pages source가 GitHub Actions이고 배포 URL에서 정적 자산과 마이크 UI가 정상임
 
 ## 다음 단계 우선순위
 
-1. 각 사용자에게 **현재 서버 주소를 먼저**, `.data/invitations.txt`의 본인 초대 링크를 별도로 전달한다. 사용자가 직접 링크를 열고 비밀번호를 정해야 완료된다.
+1. 서버와 터널을 시작해 Pages 자동 주소 게시 완료를 확인한 뒤 각 사용자에게 `.data/invitations.txt`의 본인 초대 링크만 전달한다. 사용자가 직접 링크를 열고 비밀번호를 정해야 완료된다.
 2. 활성화 뒤 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 두 계정 격리를 확인한다.
 3. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
 4. 사용자에게 개인정보를 제거한 실제 한국어 수업 음성 5~10분 샘플을 요청해 품질과 경계 누락·중복을 검증한다.

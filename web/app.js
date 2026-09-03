@@ -15,6 +15,8 @@ let lectureRefreshGeneration = 0, importLectureSequence = 0;
 let lectureDateFilter = '', recordingDownloadPending = false, recordingFinalizePending = false;
 let deletingLecture = false, deleteTarget = null;
 let noteActionSequence = 0;
+let connectionState = 'unverified', verifiedApiUrl = '', verifiedApiExpiresAt = 0;
+let connectionGeneration = 0, connectionController = null, connectionLeaseTimer = null, leaseRefreshPromise = null;
 const MAX_PENDING = 8;
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30000;
@@ -22,6 +24,9 @@ const MAX_AUTO_UPLOAD_RETRIES = 8;
 const RETRYABLE_UPLOAD_STATUSES = new Set([408, 425, 429]);
 const PERMANENT_UPLOAD_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 507]);
 const UPLOAD_TIMEOUT_MS = 60000;
+const CONFIG_TIMEOUT_MS = 8000;
+const RUNTIME_CONFIG_TTL_MS = 24 * 60 * 60 * 1000;
+const CONFIG_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const fmt = seconds => { const n = Math.max(0, Math.floor(seconds || 0)); return `${Math.floor(n / 60).toString().padStart(2, '0')}:${(n % 60).toString().padStart(2, '0')}`; };
 const KST_DATE_FORMATTER = new Intl.DateTimeFormat('ko-KR', {timeZone:'Asia/Seoul',year:'numeric',month:'long',day:'numeric'});
 const KST_DATE_PARTS = new Intl.DateTimeFormat('en', {timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'});
@@ -80,21 +85,36 @@ function nativeDownloadUrl(value, server = apiUrl) {
   return url.href;
 }
 function setServer(value) { apiUrl = normalizeUrl(value); storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl; }
-async function api(path, options = {}, timeout = 15000, baseUrl = apiUrl) {
+async function api(path, options = {}, timeout = 15000, baseUrl = '') {
+  const anonymous = options.anonymous === true;
+  const {anonymous:_anonymous, ...requestOptions} = options;
+  const requestedServer = baseUrl || apiUrl, requestedToken = token;
+  if (!anonymous) {
+    if (!hasVerifiedServer()) await ensureTrustedApiRequest();
+    if (!hasVerifiedServer() || apiUrl !== requestedServer || token !== requestedToken) {
+      throw connectionChangedBeforeRequestError();
+    }
+    baseUrl = apiUrl;
+  } else {
+    baseUrl = baseUrl || apiUrl;
+  }
   if (!baseUrl) throw new Error('먼저 연결 설정에서 서버 주소를 입력해 주세요.');
+  if (requestOptions.signal?.aborted) {
+    const error = new Error('요청이 취소됐습니다.'); error.name = 'AbortError'; throw error;
+  }
   const controller = new AbortController();
-  const callerSignal = options.signal;
+  const callerSignal = requestOptions.signal;
   let timedOut = false;
   const abortFromCaller = () => controller.abort(callerSignal?.reason);
   if (callerSignal?.aborted) abortFromCaller();
   else callerSignal?.addEventListener?.('abort', abortFromCaller, {once:true});
   const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, timeout);
-  const headers = new Headers(options.headers);
-  const requestToken = options.anonymous ? '' : token, requestServer = baseUrl;
+  const headers = new Headers(requestOptions.headers);
+  const requestToken = anonymous ? '' : token, requestServer = baseUrl;
   if (requestToken) headers.set('Authorization', `Bearer ${requestToken}`);
-  if (options.body && !(options.body instanceof Blob)) headers.set('Content-Type', 'application/json');
+  if (requestOptions.body && !(requestOptions.body instanceof Blob)) headers.set('Content-Type', 'application/json');
   try {
-    const response = await fetch(baseUrl + path, {...options, headers, signal:controller.signal, credentials:'omit', cache:'no-store', referrerPolicy:'no-referrer'});
+    const response = await fetch(baseUrl + path, {...requestOptions, headers, signal:controller.signal, credentials:'omit', cache:'no-store', referrerPolicy:'no-referrer'});
     const data = response.status === 204 ? null : await response.json().catch(() => null);
     if (!response.ok) {
       let message = typeof data?.detail === 'string' ? data.detail : `요청을 처리하지 못했습니다 (${response.status}).`;
@@ -123,6 +143,285 @@ async function api(path, options = {}, timeout = 15000, baseUrl = apiUrl) {
     callerSignal?.removeEventListener?.('abort', abortFromCaller);
   }
 }
+function updateAuthControls() {
+  $('login-button').disabled = authenticating || !hasVerifiedServer();
+}
+function automaticLeaseExpired(now = Date.now()) {
+  return verifiedApiExpiresAt > 0 && !!apiUrl && apiUrl === verifiedApiUrl && now >= verifiedApiExpiresAt;
+}
+function hasTrustedApiOrigin() {
+  return !!apiUrl && apiUrl === verifiedApiUrl && !automaticLeaseExpired();
+}
+function hasVerifiedServer() {
+  return connectionState === 'connected' && hasTrustedApiOrigin();
+}
+function connectionChangedBeforeRequestError() {
+  const error = new Error('서버 연결이 바뀌어 요청을 보내지 않았어요. 연결을 확인한 뒤 다시 시도해 주세요.');
+  error.connectionChanged = true;
+  return error;
+}
+function expiredLeaseError() {
+  const error = new Error('자동 서버 주소가 만료되어 요청을 보내지 않았어요. 새 서버 연결을 확인한 뒤 다시 시도해 주세요.');
+  error.connectionLeaseExpired = true;
+  return error;
+}
+function clearConnectionLeaseTimer() {
+  if (connectionLeaseTimer !== null) clearTimeout(connectionLeaseTimer);
+  connectionLeaseTimer = null;
+}
+function scheduleConnectionLeaseTimer() {
+  clearConnectionLeaseTimer();
+  if (!(verifiedApiExpiresAt > 0) || apiUrl !== verifiedApiUrl) return;
+  const server = verifiedApiUrl, expiresAt = verifiedApiExpiresAt;
+  const delay = Math.max(0,expiresAt - Date.now() + 1);
+  connectionLeaseTimer = setTimeout(() => {
+    connectionLeaseTimer = null;
+    if (apiUrl !== server || verifiedApiUrl !== server || verifiedApiExpiresAt !== expiresAt
+        || !automaticLeaseExpired()) return;
+    // Do not cancel an explicit user verification at the lease boundary. It is
+    // anonymous, keeps login locked, and will replace the automatic lease with
+    // tab-scoped manual trust only after its own health check succeeds.
+    if (connectionState === 'checking') { updateAuthControls(); return; }
+    setConnectionState('unverified','자동 서버 주소가 만료되어 새 연결을 확인하고 있어요.');
+    void refreshExpiredAutomaticServer().catch(() => {});
+  },delay);
+}
+function setConnectionState(state, message = '') {
+  connectionState = state;
+  const labels = {
+    unverified:'연결 확인 필요',
+    discovering:'서버 찾는 중…',
+    checking:'서버 확인 중…',
+    connected:apiUrl ? new URL(apiUrl).host : '서버 연결됨',
+    'manual-needed':'연결 설정 필요',
+  };
+  const messages = {
+    unverified:'서버 연결을 확인해야 로그인할 수 있어요.',
+    discovering:'현재 서버 주소를 자동으로 찾고 있어요.',
+    checking:'입력한 서버가 안전하게 연결되는지 확인하고 있어요.',
+    connected:'서버 연결을 확인했어요. 로그인할 수 있습니다.',
+    'manual-needed':'서버를 자동으로 연결하지 못했어요. 현재 주소를 직접 입력해 주세요.',
+  };
+  const busy = state === 'discovering' || state === 'checking';
+  const label = labels[state] || labels.unverified;
+  const status = message || messages[state] || messages.unverified;
+  $('server-label').textContent = label;
+  $('connection-open').setAttribute('data-state',state);
+  $('connection-open').setAttribute('aria-label',state === 'connected'
+    ? `내 서버 ${label}, 연결 설정 열기`
+    : `${label}, 연결 설정 열기`);
+  if (busy) $('connection-open').setAttribute('aria-busy','true');
+  else $('connection-open').removeAttribute('aria-busy');
+  $('auth-server-status').textContent = status;
+  $('connection-status').textContent = status;
+  updateAuthControls();
+}
+function cancelConnectionAttempt() {
+  ++connectionGeneration;
+  connectionController?.abort();
+  connectionController = null;
+}
+function runtimeConfigError(code, message, transient = false) {
+  const error = new Error(message);
+  error.discoveryCode = code;
+  error.configTransient = transient;
+  return error;
+}
+function parseRuntimeTimestamp(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) {
+    throw runtimeConfigError('malformed','자동 연결 설정의 시간이 올바르지 않습니다.');
+  }
+  const milliseconds = Date.parse(value);
+  const canonical = Number.isFinite(milliseconds)
+    ? new Date(milliseconds).toISOString().replace('.000Z','Z') : '';
+  if (canonical !== value) throw runtimeConfigError('malformed','자동 연결 설정의 시간이 올바르지 않습니다.');
+  return milliseconds;
+}
+function validateRuntimeConfig(value, now = Date.now()) {
+  const expectedKeys = 'apiUrl,expiresAt,publishedAt,state,version';
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).sort().join(',') !== expectedKeys
+      || value.version !== 1 || !['online','offline'].includes(value.state)) {
+    throw runtimeConfigError('malformed','자동 연결 설정 형식이 올바르지 않습니다.');
+  }
+  const publishedAt = parseRuntimeTimestamp(value.publishedAt);
+  const expiresAt = parseRuntimeTimestamp(value.expiresAt);
+  if (publishedAt > now + CONFIG_CLOCK_SKEW_MS) {
+    throw runtimeConfigError('malformed','자동 연결 설정의 게시 시간이 올바르지 않습니다.');
+  }
+  if (value.state === 'offline') {
+    if (value.apiUrl !== '' || expiresAt !== publishedAt) {
+      throw runtimeConfigError('malformed','꺼진 서버의 자동 연결 설정이 올바르지 않습니다.');
+    }
+    return {state:'offline',apiUrl:''};
+  }
+  if (expiresAt - publishedAt !== RUNTIME_CONFIG_TTL_MS) {
+    throw runtimeConfigError('malformed','자동 연결 설정의 유효 기간이 올바르지 않습니다.');
+  }
+  if (expiresAt <= now) throw runtimeConfigError('expired','게시된 서버 주소가 만료됐습니다.');
+  let candidate;
+  try { candidate = normalizeUrl(value.apiUrl); }
+  catch { throw runtimeConfigError('malformed','자동 연결 설정의 서버 주소가 올바르지 않습니다.'); }
+  if (candidate !== value.apiUrl) throw runtimeConfigError('malformed','자동 연결 설정의 서버 주소 형식이 올바르지 않습니다.');
+  return {state:'online',apiUrl:candidate,expiresAt};
+}
+async function fetchRuntimeConfig(signal) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abortFromCaller();
+  else signal?.addEventListener?.('abort',abortFromCaller,{once:true});
+  const deadline = setTimeout(() => { timedOut = true; controller.abort(); },CONFIG_TIMEOUT_MS);
+  let response;
+  try {
+    // Pages/CDN caches can briefly retain the previous tunnel after a publish.
+    // The query contains no user data; it only makes each reload a fresh lookup.
+    response = await fetch(`./config.json?v=${Date.now()}`,{cache:'no-store',credentials:'omit',referrerPolicy:'no-referrer',signal:controller.signal});
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    throw runtimeConfigError('config-unavailable',timedOut
+      ? '자동 연결 설정을 불러오는 데 시간이 오래 걸리고 있습니다.'
+      : '자동 연결 설정을 불러오지 못했습니다.',true);
+  } finally {
+    clearTimeout(deadline);
+    signal?.removeEventListener?.('abort',abortFromCaller);
+  }
+  if (!response.ok) {
+    const transient = response.status === 408 || response.status === 429 || response.status >= 500;
+    throw runtimeConfigError(transient ? 'config-unavailable' : 'malformed',
+      `자동 연결 설정을 불러오지 못했습니다 (${response.status}).`,transient);
+  }
+  try { return await response.json(); }
+  catch { throw runtimeConfigError('malformed','자동 연결 설정을 읽지 못했습니다.'); }
+}
+async function verifyServerCandidate(value, signal, timeout = 10000) {
+  const candidate = normalizeUrl(value);
+  const health = await api('/health',{anonymous:true,signal},timeout,candidate);
+  if (health?.status !== 'ok') throw new Error('서버 상태 응답을 확인하지 못했습니다.');
+  return candidate;
+}
+function installVerifiedServer(candidate, message, {expiresAt = 0} = {}) {
+  const before = apiUrl;
+  let changed = false;
+  if (candidate !== before) {
+    const preserveOwner = !!user && (!!draft || pending.length > 0);
+    const hasExistingSession = !!before || !!token || !!user || !!draft || pending.length > 0;
+    if (hasExistingSession) {
+      token = '';
+      ++requestGeneration;
+      setServer(candidate);
+      showLogin(!preserveOwner);
+      if (preserveOwner) $('username').value = user;
+    } else {
+      setServer(candidate);
+    }
+    changed = true;
+  } else {
+    setServer(candidate);
+  }
+  verifiedApiUrl = candidate;
+  verifiedApiExpiresAt = expiresAt;
+  setConnectionState('connected',message);
+  scheduleConnectionLeaseTimer();
+  return changed;
+}
+function discoveryFailureMessage(error) {
+  if (error?.discoveryCode === 'offline') return '서버가 꺼져 있어요. 서버 컴퓨터를 켠 뒤 새로고침하거나 현재 주소를 직접 입력해 주세요.';
+  if (error?.discoveryCode === 'expired') return '자동으로 게시된 서버 주소가 만료됐어요. 서버를 다시 켠 뒤 새로고침하거나 현재 주소를 직접 입력해 주세요.';
+  if (error?.discoveryCode === 'malformed') return '자동 연결 설정을 확인하지 못했어요. 현재 서버 주소를 직접 입력해 주세요.';
+  return '서버를 자동으로 찾지 못했어요. 서버가 켜져 있는지 확인하고 현재 주소를 직접 입력해 주세요.';
+}
+async function discoverServer() {
+  const retainedVerifiedOrigin = connectionState === 'connected' && hasVerifiedServer() ? apiUrl : '';
+  cancelConnectionAttempt();
+  const sequence = connectionGeneration;
+  const controller = new AbortController();
+  connectionController = controller;
+  const operationIsCurrent = () => sequence === connectionGeneration && connectionController === controller;
+  setConnectionState('discovering');
+  const local = ['localhost','127.0.0.1','[::1]'].includes(location.hostname);
+  const saved = storage.get();
+  let savedCandidate = '';
+  try { if (saved) savedCandidate = normalizeUrl(saved); } catch {}
+  if (!$('api-url').value && savedCandidate) $('api-url').value = savedCandidate;
+  try {
+    let candidate, connectedMessage, expiresAt = 0;
+    if (local) {
+      const localCandidate = savedCandidate || 'http://127.0.0.1:8765';
+      $('api-url').value = localCandidate;
+      candidate = await verifyServerCandidate(localCandidate,controller.signal);
+      connectedMessage = '로컬 서버 연결을 확인했어요. 로그인할 수 있습니다.';
+    } else {
+      // A saved Quick Tunnel cannot safely replace the same-origin runtime
+      // lease: it may be expired, stopped, or later reassigned. Keep it only as
+      // a manual prefill when Pages config itself is unavailable.
+      const config = await fetchRuntimeConfig(controller.signal);
+      if (!operationIsCurrent()) return;
+      const runtime = validateRuntimeConfig(config);
+      if (runtime.state === 'offline') throw runtimeConfigError('offline','서버가 꺼져 있습니다.');
+      expiresAt = runtime.expiresAt;
+      $('api-url').value = runtime.apiUrl;
+      try { candidate = await verifyServerCandidate(runtime.apiUrl,controller.signal); }
+      catch (error) {
+        if (!operationIsCurrent()) return;
+        throw runtimeConfigError('unreachable',errorText(error));
+      }
+      connectedMessage = '현재 서버를 자동으로 찾아 연결을 확인했어요. 로그인할 수 있습니다.';
+    }
+    if (!operationIsCurrent()) return;
+    installVerifiedServer(candidate,connectedMessage,{expiresAt});
+  } catch (error) {
+    if (!operationIsCurrent()) return;
+    const canRetainConnection = !!retainedVerifiedOrigin
+      && apiUrl === retainedVerifiedOrigin && verifiedApiUrl === retainedVerifiedOrigin
+      && !automaticLeaseExpired();
+    setConnectionState(canRetainConnection ? 'connected' : 'manual-needed',canRetainConnection
+      ? '기존 서버 연결을 유지하고 있어요.' : discoveryFailureMessage(error));
+  } finally {
+    if (operationIsCurrent()) connectionController = null;
+  }
+}
+function invalidateExpiredAutomaticServer(server, expiresAt) {
+  if (apiUrl !== server || verifiedApiUrl !== server || verifiedApiExpiresAt !== expiresAt) return;
+  const owner = user;
+  const preserveOwner = !!owner && (!!draft || pending.length > 0);
+  const hadSession = !!token || !!owner || !!draft || pending.length > 0 || !$('workspace').hidden;
+  clearConnectionLeaseTimer();
+  verifiedApiUrl = ''; verifiedApiExpiresAt = 0; token = '';
+  if (hadSession) {
+    showLogin(!preserveOwner);
+    if (preserveOwner) $('username').value = owner;
+  } else {
+    ++requestGeneration;
+  }
+  setConnectionState('manual-needed','자동 서버 주소가 만료되어 새 연결을 확인하지 못했어요. 서버를 다시 켠 뒤 새로고침하거나 현재 주소를 직접 입력해 주세요.');
+}
+async function refreshExpiredAutomaticServer() {
+  if (hasVerifiedServer()) return apiUrl;
+  if (!automaticLeaseExpired()) throw connectionChangedBeforeRequestError();
+  const expiredServer = apiUrl, expiredAt = verifiedApiExpiresAt;
+  if (!leaseRefreshPromise) {
+    const refresh = discoverServer();
+    const tracked = refresh.finally(() => {
+      if (leaseRefreshPromise === tracked) leaseRefreshPromise = null;
+    });
+    leaseRefreshPromise = tracked;
+  }
+  try {
+    await leaseRefreshPromise;
+  } catch {
+    invalidateExpiredAutomaticServer(expiredServer,expiredAt);
+    throw expiredLeaseError();
+  }
+  if (hasVerifiedServer()) return apiUrl;
+  invalidateExpiredAutomaticServer(expiredServer,expiredAt);
+  throw expiredLeaseError();
+}
+async function ensureTrustedApiRequest() {
+  if (hasVerifiedServer()) return apiUrl;
+  if (automaticLeaseExpired()) return refreshExpiredAutomaticServer();
+  throw connectionChangedBeforeRequestError();
+}
 function setActivation(value) {
   activation = value;
   $('auth-title').textContent = value ? '내 비밀번호를 정해 주세요.' : '다시 만나 반가워요.';
@@ -135,6 +434,7 @@ function setActivation(value) {
   $('login-button').textContent = value ? '비밀번호 설정하고 시작' : '로그인 ↗';
   $('auth-toggle').textContent = value ? '이미 비밀번호가 있어요 · 로그인' : '처음이라면 · 비밀번호 설정하기';
   $('auth-error').hidden = true;
+  updateAuthControls();
 }
 function importIsActive() { return !!importJob && !isTerminalImportState(importJob); }
 function importTransportBusy() {
@@ -160,41 +460,79 @@ function showLogin(clear = true) {
   setActivation(false);
 }
 $('auth-toggle').onclick = () => setActivation(!activation);
-$('connection-open').onclick = () => { $('connection-error').hidden = true; $('connection-dialog').showModal(); };
-$('connection-close').onclick = () => $('connection-dialog').close();
+function openConnectionDialog() {
+  if (connectionState === 'discovering') {
+    cancelConnectionAttempt();
+    setConnectionState(hasTrustedApiOrigin() ? 'connected' : 'manual-needed',hasTrustedApiOrigin()
+      ? '기존 서버 연결을 유지하고 있어요.'
+      : '자동 찾기를 멈췄어요. 현재 서버 주소를 직접 입력해 주세요.');
+  }
+  if (!$('api-url').value) {
+    try { $('api-url').value = normalizeUrl(storage.get()); } catch {}
+  }
+  $('connection-error').hidden = true;
+  $('api-url').removeAttribute('aria-invalid');
+  $('connection-dialog').showModal();
+  $('api-url').focus();
+}
+function cancelManualConnection() {
+  if (connectionState === 'checking') cancelConnectionAttempt();
+  $('api-url').disabled = false;
+  $('connection-save').disabled = false;
+  setConnectionState(hasTrustedApiOrigin() ? 'connected' : 'manual-needed',hasTrustedApiOrigin()
+    ? '기존 서버 연결을 유지하고 있어요.'
+    : '현재 서버 주소를 직접 입력해 주세요.');
+}
+$('connection-open').onclick = openConnectionDialog;
+$('auth-server-open').onclick = openConnectionDialog;
+$('connection-close').onclick = () => { cancelManualConnection(); $('connection-dialog').close(); };
+$('connection-dialog').oncancel = cancelManualConnection;
 $('connection-form').onsubmit = async event => {
-  event.preventDefault(); const before = apiUrl; let changed = false;
-  $('connection-save').disabled = true; $('connection-error').hidden = true;
+  event.preventDefault(); let changed = false, sequence = null, controller = null;
+  $('connection-error').hidden = true; $('api-url').removeAttribute('aria-invalid');
   try {
     if (authenticating || loggingOut || recording || starting || stopping || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture) throw new Error('로그인, 로그아웃, 녹음, 다운로드 또는 파일 전송이 끝난 뒤 서버 주소를 바꿔 주세요.');
+    const candidate = normalizeUrl($('api-url').value);
     // A dead Quick Tunnel must not strand the in-memory queue. Stop its old
     // retry timer, verify the candidate anonymously, then require the same
     // account to log in before stable chunk UUIDs are sent to the new origin.
     clearUploadRetry();
-    const candidate = normalizeUrl($('api-url').value);
+    cancelConnectionAttempt(); sequence = connectionGeneration;
+    controller = new AbortController(); connectionController = controller;
+    const operationIsCurrent = () => sequence === connectionGeneration && connectionController === controller;
+    $('connection-save').disabled = true; $('api-url').disabled = true;
+    setConnectionState('checking');
     // Keep the active origin unchanged while checking the candidate. Otherwise
     // a status timer could send the current Bearer token to an untrusted host.
-    await api('/health', {anonymous:true}, 10000, candidate);
-    if (candidate !== before) {
-      const preserveOwner = !!user && (!!draft || pending.length > 0);
-      token = '';
-      ++requestGeneration;
-      setServer(candidate);
-      showLogin(!preserveOwner);
-      if (preserveOwner) $('username').value = user;
-      changed = true;
-    } else {
-      setServer(candidate);
-    }
+    await verifyServerCandidate(candidate,controller.signal);
+    if (!operationIsCurrent()) return;
+    changed = installVerifiedServer(candidate,'입력한 서버 연결을 확인했어요. 로그인할 수 있습니다.');
     $('connection-dialog').close(); notice('서버에 연결했어요.');
-  } catch (error) { $('connection-error').textContent = errorText(error); $('connection-error').hidden = false; }
+  } catch (error) {
+    if (sequence !== null && (sequence !== connectionGeneration || connectionController !== controller)) return;
+    setConnectionState(hasTrustedApiOrigin() ? 'connected' : 'manual-needed',hasTrustedApiOrigin()
+      ? '기존 서버 연결을 유지하고 있어요.' : '서버 주소를 확인하고 다시 시도해 주세요.');
+    $('api-url').setAttribute('aria-invalid','true');
+    $('connection-error').textContent = errorText(error); $('connection-error').hidden = false;
+    $('api-url').focus();
+  }
   finally {
-    $('connection-save').disabled = false;
-    if (!changed && token && pending.length && !sendError && retryTimer === null) void drain();
+    if (sequence === null || sequence === connectionGeneration) {
+      if (connectionController === controller) connectionController = null;
+      $('connection-save').disabled = false; $('api-url').disabled = false;
+      if (!changed && token && pending.length && !sendError && retryTimer === null) void drain();
+    }
   }
 };
 $('auth-form').onsubmit = async event => {
-  event.preventDefault(); $('auth-error').hidden = true; $('login-button').disabled = true; authenticating = true;
+  event.preventDefault(); $('auth-error').hidden = true;
+  const refreshingExpiredLease = automaticLeaseExpired();
+  if (!hasVerifiedServer() && !refreshingExpiredLease) {
+    $('auth-error').textContent = '서버 연결을 먼저 확인해 주세요.'; $('auth-error').hidden = false;
+    $('auth-server-open').focus(); return;
+  }
+  if (!refreshingExpiredLease) cancelConnectionAttempt();
+  authenticating = true; updateAuthControls();
   const authServer = apiUrl, generation = requestGeneration;
   try {
     const username = $('username').value, password = $('password').value;
@@ -216,7 +554,7 @@ $('auth-form').onsubmit = async event => {
     renderCurrent(); void updateStatus(); clearInterval(statusTimer); statusTimer = setInterval(updateStatus, 20000);
     if (pending.length || draft) { sendError = ''; void retryPending(); }
   } catch (error) { $('auth-error').textContent = errorText(error); $('auth-error').hidden = false; }
-  finally { authenticating = false; $('login-button').disabled = false; updateControls(); }
+  finally { authenticating = false; updateAuthControls(); updateControls(); }
 };
 async function updateStatus() {
   if (!token) return;
@@ -786,6 +1124,7 @@ function scheduleUploadRetry(error) {
   }, delay);
 }
 function manualUploadError(error) {
+  if (error?.connectionLeaseExpired || error?.connectionChanged) return errorText(error);
   const reason = PERMANENT_UPLOAD_STATUSES.has(error?.status)
     ? '서버가 요청을 거절해 자동 재시도를 멈췄어요.'
     : '예상하지 못한 오류라 자동 재시도를 멈췄어요.';
@@ -1037,12 +1376,8 @@ async function init() {
   // Keep invitation codes out of the URL as soon as the document runs.
   const invite = new URLSearchParams(location.hash.slice(1));
   if (location.hash) history.replaceState(null,'',location.pathname + location.search);
-  let configured = '';
-  try { const response = await fetch('./config.json',{cache:'no-store'}); configured = (await response.json()).apiUrl || ''; } catch {}
-  const local = ['localhost','127.0.0.1','[::1]'].includes(location.hostname);
   // Invitation fragments are easy to forge. Never let one choose the server
   // that receives a setup code and new password; users set that origin apart.
-  try { const preferred = storage.get() || configured || (local ? 'http://127.0.0.1:8765' : ''); if (preferred) setServer(preferred); } catch { notice('서버 주소를 다시 설정해 주세요.'); }
   if (invite.get('setup_code')) {
     setActivation(true);
     $('setup-code').value = invite.get('setup_code');
@@ -1052,5 +1387,6 @@ async function init() {
   }
   updateSourceGuidance();
   renderCurrent();
+  await discoverServer();
 }
 void init();
