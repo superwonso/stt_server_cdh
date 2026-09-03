@@ -1,0 +1,42 @@
+name: Deploy classroom to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - web/**
+      - tests/*.test.mjs
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out the public website
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Test microphone queue and static privacy boundaries
+        run: node --test tests/*.test.mjs
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload only static website files
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: web
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

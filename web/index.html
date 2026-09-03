@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#315c4c">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://*.trycloudflare.com http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:* http://[::1]:* https://[::1]:*; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>여백 · 수업 받아쓰기</title>
+  <meta name="description" content="내 서버에 안전하게 저장하는 한국어 수업 받아쓰기">
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#primary-content">본문으로 건너뛰기</a>
+
+  <header class="site-header">
+    <a class="brand" href="./" aria-label="여백 홈">
+      <span class="brand-mark" aria-hidden="true">여</span>
+      <span>
+        <strong>여백</strong>
+        <small>수업 받아쓰기</small>
+      </span>
+    </a>
+    <button id="connection-open" class="connection-button" type="button" aria-haspopup="dialog" aria-controls="connection-dialog">
+      <span class="connection-pulse" aria-hidden="true"></span>
+      <span class="connection-copy">
+        <small>내 서버</small>
+        <strong id="server-label">연결 설정 필요</strong>
+      </span>
+      <span aria-hidden="true">⌄</span>
+    </button>
+  </header>
+
+  <div id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+
+  <div id="primary-content" tabindex="-1">
+  <main id="auth-screen" class="auth-screen" aria-labelledby="auth-title">
+    <section class="auth-intro" aria-label="서비스 소개">
+      <p class="eyebrow">PRIVATE CLASS NOTE</p>
+      <h1>말은 흘러가도,<br><em>배움은 남도록.</em></h1>
+      <p class="auth-lead">노트북이나 태블릿의 마이크로 수업을 듣고, 내 계정의 기록으로 차분히 모아 보세요.</p>
+      <div class="privacy-card">
+        <span class="privacy-icon" aria-hidden="true">⌁</span>
+        <div>
+          <strong>수업 내용은 지정한 서버에 저장돼요.</strong>
+          <p>음성과 로그인 요청은 설정한 Cloudflare 연결을 거쳐 내 서버로 전송됩니다. 이 페이지는 광고, 분석 도구, 외부 폰트를 사용하지 않습니다.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="auth-panel" aria-describedby="auth-description">
+      <div class="auth-heading">
+        <span class="auth-symbol" aria-hidden="true">✦</span>
+        <p class="eyebrow">나만의 수업 노트</p>
+        <h2 id="auth-title">다시 만나 반가워요.</h2>
+        <p id="auth-description">내 계정으로 로그인해 수업을 기록하세요.</p>
+      </div>
+
+      <form id="auth-form" class="auth-form">
+        <div class="field">
+          <label for="username">아이디</label>
+          <input id="username" name="username" type="text" required maxlength="32" autocomplete="username" autocapitalize="none" enterkeyhint="next" spellcheck="false">
+        </div>
+        <div class="field">
+          <label id="password-label" for="password">비밀번호</label>
+          <input id="password" name="password" type="password" required minlength="1" maxlength="128" autocomplete="current-password" autocapitalize="none" enterkeyhint="go" spellcheck="false">
+        </div>
+        <div id="setup-code-field" class="field" hidden>
+          <label for="setup-code">일회용 초대 코드</label>
+          <input id="setup-code" name="setup-code" type="password" minlength="20" maxlength="128" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" aria-describedby="setup-code-help">
+          <small id="setup-code-help">초대 링크로 열었다면 자동으로 입력됩니다.</small>
+        </div>
+        <div id="confirm-field" class="field" hidden>
+          <label for="password-confirm">새 비밀번호 확인</label>
+          <input id="password-confirm" name="password-confirm" type="password" minlength="4" maxlength="128" autocomplete="new-password" autocapitalize="none" enterkeyhint="go" spellcheck="false">
+        </div>
+        <p id="auth-error" class="form-error" role="alert" hidden></p>
+        <button id="login-button" class="primary-button" type="submit">로그인 ↗</button>
+      </form>
+
+      <button id="auth-toggle" class="text-button" type="button">처음이라면 · 비밀번호 설정하기</button>
+      <p class="session-note"><span aria-hidden="true">○</span> 로그인 정보는 이 탭을 닫으면 사라집니다.</p>
+    </section>
+  </main>
+
+  <div id="workspace" class="workspace" hidden>
+    <aside class="sidebar" aria-label="내 수업 기록">
+      <div class="profile-row">
+        <span class="user-avatar" aria-hidden="true">–</span>
+        <div>
+          <strong id="current-user">내 계정</strong>
+          <span id="model-status" role="status">서버 상태 확인 중</span>
+        </div>
+      </div>
+
+      <button id="new-note" class="new-note-button" type="button">＋ 새 수업</button>
+
+      <div class="history-heading">
+        <h2>지난 수업</h2>
+        <span id="lecture-count" aria-label="저장된 수업 수">0</span>
+      </div>
+      <nav id="lecture-list" class="lecture-list" aria-label="지난 수업 목록"></nav>
+
+      <div class="sidebar-footer">
+        <p><span aria-hidden="true">⌂</span> 기록은 서버 컴퓨터에 보관됩니다.</p>
+        <button id="logout" class="logout-button" type="button">로그아웃</button>
+      </div>
+    </aside>
+
+    <main id="main-content" class="note-main" tabindex="-1">
+      <div class="note-shell">
+        <div class="view-meta" aria-label="현재 화면">
+          <span>내 수업</span><span aria-hidden="true">/</span><strong id="view-label">새 수업</strong>
+        </div>
+
+        <header class="note-heading">
+          <div>
+            <p id="note-date" class="note-date"></p>
+            <h1>오늘의 배움을 담아보세요.</h1>
+          </div>
+          <button id="download" class="secondary-button" type="button" disabled>↓ 텍스트 저장</button>
+        </header>
+
+        <section class="recorder" aria-labelledby="recorder-title">
+          <h2 id="recorder-title" class="visually-hidden">받아쓰기 설정과 녹음</h2>
+          <div class="lesson-fields">
+            <div class="field compact-field">
+              <label for="lecture-title">수업 이름</label>
+              <input id="lecture-title" name="lecture-title" type="text" maxlength="120" placeholder="예: 3교시 한국사" autocomplete="off">
+            </div>
+            <div class="field compact-field language-field">
+              <label for="language">말하는 언어</label>
+              <select id="language" name="language">
+                <option value="ko" selected>한국어</option>
+                <option value="en">영어</option>
+                <option value="auto">자동 감지</option>
+              </select>
+            </div>
+            <div class="field compact-field source-field">
+              <label for="audio-source">실시간 입력</label>
+              <select id="audio-source" name="audio-source" aria-describedby="source-guidance source-privacy">
+                <option value="microphone" selected>기기 마이크</option>
+                <option value="system">컴퓨터·브라우저 탭 소리</option>
+              </select>
+            </div>
+            <p id="source-guidance" class="source-guidance">마이크로 주변의 수업 소리를 받아씁니다.</p>
+            <p id="source-privacy" class="source-privacy" hidden>공유 대상으로 선택한 범위의 알림·다른 앱 소리도 함께 전송될 수 있습니다. 수업 외 소리는 끄고 공유 범위를 확인하세요.</p>
+          </div>
+
+          <div class="record-panel">
+            <div class="record-copy">
+              <div class="record-title-row">
+                <span id="record-dot" class="record-dot" aria-hidden="true"></span>
+                <strong id="record-state">시작할 준비가 됐어요</strong>
+                <time id="elapsed" aria-label="녹음 시간">00:00</time>
+              </div>
+              <p id="record-hint">약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.</p>
+              <div class="level-track" aria-hidden="true"><span id="mic-level"></span></div>
+            </div>
+            <button id="record-button" class="record-button" type="button">● 받아쓰기 시작</button>
+          </div>
+
+          <div class="file-import-panel">
+            <div class="file-import-copy">
+              <strong>녹음 파일 가져오기</strong>
+              <p>WAV, MP3, M4A, AAC, FLAC, OGG, Opus, WebM과 오디오가 든 MP4·MKV·MOV 파일을 올려 새 수업 기록으로 변환합니다.</p>
+              <small>파일은 Cloudflare를 거쳐 이 서버에 임시 저장되며, 변환 완료·취소·실패 시 원본을 삭제합니다. 최대 1 GiB·4시간입니다.</small>
+            </div>
+            <div class="file-import-actions">
+              <label class="visually-hidden" for="recording-file">변환할 녹음 파일</label>
+              <input id="recording-file" type="file" accept="audio/*,video/mp4,video/webm,video/quicktime,video/x-matroska,.wav,.mp3,.m4a,.aac,.flac,.ogg,.oga,.opus,.webm,.mp4,.mkv,.mov">
+              <button id="import-button" class="secondary-button import-button" type="button">파일 올려 변환</button>
+            </div>
+          </div>
+          <div id="import-status" class="import-status" role="status" aria-live="polite" hidden>
+            <div class="import-status-row">
+              <strong id="import-state">파일을 준비하고 있어요</strong>
+              <button id="import-cancel" type="button">취소</button>
+            </div>
+            <progress id="import-progress" max="100" value="0">0%</progress>
+            <p id="import-detail"></p>
+          </div>
+
+          <div class="save-row">
+            <span class="save-check" aria-hidden="true">✓</span>
+            <span id="save-state">서버 컴퓨터에 저장</span>
+          </div>
+          <div id="processing" class="processing" role="status" aria-live="polite" hidden>
+            <span class="processing-spinner" aria-hidden="true"></span>
+            <span id="processing-text">다음 문장을 듣고 있어요…</span>
+          </div>
+          <div id="queue-warning" class="queue-warning" role="alert" hidden>
+            <p id="queue-message"></p>
+            <div class="queue-actions">
+              <button id="save-failed" type="button">실패 WAV 내려받기</button>
+              <button id="skip-failed" type="button" hidden>파일 저장 확인 · 건너뛰기</button>
+              <button id="retry" type="button">다시 전송</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="transcript-section" aria-labelledby="transcript-title">
+          <header class="transcript-heading">
+            <div>
+              <p class="eyebrow">LIVE NOTES</p>
+              <h2 id="transcript-title">받아쓴 내용</h2>
+            </div>
+            <span><strong id="segment-count">0</strong>개 문장</span>
+          </header>
+          <div id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  </div>
+
+  <dialog id="connection-dialog" class="connection-dialog" aria-labelledby="connection-title" aria-describedby="connection-description">
+    <form id="connection-form" class="connection-form">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">CONNECTION</p>
+          <h2 id="connection-title">내 서버 연결</h2>
+        </div>
+        <button id="connection-close" class="dialog-close" type="button" aria-label="연결 설정 닫기">×</button>
+      </div>
+      <p id="connection-description">서버 컴퓨터에서 표시된 Cloudflare HTTPS 주소를 입력하세요. 다시 시작하면 주소가 바뀔 수 있습니다.</p>
+      <div class="field">
+        <label for="api-url">서버 주소</label>
+        <input id="api-url" name="api-url" type="url" required inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" placeholder="https://…trycloudflare.com">
+      </div>
+      <p class="connection-privacy">주소만 이 기기에 저장됩니다. 비밀번호, 초대 코드, 음성은 브라우저 저장소에 보관하지 않습니다.</p>
+      <p id="connection-error" class="form-error" role="alert" hidden></p>
+      <button id="connection-save" class="primary-button" type="submit">연결 확인하고 저장</button>
+    </form>
+  </dialog>
+</body>
+</html>

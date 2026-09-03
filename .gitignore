@@ -1,0 +1,46 @@
+# Local credentials and private classroom data
+server/.env*
+.data/
+invitations*.txt
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+# Models, virtual environments, and local tools
+.models/
+.venv/
+.tools/
+.samples/
+
+# Audio and runtime output must never be committed
+*.[Ww][Aa][Vv]
+*.[Ww][Ee][Bb][Mm]
+*.[Mm]4[Aa]
+*.[Mm][Pp]3
+*.[Ff][Ll][Aa][Cc]
+*.[Oo][Gg][Gg]
+*.[Oo][Gg][Aa]
+*.[Aa][Aa][Cc]
+*.[Oo][Pp][Uu][Ss]
+*.[Mm][Pp]4
+*.[Mm][Kk][Vv]
+*.[Mm][Oo][Vv]
+*.[Aa][Ii][Ff]
+*.[Aa][Ii][Ff][Ff]
+*.[Aa][Pp][Ee]
+*.[Aa][Ss][Ff]
+*.[Ww][Mm][Aa]
+*.[Aa][Uu]
+*.log
+*.pid
+
+# Python / JavaScript caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.DS_Store
+
+# Local editor / agent state
+.agents/
+.codex/
