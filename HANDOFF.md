@@ -284,6 +284,8 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 2026-09-04 새 후보정 코드로 로컬 Qwen API를 재시작해 warmup·health와 DB v4 migration/integrity/FK를 확인했고, 기존 Quick Tunnel도 외부 HTTPS health가 정상인 상태다. 동적 주소는 Git 커밋에 고정하지 않고 실행 중에는 `.data/tunnel-url.txt`와 공개 Pages 런타임 설정에만 둔다. 두 계정 중 한 계정은 비밀번호 설정을 완료했고, 나머지 한 계정에는 아직 유효한 일회용 초대가 있다. 따라서 두 사용자 설정이 모두 끝났다고 표시하면 안 된다.
 
+후보정 구현 커밋 `ea1a934`의 Pages 실행 `33780005582`가 성공했다. 공개 `index.html`, JavaScript, CSS, favicon 7개를 로컬 파일과 SHA-256으로 비교해 모두 일치했고, 런타임 설정도 현재 터널을 `online`으로 가리켰다. 같은 외부 edge에서 health 200, 무인증 후보정 401, 외부 Origin 403, Pages Origin CORS 허용을 다시 확인했다.
+
 푸시 전에 반드시 확인할 것:
 
 - 평탄화 잔여 루트 파일이 staging에 없음
@@ -294,7 +296,7 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 ## 다음 단계 우선순위
 
-1. 새 정적 자산의 Pages 배포와 현재 Quick Tunnel 자동 주소 게시를 확인한다. 아직 미활성인 한 사용자에게 `.data/invitations.txt`의 본인 초대 링크만 전달하고 사용자가 직접 비밀번호를 정해야 두 계정 설정이 완료된다.
+1. 아직 미활성인 한 사용자에게 `.data/invitations.txt`의 본인 초대 링크만 전달하고 사용자가 직접 비밀번호를 정해야 두 계정 설정이 완료된다.
 2. 두 계정 활성화 뒤 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 두 계정 격리를 확인한다.
 3. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
 4. 사용자에게 개인정보를 제거한 실제 한국어 수업 음성 5~10분 샘플과 가능하면 교정문을 요청해 Qwen 원문 품질·경계 누락/중복과 Solar 후보정 전후 CER·의미 보존을 함께 검증한다.
