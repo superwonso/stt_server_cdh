@@ -24,22 +24,53 @@ const chunk = (startSeconds, durationSeconds = 8, overlapSeconds = 0, final = fa
 });
 function deferred() { let resolve, reject; const promise = new Promise((yes,no) => { resolve = yes; reject = no; }); return {promise,resolve,reject}; }
 function setup(fetch, { FileUploader = class { detach() {} } } = {}) {
-  const elements = new Map(), intervals = new Set(), timeouts = new Map();
+  const elements = new Map(), createdElements = new Map(), intervals = new Set(), timeouts = new Map(), objectUrls = new Map();
   const location = {hash:'',hostname:'student.github.io',pathname:'/classroom/',search:''};
   const historyCalls = [];
   let id = 0, mic;
+  const makeElement = (name, value = '') => ({
+    name,tagName:name.toUpperCase(),value,style:{},children:[],open:false,
+    classList:{values:new Set(),toggle(className,force){
+      const enabled = force === undefined ? !this.values.has(className) : !!force;
+      if (enabled) this.values.add(className); else this.values.delete(className);
+      return enabled;
+    }},
+    replaceChildren(...children){ this.children = [...children]; },
+    append(...children){ this.children.push(...children); },
+    querySelectorAll(selector){
+      const matches = [];
+      const visit = node => {
+        if (!node || typeof node !== 'object') return;
+        if (selector === 'button' && node.tagName === 'BUTTON') matches.push(node);
+        for (const child of node.children || []) visit(child);
+      };
+      for (const child of this.children) visit(child);
+      return matches;
+    },
+    focus(){ this.focused = true; },
+    showModal(){ this.open = true; },
+    close(){ this.open = false; },
+    removeAttribute(attribute){ delete this[attribute]; },
+    setAttribute(attribute,value){ this[attribute] = String(value); },
+    click(){ this.clicked = true; },
+  });
   const element = name => {
-    if (!elements.has(name)) elements.set(name, {
-      value: name === 'language' ? 'ko' : '', style:{}, classList:{toggle(){}},
-      replaceChildren(){},append(){},querySelectorAll(){return [];},focus(){},showModal(){},close(){},
-      removeAttribute(name){ delete this[name]; },
-      click(){ this.clicked = true; },
-    });
+    const initialValue = name === 'language' ? 'ko' : name === 'export-format' ? 'text' : '';
+    if (!elements.has(name)) elements.set(name, makeElement(name,initialValue));
     return elements.get(name);
   };
+  const TestURL = class extends URL {};
+  TestURL.createObjectURL = blob => { const value = `blob:test/${++id}`; objectUrls.set(value,blob); return value; };
+  TestURL.revokeObjectURL = value => objectUrls.delete(value);
+  const createElement = tag => {
+    const node = makeElement(tag);
+    const values = createdElements.get(tag) || [];
+    values.push(node); createdElements.set(tag,values);
+    return node;
+  };
   const context = vm.createContext({
-    Blob, Headers, URL, URLSearchParams, AbortController, console, crypto:webcrypto,
-    document:{getElementById:element,querySelector:element,createElement:element,addEventListener(){}},
+    Blob, Headers, URL:TestURL, URLSearchParams, AbortController, console, crypto:webcrypto,
+    document:{getElementById:element,querySelector:element,createElement,addEventListener(){}},
     window:{addEventListener(){}}, performance:{now:() => 0},
     location,history:{replaceState(...args){historyCalls.push(args);}},
     localStorage:{getItem(){return '';},setItem(){}},
@@ -67,7 +98,10 @@ function setup(fetch, { FileUploader = class { detach() {} } } = {}) {
     assert.ok(entry, `missing ${delay} ms timer`);
     timeouts.delete(entry[0]); entry[1].callback(); await tick(); await tick();
   };
-  return {run,element,intervals,timeouts,runTimeout,location,historyCalls,microphone:() => mic};
+  const created = tag => createdElements.get(tag)?.at(-1);
+  const createdAll = tag => createdElements.get(tag) || [];
+  const objectUrlBlob = value => objectUrls.get(value);
+  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,location,historyCalls,microphone:() => mic};
 }
 
 test('activation presents and enforces the four-character minimum in the browser', () => {
@@ -250,6 +284,289 @@ test('only the newest lecture-list refresh can update history', async () => {
   first.resolve(response([{id:'old',title:'오래된 응답',created_at:'2026-01-01T00:00:00Z'}]));
   await older;
   assert.equal(app.run('lectures[0].id'), 'new');
+});
+
+test('lecture history groups and filters by the fixed Korean calendar date', () => {
+  const app = setup(async () => response({}));
+  assert.equal(app.run("dateKey('2026-01-01T16:00:00Z')"), '2026-01-02');
+  assert.match(app.run("dateLabel('2026-01-01T16:00:00Z')"), /1월 2일/);
+  app.run(`
+    lectures=[
+      {id:'late',title:'둘째 날 오후',created_at:'2026-01-02T02:00:00Z'},
+      {id:'early',title:'둘째 날 새벽',created_at:'2026-01-01T16:00:00Z'},
+      {id:'previous',title:'첫째 날',created_at:'2026-01-01T14:00:00Z'},
+    ];
+    current=lectures[1];
+    renderHistory();
+  `);
+  assert.deepEqual(app.element('lecture-date').children.map(option => option.value), ['', '2026-01-02', '2026-01-01']);
+  assert.equal(app.element('lecture-list').children.length, 2);
+  assert.match(app.element('lecture-list').children[0].children[0].textContent, /1월 2일/);
+  assert.equal(app.element('lecture-list').children[0].children[1].children.length, 2);
+  assert.equal(app.element('lecture-list').children[0].children[1].children[1]['aria-current'], 'page');
+
+  app.element('lecture-date').value = '2026-01-01';
+  app.element('lecture-date').onchange();
+  assert.equal(app.run('lectureDateFilter'), '2026-01-01');
+  assert.equal(app.element('lecture-count').textContent, '1/3');
+  assert.equal(app.element('lecture-list').children.length, 1);
+  assert.equal(app.element('lecture-list').children[0].children[1].children[0].children[0].textContent, '첫째 날');
+});
+
+test('starting a new recording clears an older date filter before the new lecture arrives', async () => {
+  const creation = deferred();
+  const app = setup((url, options = {}) => {
+    if (url.endsWith('/lectures') && options.method === 'POST') return creation.promise;
+    return response({segments:[],recording_available:true,recording_finalized:true});
+  });
+  app.run(`
+    lectures=[{id:'old',title:'지난 수업',created_at:'2026-01-01T00:00:00Z'}];
+    lectureDateFilter='2026-01-01';
+    renderHistory();
+  `);
+  const starting = app.run('startRecording()');
+  assert.equal(app.run('lectureDateFilter'), '');
+  assert.equal(app.element('lecture-date').value, '');
+  creation.resolve(response({id:'new',title:'새 수업',created_at:'2026-02-01T00:00:00Z',segments:[]},201));
+  await starting;
+  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), ['new','old']);
+  assert.equal(app.element('lecture-list').children.length, 2, 'the new date must not stay hidden by the old filter');
+  await app.run('stopRecording()');
+  await tick(); await tick();
+});
+
+test('starting a new file import clears an older date filter without changing resume behavior', async () => {
+  class PendingUploader {
+    detach() {}
+    start() { this.running = true; return new Promise(() => {}); }
+  }
+  const app = setup(async () => response({}), {FileUploader:PendingUploader});
+  const file = new Blob([new Uint8Array(10)]);
+  Object.defineProperty(file, 'name', {value:'새 수업.wav'});
+  Object.defineProperty(app.element('recording-file'), 'files', {configurable:true,value:[file]});
+  app.run(`
+    lectures=[{id:'old',title:'지난 수업',created_at:'2026-01-01T00:00:00Z'}];
+    lectureDateFilter='2026-01-01';
+    renderHistory();
+  `);
+  await app.run('startOrResumeFileImport()');
+  assert.equal(app.run('lectureDateFilter'), '');
+  assert.equal(app.element('lecture-date').value, '');
+});
+
+test('Markdown and plain-text exports preserve content safely and lock during audio work', async () => {
+  const app = setup(async () => response({}));
+  app.run(`
+    current={id:'lesson',title:'# 역사 [1]',language:'ko',created_at:'2026-01-01T16:00:00Z',
+      recording_available:true,recording_finalized:true,
+      segments:[{id:'s1',start:2,text:'<script> *강조* \\\\경로 $공식$ ~~삭제~~ [링크](https://example.test?a=1&b=2)'}]};
+    renderCurrent();
+  `);
+  assert.equal(app.element('download').disabled, false);
+  app.element('export-format').value = 'markdown';
+  app.element('download').onclick();
+  const markdownLink = app.created('a');
+  const markdown = await app.objectUrlBlob(markdownLink.href).text();
+  assert.equal(markdownLink.download, '# 역사 [1].md');
+  assert.ok(markdown.startsWith('# \\# 역사 \\[1\\]'));
+  assert.ok(markdown.includes('**\\[00:02\\]** \\<script\\> \\*강조\\* \\\\경로'));
+  assert.ok(markdown.includes(String.raw`\$공식\$ \~\~삭제\~\~ \[링크\]\(https\:\/\/example\.test\?a\=1\&b\=2\)`));
+
+  app.element('export-format').value = 'text';
+  app.element('download').onclick();
+  const textLink = app.created('a');
+  const plain = await app.objectUrlBlob(textLink.href).text();
+  assert.equal(textLink.download, '# 역사 [1].txt');
+  assert.ok(plain.includes('[00:02] <script> *강조* \\경로 $공식$ ~~삭제~~'));
+
+  app.run('recording=true; updateControls()');
+  for (const id of ['export-format','download','recording-download','delete-lecture']) {
+    assert.equal(app.element(id).disabled, true, `${id} must lock while recording`);
+  }
+});
+
+test('recording download exchanges bearer auth for a same-origin native ticket link', async () => {
+  const ticket = deferred();
+  const ticketPath = `/recording-downloads/${'a'.repeat(43)}`;
+  let request;
+  const app = setup((url, options) => {
+    request = {url,options}; return ticket.promise;
+  });
+  app.run(`current={id:'lesson-id',title:'한국사: 1교시',created_at:'2026-01-01T16:00:00Z',segments:[],recording_available:true,recording_finalized:true}; renderCurrent()`);
+  assert.equal(app.element('recording-download').disabled, false);
+  app.run('current.recording_finalized=false; updateControls()');
+  assert.equal(app.element('recording-download').disabled, false, 'saved unfinished audio must be recoverable');
+  assert.match(app.element('recording-download').textContent, /마무리/);
+  app.run('current.recording_finalized=true; updateControls()');
+  const downloading = app.run('downloadRecording()');
+  assert.equal(app.run('recordingDownloadPending'), true);
+  assert.equal(app.element('recording-download').disabled, true);
+  assert.match(request.url, /\/lectures\/lesson-id\/recording-download-ticket$/);
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.headers.get('Authorization'), 'Bearer old-token');
+  ticket.resolve(response({path:ticketPath}));
+  await downloading;
+  const link = app.created('a');
+  assert.equal(link.href, `https://classroom.example${ticketPath}`);
+  assert.equal(link.download, '한국사_ 1교시.wav');
+  assert.equal(link.rel, 'noreferrer');
+  assert.equal(link.referrerPolicy, 'no-referrer');
+  assert.doesNotMatch(link.href, /old-token/);
+  assert.equal(app.run('recordingDownloadPending'), false);
+  for (const unsafe of [
+    'https://attacker.example/private',
+    `${ticketPath}?session=old-token`,
+    `/recording-downloads/${'a'.repeat(31)}`,
+    `/lectures/${'a'.repeat(43)}`,
+  ]) {
+    assert.throws(() => app.run(`nativeDownloadUrl(${JSON.stringify(unsafe)})`), /안전하지 않은/);
+  }
+});
+
+test('recording download repairs an unfinished saved WAV before requesting its ticket', async () => {
+  const ticketPath = `/recording-downloads/${'b'.repeat(43)}`;
+  const requests = [];
+  const app = setup(async (url, options = {}) => {
+    requests.push({url,method:options.method,authorization:options.headers.get('Authorization')});
+    if (url.endsWith('/recording-finalize')) {
+      return response({recording_available:true,recording_finalized:true});
+    }
+    if (url.endsWith('/recording-download-ticket')) return response({path:ticketPath});
+    return response({});
+  });
+  app.run(`
+    current={id:'unfinished',title:'복구 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    lectures=[{...current}]; renderCurrent(); renderHistory();
+  `);
+  assert.equal(app.element('recording-download').disabled, false);
+  assert.match(app.element('recording-download').textContent, /마무리/);
+  await app.run('downloadRecording()');
+  assert.deepEqual(requests.map(request => request.url.replace('https://classroom.example','')), [
+    '/lectures/unfinished/recording-finalize',
+    '/lectures/unfinished/recording-download-ticket',
+  ]);
+  assert.ok(requests.every(request => request.method === 'POST' && request.authorization === 'Bearer old-token'));
+  assert.equal(app.run('current.recording_finalized'), true);
+  assert.equal(app.run('lectures[0].recording_finalized'), true);
+  assert.equal(app.created('a').href, `https://classroom.example${ticketPath}`);
+  assert.equal(app.created('a').clicked, true);
+});
+
+test('deletion requires confirmation and invalidates an older lecture response', async () => {
+  const lateLecture = deferred();
+  const lateList = deferred();
+  const requests = [];
+  const app = setup((url, options = {}) => {
+    requests.push({url,method:options.method || 'GET'});
+    if (url.endsWith('/lectures') && !options.method) return lateList.promise;
+    if (url.endsWith('/lectures/second') && !options.method) return lateLecture.promise;
+    if (url.endsWith('/lectures/first') && options.method === 'DELETE') return response(null,204);
+    return response({});
+  });
+  app.run(`
+    lectures=[
+      {id:'first',title:'지울 수업',created_at:'2026-01-02T00:00:00Z'},
+      {id:'second',title:'늦은 수업',created_at:'2026-01-01T00:00:00Z'},
+    ];
+    current={id:'first',title:'지울 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
+    renderCurrent(); renderHistory();
+  `);
+  const groups = app.element('lecture-list').children;
+  const secondButton = groups[1].children[1].children[0];
+  const selecting = secondButton.onclick();
+  const refreshing = app.run('refreshLectures()');
+  await tick();
+
+  app.element('delete-lecture').onclick();
+  assert.equal(app.element('delete-dialog').open, true);
+  assert.equal(app.element('delete-lecture-title').textContent, '지울 수업');
+  await app.element('delete-confirm').onclick();
+  assert.equal(app.element('delete-dialog').open, false);
+  assert.equal(app.run('current'), null);
+  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), ['second']);
+  assert.ok(requests.some(item => item.method === 'DELETE' && item.url.endsWith('/lectures/first')));
+
+  lateLecture.resolve(response({id:'second',title:'늦게 온 내용',created_at:'2026-01-01T00:00:00Z',segments:[]}));
+  lateList.resolve(response([
+    {id:'first',title:'삭제 전 목록',created_at:'2026-01-02T00:00:00Z'},
+    {id:'second',title:'남은 수업',created_at:'2026-01-01T00:00:00Z'},
+  ]));
+  await selecting;
+  await refreshing;
+  assert.equal(app.run('current'), null, 'the response started before deletion must not restore a note');
+  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), ['second'], 'a stale list must not restore the deleted note');
+});
+
+test('deletion safely retries once after a lost response', async () => {
+  let deleteCalls = 0;
+  let app;
+  app = setup(async (_url, options = {}) => {
+    if (options.method !== 'DELETE') return response({});
+    deleteCalls += 1;
+    if (deleteCalls === 1) throw app.run("new TypeError('response lost')");
+    return response({status:'deleted'});
+  });
+  app.run(`
+    current={id:'lost-response',title:'응답이 끊긴 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
+    lectures=[current]; renderCurrent(); renderHistory();
+  `);
+  app.element('delete-lecture').onclick();
+  await app.element('delete-confirm').onclick();
+  assert.equal(deleteCalls, 2);
+  assert.equal(app.run('current'), null);
+  assert.equal(app.run('lectures.length'), 0);
+  assert.match(app.element('notice').textContent, /삭제했어요/);
+});
+
+test('an explicit deletion failure keeps the lecture available for a later retry', async () => {
+  let deleteCalls = 0;
+  const app = setup(async (_url, options = {}) => {
+    if (options.method === 'DELETE') {
+      deleteCalls += 1;
+      return response({detail:'녹음 파일을 지우지 못했습니다.'},503);
+    }
+    return response({});
+  });
+  app.run(`
+    current={id:'cleanup-failed',title:'남겨 둘 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
+    lectures=[current]; renderCurrent(); renderHistory();
+  `);
+  app.element('delete-lecture').onclick();
+  await app.element('delete-confirm').onclick();
+  assert.equal(deleteCalls, 1, 'an explicit server failure must not be blindly retried');
+  assert.equal(app.run('current.id'), 'cleanup-failed');
+  assert.equal(app.run('lectures[0].id'), 'cleanup-failed');
+  assert.equal(app.element('delete-dialog').open, false);
+  assert.match(app.element('notice').textContent, /삭제하지 못했습니다/);
+});
+
+test('closing deletion confirmation makes no request and an old account response cannot clear the next account', async () => {
+  const deletion = deferred();
+  let deleteCalls = 0;
+  const app = setup((url, options = {}) => {
+    if (options.method === 'DELETE') { deleteCalls += 1; return deletion.promise; }
+    return response({});
+  });
+  app.run(`current={id:'old-lesson',title:'기존 수업',created_at:'2026-01-01T00:00:00Z',segments:[]}; lectures=[current]; renderCurrent(); renderHistory()`);
+  app.element('delete-lecture').onclick();
+  app.element('delete-cancel').onclick();
+  assert.equal(app.element('delete-dialog').open, false);
+  assert.equal(deleteCalls, 0);
+
+  app.element('delete-lecture').onclick();
+  const removing = app.element('delete-confirm').onclick();
+  await tick();
+  assert.equal(deleteCalls, 1);
+  app.run(`
+    showLogin(); token='next-token'; user='user-beta';
+    current={id:'next-lesson',title:'다음 계정 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
+    lectures=[current];
+  `);
+  deletion.resolve(response(null,204));
+  await removing;
+  assert.equal(app.run('current.id'), 'next-lesson');
+  assert.equal(app.run('lectures[0].id'), 'next-lesson');
+  assert.equal(app.run('deletingLecture'), false);
 });
 
 test('cancel racing with completion reports completion rather than claiming cancellation', async () => {
@@ -586,7 +903,11 @@ test('temporary upload failures use exponential retry with one stable chunk id a
     if (attempt === 1) return response({detail:'잠시 사용할 수 없습니다.'},503);
     if (attempt === 2) return response({detail:'처리 대기열이 찼습니다.'},429);
     const start = Number(options.headers.get('X-Start-Seconds'));
-    return response({segments:[{id:`segment-${start}`,start,end:start + 1,text:`문장 ${start}`}]});
+    const finalized = options.headers.get('X-Final-Chunk') === 'true';
+    return response({
+      segments:[{id:`segment-${start}`,start,end:start + 1,text:`문장 ${start}`}],
+      recording_available:true,recording_finalized:finalized,
+    });
   });
 
   await app.run('startRecording()');
@@ -630,6 +951,8 @@ test('temporary upload failures use exponential retry with one stable chunk id a
     'a retry preserves the UUID and all boundary/finalization headers');
   assert.equal(new Set([firstId,secondId,tailId]).size, 3);
   assert.equal(app.run('current.segments.length'), 3);
+  assert.equal(app.run('current.recording_available && current.recording_finalized'), true);
+  assert.equal(app.element('recording-download').disabled, false);
 });
 
 test('an in-flight idempotent 409 retries while a changed-payload 409 remains manual', async () => {
@@ -668,6 +991,7 @@ test('an in-flight idempotent 409 retries while a changed-payload 409 remains ma
   assert.equal(rejected.run("retryableUpload({status:530})"), true);
   assert.equal(rejected.run("retryableUpload({status:408})"), true);
   assert.equal(rejected.run("retryableUpload({status:422})"), false);
+  assert.equal(rejected.run("retryableUpload({status:507})"), false);
 });
 
 test('permanent upload failure stops safely without an automatic loop and retains the tail for manual recovery', async () => {
@@ -677,7 +1001,7 @@ test('permanent upload failure stops safely without an automatic loop and retain
       return response({id:'rejected-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201);
     }
     uploads.push(options.headers.get('X-Chunk-Id'));
-    return response({detail:'오디오 형식이 올바르지 않습니다.'},422);
+    return response({detail:'녹음 저장 공간이 부족합니다.'},507);
   });
 
   await app.run('startRecording()');
@@ -753,6 +1077,107 @@ test('repeated 503 responses stop after the bounded automatic retry budget', asy
   assert.equal(app.run('pending.length'), 2, 'the failed head and final microphone tail remain recoverable');
 });
 
+test('skipping the last failed chunk finalizes the saved recording and applies its flags', async () => {
+  const finalization = deferred();
+  let request;
+  const app = setup((url, options = {}) => {
+    if (url.endsWith('/lectures/recoverable-lesson/recording-finalize')) {
+      request = {url,options};
+      return finalization.promise;
+    }
+    return response({});
+  });
+  app.run(`
+    current={id:'recoverable-lesson',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    lectures=[{...current}];
+    pending=[{id:'failed-final',lectureId:'recoverable-lesson',final:true,downloadRequested:true}];
+    sendError='마지막 조각 실패'; renderCurrent();
+  `);
+  app.run('skipFailedChunk()');
+  assert.equal(app.run('pending.length'), 0);
+  assert.equal(app.run('recordingFinalizePending'), true);
+  assert.equal(app.run('isBusy()'), true);
+  for (const id of ['new-note','record-button','recording-file','download','recording-download','delete-lecture']) {
+    assert.equal(app.element(id).disabled, true, `${id} must lock while finalizing the recording`);
+  }
+  assert.match(request.url, /\/lectures\/recoverable-lesson\/recording-finalize$/);
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.headers.get('Authorization'), 'Bearer old-token');
+
+  finalization.resolve(response({recording_available:true,recording_finalized:true}));
+  await tick(); await tick();
+  assert.equal(app.run('recordingFinalizePending'), false);
+  assert.equal(app.run('current.recording_available && current.recording_finalized'), true);
+  assert.equal(app.run('lectures[0].recording_available && lectures[0].recording_finalized'), true);
+  assert.equal(app.element('recording-download').disabled, false);
+  assert.match(app.element('notice').textContent, /WAV로 마무리/);
+});
+
+test('skipping the only failed chunk never claims that a server WAV exists', async () => {
+  const app = setup((url) => url.endsWith('/recording-finalize')
+    ? response({recording_available:false,recording_finalized:true})
+    : response({}));
+  app.run(`
+    current={id:'empty-recording',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:false,recording_finalized:false};
+    lectures=[{...current}];
+    pending=[{id:'failed-only',lectureId:'empty-recording',final:true,downloadRequested:true}];
+    sendError='첫 조각 실패';
+    skipFailedChunk();
+  `);
+  await tick(); await tick();
+  assert.equal(app.run('current.recording_available'), false);
+  assert.equal(app.run('current.recording_finalized'), true);
+  assert.equal(app.element('recording-download').disabled, true);
+  assert.match(app.element('notice').textContent, /내려받을 녹음은 없습니다/);
+  assert.doesNotMatch(app.element('notice').textContent, /WAV로 마무리/);
+});
+
+test('recording finalization retries once after a transient response loss', async () => {
+  let finalizeCalls = 0;
+  let app;
+  app = setup(async (url) => {
+    if (!url.endsWith('/recording-finalize')) return response({});
+    finalizeCalls += 1;
+    if (finalizeCalls === 1) throw app.run("new TypeError('response lost')");
+    return response({recording_available:true,recording_finalized:true});
+  });
+  app.run(`
+    current={id:'retry-finalize',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    lectures=[{...current}];
+    pending=[{id:'failed-final',lectureId:'retry-finalize',final:true,downloadRequested:true}];
+    sendError='마지막 조각 실패';
+    skipFailedChunk();
+  `);
+  await tick(); await tick();
+  assert.equal(finalizeCalls, 2);
+  assert.equal(app.run('recordingFinalizePending'), false);
+  assert.equal(app.run('current.recording_finalized'), true);
+});
+
+test('a stale recording-finalize response cannot alter the next account', async () => {
+  const finalization = deferred();
+  const app = setup((url) => url.endsWith('/recording-finalize') ? finalization.promise : response({}));
+  app.run(`
+    current={id:'old-lesson',title:'이전 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    lectures=[{...current}];
+    pending=[{id:'failed-final',lectureId:'old-lesson',final:true,downloadRequested:true}];
+    sendError='마지막 조각 실패';
+    skipFailedChunk();
+  `);
+  assert.equal(app.run('recordingFinalizePending'), true);
+  app.run(`
+    showLogin(); token='next-token'; user='next-user';
+    current={id:'next-lesson',title:'다음 수업',created_at:'2026-01-02T00:00:00Z',segments:[],recording_available:false,recording_finalized:false};
+    lectures=[{...current}];
+  `);
+  finalization.resolve(response({recording_available:true,recording_finalized:true}));
+  await tick(); await tick();
+  assert.equal(app.run('current.id'), 'next-lesson');
+  assert.equal(app.run('current.recording_available || current.recording_finalized'), false);
+  assert.equal(app.run('lectures[0].id'), 'next-lesson');
+  assert.equal(app.run('recordingFinalizePending'), false);
+});
+
 test('a failed head requires a separate download request and save confirmation before skipping', async () => {
   let uploads = 0;
   const app = setup(async url => {
@@ -775,8 +1200,8 @@ test('a failed head requires a separate download request and save confirmation b
   assert.equal(app.element('skip-failed').hidden, false);
   app.run('skipFailedChunk()');
   await tick(); await tick();
-  assert.equal(app.element('a').clicked, true);
-  assert.match(app.element('a').download, /처리실패\.wav$/);
+  assert.equal(app.created('a').clicked, true);
+  assert.match(app.created('a').download, /처리실패\.wav$/);
   assert.equal(uploads, 2, 'the next queued chunk is sent after the preserved head is skipped');
   assert.equal(app.run('pending.length'), 0);
   assert.equal(app.run('sendError'), '');

@@ -132,13 +132,16 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 수업 생성은 브라우저가 보낸 UUID와 소유자·제목·언어를 확인해 응답 손실 뒤 재요청도 idempotent하게 처리한다.
 - 한 모델과 inference lock을 사용하며 running+waiting 요청은 기본 2개로 제한한다.
 - WAV는 최대 512,000 bytes, 0.05~15초, 16 kHz mono PCM16만 받는다. VAD가 침묵 hallucination 저장을 줄인다.
-- 실시간 WAV는 DB/파일에 쓰지 않는다. 텍스트와 chunk 처리 메타데이터만 SQLite에 commit한다.
+- 새로 처리한 실시간·파일 import 음성은 overlap을 제거한 16 kHz mono PCM WAV로 `.data/recordings/<private-account>/<lecture UUID>.wav`에 보존한다. 계정 폴더는 `0700`, 파일은 `0600`이며 과거에 이미 버린 음성은 소급 복구하지 않는다.
+- WAV 저장은 시간축에 이미 있는 PCM과 byte 단위로 대조해 같은 요청/응답 유실 재시도가 파일을 늘리지 않게 한다. 제한된 건너뛴 구간은 무음으로 채우고, 4시간·전체 20 GiB·최소 여유 1 GiB 한도를 적용한다.
 - 녹음 파일은 `POST /imports` → 고정 480 KiB `PUT /imports/{id}` → `POST .../complete` 계약으로 계정별 `0700` 폴더의 UUID 파일(`0600`)에 올린다. 최대 1 GiB, 디코딩 음성 4시간, 계정당 활성 작업 1개다.
 - 브라우저와 서버는 모든 480 KiB 조각의 SHA-256을 순서대로 묶은 v2 지문으로 재선택 파일 전체를 검증한다. 브라우저/서버 모두 전체 파일을 메모리에 펼치지 않는다.
 - PyAV 18.1.0이 첫 오디오 스트림만 16 kHz mono s16으로 스트리밍 디코딩한다. nested URL/playlist I/O, 비정상 채널·sample rate·frame duration을 거절하고 디코딩 뒤 최대 15초 PCM만 유지한다.
 - PyAV/FFmpeg 네이티브 디코더는 API 프로세스 안에서 실행된다. 두 명의 인증된 사용자가 신뢰할 수 있는 수업 파일만 올린다는 운영 가정이며, 악의적으로 만든 미디어의 네이티브 hang/crash까지 OS sandbox로 격리한 구조는 아니다.
 - 결정적 import chunk UUID와 기존 chunk idempotency로 정상 종료 뒤 재시작 시 완료 청크를 재사용한다. 단일 background worker는 loop 예외를 재시도하고 GET/list가 죽은 worker를 다시 확인한다.
 - 완료·취소·실패 DB 상태와 별도로 `raw_deleted`를 기록한다. unlink 실패를 삭제 성공으로 표시하지 않으며 60초 maintenance/list 조회에서 재시도한다. 7일간 멈춘 업로드는 서버를 재시작하지 않아도 정리한다.
+- 녹음 다운로드는 소유권·완료 상태를 확인한 인증 POST가 60초짜리 무작위 전용 경로를 발급하고, 네이티브 파일 응답은 세션 Bearer를 URL에 넣지 않는다. 짧은 Wi-Fi 중단 뒤 Range 재개를 위해 최대 16회만 재사용하며, 경로는 UUID에서만 계산하고 다운로드 시 열린 `O_NOFOLLOW` descriptor의 WAV 구조와 일반 파일 여부를 다시 검사한다.
+- 수업 삭제는 진행 중 import나 pending chunk가 있으면 `409`로 거절한다. 연결된 import metadata를 지우고 durable `deleting` 상태를 먼저 기록한 뒤 WAV와 lecture cascade 데이터를 제거하며, 중간 파일 삭제 실패는 성공으로 표시하지 않고 재시작 때 다시 처리한다.
 - `MODEL_WARMUP=1`이면 lifespan 중 모델을 로드하고 첫 경로를 실행한다.
 
 ### 웹
@@ -158,6 +161,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 서버 응답 segment ID도 다시 검사해 같은 응답 렌더링을 중복 append하지 않는다.
 - `RecordingFileUploader`는 파일을 480 KiB씩 지문 확인·해시·순차 업로드하고 서버 offset으로 재개한다. 업로드 중 탭을 닫으면 같은 전체 지문의 파일 재선택이 필요하지만 queued/processing은 파일 참조 없이 polling을 복구한다.
 - import polling delay의 abort listener는 매 회 제거한다. 로그아웃/탭 이탈은 watcher만 detach하고 서버 작업을 취소하지 않으며, 취소/완료 경쟁과 오래된 lecture/list 응답은 terminal 상태·generation/sequence로 판별한다.
+- 지난 수업을 `Asia/Seoul` 날짜로 묶고 단일 날짜를 필터링한다. 상세 기록은 UTF-8 TXT 또는 Markdown으로 내보내며 Markdown 제어문자와 파일명 문자를 정리한다.
+- 녹음 WAV 버튼은 `recording_available`인 수업에만 열린다. 미확정 WAV는 owner-only idempotent finalize POST로 받은 범위까지 먼저 닫고, 로그인 Bearer로 ticket을 받은 뒤 같은 API origin의 상대 경로만 세션 토큰 없이 브라우저 네이티브 다운로드로 연다.
+- 수업 삭제 확인창은 제목과 텍스트·녹음 삭제 범위를 보여 준다. 삭제·다운로드·녹음·파일 변환 중 동작을 상호 잠그고 generation/sequence로 늦게 도착한 이전 수업·계정 응답을 버린다.
 
 ### 운영 스크립트
 
@@ -166,7 +172,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - `scripts/start-tunnel.sh`: 서버 health 확인 후 Quick Tunnel 생성, URL 파일 기록
 - `scripts/status.sh`: PID 소유권, 로컬 health, 실행 중인 tunnel URL과 외부 HTTPS health 표시. 죽은 터널의 마지막 URL은 현재 주소와 구분
 - `scripts/stop.sh`: tunnel 먼저, 서버 다음으로 SIGTERM 종료; PID가 다른 프로세스를 가리키면 건드리지 않음
-- `scripts/backup.sh`: SQLite online backup으로 WAL의 최신 커밋까지 일관된 스냅샷 생성; 기존 대상은 덮어쓰지 않음
+- `scripts/backup.sh`: SQLite online backup으로 WAL의 최신 커밋까지 일관된 스냅샷 생성; 기존 대상은 덮어쓰지 않음. 보존 WAV는 포함하지 않으므로 음성 백업은 서버를 끈 상태에서 `.data/recordings/`를 같은 암호화 저장소에 별도로 복사해야 함
 - `server/manage.py`: private `ACCOUNT_USERNAMES`의 두 미활성 계정 invite 생성과 `SITE_ORIGINS` 갱신. 서버 주소와 초대 링크를 같은 로컬 파일에 쓰되 링크 자체나 서버 설정에는 임시 API 주소를 결합하지 않음
 
 ## 검증 범위
@@ -189,8 +195,10 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 위 7:52 실험에서 2/4/6분/종료의 KV 1,702/3,368/5,034/6,574, allocated 16.324/16.412/16.501/16.585 GiB, reserved 16.586/17.887/19.820/22.193 GiB, 최근 10청크 평균 연산 2.149/2.398/3.018/3.253초를 기록했다. peak allocated는 16.957 GiB, 최대 연속 backlog 청크는 3개였다.
 - VibeVoice 짧은 종료 처리에서 존재하지 않는 `Speaker 1: 그치.`와, 이미 lookahead로 처리한 0.14초를 공식 flush loop가 다시 넣어 `[Silence]`를 덧붙이는 현상을 재현했다. 7:52 반복 실험은 기대한 42개 발화 라벨을 한 번씩 냈고 마지막 flush는 빈 문자열이어서 발화 단위 누락·중복은 보이지 않았지만, 이는 반복 낭독 음성에 한정된 결과다.
 - VibeVoice 벤치마크 종료 후 별도 프로세스에서 PyTorch allocated/reserved 0과 free 46.80/47.47 GiB를 확인했다.
-- 코드 검토로 확인한 방어선: ignored 환경설정 기반 서버 측 계정 allow-list·DB exact-set 검사·소유권 검사, exact-origin 제한, chunked body 제한, 실시간 음성 비저장, import 원본 권한/삭제 상태, 동일 lecture/chunk/import UUID의 idempotent 응답, 초대 링크의 API 주소 배제, 계정 전체 주소 합산 로그인 제한
-- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer 46개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID 비공개 설정 검증, legacy DB 계정 제약 제거와 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정 전환의 오래된 UI 응답, system-audio track 분리도 포함한다. 모든 shell script `bash -n`과 Python source `py_compile`도 통과했다.
+- 코드 검토로 확인한 방어선: ignored 환경설정 기반 서버 측 계정 allow-list·DB exact-set 검사·소유권 검사, exact-origin 제한, chunked body 제한, 계정별 녹음 권한·UUID 경로·WAV 검증, import 원본 권한/삭제 상태, 동일 lecture/chunk/import UUID의 idempotent 응답, 초대 링크의 API 주소 배제, 계정 전체 주소 합산 로그인 제한
+- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장 57개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID 비공개 설정 검증, legacy DB 계정 제약 제거와 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정 전환의 오래된 UI 응답, system-audio track 분리도 포함한다.
+- 녹음 전용 시험은 overlap PCM 제거, byte-identical retry, bounded silence gap, quota 실패 시 기존 파일 불변, 부분 write rollback, symlink 거부/안전 삭제, 전송 중단 fd close, 60초 ticket Range 재개·만료, 명시적 final 복구, 다른 계정 불변, DELETE/inference 경합과 응답 유실 idempotency를 포함한다.
+- 웹 시험은 KST 자정 경계 날짜 그룹, TXT/Markdown 내용·이스케이프·안전 파일명, 동일 API origin ticket 제한, 마지막 실패 조각 확정과 WAV 없음의 정확한 안내, 507 수동 복구, 다운로드·삭제·계정 전환의 stale 응답 방어를 포함한다. Python source `py_compile`, JavaScript `--check`, `git diff --check`도 통과했다.
 - GitHub Actions Pages 배포 성공 후 공개 URL의 `index.html`, `app.js`, `audio.js`, `file-import.js`, `pcm-worklet.js`, `style.css`가 로컬 배포본과 byte-for-byte 일치하고 HTTPS 200임을 확인했다.
 - 실제 Quick Tunnel edge를 통해 `/health` 200, Pages Origin의 CORS 헤더와 새 파일 조각 `PUT` preflight를 확인했고, 허용하지 않은 Origin은 서버 경계에서 403으로 거절됐다. cloudflared의 DNS·UDP/QUIC·TCP·Cloudflare API 사전 점검도 모두 PASS였다.
 
@@ -207,6 +215,8 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 새 UUID로 동일 오디오가 다시 생성되는 앱/브라우저 수준의 의미적 중복
 - 실제 두 계정의 외부 활성화·로그인·기록 격리 end-to-end
 - Quick Tunnel을 통한 실제 활성 계정 로그인, 실시간 WAV/녹음 파일 업로드, 기록 조회·다운로드. 외부 `/health`와 CORS까지만 확인했다.
+- 실제 브라우저와 Quick Tunnel에서 새 녹음 WAV 다운로드를 중단·재개하거나, 다운로드 도중 같은 수업을 삭제하는 동작
+- 기능 추가 전에 만든 과거 수업에는 원본 음성이 남아 있지 않으므로 녹음 다운로드를 제공할 수 없음
 - 두 사용자 본인이 일회용 링크를 열어 비밀번호를 설정하는 단계
 - VibeVoice를 8분보다 긴 하나의 state 또는 실제 45~90분 수업으로 운용했을 때의 품질·메모리·처리량. 이번 실험은 공식 목표에 가까운 7:52에서 끝났고 반복 낭독 음성을 사용했다.
 

@@ -391,6 +391,7 @@ button {
 
 .primary-button,
 .secondary-button,
+.danger-button,
 .new-note-button,
 .record-button {
   min-height: 48px;
@@ -524,6 +525,12 @@ button {
   margin: 30px 5px 11px;
 }
 
+.history-heading > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
 .history-heading h2 {
   margin: 0;
   font-size: 12px;
@@ -540,6 +547,16 @@ button {
   text-align: center;
 }
 
+.history-heading select {
+  width: min(134px, 55%);
+  min-height: 34px;
+  padding: 5px 27px 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  font-size: 10px;
+}
+
 .lecture-list {
   display: flex;
   min-height: 0;
@@ -549,6 +566,30 @@ button {
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
+}
+
+.lecture-day {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.lecture-day h3 {
+  margin: 7px 7px 1px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+}
+
+.lecture-day:first-child h3 {
+  margin-top: 0;
+}
+
+.lecture-day-items {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .lecture-item {
@@ -673,6 +714,24 @@ button {
   line-height: 1.2;
 }
 
+.note-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.note-actions select {
+  min-height: 48px;
+  padding: 9px 31px 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface);
+  font-size: 12px;
+}
+
 .secondary-button {
   flex: 0 0 auto;
   padding: 10px 15px;
@@ -685,6 +744,29 @@ button {
 .secondary-button:hover:not(:disabled) {
   border-color: var(--forest-600);
   background: var(--forest-100);
+}
+
+.danger-button {
+  flex: 0 0 auto;
+  padding: 10px 15px;
+  border: 1px solid rgba(163, 62, 62, 0.35);
+  color: var(--danger);
+  background: transparent;
+  font-size: 12px;
+}
+
+.danger-button:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.danger-button.solid {
+  color: white;
+  background: var(--danger);
+}
+
+.danger-button.solid:hover:not(:disabled) {
+  background: #843232;
 }
 
 .recorder,
@@ -1088,7 +1170,8 @@ button {
   overflow-wrap: anywhere;
 }
 
-.connection-dialog {
+.connection-dialog,
+.delete-dialog {
   width: min(92vw, 500px);
   max-width: 500px;
   padding: 0;
@@ -1099,7 +1182,8 @@ button {
   box-shadow: var(--shadow);
 }
 
-.connection-dialog::backdrop {
+.connection-dialog::backdrop,
+.delete-dialog::backdrop {
   background: rgba(15, 28, 23, 0.55);
   backdrop-filter: blur(3px);
 }
@@ -1108,6 +1192,29 @@ button {
   display: grid;
   gap: 18px;
   padding: 30px;
+}
+
+.delete-dialog-content {
+  display: grid;
+  gap: 20px;
+  padding: 30px;
+}
+
+.delete-dialog-content > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.delete-dialog-content > p strong {
+  color: var(--ink);
+}
+
+.delete-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
 }
 
 .dialog-heading {
@@ -1289,6 +1396,18 @@ button {
     scroll-snap-type: x proximity;
   }
 
+  .lecture-day {
+    flex: 0 0 auto;
+  }
+
+  .lecture-day h3 {
+    margin-top: 0;
+  }
+
+  .lecture-day-items {
+    flex-direction: row;
+  }
+
   .lecture-item {
     width: 184px;
     scroll-snap-align: start;
@@ -1320,6 +1439,17 @@ button {
 
   .note-heading {
     align-items: flex-start;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .note-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .note-actions select {
+    flex: 1 1 170px;
   }
 
   .note-heading h1 {
@@ -1346,8 +1476,11 @@ button {
   }
 
   .note-heading {
-    flex-direction: column;
-    gap: 16px;
+    gap: 14px;
+  }
+
+  .note-actions {
+    gap: 6px;
   }
 
   .lesson-fields {
@@ -1391,6 +1524,15 @@ button {
   .connection-form {
     padding: 25px 20px;
   }
+
+  .delete-dialog-content {
+    padding: 25px 20px;
+  }
+
+  .delete-dialog-actions {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1408,7 +1550,7 @@ button {
   .site-header,
   .sidebar,
   .recorder,
-  .secondary-button,
+  .note-actions,
   .view-meta {
     display: none !important;
   }

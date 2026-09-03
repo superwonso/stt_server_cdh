@@ -128,7 +128,10 @@ class Database:
                     username TEXT NOT NULL REFERENCES users(username),
                     title TEXT NOT NULL,
                     language TEXT CHECK (language IS NULL OR language IN ('ko', 'en')),
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    deleting INTEGER NOT NULL DEFAULT 0 CHECK (deleting IN (0, 1)),
+                    recording_finalized INTEGER NOT NULL DEFAULT 0
+                        CHECK (recording_finalized IN (0, 1))
                 );
                 CREATE INDEX IF NOT EXISTS lectures_user ON lectures(username, created_at);
                 CREATE TABLE IF NOT EXISTS chunks (
@@ -182,6 +185,17 @@ class Database:
                     WHERE status IN ('uploading', 'queued', 'processing');
             """)
             chunk_columns = {row[1] for row in connection.execute("PRAGMA table_info(chunks)")}
+            lecture_columns = {row[1] for row in connection.execute("PRAGMA table_info(lectures)")}
+            if "deleting" not in lecture_columns:
+                connection.execute(
+                    "ALTER TABLE lectures ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (deleting IN (0, 1))"
+                )
+            if "recording_finalized" not in lecture_columns:
+                connection.execute(
+                    "ALTER TABLE lectures ADD COLUMN recording_finalized INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (recording_finalized IN (0, 1))"
+                )
             if "overlap_seconds" not in chunk_columns:
                 connection.execute("ALTER TABLE chunks ADD COLUMN overlap_seconds REAL NOT NULL DEFAULT 0")
             if "final_chunk" not in chunk_columns:
@@ -221,5 +235,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 1:
-                connection.execute("PRAGMA user_version = 1")
+            if schema_version < 2:
+                connection.execute("PRAGMA user_version = 2")

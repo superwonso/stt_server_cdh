@@ -327,13 +327,17 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.engine.calls, 1)
         self.engine.block = False
         self.engine.fail = True
+        # The first upload finalized its recording. A failed inference retry
+        # belongs to a new lecture because finalized lectures intentionally
+        # reject every previously unseen chunk.
+        retry_lecture_id = self.lecture(token, "실패 재시도 수업")
         chunk_id = str(uuid.uuid4())
         with self.assertLogs("classroom", level="ERROR"):
-            failed = self.upload(token, lecture_id, chunk_id=chunk_id)
+            failed = self.upload(token, retry_lecture_id, chunk_id=chunk_id)
         self.assertEqual(failed.status_code, 503)
         self.assertNotIn("private-test-path", failed.text)
         self.engine.fail = False
-        self.assertEqual(self.upload(token, lecture_id, chunk_id=chunk_id).status_code, 200)
+        self.assertEqual(self.upload(token, retry_lecture_id, chunk_id=chunk_id).status_code, 200)
 
     def test_origins_validation_privacy_and_rate_limit(self):
         self.assertEqual(self.client.get("/health").json(), {"status": "ok"})

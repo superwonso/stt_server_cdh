@@ -18,7 +18,7 @@ from typing import Annotated, Literal
 import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, StrictInt, StringConstraints
 from starlette.concurrency import run_in_threadpool
@@ -27,6 +27,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .db import Database
 from .importer import ImportDurationError, ImportInterrupted, ImportMediaError, iter_audio_chunks
+from .recordings import (
+    RecordingCapacityError,
+    RecordingConflict,
+    RecordingCorruptError,
+    RecordingStore,
+)
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
 from .settings import Settings
 from .transcriber import LocalTranscriber
@@ -62,6 +68,25 @@ class ImportBody(BaseModel):
     filename: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
     file_fingerprint: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     size: StrictInt
+
+
+class DescriptorFileResponse(FileResponse):
+    """Serve an already validated Linux descriptor and close it on disconnect."""
+
+    def __init__(self, descriptor: int, **kwargs):
+        self.descriptor = descriptor
+        super().__init__(f"/proc/self/fd/{descriptor}", **kwargs)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            descriptor, self.descriptor = self.descriptor, -1
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 class BodySizeLimitMiddleware:
@@ -168,7 +193,7 @@ class RequestBoundaryMiddleware:
         await self.app(scope, receive, secure_send)
 
 
-def decode_wav(payload: bytes) -> tuple[np.ndarray, float]:
+def decode_wav(payload: bytes) -> tuple[np.ndarray, float, bytes]:
     try:
         with wave.open(io.BytesIO(payload), "rb") as audio:
             if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getcomptype()) != (1, 2, 16000, "NONE"):
@@ -181,7 +206,7 @@ def decode_wav(payload: bytes) -> tuple[np.ndarray, float]:
                 raise ValueError("Truncated WAV")
     except (wave.Error, EOFError, ValueError, OverflowError) as error:
         raise HTTPException(422, "오디오는 0.05~15초의 16kHz 모노 16비트 PCM WAV여야 합니다.") from error
-    return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0, frames / 16000
+    return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0, frames / 16000, pcm
 
 
 def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
@@ -197,6 +222,21 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
     import_directory = settings.data_dir / "imports"
     import_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     import_directory.chmod(0o700)
+    recording_store = RecordingStore(
+        settings.data_dir / "recordings",
+        settings.accounts,
+        max_total_bytes=settings.max_recordings_bytes,
+        min_free_bytes=settings.recording_free_reserve_bytes,
+        max_seconds=settings.max_import_seconds,
+        # A user can explicitly save and skip several failed browser chunks.
+        # Keep the resulting silence bounded, while allowing the remaining
+        # in-memory queue to continue into the same recording.
+        max_gap_seconds=180,
+    )
+    download_ticket_lock = threading.Lock()
+    # A small reuse budget lets a browser resume a Range download after a
+    # Wi-Fi interruption without ever putting the login bearer in a URL.
+    download_tickets: dict[str, tuple[float, str, str, int]] = {}
     if settings.max_upload_bytes < settings.import_part_bytes:
         raise RuntimeError("MAX_UPLOAD_BYTES must be at least the fixed import part size")
     import_part_bytes = settings.import_part_bytes
@@ -215,6 +255,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
         # running the account setup CLI must not disturb an active request.
         with database.connect() as connection:
             connection.execute("DELETE FROM chunks WHERE status = 'pending'")
+        recover_lecture_deletions()
         recover_import_jobs()
         if settings.model_warmup and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
@@ -228,6 +269,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
     app.state.settings = settings
     app.state.database = database
     app.state.transcriber = engine
+    app.state.recording_store = recording_store
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, error: RequestValidationError):
@@ -239,7 +281,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(settings.site_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=[
             "Authorization",
             "Content-Type",
@@ -300,15 +342,25 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
             raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인하세요.", headers={"WWW-Authenticate": "Bearer"})
         return {"username": session["username"], "token_hash": token_hash}
 
-    def owned_lecture(lecture_id: str, username: str) -> dict:
+    def owned_lecture(lecture_id: str, username: str, *, include_deleting: bool = False) -> dict:
+        deleting_clause = "" if include_deleting else " AND deleting = 0"
         with database.connect() as connection:
             lecture = connection.execute(
-                "SELECT id, title, language, created_at FROM lectures WHERE id = ? AND username = ?",
+                "SELECT id, username, title, language, created_at, deleting, recording_finalized FROM lectures "
+                f"WHERE id = ? AND username = ?{deleting_clause}",
                 (lecture_id, username),
             ).fetchone()
         if lecture is None:
             raise HTTPException(404, "수업을 찾을 수 없습니다.")
         return dict(lecture)
+
+    def lecture_result(lecture: dict, *, segments: list[dict] | None = None) -> dict:
+        result = {key: lecture[key] for key in ("id", "title", "language", "created_at")}
+        result["recording_available"] = recording_store.available(lecture["username"], lecture["id"])
+        result["recording_finalized"] = bool(lecture["recording_finalized"])
+        if segments is not None:
+            result["segments"] = segments
+        return result
 
     @app.get("/health")
     def health():
@@ -363,10 +415,11 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
     def list_lectures(user: dict = Depends(identity)):
         with database.connect() as connection:
             rows = connection.execute(
-                "SELECT id, title, language, created_at FROM lectures WHERE username = ? ORDER BY created_at DESC, id DESC",
+                "SELECT id, username, title, language, created_at, deleting, recording_finalized FROM lectures "
+                "WHERE username = ? AND deleting = 0 ORDER BY created_at DESC, id DESC",
                 (user["username"],),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [lecture_result(dict(row)) for row in rows]
 
     @app.post("/lectures", status_code=201)
     def create_lecture(
@@ -381,7 +434,8 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
 
         def replay_or_conflict(connection):
             existing = connection.execute(
-                "SELECT id, username, title, language, created_at FROM lectures WHERE id = ?",
+                "SELECT id, username, title, language, created_at, deleting, recording_finalized "
+                "FROM lectures WHERE id = ?",
                 (lecture_id,),
             ).fetchone()
             if existing is None:
@@ -392,12 +446,14 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                 or existing["language"] != body.language
             ):
                 raise HTTPException(409, "같은 수업 ID로 다른 내용을 만들 수 없습니다.")
-            return {key: existing[key] for key in ("id", "title", "language", "created_at")}
+            if existing["deleting"]:
+                raise HTTPException(409, "삭제 중인 수업 ID는 다시 사용할 수 없습니다.")
+            return dict(existing)
 
         with database.connect() as connection:
             replay = replay_or_conflict(connection)
         if replay is not None:
-            return replay
+            return lecture_result(replay)
         if not limiter.allow(("lecture", user["username"]), 30, 300):
             raise HTTPException(429, "잠시 후 다시 수업을 생성하세요.", headers={"Retry-After": "300"})
         lecture = {
@@ -409,22 +465,132 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
         with database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             replay = replay_or_conflict(connection)
-            if replay is not None:
-                return replay
-            connection.execute(
-                "INSERT INTO lectures(id, username, title, language, created_at) VALUES (?, ?, ?, ?, ?)",
-                (lecture["id"], user["username"], lecture["title"], lecture["language"], lecture["created_at"]),
-            )
-        return lecture
+            if replay is None:
+                connection.execute(
+                    "INSERT INTO lectures(id, username, title, language, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (lecture["id"], user["username"], lecture["title"], lecture["language"], lecture["created_at"]),
+                )
+        if replay is not None:
+            return lecture_result(replay)
+        return lecture_result(
+            {**lecture, "username": user["username"], "recording_finalized": 0}
+        )
 
     @app.get("/lectures/{lecture_id}")
     def get_lecture(lecture_id: str, user: dict = Depends(identity)):
         lecture = owned_lecture(lecture_id, user["username"])
         with database.connect() as connection:
-            lecture["segments"] = [dict(row) for row in connection.execute(
+            segments = [dict(row) for row in connection.execute(
                 "SELECT id, start, end, text FROM segments WHERE lecture_id = ? ORDER BY start, end, id", (lecture_id,)
             ).fetchall()]
-        return lecture
+        return lecture_result(lecture, segments=segments)
+
+    def clear_expired_download_tickets(now: float) -> None:
+        for token_hash, ticket in tuple(download_tickets.items()):
+            if ticket[0] <= now:
+                download_tickets.pop(token_hash, None)
+
+    @app.post("/lectures/{lecture_id}/recording-download-ticket")
+    def create_recording_download_ticket(lecture_id: str, user: dict = Depends(identity)):
+        lecture = owned_lecture(lecture_id, user["username"])
+        try:
+            recording = recording_store.info(user["username"], lecture["id"])
+        except RecordingCorruptError as error:
+            log.exception("Stored recording is not readable for lecture %s", lecture["id"])
+            raise HTTPException(503, "저장된 녹음 파일을 확인하지 못했습니다.") from error
+        if recording is None:
+            raise HTTPException(404, "이 수업에는 내려받을 녹음이 없습니다.")
+        if not lecture["recording_finalized"]:
+            raise HTTPException(409, "녹음이 완전히 저장된 뒤 내려받아 주세요.")
+        if not limiter.allow(("recording-download", user["username"]), 30, 60):
+            raise HTTPException(429, "잠시 후 녹음을 다시 내려받아 주세요.", headers={"Retry-After": "60"})
+        ticket = secrets.token_urlsafe(32)
+        expires_at = time.monotonic() + 60
+        with download_ticket_lock:
+            clear_expired_download_tickets(time.monotonic())
+            for token_hash, granted in tuple(download_tickets.items()):
+                if granted[1:3] == (user["username"], lecture["id"]):
+                    download_tickets.pop(token_hash, None)
+            download_tickets[digest(ticket)] = (expires_at, user["username"], lecture["id"], 16)
+        return {"path": f"/recording-downloads/{ticket}", "expires_in": 60}
+
+    @app.post("/lectures/{lecture_id}/recording-finalize")
+    def finalize_received_recording(lecture_id: str, user: dict = Depends(identity)):
+        """Close a stopped lesson after its failed final browser chunk was skipped."""
+
+        with recording_store.lock:
+            with database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                lecture = connection.execute(
+                    "SELECT id, username, recording_finalized FROM lectures "
+                    "WHERE id = ? AND username = ? AND deleting = 0",
+                    (lecture_id, user["username"]),
+                ).fetchone()
+                if lecture is None:
+                    raise HTTPException(404, "수업을 찾을 수 없습니다.")
+                active_import = connection.execute(
+                    "SELECT 1 FROM imports WHERE lecture_id = ? "
+                    "AND status IN ('uploading', 'queued', 'processing')",
+                    (lecture_id,),
+                ).fetchone()
+                pending = connection.execute(
+                    "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
+                    (lecture_id,),
+                ).fetchone()
+                if active_import is not None or pending is not None:
+                    raise HTTPException(409, "진행 중인 음성 처리가 끝난 뒤 녹음을 확정하세요.")
+                if not lecture["recording_finalized"]:
+                    connection.execute(
+                        "UPDATE lectures SET recording_finalized = 1 "
+                        "WHERE id = ? AND username = ? AND deleting = 0",
+                        (lecture_id, user["username"]),
+                    )
+            available = recording_store.available(user["username"], lecture_id)
+        return {"recording_available": available, "recording_finalized": True}
+
+    @app.get("/recording-downloads/{ticket}")
+    def download_recording(ticket: str):
+        if not 32 <= len(ticket) <= 128:
+            raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
+        now = time.monotonic()
+        with download_ticket_lock:
+            clear_expired_download_tickets(now)
+            token_hash = digest(ticket)
+            granted = download_tickets.get(token_hash)
+            if granted is not None and granted[0] > now:
+                if granted[3] <= 1:
+                    download_tickets.pop(token_hash, None)
+                else:
+                    download_tickets[token_hash] = (*granted[:3], granted[3] - 1)
+        if granted is None or granted[0] <= now:
+            raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
+        _, username, lecture_id, _ = granted
+        lecture = owned_lecture(lecture_id, username)
+        if not lecture["recording_finalized"]:
+            raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
+        try:
+            recording = recording_store.open_info(username, lecture_id)
+        except RecordingCorruptError as error:
+            log.exception("Stored recording is not readable for lecture %s", lecture_id)
+            raise HTTPException(503, "저장된 녹음 파일을 확인하지 못했습니다.") from error
+        if recording is None:
+            raise HTTPException(404, "이 수업에는 내려받을 녹음이 없습니다.")
+        filename = "".join(
+            "_" if character in '<>:"/\\|?*' or ord(character) < 32 else character
+            for character in lecture["title"]
+        ).strip(" .")[:100] or "수업-녹음"
+        descriptor = recording["descriptor"]
+        try:
+            return DescriptorFileResponse(
+                descriptor,
+                media_type="audio/wav",
+                filename=f"{filename}.wav",
+                stat_result=recording["stat"],
+                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
 
     def replay_result(
         connection,
@@ -453,7 +619,29 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
             "SELECT id, start, end, text FROM segments WHERE lecture_id = ? AND chunk_id = ? ORDER BY start, end, id",
             (lecture_id, chunk_id),
         ).fetchall()]
-        return {"segments": segments, "processing_seconds": previous["processing_seconds"]}
+        lecture = connection.execute(
+            "SELECT username, recording_finalized FROM lectures WHERE id = ? AND deleting = 0",
+            (lecture_id,),
+        ).fetchone()
+        if lecture is None:
+            raise HTTPException(404, "수업을 찾을 수 없습니다.")
+        return {
+            "segments": segments,
+            "processing_seconds": previous["processing_seconds"],
+            "_recording_owner": lecture["username"],
+            "recording_finalized": bool(lecture["recording_finalized"]),
+        }
+
+    def replay_response(lecture_id: str, replay: dict) -> dict:
+        # Never wait for the recording filesystem lock while a SQLite
+        # connection/transaction is held; DELETE and normal writes use the
+        # opposite (filesystem -> SQLite) order.
+        return {
+            "segments": replay["segments"],
+            "processing_seconds": replay["processing_seconds"],
+            "recording_available": recording_store.available(replay["_recording_owner"], lecture_id),
+            "recording_finalized": replay["recording_finalized"],
+        }
 
     def process_chunk(
         lecture: dict,
@@ -464,7 +652,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
         payload: bytes,
         interrupted=None,
     ):
-        samples, duration = decode_wav(payload)
+        samples, duration, pcm = decode_wav(payload)
         if overlap_seconds > duration or (not final_chunk and overlap_seconds >= duration):
             raise HTTPException(422, "겹침 시간이 음성 길이보다 짧아야 합니다.")
         payload_hash = hashlib.sha256(payload).hexdigest()
@@ -474,7 +662,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                 connection, lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, final_chunk
             )
         if replay is not None:
-            return replay
+            return replay_response(lecture_id, replay)
         if not capacity.acquire(blocking=False):
             raise HTTPException(429, "음성 처리 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.", headers={"Retry-After": "2"})
         claimed = False
@@ -484,14 +672,24 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                 replay = replay_result(
                     connection, lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, final_chunk
                 )
-                if replay is not None:
-                    return replay
-                connection.execute(
-                    "INSERT INTO chunks(lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, final_chunk, status) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-                    (lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, int(final_chunk)),
-                )
-                claimed = True
+                if replay is None:
+                    still_owned = connection.execute(
+                        "SELECT recording_finalized FROM lectures "
+                        "WHERE id = ? AND username = ? AND deleting = 0",
+                        (lecture_id, lecture["username"]),
+                    ).fetchone()
+                    if still_owned is None:
+                        raise HTTPException(404, "수업을 찾을 수 없습니다.")
+                    if still_owned["recording_finalized"]:
+                        raise HTTPException(409, "이미 종료된 수업에는 음성을 더 추가할 수 없습니다.")
+                    connection.execute(
+                        "INSERT INTO chunks(lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, final_chunk, status) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                        (lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, int(final_chunk)),
+                    )
+                    claimed = True
+            if replay is not None:
+                return replay_response(lecture_id, replay)
             started = time.perf_counter()
             if interrupted is None:
                 inference_lock.acquire()
@@ -519,21 +717,61 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                     continue
                 segments.append({"id": str(uuid.uuid4()), "start": round(start_seconds + begin, 3), "end": round(start_seconds + end, 3), "text": text})
             segments.sort(key=lambda segment: (segment["start"], segment["end"], segment["id"]))
-            with database.connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                connection.executemany(
-                    "INSERT INTO segments(id, lecture_id, chunk_id, start, end, text) VALUES (?, ?, ?, ?, ?, ?)",
-                    [(segment["id"], lecture_id, chunk_id, segment["start"], segment["end"], segment["text"]) for segment in segments],
-                )
-                connection.execute(
-                    "UPDATE chunks SET status = 'done', processing_seconds = ? WHERE lecture_id = ? AND chunk_id = ?",
-                    (processing_seconds, lecture_id, chunk_id),
-                )
-            return {"segments": segments, "processing_seconds": processing_seconds}
+            with recording_store.lock:
+                with database.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    still_owned = connection.execute(
+                        "SELECT recording_finalized FROM lectures "
+                        "WHERE id = ? AND username = ? AND deleting = 0",
+                        (lecture_id, lecture["username"]),
+                    ).fetchone()
+                    if still_owned is None:
+                        raise HTTPException(404, "수업을 찾을 수 없습니다.")
+                    if still_owned["recording_finalized"]:
+                        raise HTTPException(409, "이미 종료된 수업에는 음성을 더 추가할 수 없습니다.")
+                    try:
+                        recording_store.write_chunk(
+                            lecture["username"],
+                            lecture_id,
+                            start_seconds=start_seconds,
+                            overlap_seconds=overlap_seconds,
+                            pcm=pcm,
+                        )
+                    except RecordingConflict as error:
+                        raise HTTPException(409, "녹음 조각의 시간 순서가 기존 파일과 맞지 않습니다.") from error
+                    except RecordingCapacityError as error:
+                        raise HTTPException(507, "녹음을 보관할 서버 저장 공간이 부족합니다.") from error
+                    except RecordingCorruptError as error:
+                        log.exception("Stored recording is corrupt for lecture %s", lecture_id)
+                        raise HTTPException(503, "저장된 녹음 파일을 갱신하지 못했습니다.") from error
+                    connection.executemany(
+                        "INSERT INTO segments(id, lecture_id, chunk_id, start, end, text) VALUES (?, ?, ?, ?, ?, ?)",
+                        [
+                            (segment["id"], lecture_id, chunk_id, segment["start"], segment["end"], segment["text"])
+                            for segment in segments
+                        ],
+                    )
+                    connection.execute(
+                        "UPDATE chunks SET status = 'done', processing_seconds = ? "
+                        "WHERE lecture_id = ? AND chunk_id = ?",
+                        (processing_seconds, lecture_id, chunk_id),
+                    )
+                    if final_chunk:
+                        connection.execute(
+                            "UPDATE lectures SET recording_finalized = 1 WHERE id = ?",
+                            (lecture_id,),
+                        )
+            recording_available = recording_store.available(lecture["username"], lecture_id)
+            return {
+                "segments": segments,
+                "processing_seconds": processing_seconds,
+                "recording_available": recording_available,
+                "recording_finalized": final_chunk,
+            }
         except (HTTPException, ImportInterrupted):
             raise
         except Exception as error:
-            log.exception("Local transcription failed; audio was not saved")
+            log.exception("Local transcription failed")
             raise HTTPException(503, "이 PC에서 음성 인식을 실행하지 못했습니다. 서버 상태를 확인하고 다시 시도하세요.", headers={"Retry-After": "5"}) from error
         finally:
             if claimed:
@@ -681,6 +919,117 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                 current = fetch_import(job["id"])
             return current or job
 
+    def purge_download_tickets(lecture_id: str) -> None:
+        with download_ticket_lock:
+            for token_hash, ticket in tuple(download_tickets.items()):
+                if ticket[2] == lecture_id:
+                    download_tickets.pop(token_hash, None)
+
+    def finalize_lecture_deletion(lecture_id: str, username: str) -> bool:
+        """Remove private audio before committing the final metadata deletion."""
+
+        try:
+            recording_store.delete(username, lecture_id)
+        except (OSError, RecordingCorruptError):
+            log.exception("Could not remove private recording for lecture %s", lecture_id)
+            return False
+        with database.connect() as connection:
+            connection.execute(
+                "DELETE FROM lectures WHERE id = ? AND username = ? AND deleting = 1",
+                (lecture_id, username),
+            )
+        purge_download_tickets(lecture_id)
+        return True
+
+    def recover_lecture_deletions() -> None:
+        """Finish durable deletions and remove UUID recordings with no DB owner."""
+
+        with recording_store.lock:
+            with database.connect() as connection:
+                deleting = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT id, username FROM lectures WHERE deleting = 1"
+                    ).fetchall()
+                ]
+            for lecture in deleting:
+                finalize_lecture_deletion(lecture["id"], lecture["username"])
+            with database.connect() as connection:
+                expected = {username: set() for username in settings.accounts}
+                for row in connection.execute("SELECT id, username FROM lectures").fetchall():
+                    expected[row["username"]].add(row["id"])
+            try:
+                recording_store.remove_orphans(expected)
+            except (OSError, RecordingCorruptError):
+                log.exception("Could not remove an orphaned private recording")
+
+    @app.delete("/lectures/{lecture_id}")
+    def delete_lecture(lecture_id: str, user: dict = Depends(identity)):
+        with import_fs_lock, recording_store.lock:
+            try:
+                lecture = owned_lecture(lecture_id, user["username"], include_deleting=True)
+            except HTTPException as error:
+                if error.status_code == 404:
+                    # DELETE is idempotent across a lost Quick Tunnel response.
+                    # The same response for absent and other-owned UUIDs keeps
+                    # another account's lesson existence private.
+                    return {"status": "deleted"}
+                raise
+            if lecture["deleting"]:
+                if not finalize_lecture_deletion(lecture["id"], user["username"]):
+                    raise HTTPException(503, "녹음 파일 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
+                return {"status": "deleted"}
+
+            with database.connect() as connection:
+                active = connection.execute(
+                    "SELECT 1 FROM imports WHERE lecture_id = ? "
+                    "AND status IN ('uploading', 'queued', 'processing')",
+                    (lecture["id"],),
+                ).fetchone()
+                pending = connection.execute(
+                    "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
+                    (lecture["id"],),
+                ).fetchone()
+                terminal_jobs = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM imports WHERE lecture_id = ?",
+                        (lecture["id"],),
+                    ).fetchall()
+                ]
+            if active is not None or pending is not None:
+                raise HTTPException(409, "진행 중인 음성 처리가 끝난 뒤 수업을 삭제하세요.")
+            for job in terminal_jobs:
+                if not remove_private_upload(job):
+                    raise HTTPException(503, "업로드 원본 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
+
+            with database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    "SELECT deleting FROM lectures WHERE id = ? AND username = ?",
+                    (lecture["id"], user["username"]),
+                ).fetchone()
+                if current is None:
+                    raise HTTPException(404, "수업을 찾을 수 없습니다.")
+                if not current["deleting"]:
+                    active = connection.execute(
+                        "SELECT 1 FROM imports WHERE lecture_id = ? "
+                        "AND status IN ('uploading', 'queued', 'processing')",
+                        (lecture["id"],),
+                    ).fetchone()
+                    pending = connection.execute(
+                        "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
+                        (lecture["id"],),
+                    ).fetchone()
+                    if active is not None or pending is not None:
+                        raise HTTPException(409, "진행 중인 음성 처리가 끝난 뒤 수업을 삭제하세요.")
+                    connection.execute("DELETE FROM imports WHERE lecture_id = ?", (lecture["id"],))
+                    connection.execute("UPDATE lectures SET deleting = 1 WHERE id = ?", (lecture["id"],))
+            purge_download_tickets(lecture["id"])
+            if not finalize_lecture_deletion(lecture["id"], user["username"]):
+                raise HTTPException(503, "녹음 파일 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
+        return {"status": "deleted"}
+
     def abandon_import(import_id: str, status: str, message: str | None) -> None:
         """Finish a failed/cancelled job and remove its partial lecture."""
 
@@ -688,6 +1037,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
             job = fetch_import(import_id)
             if job is None:
                 return
+            lecture_id = None
             with database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current = connection.execute("SELECT * FROM imports WHERE id = ?", (import_id,)).fetchone()
@@ -698,7 +1048,13 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                     (status, message, now_text(), import_id),
                 )
                 if current["lecture_id"]:
-                    connection.execute("DELETE FROM lectures WHERE id = ?", (current["lecture_id"],))
+                    lecture_id = current["lecture_id"]
+                    connection.execute(
+                        "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ?",
+                        (lecture_id, current["username"]),
+                    )
+            if lecture_id:
+                finalize_lecture_deletion(lecture_id, job["username"])
             remove_private_upload(job)
 
     def maintain_import_jobs() -> None:
@@ -735,10 +1091,12 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
         """Make an interrupted worker resumable and clean terminal raw files."""
 
         with import_fs_lock:
+            cancelled_lectures: list[tuple[str, str]] = []
             with database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 cancelled = connection.execute(
-                    "SELECT id, lecture_id FROM imports WHERE status = 'processing' AND cancel_requested = 1"
+                    "SELECT id, lecture_id, username FROM imports "
+                    "WHERE status = 'processing' AND cancel_requested = 1"
                 ).fetchall()
                 for row in cancelled:
                     connection.execute(
@@ -747,13 +1105,20 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                         (now_text(), row["id"]),
                     )
                     if row["lecture_id"]:
-                        connection.execute("DELETE FROM lectures WHERE id = ?", (row["lecture_id"],))
+                        connection.execute(
+                            "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ?",
+                            (row["lecture_id"], row["username"]),
+                        )
+                        cancelled_lectures.append((row["lecture_id"], row["username"]))
                 connection.execute(
                     "UPDATE imports SET status = 'queued', updated_at = ? "
                     "WHERE status = 'processing' AND cancel_requested = 0",
                     (now_text(),),
                 )
                 rows = [dict(row) for row in connection.execute("SELECT * FROM imports").fetchall()]
+
+            for lecture_id, username in cancelled_lectures:
+                finalize_lecture_deletion(lecture_id, username)
 
             for job in rows:
                 path = import_path(job["username"], job["id"], create_parent=True)
@@ -793,6 +1158,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                 for candidate in account_directory.glob("*.upload"):
                     if candidate not in expected_uploads:
                         candidate.unlink(missing_ok=True)
+            recover_lecture_deletions()
 
     def import_was_cancelled(import_id: str) -> bool:
         job = fetch_import(import_id)
@@ -809,6 +1175,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
             return
         lecture = {
             "id": lecture_id,
+            "username": job["username"],
             "title": job["title"],
             "language": job["language"],
             "created_at": job["created_at"],
@@ -1036,6 +1403,13 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                 if body.size + reserved + 256 * 1024 * 1024 > free:
                     raise HTTPException(507, "서버 저장 공간이 부족합니다.")
                 try:
+                    recording_store.ensure_capacity(
+                        settings.max_import_seconds * 16_000 * 2,
+                        other_reserved_bytes=body.size + reserved,
+                    )
+                except RecordingCapacityError as error:
+                    raise HTTPException(507, "녹음과 변환 파일을 보관할 서버 저장 공간이 부족합니다.") from error
+                try:
                     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     os.close(descriptor)
                     made_file = True
@@ -1217,6 +1591,7 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                         import_current_cancel.set()
                 result = import_result(owned_import(job["id"], user["username"]))
             else:
+                lecture_id = None
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     current = connection.execute("SELECT * FROM imports WHERE id = ?", (job["id"],)).fetchone()
@@ -1226,7 +1601,13 @@ def create_app(settings: Settings | None = None, transcriber=None) -> FastAPI:
                         (now_text(), job["id"]),
                     )
                     if current and current["lecture_id"]:
-                        connection.execute("DELETE FROM lectures WHERE id = ?", (current["lecture_id"],))
+                        lecture_id = current["lecture_id"]
+                        connection.execute(
+                            "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ?",
+                            (lecture_id, current["username"]),
+                        )
+                if lecture_id:
+                    finalize_lecture_deletion(lecture_id, user["username"])
                 remove_private_upload(job)
                 result = import_result(owned_import(job["id"], user["username"]))
         import_worker_wake.set()

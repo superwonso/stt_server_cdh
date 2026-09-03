@@ -101,7 +101,8 @@ class DatabaseTests(unittest.TestCase):
             chunk_id = str(uuid.uuid4())
             with database.connect() as connection:
                 connection.execute(
-                    "INSERT INTO lectures VALUES (?, 'user-alpha', 'current', 'ko', '2026-01-01T00:00:00Z')",
+                    "INSERT INTO lectures(id, username, title, language, created_at) "
+                    "VALUES (?, 'user-alpha', 'current', 'ko', '2026-01-01T00:00:00Z')",
                     (lecture_id,),
                 )
                 connection.execute(
@@ -200,7 +201,15 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(session, ("token-hash", "user-alpha", 4102444800.0, 1.0))
             self.assertEqual(
                 lecture,
-                ("lesson-id", "user-alpha", "private title", "ko", "2026-01-01T00:00:00Z"),
+                (
+                    "lesson-id",
+                    "user-alpha",
+                    "private title",
+                    "ko",
+                    "2026-01-01T00:00:00Z",
+                    0,
+                    0,
+                ),
             )
             self.assertNotIn("CHECK", schema.upper())
             self.assertEqual(foreign_key_errors, [])

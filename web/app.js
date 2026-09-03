@@ -12,16 +12,44 @@ let fileUploader = null, importJob = null, importProgress = null, importError = 
 let importStarting = false, importCancelling = false, importPromise = null, importGeneration = 0;
 let importLectureRequest = null, lastImportLectureRefresh = 0, selectImportLecture = false;
 let lectureRefreshGeneration = 0, importLectureSequence = 0;
+let lectureDateFilter = '', recordingDownloadPending = false, recordingFinalizePending = false;
+let deletingLecture = false, deleteTarget = null;
+let noteActionSequence = 0;
 const MAX_PENDING = 8;
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30000;
 const MAX_AUTO_UPLOAD_RETRIES = 8;
 const RETRYABLE_UPLOAD_STATUSES = new Set([408, 425, 429]);
-const PERMANENT_UPLOAD_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422]);
+const PERMANENT_UPLOAD_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 507]);
 const UPLOAD_TIMEOUT_MS = 60000;
 const fmt = seconds => { const n = Math.max(0, Math.floor(seconds || 0)); return `${Math.floor(n / 60).toString().padStart(2, '0')}:${(n % 60).toString().padStart(2, '0')}`; };
-const dateLabel = value => new Date(value).toLocaleDateString('ko-KR', {year:'numeric',month:'long',day:'numeric'});
+const KST_DATE_FORMATTER = new Intl.DateTimeFormat('ko-KR', {timeZone:'Asia/Seoul',year:'numeric',month:'long',day:'numeric'});
+const KST_DATE_PARTS = new Intl.DateTimeFormat('en', {timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'});
+const dateLabel = value => KST_DATE_FORMATTER.format(new Date(value));
+function dateKey(value) {
+  const parts = Object.fromEntries(KST_DATE_PARTS.formatToParts(new Date(value)).map(part => [part.type,part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
 const bytesLabel = value => { const bytes = Math.max(0, Number(value) || 0); return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GiB` : bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MiB` : `${Math.ceil(bytes / 1024)} KiB`; };
+function safeFilename(value) {
+  const cleaned = Array.from(String(value || '').replace(/[<>:"/\\|?*\u0000-\u001F]/g,'_').trim())
+    .slice(0,100).join('').replace(/[. ]+$/g,'');
+  return cleaned || '수업';
+}
+function escapeMarkdown(value) {
+  return String(value ?? '').replace(/\r\n?/g,'\n')
+    .replace(/[\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E]/g, character => `\\${character}`)
+    .replace(/\n/g,'  \n');
+}
+function exportText(lecture, format) {
+  const segments = lecture?.segments || [];
+  if (format === 'text') {
+    return `${lecture.title}\n${dateLabel(lecture.created_at)}\n\n${segments.map(segment => `[${fmt(segment.start)}] ${segment.text}`).join('\n\n')}\n`;
+  }
+  const language = ({ko:'한국어',en:'영어'})[lecture.language] || '자동 감지';
+  const body = segments.map(segment => `**\\[${fmt(segment.start)}\\]** ${escapeMarkdown(segment.text)}`).join('\n\n');
+  return `# ${escapeMarkdown(lecture.title)}\n\n- 날짜: ${dateLabel(lecture.created_at)}\n- 언어: ${language}\n\n## 받아쓴 내용\n\n${body}\n`;
+}
 const storage = { get() { try { return localStorage.getItem('yeobaek-server') || ''; } catch { return ''; } }, set(value) { try { localStorage.setItem('yeobaek-server', value); } catch {} } };
 function notice(message) { $('notice').textContent = message; $('notice').hidden = false; clearTimeout(noticeTimer); noticeTimer = setTimeout(() => $('notice').hidden = true, 6000); }
 function errorText(error) { return error?.message || '잠시 후 다시 시도해 주세요.'; }
@@ -39,6 +67,17 @@ function normalizeUrl(value) {
     throw new Error('외부 서버는 https://…trycloudflare.com 임시 연결만 사용할 수 있어요.');
   }
   return url.origin;
+}
+function nativeDownloadUrl(value, server = apiUrl) {
+  if (typeof value !== 'string' || !/^\/recording-downloads\/[A-Za-z0-9_-]{32,128}$/.test(value)) {
+    throw new Error('서버가 안전하지 않은 다운로드 주소를 보냈습니다.');
+  }
+  const base = new URL(server);
+  const url = new URL(value, `${base.origin}/`);
+  if (url.origin !== base.origin || url.username || url.password || url.search || url.hash || url.pathname !== value) {
+    throw new Error('서버가 안전하지 않은 다운로드 주소를 보냈습니다.');
+  }
+  return url.href;
 }
 function setServer(value) { apiUrl = normalizeUrl(value); storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl; }
 async function api(path, options = {}, timeout = 15000, baseUrl = apiUrl) {
@@ -111,10 +150,13 @@ function detachImportWatcher({ clear = true } = {}) {
 }
 function showLogin(clear = true) {
   ++requestGeneration;
+  ++noteActionSequence;
+  recordingDownloadPending = false; recordingFinalizePending = false; deletingLecture = false; deleteTarget = null;
+  if ($('delete-dialog').open) $('delete-dialog').close();
   if (recording || starting) void stopRecording('로그인이 만료되어 받아쓰기를 멈췄어요.');
   detachImportWatcher();
   $('workspace').hidden = true; $('auth-screen').hidden = false; clearInterval(statusTimer);
-  if (clear) { user = ''; current = null; lectures = []; }
+  if (clear) { user = ''; current = null; lectures = []; lectureDateFilter = ''; }
   setActivation(false);
 }
 $('auth-toggle').onclick = () => setActivation(!activation);
@@ -124,7 +166,7 @@ $('connection-form').onsubmit = async event => {
   event.preventDefault(); const before = apiUrl; let changed = false;
   $('connection-save').disabled = true; $('connection-error').hidden = true;
   try {
-    if (authenticating || loggingOut || recording || starting || stopping || sending || importTransportBusy()) throw new Error('로그인, 로그아웃, 녹음 또는 파일 전송이 끝난 뒤 서버 주소를 바꿔 주세요.');
+    if (authenticating || loggingOut || recording || starting || stopping || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture) throw new Error('로그인, 로그아웃, 녹음, 다운로드 또는 파일 전송이 끝난 뒤 서버 주소를 바꿔 주세요.');
     // A dead Quick Tunnel must not strand the in-memory queue. Stop its old
     // retry timer, verify the candidate anonymously, then require the same
     // account to log in before stable chunk UUIDs are sent to the new origin.
@@ -165,7 +207,7 @@ $('auth-form').onsubmit = async event => {
     if (apiUrl !== authServer || requestGeneration !== generation) throw new Error('서버 연결 상태가 바뀌어 로그인 응답을 적용하지 않았어요. 다시 로그인해 주세요.');
     const previousUser = user;
     token = response.token; user = response.user.username; ++requestGeneration;
-    if (previousUser !== user) { current = null; lectures = []; sampleSeconds = 0; $('elapsed').textContent = '00:00'; }
+    if (previousUser !== user) { current = null; lectures = []; lectureDateFilter = ''; sampleSeconds = 0; $('elapsed').textContent = '00:00'; }
     $('password').value = ''; $('password-confirm').value = ''; $('setup-code').value = '';
     try { await refreshLectures(); await recoverFileImport(); } catch (error) { notice(errorText(error)); }
     if (!token) return;
@@ -345,18 +387,55 @@ async function recoverFileImport() {
   await refreshImportLecture(active, true, generation);
 }
 function queuedCount() { return pending.length + (draft?.buffered.length || 0); }
-function isBusy() { return authenticating || loggingOut || recording || starting || stopping || !!draft || pending.length > 0 || sending || importTransportBusy(); }
+function isBusy() { return authenticating || loggingOut || recording || starting || stopping || !!draft || pending.length > 0 || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture; }
 function renderHistory() {
-  $('lecture-count').textContent = lectures.length; const list = $('lecture-list'); list.replaceChildren();
-  if (!lectures.length) { const empty = document.createElement('p'); empty.className = 'empty-history'; empty.textContent = '아직 기록한 수업이 없어요.'; list.append(empty); }
+  const dateCounts = new Map();
   for (const lecture of lectures) {
-    const button = document.createElement('button'); button.type = 'button'; button.className = `lecture-item${current?.id === lecture.id ? ' selected' : ''}`; button.disabled = isBusy();
-    const title = document.createElement('strong'); title.textContent = lecture.title;
-    const date = document.createElement('span'); date.textContent = dateLabel(lecture.created_at); button.append(title, date);
-    button.onclick = async () => { if (isBusy()) return; selectImportLecture = false; ++importLectureSequence; const generation = ++requestGeneration; try { const note = await api(`/lectures/${lecture.id}`); if (generation !== requestGeneration || isBusy()) return; current = note; renderCurrent(); renderHistory(); } catch (error) { notice(errorText(error)); } };
-    list.append(button);
+    const key = dateKey(lecture.created_at);
+    const entry = dateCounts.get(key) || {count:0,label:dateLabel(lecture.created_at)};
+    entry.count += 1; dateCounts.set(key,entry);
+  }
+  if (lectureDateFilter && !dateCounts.has(lectureDateFilter)) lectureDateFilter = '';
+  const dateSelect = $('lecture-date'); dateSelect.replaceChildren();
+  const allDates = document.createElement('option'); allDates.value = ''; allDates.textContent = '전체 날짜'; dateSelect.append(allDates);
+  for (const [key,entry] of dateCounts) {
+    const option = document.createElement('option'); option.value = key;
+    option.textContent = `${entry.label} (${entry.count})`; dateSelect.append(option);
+  }
+  dateSelect.value = lectureDateFilter;
+
+  const visible = lectureDateFilter ? lectures.filter(lecture => dateKey(lecture.created_at) === lectureDateFilter) : lectures;
+  $('lecture-count').textContent = lectureDateFilter ? `${visible.length}/${lectures.length}` : lectures.length;
+  $('lecture-count').ariaLabel = lectureDateFilter ? `선택한 날짜 수업 ${visible.length}개, 전체 ${lectures.length}개` : `저장된 수업 ${lectures.length}개`;
+  const list = $('lecture-list'); list.replaceChildren();
+  if (!lectures.length) {
+    const empty = document.createElement('p'); empty.className = 'empty-history'; empty.textContent = '아직 기록한 수업이 없어요.'; list.append(empty); return;
+  }
+  if (!visible.length) {
+    const empty = document.createElement('p'); empty.className = 'empty-history'; empty.textContent = '이 날짜에 저장된 수업이 없어요.'; list.append(empty); return;
+  }
+  const groups = new Map();
+  for (const lecture of visible) {
+    const key = dateKey(lecture.created_at);
+    if (!groups.has(key)) groups.set(key,[]);
+    groups.get(key).push(lecture);
+  }
+  for (const groupLectures of groups.values()) {
+    const group = document.createElement('section'); group.className = 'lecture-day';
+    const heading = document.createElement('h3'); heading.textContent = dateLabel(groupLectures[0].created_at);
+    const items = document.createElement('div'); items.className = 'lecture-day-items';
+    for (const lecture of groupLectures) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = `lecture-item${current?.id === lecture.id ? ' selected' : ''}`; button.disabled = isBusy();
+      if (current?.id === lecture.id) button.setAttribute('aria-current','page');
+      const title = document.createElement('strong'); title.textContent = lecture.title;
+      const date = document.createElement('span'); date.textContent = dateLabel(lecture.created_at); button.append(title,date);
+      button.onclick = async () => { if (isBusy()) return; selectImportLecture = false; ++importLectureSequence; const generation = ++requestGeneration; try { const note = await api(`/lectures/${lecture.id}`); if (generation !== requestGeneration || isBusy()) return; current = note; renderCurrent(); renderHistory(); } catch (error) { notice(errorText(error)); } };
+      items.append(button);
+    }
+    group.append(heading,items); list.append(group);
   }
 }
+$('lecture-date').onchange = () => { lectureDateFilter = $('lecture-date').value; renderHistory(); updateControls(); };
 function renderCurrent() {
   $('note-date').textContent = dateLabel(current?.created_at || new Date());
   $('view-label').textContent = current?.title || '새 수업';
@@ -372,7 +451,7 @@ function renderCurrent() {
   } else {
     for (const segment of segments) { const row = document.createElement('div'); row.className = 'segment'; const time = document.createElement('time'); time.textContent = fmt(segment.start); const text = document.createElement('p'); text.textContent = segment.text; row.append(time,text); transcript.append(row); }
   }
-  $('segment-count').textContent = segments.length; $('download').disabled = segments.length === 0;
+  $('segment-count').textContent = segments.length;
   updateControls();
 }
 function selectedCaptureSource() { return $('audio-source').value === 'system' ? 'system' : 'microphone'; }
@@ -387,7 +466,7 @@ $('audio-source').onchange = () => { updateSourceGuidance(); updateControls(); }
 function resetNewNote({ focus = false } = {}) {
   ++requestGeneration;
   selectImportLecture = false; ++importLectureSequence;
-  current = null; sampleSeconds = 0;
+  current = null; lectureDateFilter = ''; sampleSeconds = 0;
   $('lecture-title').value = '';
   $('language').value = 'ko';
   $('elapsed').textContent = '00:00';
@@ -438,9 +517,23 @@ function renderImportStatus() {
 }
 function updateControls() {
   const busy = isBusy(), queued = queuedCount(), system = selectedCaptureSource() === 'system', activeImport = importIsActive(); $('new-note').disabled = busy; $('logout').disabled = busy;
+  const noteToolsBusy = busy || activeImport || importStarting || importCancelling;
+  const hasTranscript = !!current?.segments?.length;
+  $('lecture-date').disabled = busy;
+  $('export-format').disabled = noteToolsBusy || !hasTranscript;
+  $('download').disabled = noteToolsBusy || !hasTranscript;
+  $('recording-download').disabled = noteToolsBusy || !current?.recording_available;
+  $('recording-download').textContent = !current ? '↓ 녹음 WAV'
+    : !current.recording_available ? '저장된 녹음 없음'
+      : current.recording_finalized ? '↓ 녹음 WAV' : '녹음 WAV 마무리';
+  $('delete-lecture').disabled = noteToolsBusy || !current;
+  $('delete-close').disabled = deletingLecture;
+  $('delete-cancel').disabled = deletingLecture;
+  $('delete-confirm').disabled = deletingLecture;
+  $('delete-confirm').textContent = deletingLecture ? '삭제하는 중…' : '수업 영구 삭제';
   $('lecture-title').disabled = busy || !!current; $('language').disabled = busy || !!current;
   $('audio-source').disabled = busy || !!current;
-  $('record-button').disabled = authenticating || loggingOut || (starting && !recording) || stopping || activeImport || importStarting || (!recording && (!!draft || pending.length > 0 || sending));
+  $('record-button').disabled = authenticating || loggingOut || (starting && !recording) || stopping || activeImport || importStarting || recordingFinalizePending || (!recording && (!!draft || pending.length > 0 || sending));
   $('record-button').classList.toggle('stop', recording);
   $('record-button').textContent = recording ? '■ 받아쓰기 중지' : starting ? (system ? '공유 화면 준비 중…' : '마이크 준비 중…') : stopping ? '마지막 음성 정리 중…' : activeImport || importStarting ? '파일 변환이 끝난 뒤 시작' : current ? '＋ 새 수업 시작' : system ? '● 화면 소리 받아쓰기' : '● 받아쓰기 시작';
   $('record-dot').classList.toggle('live', recording);
@@ -455,7 +548,7 @@ function updateControls() {
   $('skip-failed').hidden = !sendError || !pending[0]?.downloadRequested;
   $('skip-failed').disabled = sending || starting || stopping || !pending[0]?.downloadRequested;
   const canResumeImport = importJob?.status === 'uploading' && !fileUploader?.running;
-  const liveAudioBusy = authenticating || loggingOut || recording || starting || stopping || !!draft || pending.length > 0 || sending;
+  const liveAudioBusy = authenticating || loggingOut || recording || starting || stopping || !!draft || pending.length > 0 || sending || recordingFinalizePending;
   $('recording-file').disabled = liveAudioBusy || importStarting || (activeImport && !canResumeImport);
   $('import-button').disabled = liveAudioBusy || importStarting || (activeImport && !canResumeImport) || !$('recording-file').files?.length;
   $('import-button').textContent = canResumeImport ? '같은 파일 이어 올리기' : '파일 올려 변환';
@@ -513,6 +606,7 @@ async function startOrResumeFileImport() {
     return;
   }
   detachImportWatcher();
+  lectureDateFilter = ''; renderHistory();
   const generation = ++importGeneration;
   importStarting = true; importError = ''; importProgress = null; selectImportLecture = true;
   fileUploader = makeFileUploader(generation);
@@ -580,6 +674,7 @@ $('record-button').onclick = () => recording ? void stopRecording() : void start
 async function startRecording() {
   if (isBusy() || importIsActive() || importStarting) return;
   if (current) resetNewNote();
+  else if (lectureDateFilter) { lectureDateFilter = ''; renderHistory(); }
   ++requestGeneration; starting = true; sendError = ''; captureWarning = ''; sampleSeconds = 0; $('elapsed').textContent = '00:00'; updateControls();
   const title = $('lecture-title').value.trim() || `${dateLabel(new Date())} 수업`;
   const language = $('language').value === 'auto' ? null : $('language').value;
@@ -627,6 +722,7 @@ async function assignLecture(session) {
     session.lecture = lecture;
     if (draft === session) draft = null;
     current = {...lecture,segments:lecture.segments || []};
+    lectureDateFilter = '';
     lectures.unshift(lecture);
     for (const chunk of session.buffered.splice(0)) enqueueChunk(session, chunk);
     renderHistory(); renderCurrent();
@@ -673,7 +769,7 @@ function retryableUpload(error) {
   const status = Number(error?.status);
   return error?.transient === true
     || RETRYABLE_UPLOAD_STATUSES.has(status)
-    || (status >= 500 && status <= 599)
+    || (status >= 500 && status <= 599 && !PERMANENT_UPLOAD_STATUSES.has(status))
     || (status === 409 && Number.isFinite(error?.retryAfterMs));
 }
 function clearUploadRetry() {
@@ -723,6 +819,8 @@ async function drain() {
         const ids = new Set(current.segments.map(x => x.id));
         for (const segment of response.segments) if (!ids.has(segment.id)) current.segments.push(segment);
         current.segments.sort((a,b) => a.start - b.start);
+        current.recording_available = !!response.recording_available;
+        current.recording_finalized = !!response.recording_finalized;
       }
       pending.shift(); retryAttempt = 0; retryMessage = ''; renderCurrent();
     }
@@ -767,19 +865,159 @@ async function saveFailedChunk() {
   }
 }
 $('save-failed').onclick = () => { void saveFailedChunk(); };
+function applyRecordingFlags(lectureId, result) {
+  const state = {
+    recording_available: !!result?.recording_available,
+    recording_finalized: !!result?.recording_finalized,
+  };
+  const summary = lectures.find(lecture => lecture.id === lectureId);
+  if (summary) Object.assign(summary,state);
+  if (current?.id === lectureId) Object.assign(current,state);
+  return state;
+}
+async function requestRecordingFinalization(lectureId, operationIsCurrent) {
+  const path = `/lectures/${encodeURIComponent(lectureId)}/recording-finalize`;
+  try {
+    return await api(path, {method:'POST'});
+  } catch (error) {
+    if (!error?.transient || !operationIsCurrent()) throw error;
+  }
+  return api(path, {method:'POST'});
+}
+async function finalizeSkippedRecording(lectureId) {
+  if (!lectureId || !token || recordingFinalizePending) return;
+  const owner = user, sessionToken = token, server = apiUrl;
+  const generation = requestGeneration, sequence = ++noteActionSequence;
+  const operationIsCurrent = () => sequence === noteActionSequence && generation === requestGeneration
+    && owner === user && sessionToken === token && server === apiUrl;
+  recordingFinalizePending = true; updateControls();
+  try {
+    const result = await requestRecordingFinalization(lectureId, operationIsCurrent);
+    if (!operationIsCurrent()) return;
+    const state = applyRecordingFlags(lectureId,result);
+    if (current?.id === lectureId) renderCurrent();
+    renderHistory();
+    notice(state.recording_available && state.recording_finalized
+      ? '건너뛴 구간을 제외한 녹음을 WAV로 마무리했어요.'
+      : '건너뛴 구간을 제외한 받아쓰기 기록을 저장했어요. 내려받을 녹음은 없습니다.');
+  } catch (error) {
+    if (operationIsCurrent()) notice(`받아쓰기 기록은 저장했지만 녹음 WAV를 마무리하지 못했습니다. ${errorText(error)}`);
+  } finally {
+    if (sequence === noteActionSequence) { recordingFinalizePending = false; updateControls(); }
+  }
+}
 function skipFailedChunk() {
   if (!sendError || sending || starting || stopping || !pending[0]?.downloadRequested) return;
-  pending.shift();
+  const skipped = pending.shift();
   clearUploadRetry(); sendError = '';
   notice('파일 저장을 확인한 음성 조각을 건너뛰었어요. 해당 구간은 기록에서 빠집니다.');
   renderCurrent();
+  if (!pending.some(chunk => chunk.lectureId === skipped.lectureId)) void finalizeSkippedRecording(skipped.lectureId);
   void drain();
 }
 $('skip-failed').onclick = skipFailedChunk;
 $('download').onclick = () => {
-  if (!current?.segments?.length) return;
-  const text = `${current.title}\n${dateLabel(current.created_at)}\n\n${current.segments.map(s => `[${fmt(s.start)}] ${s.text}`).join('\n\n')}\n`;
-  const url = URL.createObjectURL(new Blob(['\uFEFF',text],{type:'text/plain;charset=utf-8'})); const link = document.createElement('a'); link.href = url; link.download = `${current.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g,'_').slice(0,100)}.txt`; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+  if (isBusy() || importIsActive() || importStarting || !current?.segments?.length) return;
+  const format = $('export-format').value === 'text' ? 'text' : 'markdown';
+  const extension = format === 'text' ? 'txt' : 'md';
+  const type = format === 'text' ? 'text/plain;charset=utf-8' : 'text/markdown;charset=utf-8';
+  const url = URL.createObjectURL(new Blob(['\uFEFF',exportText(current,format)],{type}));
+  const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(current.title)}.${extension}`;
+  link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+};
+async function downloadRecording() {
+  if (isBusy() || importIsActive() || importStarting || !current?.recording_available) return;
+  const lectureId = current.id, title = current.title, owner = user, sessionToken = token, server = apiUrl;
+  const generation = requestGeneration, sequence = ++noteActionSequence;
+  const operationIsCurrent = () => sequence === noteActionSequence && generation === requestGeneration
+    && owner === user && sessionToken === token && server === apiUrl && current?.id === lectureId;
+  recordingDownloadPending = true; updateControls();
+  try {
+    if (!current.recording_finalized) {
+      const result = await requestRecordingFinalization(lectureId,operationIsCurrent);
+      if (!operationIsCurrent()) return;
+      const state = applyRecordingFlags(lectureId,result);
+      renderCurrent(); renderHistory();
+      if (!state.recording_available || !state.recording_finalized) throw new Error('내려받을 녹음을 준비하지 못했습니다.');
+    }
+    const ticket = await api(`/lectures/${encodeURIComponent(lectureId)}/recording-download-ticket`, {method:'POST'});
+    if (!operationIsCurrent()) return;
+    const link = document.createElement('a');
+    link.href = nativeDownloadUrl(ticket?.path,server);
+    link.download = `${safeFilename(title)}.wav`;
+    link.rel = 'noreferrer'; link.referrerPolicy = 'no-referrer';
+    link.click(); notice('녹음 WAV 다운로드를 시작했어요.');
+  } catch (error) {
+    if (operationIsCurrent()) {
+      notice(`녹음을 내려받지 못했습니다. ${errorText(error)}`);
+    }
+  } finally {
+    if (sequence === noteActionSequence) { recordingDownloadPending = false; updateControls(); }
+  }
+}
+$('recording-download').onclick = () => { void downloadRecording(); };
+function closeDeleteDialog() {
+  if (deletingLecture) return;
+  deleteTarget = null;
+  if ($('delete-dialog').open) $('delete-dialog').close();
+}
+$('delete-lecture').onclick = () => {
+  if (isBusy() || importIsActive() || importStarting || !current) return;
+  deleteTarget = {id:current.id,title:current.title,owner:user,sessionToken:token,server:apiUrl};
+  $('delete-lecture-title').textContent = current.title;
+  $('delete-dialog').showModal(); $('delete-confirm').focus();
+};
+$('delete-close').onclick = closeDeleteDialog;
+$('delete-cancel').onclick = closeDeleteDialog;
+$('delete-dialog').oncancel = event => {
+  if (deletingLecture) event.preventDefault();
+  else deleteTarget = null;
+};
+async function requestLectureDeletion(target, operationIsCurrent) {
+  const path = `/lectures/${encodeURIComponent(target.id)}`;
+  try {
+    await api(path, {method:'DELETE'});
+    return;
+  } catch (error) {
+    if (!error?.transient || !operationIsCurrent()) throw error;
+  }
+  // A timeout or broken connection can hide a successful response. The server
+  // keeps deletion idempotent, so one retry safely completes or confirms it.
+  await api(path, {method:'DELETE'});
+}
+function finishDeletedLecture(target) {
+  lectures = lectures.filter(lecture => lecture.id !== target.id);
+  deleteTarget = null;
+  if ($('delete-dialog').open) $('delete-dialog').close();
+  if (current?.id === target.id) resetNewNote();
+  else { renderCurrent(); renderHistory(); }
+  notice('수업 기록과 저장된 녹음을 삭제했어요.');
+}
+$('delete-confirm').onclick = async () => {
+  const target = deleteTarget;
+  if (!target || deletingLecture || recordingDownloadPending || importIsActive() || importStarting
+      || target.id !== current?.id || target.owner !== user || target.sessionToken !== token || target.server !== apiUrl) {
+    closeDeleteDialog(); return;
+  }
+  const generation = ++requestGeneration, sequence = ++noteActionSequence;
+  ++lectureRefreshGeneration;
+  deletingLecture = true; updateControls();
+  const operationIsCurrent = () => sequence === noteActionSequence && generation === requestGeneration
+    && target.owner === user && target.sessionToken === token && target.server === apiUrl
+    && current?.id === target.id;
+  try {
+    await requestLectureDeletion(target, operationIsCurrent);
+    if (!operationIsCurrent()) return;
+    finishDeletedLecture(target);
+  } catch (error) {
+    if (operationIsCurrent()) {
+      deleteTarget = null;
+      if ($('delete-dialog').open) $('delete-dialog').close();
+      notice(`수업을 삭제하지 못했습니다. ${errorText(error)}`);
+    }
+  } finally {
+    if (sequence === noteActionSequence) { deletingLecture = false; updateControls(); }
+  }
 };
 $('logout').onclick = async () => {
   if (isBusy()) return;

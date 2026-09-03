@@ -192,6 +192,51 @@ class ImportApiTests(unittest.TestCase):
         lecture = self.client.get(f"/lectures/{completed['lecture_id']}", headers=self.headers())
         self.assertEqual(lecture.status_code, 200)
         self.assertEqual(len(lecture.json()["segments"]), 1)
+        self.assertTrue(lecture.json()["recording_available"])
+        self.assertTrue(lecture.json()["recording_finalized"])
+        recording = (
+            self.settings.data_dir
+            / "recordings"
+            / "user-alpha"
+            / f"{completed['lecture_id']}.wav"
+        )
+        self.assertTrue(recording.is_file())
+        self.assertEqual(recording.stat().st_mode & 0o777, 0o600)
+        ticket = self.client.post(
+            f"/lectures/{completed['lecture_id']}/recording-download-ticket",
+            headers=self.headers(),
+        )
+        self.assertEqual(ticket.status_code, 200, ticket.text)
+        downloaded = self.client.get(ticket.json()["path"])
+        self.assertEqual(downloaded.status_code, 200, downloaded.text)
+        with wave.open(io.BytesIO(downloaded.content), "rb") as audio:
+            self.assertEqual(
+                (audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getnframes()),
+                (1, 2, 16_000, 32_000),
+            )
+        self.assertEqual(
+            self.client.post(
+                f"/lectures/{completed['lecture_id']}/recording-download-ticket",
+                headers=self.headers("user-beta"),
+            ).status_code,
+            404,
+        )
+        deleted = self.client.delete(
+            f"/lectures/{completed['lecture_id']}",
+            headers=self.headers(),
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json(), {"status": "deleted"})
+        self.assertFalse(recording.exists())
+        self.assertEqual(
+            self.client.get(f"/imports/{import_id}", headers=self.headers()).status_code,
+            404,
+        )
+        self.assertEqual(self.client.get(ticket.json()["path"]).status_code, 404)
+        with self.app.state.database.connect() as connection:
+            self.assertIsNone(
+                connection.execute("SELECT 1 FROM imports WHERE id = ?", (import_id,)).fetchone()
+            )
 
     def test_complete_rejects_changed_bytes_using_full_bounded_fingerprint(self):
         payload = wav_file(16)

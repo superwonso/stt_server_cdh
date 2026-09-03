@@ -100,8 +100,14 @@
       <button id="new-note" class="new-note-button" type="button">＋ 새 수업</button>
 
       <div class="history-heading">
-        <h2>지난 수업</h2>
-        <span id="lecture-count" aria-label="저장된 수업 수">0</span>
+        <div>
+          <h2>지난 수업</h2>
+          <span id="lecture-count" aria-label="표시 중인 수업 수">0</span>
+        </div>
+        <label class="visually-hidden" for="lecture-date">수업 날짜</label>
+        <select id="lecture-date" aria-label="수업 날짜별 보기">
+          <option value="">전체 날짜</option>
+        </select>
       </div>
       <nav id="lecture-list" class="lecture-list" aria-label="지난 수업 목록"></nav>
 
@@ -122,7 +128,16 @@
             <p id="note-date" class="note-date"></p>
             <h1>오늘의 배움을 담아보세요.</h1>
           </div>
-          <button id="download" class="secondary-button" type="button" disabled>↓ 텍스트 저장</button>
+          <div class="note-actions" role="group" aria-label="현재 수업 작업">
+            <label class="visually-hidden" for="export-format">내보낼 파일 형식</label>
+            <select id="export-format" aria-label="내보낼 파일 형식" disabled>
+              <option value="text" selected>일반 텍스트 (.txt)</option>
+              <option value="markdown">Markdown (.md)</option>
+            </select>
+            <button id="download" class="secondary-button" type="button" disabled>↓ 내보내기</button>
+            <button id="recording-download" class="secondary-button" type="button" disabled>↓ 녹음 WAV</button>
+            <button id="delete-lecture" class="danger-button" type="button" disabled>수업 삭제</button>
+          </div>
         </header>
 
         <section class="recorder" aria-labelledby="recorder-title">
@@ -236,6 +251,23 @@
       <p id="connection-error" class="form-error" role="alert" hidden></p>
       <button id="connection-save" class="primary-button" type="submit">연결 확인하고 저장</button>
     </form>
+  </dialog>
+
+  <dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description">
+    <div class="delete-dialog-content">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">DELETE CLASS</p>
+          <h2 id="delete-title">이 수업을 삭제할까요?</h2>
+        </div>
+        <button id="delete-close" class="dialog-close" type="button" aria-label="삭제 확인 닫기">×</button>
+      </div>
+      <p id="delete-description"><strong id="delete-lecture-title">선택한 수업</strong>의 받아쓴 내용과 저장된 녹음을 서버에서 삭제합니다. 이 작업은 되돌릴 수 없습니다.</p>
+      <div class="delete-dialog-actions">
+        <button id="delete-cancel" class="secondary-button" type="button">취소</button>
+        <button id="delete-confirm" class="danger-button solid" type="button">수업 영구 삭제</button>
+      </div>
+    </div>
   </dialog>
 </body>
 </html>

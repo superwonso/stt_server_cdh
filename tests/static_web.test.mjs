@@ -46,3 +46,13 @@ test('secrets use bounded password fields with appropriate autofill hints', () =
   assert.match(input('password-confirm'), /\bminlength="4"/i);
   assert.match(input('setup-code'), /\bautocomplete="one-time-code"/i);
 });
+
+test('history, export, recording, and destructive controls are explicit and accessible', () => {
+  assert.match(html, /<select\b[^>]*\bid="lecture-date"[^>]*\baria-label="수업 날짜별 보기"/i);
+  assert.match(html, /<option value="">전체 날짜<\/option>/);
+  assert.match(html, /<option value="markdown">Markdown \(\.md\)<\/option>/);
+  assert.match(html, /<option value="text" selected>일반 텍스트 \(\.txt\)<\/option>/);
+  assert.match(html, /<div\b[^>]*\bclass="note-actions"[^>]*\brole="group"[^>]*\baria-label="현재 수업 작업"/i);
+  assert.match(html, /<dialog\b[^>]*\bid="delete-dialog"[^>]*\baria-labelledby="delete-title"[^>]*\baria-describedby="delete-description"/i);
+  assert.match(html, /이 작업은 되돌릴 수 없습니다/);
+});

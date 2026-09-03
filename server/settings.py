@@ -94,6 +94,8 @@ class Settings:
     import_part_bytes: int = 480 * 1024
     max_import_bytes: int = 1024 * 1024 * 1024
     max_import_seconds: int = 4 * 60 * 60
+    max_recordings_bytes: int = 20 * 1024 * 1024 * 1024
+    recording_free_reserve_bytes: int = 1024 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if account_usernames(",".join(self.accounts)) != self.accounts:
@@ -131,6 +133,14 @@ class Settings:
                 min(int(os.getenv("MAX_IMPORT_BYTES", str(1024 * 1024 * 1024))), 1024 * 1024 * 1024),
             ),
             max_import_seconds=max(60, min(int(os.getenv("MAX_IMPORT_SECONDS", str(4 * 60 * 60))), 4 * 60 * 60)),
+            max_recordings_bytes=max(
+                512 * 1024 * 1024,
+                min(int(os.getenv("MAX_RECORDINGS_BYTES", str(20 * 1024 * 1024 * 1024))), 100 * 1024 * 1024 * 1024),
+            ),
+            recording_free_reserve_bytes=max(
+                256 * 1024 * 1024,
+                min(int(os.getenv("RECORDING_FREE_RESERVE_BYTES", str(1024 * 1024 * 1024))), 20 * 1024 * 1024 * 1024),
+            ),
         )
 
     @property
