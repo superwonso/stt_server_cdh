@@ -5,6 +5,7 @@ export const OVERLAP_SECONDS = 3;
 export const PAUSE_SECONDS = 0.24;
 export const PAUSE_RMS = 0.006;
 const TRACK_MUTE_GRACE_MS = 5000;
+const MIN_UPLOAD_SAMPLES = Math.ceil(PCM_SAMPLE_RATE * 0.05);
 
 /** A continuous, anti-aliased resampler; state survives both input and WAV boundaries. */
 export class StreamingResampler {
@@ -177,6 +178,9 @@ function captureError(error, source = 'microphone') {
  * onChunk({blob, startSeconds, durationSeconds, overlapSeconds, final}) runs
  * once per WAV. Except for the first WAV, each WAV starts with the final three
  * seconds of the previous WAV so a recognizer can resolve words at boundaries.
+ * pause() flushes only the new audio at its boundary as a non-final WAV and
+ * keeps the stream open. Audio received while paused is discarded locally;
+ * resume() continues the same sample timeline and overlap context.
  * stop() delivers the final partial WAV before resolving; uploads are caller-owned.
  * onLevel receives RMS in [0, 1]. onInterrupted receives a Korean Error once;
  * the caller should call stop() and update its UI when this callback fires.
@@ -196,29 +200,38 @@ export class MicrophoneCapture {
     this.captureSource = source;
     this._state = 'idle';
     this._startPromise = null;
+    this._pausePromise = null;
+    this._resumePromise = null;
     this._stopPromise = null;
     this._context = null;
     this._stream = null;
     this._audioStream = null;
     this._node = null;
     this._source = null;
+    this._sourceConnected = false;
     this._silentGain = null;
     this._wakeLock = null;
     this._wakeRequest = null;
     this._listeners = [];
-    this._flushReceipt = null;
+    this._controlReceipt = null;
+    this._controlSequence = 0;
     this._interruptionReported = false;
+    this._pausedInterruption = null;
+    this._resumeInterruptionReject = null;
   }
 
   get recording() { return this._state === 'recording'; }
+  get paused() { return this._state === 'paused'; }
 
   start() {
-    if (this._state !== 'idle' || this._startPromise || this._stopPromise) {
+    if (this._state !== 'idle' || this._startPromise || this._pausePromise
+        || this._resumePromise || this._stopPromise) {
       const name = this.captureSource === 'system' ? '화면 오디오' : '마이크';
       return Promise.reject(new Error(`${name}가 이미 사용 중입니다. 먼저 현재 녹음을 종료해 주세요.`));
     }
     this._state = 'starting';
     this._interruptionReported = false;
+    this._pausedInterruption = null;
     this._chunkStartSamples = 0;
     this._chunkOverlap = 0;
     this._hasEmitted = false;
@@ -310,8 +323,9 @@ export class MicrophoneCapture {
           } catch (error) {
             this._interrupt(error);
           }
-        } else if (data?.type === 'stopped' && data.id === this._flushReceipt?.id) {
-          this._flushReceipt.resolve();
+        } else if (data?.type === this._controlReceipt?.ack
+            && data.id === this._controlReceipt?.id) {
+          this._controlReceipt.resolve();
         }
       };
       this._listen(this._node, 'processorerror', () => this._interrupt(
@@ -320,7 +334,8 @@ export class MicrophoneCapture {
           : '마이크 오디오 처리가 중단되었습니다. 녹음을 종료한 뒤 다시 시작해 주세요.'),
       ));
       this._listen(context, 'statechange', () => {
-        if (this.recording && context.state !== 'running') {
+        if ((this.recording && context.state !== 'running')
+            || (this._state === 'resuming' && context.state === 'closed')) {
           this._interrupt(new Error(system
             ? '기기 또는 브라우저가 화면 오디오를 중단했습니다. 페이지를 다시 열고 받아쓰기를 시작해 주세요.'
             : '기기 또는 브라우저가 마이크 녹음을 중단했습니다. 페이지를 다시 열고 녹음을 시작해 주세요.'));
@@ -343,7 +358,8 @@ export class MicrophoneCapture {
           clearMuteTimer();
           muteTimer = setTimeout(() => {
             muteTimer = null;
-            if (this.recording && track.readyState === 'live' && track.muted) {
+            if ((this.recording || this.paused || this._state === 'pausing'
+                || this._state === 'resuming') && track.readyState === 'live' && track.muted) {
               this._interrupt(new Error(system
                 ? '공유 오디오가 5초 이상 중단되었습니다. 화면 공유를 다시 시작해 주세요.'
                 : '마이크 입력이 5초 이상 중단되었습니다. 이 페이지에서 녹음을 다시 시작해 주세요.'));
@@ -370,6 +386,7 @@ export class MicrophoneCapture {
       this._silentGain.connect(context.destination);
       this._state = 'recording';
       this._source.connect(this._node);
+      this._sourceConnected = true;
       this._requestWakeLock();
     } catch (error) {
       await this._releaseResources();
@@ -384,6 +401,11 @@ export class MicrophoneCapture {
   }
 
   _interrupt(error) {
+    if (this.paused || this._state === 'pausing' || this._state === 'resuming') {
+      if (!this._pausedInterruption) this._pausedInterruption = captureError(error, this.captureSource);
+      if (this._state === 'resuming') this._resumeInterruptionReject?.(this._pausedInterruption);
+      return;
+    }
     if (!this.recording || this._interruptionReported) return;
     this._interruptionReported = true;
     this.onInterrupted(captureError(error, this.captureSource));
@@ -456,10 +478,156 @@ export class MicrophoneCapture {
     return true;
   }
 
+  _sendControl(type, ack, timeoutMessage) {
+    if (!this._node || this._context?.state === 'closed') {
+      return Promise.reject(new Error(timeoutMessage));
+    }
+    return new Promise((resolve, reject) => {
+      const id = ++this._controlSequence;
+      const receipt = {
+        id,
+        ack,
+        resolve: () => {
+          clearTimeout(receipt.timer);
+          if (this._controlReceipt === receipt) this._controlReceipt = null;
+          resolve();
+        },
+        timer: null,
+      };
+      receipt.timer = setTimeout(() => {
+        if (this._controlReceipt === receipt) this._controlReceipt = null;
+        reject(new Error(timeoutMessage));
+      }, 2500);
+      this._controlReceipt = receipt;
+      this._node.port.postMessage({ type, id });
+    });
+  }
+
+  _connectSource() {
+    if (!this._source || !this._node || this._sourceConnected) return;
+    this._source.connect(this._node);
+    this._sourceConnected = true;
+  }
+
+  _disconnectSource() {
+    if (!this._source || !this._sourceConnected) return;
+    try { this._source.disconnect(); } catch { /* Already disconnected. */ }
+    this._sourceConnected = false;
+  }
+
+  pause() {
+    if (this._pausePromise) return this._pausePromise;
+    if (this._state === 'paused') return Promise.resolve();
+    if (this._state !== 'recording' || this._resumePromise || this._stopPromise) {
+      return Promise.reject(new Error('현재 녹음 중일 때만 일시정지할 수 있습니다.'));
+    }
+    this._state = 'pausing';
+    this._pausePromise = this._finishPause().finally(() => { this._pausePromise = null; });
+    return this._pausePromise;
+  }
+
+  async _finishPause() {
+    await this._sendControl(
+      'pause',
+      'paused',
+      '오디오가 응답하지 않아 일시정지 경계를 확인하지 못했습니다.',
+    );
+    this._disconnectSource();
+    if (this._resampler) this._appendPCM(this._resampler.flush());
+    this._resampler = null;
+    // Do not resend an overlap-only guard on repeated boundaries. A final stop
+    // still sends that guard later so the server can close the recording.
+    const freshSamples = this._chunkUsed - this._chunkOverlap;
+    // The API's shortest WAV is 50 ms. Keep a smaller first boundary in this
+    // capture buffer until resume/stop instead of padding the server recording
+    // beyond the real timeline and conflicting with the next resumed samples.
+    // After the first upload, the retained overlap already makes the WAV long
+    // enough for the API. Flush even one fresh sample so a paused tab crash
+    // cannot strand up to another 50 ms of real audio in browser memory.
+    if (freshSamples > 0 && this._chunkUsed >= MIN_UPLOAD_SAMPLES) this._emitChunk(false);
+    this._state = 'paused';
+    this.onLevel(0);
+    await this._releaseWakeLock();
+  }
+
+  resume() {
+    if (this._resumePromise) return this._resumePromise;
+    if (this._state === 'recording') return Promise.resolve();
+    if (this._state !== 'paused' || this._pausePromise || this._stopPromise) {
+      return Promise.reject(new Error('일시정지된 녹음만 재개할 수 있습니다.'));
+    }
+    this._state = 'resuming';
+    this._resumePromise = this._finishResume().finally(() => { this._resumePromise = null; });
+    return this._resumePromise;
+  }
+
+  async _finishResume() {
+    const system = this.captureSource === 'system';
+    let rejectInterruption = null;
+    const interrupted = new Promise((_, reject) => { rejectInterruption = reject; });
+    this._resumeInterruptionReject = rejectInterruption;
+    const readinessError = (requireRunning = false) => {
+      if (this._pausedInterruption) return this._pausedInterruption;
+      if (!this._stream?.getAudioTracks().some((track) => track.readyState === 'live')) {
+        return new Error(system
+          ? '공유 오디오가 종료되어 받아쓰기를 재개할 수 없습니다.'
+          : '마이크 연결이 종료되어 녹음을 재개할 수 없습니다.');
+      }
+      if (!this._context || this._context.state === 'closed') {
+        return new Error('오디오 처리가 종료되어 받아쓰기를 재개할 수 없습니다.');
+      }
+      if (requireRunning && this._context.state !== 'running') {
+        return new Error('오디오 처리가 재개되지 않아 받아쓰기를 계속할 수 없습니다.');
+      }
+      return null;
+    };
+    try {
+      const before = readinessError();
+      if (before) throw before;
+      // resume() is called directly from the user's button gesture, which lets a
+      // browser restore an AudioContext suspended while the class was paused.
+      await Promise.race([this._context.resume(), interrupted]);
+      const resumed = readinessError(true);
+      if (resumed) throw resumed;
+      this._resampler = new StreamingResampler(this._context.sampleRate);
+      this._connectSource();
+      // A track can end synchronously while the graph is being reconnected.
+      const connected = readinessError(true);
+      if (connected) throw connected;
+      // Treat an uncertain acknowledgement as live so stop() will flush any audio
+      // the worklet may already have resumed instead of silently losing it.
+      this._state = 'recording';
+    } catch (error) {
+      if (this._state === 'resuming') {
+        this._disconnectSource();
+        this._resampler = null;
+        this._state = 'paused';
+      }
+      throw error;
+    } finally {
+      if (this._resumeInterruptionReject === rejectInterruption) {
+        this._resumeInterruptionReject = null;
+      }
+    }
+    await this._sendControl(
+      'resume',
+      'resumed',
+      '오디오가 응답하지 않아 녹음 재개를 확인하지 못했습니다.',
+    );
+    this._requestWakeLock();
+  }
+
   stop() {
     if (this._stopPromise) return this._stopPromise;
     if (this._state === 'idle') return Promise.resolve();
-    this._stopPromise = this._finishStop().finally(() => { this._stopPromise = null; });
+    this._stopPromise = (async () => {
+      // Navigation/auth expiry can request a stop while a pause or resume
+      // acknowledgement is in flight. Serialize the controls so two commands
+      // never overwrite one another's receipt or split the boundary.
+      await this._pausePromise?.catch(() => {});
+      await this._resumePromise?.catch(() => {});
+      await this._finishStop();
+    })().finally(() => { this._stopPromise = null; });
     return this._stopPromise;
   }
 
@@ -474,18 +642,16 @@ export class MicrophoneCapture {
     try {
       if (this._node && this._context?.state !== 'closed') {
         try {
-          await new Promise((resolve, reject) => {
-            const id = Date.now();
-            const timer = setTimeout(() => reject(new Error(
-              this.captureSource === 'system'
-                ? '화면 오디오가 응답하지 않아 마지막 조각의 완전한 수신을 확인하지 못했습니다. 받은 내용은 저장되며, 공유를 다시 시작할 수 있습니다.'
-                : '마이크가 응답하지 않아 마지막 오디오 조각의 완전한 수신을 확인하지 못했습니다. 받은 내용은 저장되며, 녹음을 다시 시작할 수 있습니다.',
-            )), 2500);
-            this._flushReceipt = { id, resolve: () => { clearTimeout(timer); resolve(); } };
-            this._node.port.postMessage({ type: 'stop', id });
-            // An interrupted tablet may need this to deliver its flush receipt.
-            if (this._context.state !== 'running') this._context.resume().catch(() => {});
-          });
+          const confirmed = this._sendControl(
+            'stop',
+            'stopped',
+            this.captureSource === 'system'
+              ? '화면 오디오가 응답하지 않아 마지막 조각의 완전한 수신을 확인하지 못했습니다. 받은 내용은 저장되며, 공유를 다시 시작할 수 있습니다.'
+              : '마이크가 응답하지 않아 마지막 오디오 조각의 완전한 수신을 확인하지 못했습니다. 받은 내용은 저장되며, 녹음을 다시 시작할 수 있습니다.',
+          );
+          // An interrupted tablet may need this to deliver its flush receipt.
+          if (this._context.state !== 'running') this._context.resume().catch(() => {});
+          await confirmed;
         } catch (error) {
           flushError = error;
         }
@@ -520,6 +686,12 @@ export class MicrophoneCapture {
     }).finally(() => { this._wakeRequest = null; });
   }
 
+  async _releaseWakeLock() {
+    const lock = this._wakeLock;
+    this._wakeLock = null;
+    if (lock) await lock.release().catch(() => {});
+  }
+
   async _releaseResources() {
     this._listeners.splice(0).forEach((remove) => remove());
     for (const node of [this._source, this._node, this._silentGain]) {
@@ -532,12 +704,14 @@ export class MicrophoneCapture {
     this._stream = null;
     this._audioStream = null;
     this._source = null;
+    this._sourceConnected = false;
     this._node = null;
     this._silentGain = null;
-    this._flushReceipt = null;
-    const lock = this._wakeLock;
-    this._wakeLock = null;
-    if (lock) await lock.release().catch(() => {});
+    this._resumeInterruptionReject = null;
+    const receipt = this._controlReceipt;
+    this._controlReceipt = null;
+    if (receipt) clearTimeout(receipt.timer);
+    await this._releaseWakeLock();
     if (context && context.state !== 'closed') await context.close().catch(() => {});
   }
 }

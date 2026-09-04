@@ -34,7 +34,8 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
   const historyCalls = [];
   let storedServerValue = storedServer;
   let id = 0, mic;
-  const makeElement = (name, value = '') => ({
+  const makeElement = (name, value = '') => {
+    const node = {
     name,tagName:name.toUpperCase(),value,style:{},children:[],open:false,
     classList:{values:new Set(),toggle(className,force){
       const enabled = force === undefined ? !this.values.has(className) : !!force;
@@ -59,7 +60,22 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
     removeAttribute(attribute){ delete this[attribute]; },
     setAttribute(attribute,value){ this[attribute] = String(value); },
     click(){ this.clicked = true; },
-  });
+    };
+    if (name === 'recording-file') {
+      let fileValue = '', selectedFiles = [];
+      Object.defineProperties(node,{
+        value:{configurable:true,get(){ return fileValue; },set(next){
+          fileValue = String(next ?? '');
+          if (!fileValue) selectedFiles = [];
+        }},
+        files:{configurable:true,get(){ return selectedFiles; },set(next){
+          selectedFiles = Array.from(next || []);
+          fileValue = selectedFiles.length ? 'selected-file' : '';
+        }},
+      });
+    }
+    return node;
+  };
   const element = name => {
     const initialValue = name === 'language' ? 'ko' : name === 'export-format' ? 'text' : '';
     if (!elements.has(name)) elements.set(name, makeElement(name,initialValue));
@@ -95,11 +111,23 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
     setInterval:(callback,delay = 0) => { const value = ++id; intervals.set(value,{callback,delay}); return value; },clearInterval:value => intervals.delete(value),
     fetch,
     TestCapture:class {
-      constructor(callbacks) { mic = this; this.callbacks = callbacks; }
-      async start() { this.recording = true; }
-      async stop() {
+      constructor(callbacks) { mic = this; this.callbacks = callbacks; this.recording = false; this.paused = false; }
+      async start() { this.recording = true; this.paused = false; }
+      async pause() {
         if (!this.recording) return;
-        this.recording = false; this.stopCalls = (this.stopCalls || 0) + 1;
+        this.recording = false; this.paused = true; this.pauseCalls = (this.pauseCalls || 0) + 1;
+        if (this.pauseTail) this.callbacks.onChunk(this.pauseTail);
+        if (this.pauseError) throw this.pauseError;
+      }
+      async resume() {
+        if (!this.paused) return;
+        this.resumeCalls = (this.resumeCalls || 0) + 1;
+        if (this.resumeError) throw this.resumeError;
+        this.paused = false; this.recording = true;
+      }
+      async stop() {
+        if (!this.recording && !this.paused) return;
+        this.recording = false; this.paused = false; this.stopCalls = (this.stopCalls || 0) + 1;
         this.callbacks.onChunk(this.tail || {blob:encodeWav(new Float32Array(160).fill(0.25)),startSeconds:0,durationSeconds:0.01,overlapSeconds:0,final:true});
         if (this.stopError) throw this.stopError;
       }
@@ -177,6 +205,90 @@ test('the selected computer-audio source is passed to capture without a precedin
   await starting;
   await app.run('stopRecording()');
   await tick();
+});
+
+test('pause flushes a non-final boundary and resume continues the same lecture and timeline', async () => {
+  let lectureCreates = 0;
+  const uploads = [];
+  const app = setup(async (url,options = {}) => {
+    if (url.endsWith('/lectures')) {
+      lectureCreates += 1;
+      return response({id:'pause-lesson',title:'수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+    }
+    if (url.includes('/lectures/pause-lesson/chunks')) {
+      uploads.push({
+        url,
+        start:options.headers.get('X-Start-Seconds'),
+        overlap:options.headers.get('X-Overlap-Seconds'),
+        final:options.headers.get('X-Final-Chunk'),
+      });
+      return response({segments:[],recording_available:true,recording_finalized:options.headers.get('X-Final-Chunk') === 'true'});
+    }
+    return response({});
+  });
+  await app.run('startRecording()');
+  app.microphone().pauseTail = chunk(0,4,0,false);
+  await app.run('pauseRecording()');
+  await tick(); await tick();
+  assert.equal(app.run('recording'),false);
+  assert.equal(app.run('paused'),true);
+  assert.equal(app.microphone().pauseCalls,1);
+  assert.equal(app.element('pause-button')['aria-pressed'],'true');
+  assert.match(app.element('pause-button').textContent,/재개/);
+  assert.match(app.element('record-state').textContent,/일시정지/);
+  assert.match(app.element('record-hint').textContent,/녹음하거나 전송하지 않/);
+  let historyButton = app.element('lecture-list').querySelectorAll('button')[0];
+  assert.match(historyButton.children[2].textContent,/일시정지/);
+  assert.match(historyButton['aria-label'],/일시정지/);
+  assert.equal(uploads[0].final,'false');
+
+  app.microphone().tail = chunk(1,5,3,true);
+  await app.run('resumeRecording()');
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.run('paused'),false);
+  assert.equal(app.microphone().resumeCalls,1);
+  historyButton = app.element('lecture-list').querySelectorAll('button')[0];
+  assert.match(historyButton.children[2].textContent,/현재 녹음/);
+  await app.run('stopRecording()');
+  await tick(); await tick();
+  assert.equal(lectureCreates,1,'resume must not create a second lecture');
+  assert.deepEqual(uploads.map(item => item.final),['false','true']);
+  assert.deepEqual(uploads.map(item => item.start),['0','1']);
+  assert.deepEqual(uploads.map(item => item.overlap),['0','3']);
+  assert.ok(uploads.every(item => item.url.includes('/lectures/pause-lesson/chunks')));
+  assert.equal(app.run('current.recording_finalized'),true);
+  assert.equal(app.run('recording || paused || starting || pausing || resuming || stopping'),false);
+  historyButton = app.element('lecture-list').querySelectorAll('button')[0];
+  assert.equal(historyButton.children.length,2,'a stopped lecture must not retain a live badge');
+  assert.equal(historyButton['aria-label'],undefined);
+});
+
+test('a defensive short non-final upload is never zero-padded beyond its real timeline', async () => {
+  const app = setup(async () => response({}));
+  const result = await app.run(`(() => {
+    const blob=new Blob([new Uint8Array(364)],{type:'audio/wav'});
+    return uploadBlob({blob,durationSeconds:0.01,final:false})
+      .then(uploaded=>({same:uploaded===blob,size:uploaded.size}));
+  })()`);
+  assert.equal(result.same,true);
+  assert.equal(result.size,364);
+});
+
+test('a paused session remains busy and recording-present, and auth expiry stops its final guard', async () => {
+  const app = setup(async url => url.endsWith('/lectures')
+    ? response({id:'paused-auth-lesson',title:'수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201)
+    : response({segments:[],recording_available:true,recording_finalized:true}));
+  await app.run('startRecording()');
+  app.microphone().pauseTail = chunk(0,2,0,false);
+  app.microphone().tail = chunk(0,2,2,true);
+  await app.run('pauseRecording()');
+  assert.equal(app.run('isBusy()'),true,'beforeunload and navigation must remain guarded while paused');
+  assert.equal(app.run('presenceActivity()'),'recording');
+  app.run('showLogin()');
+  await tick(); await tick();
+  assert.equal(app.microphone().stopCalls,1);
+  assert.equal(app.run('recording || paused || stopping'),false);
+  assert.equal(app.element('workspace').hidden,true);
 });
 
 test('an explicit caller abort reaches fetch and is not mislabeled as a timeout', async () => {
@@ -368,7 +480,7 @@ test('starting a new file import clears an older date filter without changing re
   const app = setup(async () => response({}), {FileUploader:PendingUploader});
   const file = new Blob([new Uint8Array(10)]);
   Object.defineProperty(file, 'name', {value:'새 수업.wav'});
-  Object.defineProperty(app.element('recording-file'), 'files', {configurable:true,value:[file]});
+  app.element('recording-file').files = [file];
   app.run(`
     lectures=[{id:'old',title:'지난 수업',created_at:'2026-01-01T00:00:00Z'}];
     lectureDateFilter='2026-01-01';
@@ -509,6 +621,323 @@ test('AI correction is blocked until the lecture is finalized and reports exhaus
   assert.equal(app.element('transcript').children[0].children[1].textContent, '보존할 원문');
 });
 
+test('a live lecture schedules exactly one correction after its final chunk without stopping capture', async () => {
+  const events = [];
+  let correctionPosts = 0;
+  const app = setup(async (url, options = {}) => {
+    if (url.endsWith('/lectures') && options.method === 'POST') {
+      return response({id:'live-correction',title:'현재 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+    }
+    if (url.endsWith('/lectures/live-correction/chunks')) {
+      const final = options.headers.get('X-Final-Chunk') === 'true';
+      const start = Number(options.headers.get('X-Start-Seconds'));
+      events.push(final ? 'final-chunk' : 'chunk');
+      return response({
+        segments:[{id:`live-${start}`,start,end:start + 1,text:`문장 ${start}`}],
+        recording_available:true,recording_finalized:final,
+      });
+    }
+    if (url.endsWith('/lectures/live-correction/correction') && options.method === 'POST') {
+      correctionPosts += 1; events.push('correction');
+      return response({lecture_id:'live-correction',status:'queued',raw_revision:'a'.repeat(64)});
+    }
+    return response({});
+  });
+
+  await app.run('startRecording()');
+  app.microphone().callbacks.onChunk(chunk(0));
+  await tick(); await tick();
+  assert.equal(app.run('current.segments.length'),1);
+  assert.equal(app.element('correct-transcript').disabled,false);
+
+  app.element('correct-transcript').onclick();
+  await tick(); await tick();
+  assert.equal(correctionPosts,0,'a changing transcript must not be sent before finalization');
+  assert.equal(app.microphone().stopCalls,undefined);
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.run("scheduledCorrections.get('live-correction').status"),'scheduled');
+  assert.equal(app.element('correction-panel')['data-state'],'scheduled');
+  assert.match(app.element('correction-detail').textContent,/계속됩니다/);
+
+  app.microphone().tail = chunk(6,3,2,true);
+  await app.run('stopRecording()');
+  await tick(); await tick(); await tick();
+  assert.equal(app.microphone().stopCalls,1);
+  assert.equal(correctionPosts,1);
+  assert.ok(events.indexOf('final-chunk') < events.indexOf('correction'));
+  assert.equal(app.run('scheduledCorrections.size'),0);
+  assert.equal(app.run('correction.status'),'queued');
+  assert.equal(app.run('current.recording_finalized'),true);
+  assert.equal(app.run('current.segments.length'),2,'the selected finalized transcript stays available');
+  assert.equal(app.run('captureSession'),null,'a finalized capture must not retain a second long transcript');
+  assert.equal(app.run("Object.hasOwn(lectures[0],'segments')"),false,
+    'the history summary must release finalized live segment arrays');
+});
+
+test('an auth-expired scheduled correction is rebound only to the same owner and resumes once', async () => {
+  let oldCorrectionPosts = 0, newCorrectionPosts = 0, loginPosts = 0;
+  const finalized = {
+    id:'reauth-correction',title:'인증 복구 수업',language:'ko',created_at:'2026-01-01T00:00:00Z',
+    segments:[{id:'raw',start:0,end:2,text:'보존할 원문'}],recording_available:true,recording_finalized:true,
+  };
+  const app = setup((url, options = {}) => {
+    const authorization = options.headers?.get?.('Authorization');
+    if (url.endsWith('/lectures/reauth-correction/correction') && options.method === 'POST') {
+      if (authorization === 'Bearer old-token') {
+        oldCorrectionPosts += 1;
+        return response({detail:'expired'},401);
+      }
+      newCorrectionPosts += 1;
+      return response({lecture_id:'reauth-correction',status:'queued'});
+    }
+    if (url.endsWith('/auth/login')) {
+      loginPosts += 1;
+      return response({token:'renewed-token',user:{username:'user-alpha',is_admin:false}});
+    }
+    if (url.endsWith('/lectures')) return response([finalized]);
+    if (url.endsWith('/imports')) return response([]);
+    if (url.endsWith('/status')) return response({model_state:'ready'});
+    return response({});
+  });
+  app.run(`
+    current=${JSON.stringify(finalized)}; lectures=[current]; captureSession={id:'reauth-capture',lecture:current};
+    scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
+      captureId:captureSession.id,status:'scheduled'});
+    submitScheduledCorrection(current.id);
+  `);
+  await tick(); await tick();
+  assert.equal(oldCorrectionPosts,1);
+  assert.equal(app.run("scheduledCorrections.get('reauth-correction').status"),'scheduled');
+  assert.equal(app.run("scheduledCorrections.get('reauth-correction').sessionToken"),'');
+  assert.equal(app.run("scheduledCorrections.get('reauth-correction').server"),'');
+  assert.equal(app.run('user'),'user-alpha');
+
+  app.element('username').value = 'user-beta';
+  app.element('password').value = 'different-account';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  assert.equal(loginPosts,0,'another account must not claim a retained correction reservation');
+  assert.match(app.element('auth-error').textContent,/이전 계정/);
+
+  app.element('username').value = 'user-alpha';
+  app.element('password').value = 'same-account';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  for (let index = 0; index < 5; index += 1) await tick();
+  assert.equal(loginPosts,1);
+  assert.equal(newCorrectionPosts,1);
+  assert.equal(app.run('scheduledCorrections.size'),0);
+  assert.equal(app.run('token'),'renewed-token');
+});
+
+test('a tunnel replacement between live chunks retains the capture owner and final correction', async () => {
+  const oldUrl = 'https://old-live.trycloudflare.com';
+  const newUrl = 'https://new-live.trycloudflare.com';
+  const events = [];
+  let loginPosts = 0, correctionPosts = 0;
+  const app = setup((url, options = {}) => {
+    if (url === `${oldUrl}/lectures` && options.method === 'POST') {
+      return response({id:'moving-live',title:'현재 수업',language:'ko',created_at:'2026-01-01T00:00:00Z',segments:[]},201);
+    }
+    if (url === `${oldUrl}/lectures/moving-live/chunks`) {
+      return response({segments:[{id:'first',start:0,end:2,text:'첫 문장'}],recording_available:true,recording_finalized:false});
+    }
+    if (url === `${newUrl}/auth/login`) {
+      loginPosts += 1;
+      return response({token:'new-live-token',user:{username:'user-alpha',is_admin:false}});
+    }
+    if (url === `${newUrl}/lectures` && !options.method) {
+      return response([{id:'moving-live',title:'현재 수업',language:'ko',created_at:'2026-01-01T00:00:00Z',
+        segments:[{id:'first',start:0,end:2,text:'첫 문장'}],recording_available:true,recording_finalized:false}]);
+    }
+    if (url === `${newUrl}/imports`) return response([]);
+    if (url === `${newUrl}/status`) return response({model_state:'ready'});
+    if (url === `${newUrl}/lectures/moving-live/chunks`) {
+      assert.equal(options.headers.get('Authorization'),'Bearer new-live-token');
+      assert.equal(options.headers.get('X-Final-Chunk'),'true');
+      events.push('final');
+      return response({segments:[{id:'tail',start:6,end:9,text:'마지막 문장'}],recording_available:true,recording_finalized:true});
+    }
+    if (url === `${newUrl}/lectures/moving-live/correction` && options.method === 'POST') {
+      correctionPosts += 1; events.push('correction');
+      return response({lecture_id:'moving-live',status:'queued'});
+    }
+    throw new Error(`unexpected request: ${url}`);
+  });
+  app.run(`apiUrl=${JSON.stringify(oldUrl)}; verifiedApiUrl=apiUrl; setServer(apiUrl);`);
+  await app.run('startRecording()');
+  app.microphone().callbacks.onChunk(chunk(0));
+  await tick(); await tick();
+  assert.equal(app.run('pending.length'),0,'the tunnel changes between ordinary chunks');
+  app.element('correct-transcript').onclick();
+  app.microphone().tail = chunk(6,3,2,true);
+
+  app.run(`installVerifiedServer(${JSON.stringify(newUrl)},'새 연결 확인',{expiresAt:Date.now()+86400000})`);
+  await tick(); await tick();
+  assert.equal(app.run('apiUrl'),newUrl);
+  assert.equal(app.run('token'),'');
+  assert.equal(app.run('user'),'user-alpha');
+  assert.equal(app.run('pending.length'),1);
+  assert.equal(app.run("scheduledCorrections.get('moving-live').sessionToken"),'');
+  assert.equal(app.run("scheduledCorrections.get('moving-live').server"),'');
+  assert.equal(app.element('username').value,'user-alpha');
+
+  app.element('username').value = 'user-beta';
+  app.element('password').value = 'different-account';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  assert.equal(loginPosts,0);
+  assert.match(app.element('auth-error').textContent,/이전 계정/);
+
+  app.element('username').value = 'user-alpha';
+  app.element('password').value = 'same-account';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  for (let index = 0; index < 6; index += 1) await tick();
+  assert.equal(loginPosts,1);
+  assert.equal(app.run('pending.length'),0);
+  assert.equal(correctionPosts,1);
+  assert.deepEqual(events,['final','correction']);
+  assert.equal(app.run('scheduledCorrections.size'),0);
+});
+
+test('a finalized past lecture can be corrected while live chunks stay attached to the active lecture', async () => {
+  const chunkUrls = [];
+  let pastCorrectionPosts = 0;
+  const past = {
+    id:'past-finalized',title:'지난 수업',language:'ko',created_at:'2026-01-01T00:00:00Z',
+    recording_available:true,recording_finalized:true,
+    segments:[{id:'past-raw',start:0,end:2,text:'지난 수업 원문'}],
+  };
+  const app = setup(async (url, options = {}) => {
+    if (url.endsWith('/lectures') && options.method === 'POST') {
+      return response({id:'active-live',title:'현재 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+    }
+    if (url.endsWith('/lectures/active-live/chunks')) {
+      chunkUrls.push(url);
+      const start = Number(options.headers.get('X-Start-Seconds'));
+      return response({
+        segments:[{id:`active-${start}`,start,end:start + 1,text:`현재 문장 ${start}`}],
+        recording_available:true,recording_finalized:options.headers.get('X-Final-Chunk') === 'true',
+      });
+    }
+    if (url.endsWith('/lectures/past-finalized/correction')) {
+      if (options.method === 'POST') {
+        pastCorrectionPosts += 1;
+        return response({lecture_id:'past-finalized',status:'queued',raw_revision:'b'.repeat(64)});
+      }
+      return response({detail:'이 수업에는 후보정 작업이 없습니다.'},404);
+    }
+    if (url.endsWith('/lectures/past-finalized')) return response(past);
+    return response({});
+  });
+
+  await app.run('startRecording()');
+  app.microphone().callbacks.onChunk(chunk(0));
+  await tick(); await tick();
+  app.run(`lectures.push(${JSON.stringify(past)}); renderHistory(); updateControls()`);
+  const buttons = app.element('lecture-list').querySelectorAll('button');
+  const activeButton = buttons.find(button => button.children[0]?.textContent === '현재 수업');
+  const pastButton = buttons.find(button => button.children[0]?.textContent === '지난 수업');
+  assert.equal(app.element('lecture-date').disabled,false);
+  assert.equal(activeButton.disabled,false);
+  assert.equal(pastButton.disabled,false);
+  assert.match(activeButton.children[2].textContent,/현재 녹음/);
+
+  await pastButton.onclick();
+  await tick(); await tick();
+  assert.equal(app.run('current.id'),'past-finalized');
+  assert.equal(app.element('live-capture-banner').hidden,false);
+  assert.equal(app.element('return-live-capture').disabled,false);
+  for (const id of ['new-note','logout','recording-file','download','recording-download','delete-lecture']) {
+    assert.equal(app.element(id).disabled,true,`${id} must remain locked during background capture`);
+  }
+  assert.equal(app.element('correct-transcript').disabled,false);
+  app.element('correct-transcript').onclick();
+  await tick(); await tick();
+  assert.equal(pastCorrectionPosts,1);
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.microphone().stopCalls,undefined);
+  const pastTranscriptNode = app.element('transcript').children[0];
+
+  app.microphone().callbacks.onChunk(chunk(6,10,2));
+  await tick(); await tick();
+  assert.ok(chunkUrls.length >= 2);
+  assert.ok(chunkUrls.every(url => url.endsWith('/lectures/active-live/chunks')));
+  assert.equal(app.run('current.id'),'past-finalized');
+  assert.equal(app.run("captureSession.lecture.segments.length"),2);
+  assert.equal(app.element('transcript').children[0],pastTranscriptNode,
+    'background live chunks must not rebuild the past transcript being read');
+
+  app.element('return-live-capture').onclick();
+  assert.equal(app.run('current.id'),'active-live');
+  assert.equal(app.run('current.segments.length'),2,'returning must retain chunks received while viewing history');
+  assert.equal(app.element('live-capture-banner').hidden,true);
+  assert.equal(app.element('main-content').focused,true);
+  await app.run('stopRecording()');
+  await tick(); await tick();
+});
+
+test('paused capture supports both current-lecture scheduling and past-lecture correction', async () => {
+  let activeCorrectionPosts = 0, pastCorrectionPosts = 0;
+  const past = {
+    id:'paused-past',title:'지난 기록',language:'ko',created_at:'2026-01-01T00:00:00Z',recording_finalized:true,
+    segments:[{id:'old',start:0,end:1,text:'지난 원문'}],
+  };
+  const app = setup(async (url, options = {}) => {
+    if (url.endsWith('/lectures') && options.method === 'POST') {
+      return response({id:'paused-live',title:'일시정지 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+    }
+    if (url.endsWith('/lectures/paused-live/chunks')) {
+      const start = Number(options.headers.get('X-Start-Seconds'));
+      return response({segments:[{id:`p-${start}`,start,end:start + 1,text:'현재 원문'}],recording_available:true,
+        recording_finalized:options.headers.get('X-Final-Chunk') === 'true'});
+    }
+    if (url.endsWith('/lectures/paused-live/correction') && options.method === 'POST') {
+      activeCorrectionPosts += 1; return response({lecture_id:'paused-live',status:'queued'});
+    }
+    if (url.endsWith('/lectures/paused-past/correction')) {
+      if (options.method === 'POST') {
+        pastCorrectionPosts += 1; return response({lecture_id:'paused-past',status:'queued'});
+      }
+      return response({detail:'not found'},404);
+    }
+    if (url.endsWith('/lectures/paused-past')) return response(past);
+    return response({});
+  });
+
+  await app.run('startRecording()');
+  app.microphone().callbacks.onChunk(chunk(0));
+  await tick(); await tick();
+  app.microphone().pauseTail = chunk(6,2,2,false);
+  await app.run('pauseRecording()');
+  await tick(); await tick();
+  assert.equal(app.run('paused'),true);
+  assert.equal(app.element('correct-transcript').disabled,false);
+  app.element('correct-transcript').onclick();
+  assert.equal(activeCorrectionPosts,0);
+  assert.equal(app.run("scheduledCorrections.has('paused-live')"),true);
+  assert.equal(app.microphone().stopCalls,undefined);
+
+  app.run(`lectures.push(${JSON.stringify(past)}); renderHistory(); updateControls()`);
+  const pastButton = app.element('lecture-list').querySelectorAll('button')
+    .find(button => button.children[0]?.textContent === '지난 기록');
+  assert.equal(pastButton.disabled,false);
+  await pastButton.onclick(); await tick(); await tick();
+  assert.equal(app.run('paused'),true);
+  assert.match(app.element('live-capture-title').textContent,/일시정지/);
+  app.element('correct-transcript').onclick();
+  await tick(); await tick();
+  assert.equal(pastCorrectionPosts,1);
+  assert.equal(activeCorrectionPosts,0);
+  assert.equal(app.microphone().stopCalls,undefined);
+
+  app.element('return-live-capture').onclick();
+  assert.equal(app.run('current.id'),'paused-live');
+  assert.equal(app.element('correction-panel')['data-state'],'scheduled');
+  app.microphone().tail = chunk(6,2,2,true);
+  await app.run('stopRecording()');
+  await tick(); await tick(); await tick();
+  assert.equal(activeCorrectionPosts,1);
+  assert.equal(app.microphone().stopCalls,1);
+});
+
 test('late AI correction responses and polling timers cannot cross lecture boundaries', async () => {
   const late = deferred();
   const app = setup(() => late.promise);
@@ -537,6 +966,61 @@ test('late AI correction responses and polling timers cannot cross lecture bound
   app.run('resetNewNote()');
   assert.equal(app.run('correctionPollTimer'), null);
   assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 2500));
+});
+
+test('a late automatically scheduled correction cannot alter another account', async () => {
+  const late = deferred();
+  const app = setup((url, options = {}) => url.endsWith('/lectures/old-auto/correction') && options.method === 'POST'
+    ? late.promise : response({}));
+  app.run(`
+    current={id:'old-auto',title:'이전 수업',created_at:'2026-01-01T00:00:00Z',
+      segments:[{id:'old',start:0,end:1,text:'이전 원문'}],recording_available:true,recording_finalized:false};
+    lectures=[current]; captureSession={id:'old-capture',lecture:current};
+    scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
+      captureId:captureSession.id,status:'scheduled'});
+    applyRecordingFlags(current.id,{recording_available:true,recording_finalized:true});
+  `);
+  await tick();
+  assert.equal(app.run("scheduledCorrections.get('old-auto').status"),'starting');
+  app.run(`
+    showLogin(); token='next-token'; user='next-user';
+    current={id:'next-lesson',title:'다음 수업',created_at:'2026-01-02T00:00:00Z',recording_finalized:true,
+      segments:[{id:'next',start:0,end:1,text:'다음 원문'}]}; lectures=[current]; renderCurrent();
+  `);
+  late.resolve(response({lecture_id:'old-auto',status:'completed',corrected_text:'노출되면 안 되는 이전 결과',
+    corrected_segments:[{id:'old',start:0,end:1,text:'노출되면 안 됨'}]}));
+  await tick(); await tick();
+  assert.equal(app.run('scheduledCorrections.size'),0);
+  assert.equal(app.run('current.id'),'next-lesson');
+  assert.equal(app.run('correction'),null);
+  assert.equal(app.element('transcript').children[0].children[1].textContent,'다음 원문');
+});
+
+test('an in-flight reserved correction keeps logout and navigation protected until acknowledged', async () => {
+  const correctionRequest = deferred();
+  const app = setup((url, options = {}) =>
+    url.endsWith('/lectures/protected-auto/correction') && options.method === 'POST'
+      ? correctionRequest.promise : response({}));
+  app.run(`
+    current={id:'protected-auto',title:'보호할 수업',created_at:'2026-01-01T00:00:00Z',
+      segments:[{id:'raw',start:0,end:1,text:'원문'}],recording_available:true,recording_finalized:false};
+    lectures=[current]; captureSession={id:'protected-capture',lecture:current};
+    scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
+      captureId:captureSession.id,finalized:false,status:'scheduled'});
+    applyRecordingFlags(current.id,{recording_available:true,recording_finalized:true});
+    updateControls();
+  `);
+  await tick();
+  assert.equal(app.run('captureSession'),null);
+  assert.equal(app.run("scheduledCorrections.get('protected-auto').status"),'starting');
+  assert.equal(app.run('isBusy()'),true);
+  assert.equal(app.element('logout').disabled,true);
+
+  correctionRequest.resolve(response({lecture_id:'protected-auto',status:'queued'}));
+  await tick(); await tick();
+  assert.equal(app.run('scheduledCorrections.size'),0);
+  assert.equal(app.run('isBusy()'),false);
+  assert.equal(app.element('logout').disabled,false);
 });
 
 function adminOverviewFixture(overrides = {}) {
@@ -887,6 +1371,25 @@ test('deletion safely retries once after a lost response', async () => {
   assert.match(app.element('notice').textContent, /삭제했어요/);
 });
 
+test('deleting an unfinished recovered lesson clears its local correction reservation', async () => {
+  const app = setup((url, options = {}) => options.method === 'DELETE'
+    ? response(null,204) : response({}));
+  app.run(`
+    current={id:'delete-reserved',title:'지울 미완료 수업',created_at:'2026-01-01T00:00:00Z',
+      segments:[{id:'saved',start:0,end:1,text:'저장됨'}],recording_available:true,recording_finalized:false};
+    lectures=[current]; captureSession={id:'ended-capture',lecture:current};
+    scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
+      captureId:captureSession.id,finalized:false,status:'scheduled'});
+    updateControls();
+  `);
+  assert.equal(app.run('isBusy()'),false);
+  app.element('delete-lecture').onclick();
+  await app.element('delete-confirm').onclick();
+  assert.equal(app.run('scheduledCorrections.size'),0);
+  assert.equal(app.run('captureSession'),null);
+  assert.equal(app.run('hasOwnerLockedWork()'),false);
+});
+
 test('an explicit deletion failure keeps the lecture available for a later retry', async () => {
   let deleteCalls = 0;
   const app = setup(async (_url, options = {}) => {
@@ -999,6 +1502,97 @@ test('logging out detaches only the tab watcher while a server import keeps proc
   assert.equal(app.run('importJob'), null);
 });
 
+test('explicit logout scrubs the previous account profile, notes, draft, and selected file', async () => {
+  const app = setup(async () => response({}));
+  const selected = new Blob([new Uint8Array(32)],{type:'audio/wav'});
+  Object.defineProperty(selected,'name',{value:'private-lesson.wav'});
+  app.element('recording-file').files = [selected];
+  app.run(`
+    current={id:'private-note',title:'이전 계정 비공개 수업',language:'en',created_at:'2026-01-01T00:00:00Z',
+      segments:[{id:'secret',start:0,end:1,text:'이전 계정만 볼 문장'}]};
+    lectures=[current]; captureSession={id:'completed-capture',lecture:current};
+    document.getElementById('username').value='user-alpha';
+    document.getElementById('password').value='plaintext-password';
+    document.getElementById('password-confirm').value='plaintext-password';
+    document.getElementById('setup-code').value='one-time-code';
+    document.getElementById('current-user').textContent='user-alpha';
+    document.querySelector('.user-avatar').textContent='U';
+    document.getElementById('delete-lecture-title').textContent=current.title;
+    document.getElementById('import-detail').textContent='private-lesson.wav 업로드 중';
+    document.getElementById('notice').textContent='이전 계정 알림'; document.getElementById('notice').hidden=false;
+    renderCurrent(); renderHistory();
+  `);
+
+  await app.element('logout').onclick();
+  assert.equal(app.run('user'),'');
+  assert.equal(app.run('current'),null);
+  assert.equal(app.run('lectures.length'),0);
+  assert.equal(app.run('captureSession'),null);
+  assert.equal(app.element('username').value,'');
+  assert.equal(app.element('password').value,'');
+  assert.equal(app.element('password-confirm').value,'');
+  assert.equal(app.element('setup-code').value,'');
+  assert.equal(app.element('recording-file').value,'');
+  assert.equal(app.element('recording-file').files.length,0);
+  assert.equal(app.element('lecture-title').value,'');
+  assert.equal(app.element('language').value,'ko');
+  assert.equal(app.element('current-user').textContent,'내 계정');
+  assert.equal(app.element('.user-avatar').textContent,'–');
+  assert.equal(app.element('delete-lecture-title').textContent,'선택한 수업');
+  assert.equal(app.element('import-detail').textContent,'');
+  assert.equal(app.element('notice').hidden,true);
+  assert.doesNotMatch(JSON.stringify(app.element('lecture-list').children),/비공개 수업/);
+  assert.doesNotMatch(JSON.stringify(app.element('transcript').children),/이전 계정만 볼 문장/);
+});
+
+test('switching accounts scrubs stale workspace data even when the new history request fails', async () => {
+  const app = setup((url) => {
+    if (url.endsWith('/auth/login')) return response({token:'beta-token',user:{username:'user-beta',is_admin:false}});
+    if (url.endsWith('/lectures')) throw new TypeError('history unavailable');
+    if (url.endsWith('/status')) return response({model_state:'ready'});
+    return response([]);
+  });
+  const selected = new Blob([new Uint8Array(32)],{type:'audio/wav'});
+  Object.defineProperty(selected,'name',{value:'alpha-private.wav'});
+  app.element('recording-file').files = [selected];
+  app.run(`
+    current={id:'alpha-note',title:'알파 비공개 제목',language:'en',created_at:'2026-01-01T00:00:00Z',
+      segments:[{id:'alpha-text',start:0,end:1,text:'알파 비공개 문장'}]};
+    lectures=[current]; renderCurrent(); renderHistory(); token=''; showLogin(false);
+  `);
+  app.element('username').value = 'user-beta';
+  app.element('password').value = 'beta-password';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+
+  assert.equal(app.run('user'),'user-beta');
+  assert.equal(app.run('current'),null);
+  assert.equal(app.run('lectures.length'),0);
+  assert.equal(app.element('workspace').hidden,false);
+  assert.equal(app.element('recording-file').value,'');
+  assert.equal(app.element('recording-file').files.length,0);
+  assert.equal(app.element('lecture-title').value,'');
+  assert.equal(app.element('language').value,'ko');
+  assert.equal(app.element('import-button').disabled,true);
+  assert.doesNotMatch(JSON.stringify(app.element('lecture-list').children),/알파 비공개 제목/);
+  assert.doesNotMatch(JSON.stringify(app.element('transcript').children),/알파 비공개 문장/);
+});
+
+test('a failed login clears typed passwords while retaining an activation code for retry', async () => {
+  const app = setup(async url => url.endsWith('/auth/activate')
+    ? response({detail:'비밀번호를 확인해 주세요.'},401) : response({}));
+  app.run("token=''; user=''; setActivation(true)");
+  app.element('workspace').hidden = true;
+  app.element('username').value = 'new-user';
+  app.element('password').value = 'wrong-password';
+  app.element('password-confirm').value = 'wrong-password';
+  app.element('setup-code').value = 'retryable-one-time-code';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  assert.equal(app.element('password').value,'');
+  assert.equal(app.element('password-confirm').value,'');
+  assert.equal(app.element('setup-code').value,'retryable-one-time-code');
+  assert.equal(app.element('workspace').hidden,true);
+});
+
 test('a pending logout locks recording and file import before yielding to the network', async () => {
   const logout = deferred();
   const app = setup(url => url.endsWith('/auth/logout') ? logout.promise : response({}));
@@ -1023,7 +1617,7 @@ test('selecting an import while viewing an English note opens an editable Korean
   const file = new Blob([new Uint8Array(10)]);
   Object.defineProperty(file, 'name', {value:'한국사 녹음.m4a'});
   app.run(`current={id:'english-note',title:'English',language:'en',created_at:'2026-01-01T00:00:00Z',segments:[]}; renderCurrent()`);
-  Object.defineProperty(app.element('recording-file'), 'files', {configurable:true,value:[file]});
+  app.element('recording-file').files = [file];
   app.element('recording-file').onchange();
   assert.equal(app.run('current'), null);
   assert.equal(app.element('language').value, 'ko');
@@ -1747,6 +2341,8 @@ test('skipping the last failed chunk finalizes the saved recording and applies i
   assert.match(request.url, /\/lectures\/recoverable-lesson\/recording-finalize$/);
   assert.equal(request.options.method, 'POST');
   assert.equal(request.options.headers.get('Authorization'), 'Bearer old-token');
+  assert.ok([...app.timeouts.values()].some(timer => timer.delay === 60000),
+    'tail inference gets the same timeout budget as a regular audio chunk');
 
   finalization.resolve(response({recording_available:true,recording_finalized:true}));
   await tick(); await tick();
@@ -1755,6 +2351,86 @@ test('skipping the last failed chunk finalizes the saved recording and applies i
   assert.equal(app.run('lectures[0].recording_available && lectures[0].recording_finalized'), true);
   assert.equal(app.element('recording-download').disabled, false);
   assert.match(app.element('notice').textContent, /WAV로 마무리/);
+});
+
+test('a skipped final chunk starts its reserved correction once after recording finalization', async () => {
+  let finalizations = 0, correctionPosts = 0, correctionSawRecoveredTail = false;
+  let app;
+  app = setup((url, options = {}) => {
+    if (url.endsWith('/lectures/skipped-correction/recording-finalize')) {
+      finalizations += 1;
+      return response({recording_available:true,recording_finalized:true,
+        segments:[{id:'recovered-tail',start:4,end:4.6,text:'복구된 마지막 문장'}]});
+    }
+    if (url.endsWith('/lectures/skipped-correction/correction') && options.method === 'POST') {
+      correctionPosts += 1;
+      correctionSawRecoveredTail = app.run("current.segments.some(segment => segment.id === 'recovered-tail')");
+      return response({lecture_id:'skipped-correction',status:'queued'});
+    }
+    return response({});
+  });
+  app.run(`
+    current={id:'skipped-correction',title:'복구 수업',created_at:'2026-01-01T00:00:00Z',
+      segments:[{id:'saved',start:0,end:4,text:'저장된 원문'}],recording_available:true,recording_finalized:false};
+    lectures=[current];
+    captureSession={id:'capture-for-skip',lecture:current};
+    scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
+      captureId:captureSession.id,status:'scheduled'});
+    pending=[{id:'failed-final',lectureId:current.id,final:true,downloadRequested:true}];
+    sendError='마지막 조각 실패'; renderCurrent();
+    skipFailedChunk();
+  `);
+  await tick(); await tick(); await tick();
+  assert.equal(finalizations,1);
+  assert.equal(correctionPosts,1);
+  assert.equal(correctionSawRecoveredTail,true,'the reserved correction must start after the recovered tail is merged');
+  assert.equal(app.run("current.segments.filter(segment => segment.id === 'recovered-tail').length"),1);
+  assert.equal(app.run('scheduledCorrections.size'),0);
+  assert.equal(app.run('current.recording_finalized'),true);
+  app.run("applyRecordingFlags('skipped-correction',{recording_available:true,recording_finalized:true,segments:[{id:'recovered-tail',start:4,end:4.6,text:'복구된 마지막 문장'}]})");
+  await tick(); await tick();
+  assert.equal(correctionPosts,1,'repeated finalized state must not submit the reservation again');
+  assert.equal(app.run("current.segments.filter(segment => segment.id === 'recovered-tail').length"),1,
+    'an idempotent finalization response must not duplicate the recovered segment');
+});
+
+test('a failed recording finalization leaves its correction reserved without locking recovery controls', async () => {
+  let correctionPosts = 0;
+  const app = setup((url, options = {}) => {
+    if (url.endsWith('/recording-finalize')) {
+      return response({detail:'마지막 음성 인식을 마무리하지 못했습니다.'},503,{'Retry-After':'5'});
+    }
+    if (url.endsWith('/lectures/retry-recovery/correction') && options.method === 'POST') {
+      correctionPosts += 1;
+      return response({lecture_id:'retry-recovery',status:'queued'});
+    }
+    return response({});
+  });
+  app.run(`
+    current={id:'retry-recovery',title:'복구 수업',created_at:'2026-01-01T00:00:00Z',
+      segments:[{id:'saved',start:0,end:4,text:'저장된 원문'}],recording_available:true,recording_finalized:false};
+    lectures=[current]; captureSession={id:'capture-recovery',lecture:current};
+    scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
+      captureId:captureSession.id,finalized:false,status:'scheduled'});
+    pending=[{id:'failed-final',lectureId:current.id,final:true,downloadRequested:true}];
+    sendError='마지막 조각 실패';
+    skipFailedChunk();
+  `);
+  await tick(); await tick();
+  assert.equal(app.run('recordingFinalizePending'),false);
+  assert.equal(app.run("scheduledCorrections.get('retry-recovery').status"),'scheduled');
+  assert.equal(app.run('hasOwnerLockedWork()'),true,'same-owner reauthentication must retain the reservation');
+  assert.equal(app.run('isBusy()'),false,'a stored retryable reservation must not deadlock the workspace');
+  assert.equal(app.element('recording-download').disabled,false,'the user can retry finalization from the WAV button');
+  assert.equal(app.element('logout').disabled,false);
+
+  app.run(`
+    captureSession={id:'newer-capture',lecture:{id:'newer-lesson',segments:[]}};
+    applyRecordingFlags('retry-recovery',{recording_available:true,recording_finalized:true,segments:[]});
+  `);
+  await tick(); await tick();
+  assert.equal(correctionPosts,1,'a later successful finalization still honors the old reservation');
+  assert.equal(app.run('captureSession.id'),'newer-capture','finalizing an older lesson must not release a newer capture');
 });
 
 test('skipping the only failed chunk never claims that a server WAV exists', async () => {
@@ -1798,6 +2474,32 @@ test('recording finalization retries once after a transient response loss', asyn
   assert.equal(app.run('current.recording_finalized'), true);
 });
 
+test('recording finalization waits for an already running deterministic guard', async () => {
+  let finalizeCalls = 0;
+  const app = setup(async (url) => {
+    if (!url.endsWith('/recording-finalize')) return response({});
+    finalizeCalls += 1;
+    if (finalizeCalls === 1) {
+      return response({detail:'마지막 음성을 이미 처리하고 있습니다.'},409,{'Retry-After':'2'});
+    }
+    return response({recording_available:true,recording_finalized:true,segments:[]});
+  });
+  app.run(`
+    current={id:'busy-finalize',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    lectures=[{...current}];
+    pending=[{id:'failed-final',lectureId:'busy-finalize',final:true,downloadRequested:true}];
+    sendError='마지막 조각 실패';
+    skipFailedChunk();
+  `);
+  await tick(); await tick();
+  assert.equal(finalizeCalls,1);
+  assert.equal(app.run('recordingFinalizePending'),true);
+  await app.runTimeout(2000);
+  assert.equal(finalizeCalls,2);
+  assert.equal(app.run('recordingFinalizePending'),false);
+  assert.equal(app.run('current.recording_finalized'),true);
+});
+
 test('a stale recording-finalize response cannot alter the next account', async () => {
   const finalization = deferred();
   const app = setup((url) => url.endsWith('/recording-finalize') ? finalization.promise : response({}));
@@ -1814,10 +2516,12 @@ test('a stale recording-finalize response cannot alter the next account', async 
     current={id:'next-lesson',title:'다음 수업',created_at:'2026-01-02T00:00:00Z',segments:[],recording_available:false,recording_finalized:false};
     lectures=[{...current}];
   `);
-  finalization.resolve(response({recording_available:true,recording_finalized:true}));
+  finalization.resolve(response({recording_available:true,recording_finalized:true,
+    segments:[{id:'old-tail',start:3,end:4,text:'다른 계정에 보이면 안 됨'}]}));
   await tick(); await tick();
   assert.equal(app.run('current.id'), 'next-lesson');
   assert.equal(app.run('current.recording_available || current.recording_finalized'), false);
+  assert.equal(app.run("current.segments.some(segment => segment.id === 'old-tail')"),false);
   assert.equal(app.run('lectures[0].id'), 'next-lesson');
   assert.equal(app.run('recordingFinalizePending'), false);
 });
@@ -1849,4 +2553,19 @@ test('a failed head requires a separate download request and save confirmation b
   assert.equal(uploads, 2, 'the next queued chunk is sent after the preserved head is skipped');
   assert.equal(app.run('pending.length'), 0);
   assert.equal(app.run('sendError'), '');
+});
+
+test('a failed live chunk uses its own lecture title while a past note is open', async () => {
+  const app = setup(async () => response({}));
+  app.run(`
+    const live={id:'live-failed',title:'현재 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
+    const past={id:'past-open',title:'지난 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
+    current=past; lectures=[live,past]; captureSession={id:'live-capture',lecture:live};
+    pending=[{blob:new Blob([new Uint8Array(32044)],{type:'audio/wav'}),startSeconds:0,durationSeconds:1,
+      overlapSeconds:0,final:false,id:'failed-live',lectureId:live.id}];
+    sendError='전송 실패';
+  `);
+  await app.run('saveFailedChunk()');
+  assert.match(app.created('a').download,/^현재 수업_/);
+  assert.doesNotMatch(app.created('a').download,/지난 수업/);
 });

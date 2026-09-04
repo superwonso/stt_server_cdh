@@ -66,6 +66,10 @@ test('history, export, recording, and destructive controls are explicit and acce
   assert.match(html, /<dialog\b[^>]*\bid="delete-dialog"[^>]*\baria-labelledby="delete-title"[^>]*\baria-describedby="delete-description"/i);
   assert.match(html, /받아쓴 원문, AI 후보정본과 저장된 녹음/);
   assert.match(html, /이 작업은 되돌릴 수 없습니다/);
+  assert.match(html, /<div\b[^>]*\bclass="record-actions"[^>]*\brole="group"[^>]*\baria-label="받아쓰기 녹음 제어"/i);
+  assert.match(html, /<button\b[^>]*\bid="pause-button"[^>]*\baria-pressed="false"[^>]*\bdisabled[^>]*>Ⅱ 일시정지<\/button>/i);
+  assert.match(html, /<div\b[^>]*\bid="live-capture-banner"[^>]*\brole="region"[^>]*\baria-labelledby="live-capture-title"[^>]*\bhidden/i);
+  assert.match(html, /<button\b[^>]*\bid="return-live-capture"[^>]*>현재 녹음으로 돌아가기<\/button>/i);
 });
 
 test('AI correction controls keep raw and corrected transcripts explicit without exposing credentials', () => {

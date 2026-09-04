@@ -30,10 +30,13 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .db import Database
 from .importer import ImportDurationError, ImportInterrupted, ImportMediaError, iter_audio_chunks
 from .recordings import (
+    BYTES_PER_FRAME,
     RecordingCapacityError,
     RecordingConflict,
     RecordingCorruptError,
     RecordingStore,
+    SAMPLE_RATE,
+    WAV_HEADER_BYTES,
 )
 from .postprocessor import MindlogicPostprocessor, PostprocessingError
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
@@ -1214,39 +1217,338 @@ def create_app(
             download_tickets[digest(ticket)] = (expires_at, user["username"], lecture["id"], 16)
         return {"path": f"/recording-downloads/{ticket}", "expires_in": 60}
 
+    def final_guard_chunk_id() -> str:
+        # API clients must submit UUID chunk IDs, so this deterministic internal
+        # sentinel cannot be pre-claimed through the upload route.
+        return "server:recording-finalize-guard:v1"
+
+    def finalized_tail_segments(
+        connection,
+        lecture_id: str,
+        guard_chunk_id: str,
+        username: str,
+    ) -> list[dict]:
+        # Prefer the synthetic recovery guard when it committed. If a normal
+        # final chunk committed but its response was lost, replay that latest
+        # final chunk instead so the browser can merge its stable IDs.
+        chunk = connection.execute(
+            "SELECT c.chunk_id FROM chunks AS c "
+            "JOIN lectures AS l ON l.id = c.lecture_id "
+            "WHERE c.lecture_id = ? AND c.final_chunk = 1 AND c.status = 'done' "
+            "AND l.username = ? AND l.deleting = 0 "
+            "ORDER BY (c.chunk_id = ?) DESC, c.start_seconds DESC, c.chunk_id DESC LIMIT 1",
+            (lecture_id, username, guard_chunk_id),
+        ).fetchone()
+        if chunk is None:
+            owner = connection.execute(
+                "SELECT 1 FROM lectures WHERE id = ? AND username = ? AND deleting = 0",
+                (lecture_id, username),
+            ).fetchone()
+            if owner is None:
+                raise HTTPException(404, "수업을 찾을 수 없습니다.")
+            return []
+        return [dict(row) for row in connection.execute(
+            "SELECT s.id, s.start, s.end, s.text FROM segments AS s "
+            "JOIN chunks AS c ON c.lecture_id = s.lecture_id AND c.chunk_id = s.chunk_id "
+            "JOIN lectures AS l ON l.id = s.lecture_id "
+            "WHERE s.lecture_id = ? AND s.chunk_id = ? AND c.status = 'done' "
+            "AND l.username = ? AND l.deleting = 0 ORDER BY s.start, s.end, s.id",
+            (lecture_id, chunk["chunk_id"], username),
+        ).fetchall()]
+
+    def recording_guard_snapshot(username: str, lecture_id: str) -> dict | None:
+        """Read the same overlap-only tail that a normal paused stop would send."""
+
+        try:
+            recording = recording_store.open_info(username, lecture_id)
+        except RecordingCorruptError as error:
+            log.exception("Stored recording is not readable for lecture %s", lecture_id)
+            raise HTTPException(503, "저장된 녹음 파일을 확인하지 못했습니다.") from error
+        if recording is None:
+            return None
+        descriptor = recording["descriptor"]
+        try:
+            total_frames = (recording["bytes"] - WAV_HEADER_BYTES) // BYTES_PER_FRAME
+            tail_frames = min(total_frames, 3 * SAMPLE_RATE)
+            if tail_frames < 800:
+                raise RecordingCorruptError("recording is shorter than one accepted browser chunk")
+            wanted = tail_frames * BYTES_PER_FRAME
+            os.lseek(descriptor, recording["bytes"] - wanted, os.SEEK_SET)
+            pcm = bytearray()
+            while len(pcm) < wanted:
+                part = os.read(descriptor, wanted - len(pcm))
+                if not part:
+                    raise RecordingCorruptError("recording tail ended early")
+                pcm.extend(part)
+        except (OSError, RecordingCorruptError) as error:
+            log.exception("Stored recording tail is not readable for lecture %s", lecture_id)
+            raise HTTPException(503, "저장된 녹음 파일을 확인하지 못했습니다.") from error
+        finally:
+            os.close(descriptor)
+
+        output = io.BytesIO()
+        with wave.open(output, "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(BYTES_PER_FRAME)
+            audio.setframerate(SAMPLE_RATE)
+            audio.writeframes(pcm)
+        duration = tail_frames / SAMPLE_RATE
+        return {
+            "payload": output.getvalue(),
+            "start_seconds": (total_frames - tail_frames) / SAMPLE_RATE,
+            "duration_seconds": duration,
+            "total_frames": total_frames,
+        }
+
+    def normalized_segments(raw_segments, start_seconds: float, duration: float) -> list[dict]:
+        segments = []
+        for raw in raw_segments:
+            begin, end = float(raw["start"]), float(raw["end"])
+            text = str(raw["text"]).strip()
+            if not text or not math.isfinite(begin) or not math.isfinite(end):
+                continue
+            begin = max(0.0, min(begin, duration))
+            end = max(begin, min(end, duration))
+            if begin == end:
+                continue
+            segments.append({
+                "id": str(uuid.uuid4()),
+                "start": round(start_seconds + begin, 3),
+                "end": round(start_seconds + end, 3),
+                "text": text,
+            })
+        segments.sort(key=lambda segment: (segment["start"], segment["end"], segment["id"]))
+        return segments
+
+    def ensure_recording_can_finalize(
+        connection,
+        lecture_id: str,
+        *,
+        exclude_chunk_id: str | None = None,
+    ) -> None:
+        active_import = connection.execute(
+            "SELECT 1 FROM imports WHERE lecture_id = ? "
+            "AND status IN ('uploading', 'queued', 'processing')",
+            (lecture_id,),
+        ).fetchone()
+        pending_query = "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'"
+        pending_parameters: tuple = (lecture_id,)
+        if exclude_chunk_id is not None:
+            pending_query += " AND chunk_id != ?"
+            pending_parameters += (exclude_chunk_id,)
+        pending = connection.execute(pending_query, pending_parameters).fetchone()
+        if active_import is not None or pending is not None:
+            raise HTTPException(
+                409,
+                "진행 중인 음성 처리가 끝난 뒤 녹음을 확정하세요.",
+                headers={"Retry-After": "2"},
+            )
+
     @app.post("/lectures/{lecture_id}/recording-finalize")
     def finalize_received_recording(lecture_id: str, user: dict = Depends(data_identity)):
-        """Close a stopped lesson after its failed final browser chunk was skipped."""
+        """Close an interrupted lesson and recover its withheld final ASR guard."""
 
-        with recording_store.lock:
+        lecture = owned_lecture(lecture_id, user["username"])
+        guard_chunk_id = final_guard_chunk_id()
+        with database.connect() as connection:
+            if lecture["recording_finalized"]:
+                segments = finalized_tail_segments(
+                    connection,
+                    lecture_id,
+                    guard_chunk_id,
+                    user["username"],
+                )
+            else:
+                ensure_recording_can_finalize(connection, lecture_id)
+                segments = None
+        if segments is not None:
+            return {
+                "segments": segments,
+                "recording_available": recording_store.available(user["username"], lecture_id),
+                "recording_finalized": True,
+            }
+
+        # Read a stable snapshot, then release both storage and database locks
+        # before waiting for the single local GPU. A final overlap-only chunk
+        # emits only the stability guard withheld by the latest non-final pass.
+        snapshot = recording_guard_snapshot(user["username"], lecture_id)
+        payload_hash = None if snapshot is None else hashlib.sha256(snapshot["payload"]).hexdigest()
+        processing_seconds = 0.0
+        segments = []
+        claimed_guard = False
+        if snapshot is not None:
+            # Claim the deterministic synthetic chunk before inference. A
+            # browser retry after a timeout now receives a short 409 instead of
+            # running the same private audio through the GPU twice. A process
+            # crash is safe because startup already removes pending chunks.
             with database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                lecture = connection.execute(
-                    "SELECT id, username, recording_finalized FROM lectures "
+                current = connection.execute(
+                    "SELECT recording_finalized FROM lectures "
                     "WHERE id = ? AND username = ? AND deleting = 0",
                     (lecture_id, user["username"]),
                 ).fetchone()
-                if lecture is None:
+                if current is None:
                     raise HTTPException(404, "수업을 찾을 수 없습니다.")
-                active_import = connection.execute(
-                    "SELECT 1 FROM imports WHERE lecture_id = ? "
-                    "AND status IN ('uploading', 'queued', 'processing')",
-                    (lecture_id,),
-                ).fetchone()
-                pending = connection.execute(
-                    "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
-                    (lecture_id,),
-                ).fetchone()
-                if active_import is not None or pending is not None:
-                    raise HTTPException(409, "진행 중인 음성 처리가 끝난 뒤 녹음을 확정하세요.")
-                if not lecture["recording_finalized"]:
+                if current["recording_finalized"]:
+                    replayed = finalized_tail_segments(
+                        connection,
+                        lecture_id,
+                        guard_chunk_id,
+                        user["username"],
+                    )
+                else:
+                    ensure_recording_can_finalize(connection, lecture_id)
                     connection.execute(
-                        "UPDATE lectures SET recording_finalized = 1 "
+                        "INSERT INTO chunks(lecture_id, chunk_id, payload_hash, start_seconds, "
+                        "overlap_seconds, final_chunk, status) "
+                        "VALUES (?, ?, ?, ?, ?, 1, 'pending')",
+                        (
+                            lecture_id,
+                            guard_chunk_id,
+                            payload_hash,
+                            snapshot["start_seconds"],
+                            snapshot["duration_seconds"],
+                        ),
+                    )
+                    claimed_guard = True
+                    replayed = None
+            if replayed is not None:
+                return {
+                    "segments": replayed,
+                    "recording_available": recording_store.available(user["username"], lecture_id),
+                    "recording_finalized": True,
+                }
+
+        acquired_capacity = False
+        try:
+            if snapshot is not None:
+                samples, duration, _ = decode_wav(snapshot["payload"])
+                if not capacity.acquire(blocking=False):
+                    raise HTTPException(
+                        429,
+                        "음성 처리 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.",
+                        headers={"Retry-After": "2"},
+                    )
+                acquired_capacity = True
+                started = time.perf_counter()
+                inference_lock.acquire()
+                try:
+                    raw_segments = engine.transcribe(
+                        samples,
+                        lecture["language"],
+                        snapshot["duration_seconds"],
+                        True,
+                    )
+                finally:
+                    inference_lock.release()
+                processing_seconds = round(time.perf_counter() - started, 3)
+                segments = normalized_segments(
+                    raw_segments,
+                    snapshot["start_seconds"],
+                    duration,
+                )
+                capacity.release()
+                acquired_capacity = False
+            # Existing recording PCM is append-only. Rechecking its frame count
+            # under the normal storage->SQLite lock order is therefore a compact
+            # optimistic revision check. Never finalize over a concurrent upload.
+            with recording_store.lock:
+                try:
+                    current_recording = recording_store.info(user["username"], lecture_id)
+                except RecordingCorruptError as error:
+                    log.exception("Stored recording is not readable for lecture %s", lecture_id)
+                    raise HTTPException(503, "저장된 녹음 파일을 확인하지 못했습니다.") from error
+                current_frames = None if current_recording is None else round(
+                    current_recording["duration_seconds"] * SAMPLE_RATE
+                )
+                expected_frames = None if snapshot is None else snapshot["total_frames"]
+                with database.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = connection.execute(
+                        "SELECT recording_finalized FROM lectures "
                         "WHERE id = ? AND username = ? AND deleting = 0",
                         (lecture_id, user["username"]),
+                    ).fetchone()
+                    if current is None:
+                        raise HTTPException(404, "수업을 찾을 수 없습니다.")
+                    if current["recording_finalized"]:
+                        segments = finalized_tail_segments(
+                            connection,
+                            lecture_id,
+                            guard_chunk_id,
+                            user["username"],
+                        )
+                    else:
+                        ensure_recording_can_finalize(
+                            connection,
+                            lecture_id,
+                            exclude_chunk_id=guard_chunk_id if claimed_guard else None,
+                        )
+                        if current_frames != expected_frames:
+                            raise HTTPException(
+                                409,
+                                "새 음성이 저장되어 녹음 상태가 바뀌었습니다. 잠시 후 다시 마무리하세요.",
+                                headers={"Retry-After": "2"},
+                            )
+                        if snapshot is not None:
+                            connection.executemany(
+                                "INSERT INTO segments(id, lecture_id, chunk_id, start, end, text) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                [
+                                    (
+                                        segment["id"],
+                                        lecture_id,
+                                        guard_chunk_id,
+                                        segment["start"],
+                                        segment["end"],
+                                        segment["text"],
+                                    )
+                                    for segment in segments
+                                ],
+                            )
+                            completed = connection.execute(
+                                "UPDATE chunks SET status = 'done', processing_seconds = ? "
+                                "WHERE lecture_id = ? AND chunk_id = ? AND payload_hash = ? "
+                                "AND status = 'pending'",
+                                (processing_seconds, lecture_id, guard_chunk_id, payload_hash),
+                            )
+                            if completed.rowcount != 1:
+                                raise HTTPException(
+                                    409,
+                                    "마지막 음성 처리 상태가 바뀌었습니다. 잠시 후 다시 마무리하세요.",
+                                    headers={"Retry-After": "2"},
+                                )
+                        connection.execute(
+                            "UPDATE lectures SET recording_finalized = 1 "
+                            "WHERE id = ? AND username = ? AND deleting = 0",
+                            (lecture_id, user["username"]),
+                        )
+                available = current_recording is not None
+            return {
+                "segments": segments,
+                "recording_available": available,
+                "recording_finalized": True,
+            }
+        except HTTPException:
+            raise
+        except Exception as error:
+            log.exception("Could not finalize the stored recording guard")
+            raise HTTPException(
+                503,
+                "이 PC에서 마지막 음성 인식을 마무리하지 못했습니다. 잠시 후 다시 시도하세요.",
+                headers={"Retry-After": "5"},
+            ) from error
+        finally:
+            if acquired_capacity:
+                capacity.release()
+            if claimed_guard:
+                with database.connect() as connection:
+                    connection.execute(
+                        "DELETE FROM chunks WHERE lecture_id = ? AND chunk_id = ? "
+                        "AND payload_hash = ? AND status = 'pending'",
+                        (lecture_id, guard_chunk_id, payload_hash),
                     )
-            available = recording_store.available(user["username"], lecture_id)
-        return {"recording_available": available, "recording_finalized": True}
 
     @app.get("/recording-downloads/{ticket}")
     def download_recording(ticket: str):
@@ -1309,11 +1611,21 @@ def create_app(
         start_seconds: float,
         overlap_seconds: float,
         final_chunk: bool,
+        expected_username: str,
     ):
         previous = connection.execute(
-            "SELECT * FROM chunks WHERE lecture_id = ? AND chunk_id = ?", (lecture_id, chunk_id)
+            "SELECT c.* FROM chunks AS c JOIN lectures AS l ON l.id = c.lecture_id "
+            "WHERE c.lecture_id = ? AND c.chunk_id = ? "
+            "AND l.username = ? AND l.deleting = 0",
+            (lecture_id, chunk_id, expected_username),
         ).fetchone()
         if previous is None:
+            owner = connection.execute(
+                "SELECT 1 FROM lectures WHERE id = ? AND username = ? AND deleting = 0",
+                (lecture_id, expected_username),
+            ).fetchone()
+            if owner is None:
+                raise HTTPException(404, "수업을 찾을 수 없습니다.")
             return None
         if (
             previous["payload_hash"] != payload_hash
@@ -1325,12 +1637,16 @@ def create_app(
         if previous["status"] != "done":
             raise HTTPException(409, "이 음성을 이미 처리하고 있습니다.", headers={"Retry-After": "2"})
         segments = [dict(row) for row in connection.execute(
-            "SELECT id, start, end, text FROM segments WHERE lecture_id = ? AND chunk_id = ? ORDER BY start, end, id",
-            (lecture_id, chunk_id),
+            "SELECT s.id, s.start, s.end, s.text FROM segments AS s "
+            "JOIN lectures AS l ON l.id = s.lecture_id "
+            "WHERE s.lecture_id = ? AND s.chunk_id = ? "
+            "AND l.username = ? AND l.deleting = 0 ORDER BY s.start, s.end, s.id",
+            (lecture_id, chunk_id, expected_username),
         ).fetchall()]
         lecture = connection.execute(
-            "SELECT username, recording_finalized FROM lectures WHERE id = ? AND deleting = 0",
-            (lecture_id,),
+            "SELECT username, recording_finalized FROM lectures "
+            "WHERE id = ? AND username = ? AND deleting = 0",
+            (lecture_id, expected_username),
         ).fetchone()
         if lecture is None:
             raise HTTPException(404, "수업을 찾을 수 없습니다.")
@@ -1368,7 +1684,14 @@ def create_app(
         lecture_id = lecture["id"]
         with database.connect() as connection:
             replay = replay_result(
-                connection, lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, final_chunk
+                connection,
+                lecture_id,
+                chunk_id,
+                payload_hash,
+                start_seconds,
+                overlap_seconds,
+                final_chunk,
+                lecture["username"],
             )
         if replay is not None:
             return replay_response(lecture_id, replay)
@@ -1379,7 +1702,14 @@ def create_app(
             with database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 replay = replay_result(
-                    connection, lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, final_chunk
+                    connection,
+                    lecture_id,
+                    chunk_id,
+                    payload_hash,
+                    start_seconds,
+                    overlap_seconds,
+                    final_chunk,
+                    lecture["username"],
                 )
                 if replay is None:
                     still_owned = connection.execute(
@@ -1414,18 +1744,7 @@ def create_app(
             finally:
                 inference_lock.release()
             processing_seconds = round(time.perf_counter() - started, 3)
-            segments = []
-            for raw in raw_segments:
-                begin, end = float(raw["start"]), float(raw["end"])
-                text = str(raw["text"]).strip()
-                if not text or not math.isfinite(begin) or not math.isfinite(end):
-                    continue
-                begin = max(0.0, min(begin, duration))
-                end = max(begin, min(end, duration))
-                if begin == end:
-                    continue
-                segments.append({"id": str(uuid.uuid4()), "start": round(start_seconds + begin, 3), "end": round(start_seconds + end, 3), "text": text})
-            segments.sort(key=lambda segment: (segment["start"], segment["end"], segment["id"]))
+            segments = normalized_segments(raw_segments, start_seconds, duration)
             with recording_store.lock:
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")

@@ -8,6 +8,8 @@
 
 정확도 보조 기능으로 완료된 원문을 충북대 NOVA Gateway의 `solar-pro4`에 보내는 명시적 opt-in 후보정을 추가했다. Qwen 모델은 바꾸지 않았고 음성은 후보정 제공자에게 보내지 않는다. 원문과 후보정본은 분리 저장하며 화면은 원문을 기본으로 연다. 문장 ID·순서·개수, 기존 숫자, 개인정보 임시 표식과 응답 크기가 맞지 않으면 후보정본을 저장하지 않고, 새 숫자 표기가 생기면 원문 비교 경고를 붙인다. 따라서 이 기능은 원문을 대체하는 정답 생성기가 아니라 검토 가능한 별도 초안이다.
 
+실시간 마이크와 공유 소리는 사용자 일시정지를 지원한다. pause acknowledgement 경계까지 새 PCM을 비최종 청크로 flush하고, 정지 중 render frame은 버린다. 수업 ID·누적 음성 시간축·직전 3초 overlap은 유지하며 재개하고, 실제 종료에서만 overlap-only guard를 포함한 `final` 청크로 수업을 확정한다. 진행 수업의 후보정 버튼은 녹음을 멈추지 않고 의도만 예약하며, 사용자가 종료한 뒤 final 저장이 성공해야 후보정 요청을 시작한다.
+
 이 선택은 “Qwen이 언제나 가장 정확하다”는 결론이 아니다. 대상 Radeon/ROCm에서 실제 한국어 음성을 실시간보다 빠르게 처리했고, 현재 3초 겹침 경로가 짧은 낭독 시험에서 CER 4.03%, 마지막 기준 25자 완전 일치, 탐지된 텍스트 중복 0건을 낸 점과 요청 단위 복구가 단순하다는 운영상 이유로 정한 보수적 기본값이다. 서로 독립적으로 인식한 청크의 정렬 시각은 흔들릴 수 있으므로 실제 수업에서 exactly-once를 수학적으로 보장하지 않는다.
 
 VibeVoice-ASR-Streaming-7B는 이 PC에서도 BF16/SDPA로 실제 로드되고 공식 live-state API로 7분 52초를 완주했다. 2.9초 청크와 0.5초 lookahead, 이전 음성·텍스트 문맥, 화자 라벨을 한 세션에서 유지하는 점은 회의·수업에 매력적이다. 그러나 공개 체크포인트의 목표 세션이 최대 8분이고, 실측에서도 KV가 1,702→6,574토큰, GPU reserved가 16.59→22.19 GiB로 증가했다. 최근 10청크 평균 연산도 2분 2.15초에서 종료 시 3.25초로 늘어 2.933초 입력 간격을 넘었다. 따라서 45~90분 수업 기본값으로 두지 않았다. 8분마다 상태를 끊으면 실행은 가능할 수 있지만 화자 일관성과 장기 문맥이라는 장점도 함께 끊긴다.
@@ -60,7 +62,9 @@ VibeVoice-ASR-Streaming-7B는 이 PC에서도 BF16/SDPA로 실제 로드되고 �
 
 - `server/.env`의 `MINDLOGIC_API_KEY`만 서버에서 읽는다. `Settings` repr과 `/status`에는 키가 없고, base URL은 공식 HTTPS host/path/443로 고정한다. redirect와 환경 proxy 신뢰도 끈다.
 - `POST /lectures/{id}/correction`은 로그인·소유권·`recording_finalized`를 두 번 확인한 뒤 현재 원문의 SHA-256 revision과 모델을 기준으로 idempotent job을 만든다. `GET`도 같은 소유자만 상태/결과를 읽는다.
+- 같은 수업의 원문은 overlap 경계와 final tail 때문에 종료 전까지 segment 집합과 revision이 달라질 수 있다. 중간 가설을 즉시 보내 stale 후보정이나 마지막 문장 누락을 만들지 않도록 final 원문만 허용한다. 웹의 진행 수업 예약도 이 서버 gate를 우회하지 않는다.
 - 작업 상태는 `queued/processing/completed/failed`이며 별도 `transcript_corrections` 행에 저장한다. 단일 background worker와 attempt/revision/status CAS가 늦게 끝난 결과를 버리고, 재시작 때 `processing`을 안전하게 다시 `queued`로 돌린다.
+- 후보정 worker는 로컬 `inference_lock`, 오디오 capacity, recording/import filesystem lock을 잡지 않고 외부 호출 중 SQLite transaction도 유지하지 않는다. 따라서 완료된 과거 수업 후보정은 다른 수업의 실시간 전사·일시정지와 병행하며, 짧은 SQLite write 구간만 직렬화된다.
 - 기본 6,000자 target 묶음에 앞뒤 2개 segment를 `target=false` 문맥으로 보낸다. 응답은 strict JSON Schema로 같은 target ID를 한 번씩 같은 순서로 돌려받아 문맥 겹침이 출력 중복으로 들어오지 않게 한다.
 - payload는 전사 텍스트, `language`, 무작위 내부 segment UUID뿐이다. 오디오, 수업 제목, 로그인 ID는 보내지 않는다. 이메일·전화·주민/카드번호·긴 숫자는 형식 기반으로 가리고, 모든 아라비아 숫자도 보호 표식으로 바꾼다. 응답에서 placeholder의 순서·개수를 검사해 한 번만 복원하지만 의미적 위치까지 증명하지는 못한다. 이름·주소·드문 형식은 가려지지 않을 수 있으므로 익명화라고 표현하지 않는다.
 - 기존 숫자가 있는 문장은 결과 숫자열 전체가 정확히 같아야 하므로 삭제·치환·추가를 fail-closed한다. 숫자가 없던 문장에 새로운 숫자 표기만 생긴 경우에는 결과와 함께 로컬 경고를 넣는다. 모델에게 한글 수사를 숫자로 바꾸지 말라고 지시해도 실제 Solar가 `제 이법칙`을 `제2법칙`으로 고쳤기 때문에 이 별도 정책이 필요했다.
@@ -168,7 +172,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 결정적 import chunk UUID와 기존 chunk idempotency로 정상 종료 뒤 재시작 시 완료 청크를 재사용한다. 단일 background worker는 loop 예외를 재시도하고 GET/list가 죽은 worker를 다시 확인한다.
 - 완료·취소·실패 DB 상태와 별도로 `raw_deleted`를 기록한다. unlink 실패를 삭제 성공으로 표시하지 않으며 60초 maintenance/list 조회에서 재시도한다. 7일간 멈춘 업로드는 서버를 재시작하지 않아도 정리한다.
 - 녹음 다운로드는 소유권·완료 상태를 확인한 인증 POST가 60초짜리 무작위 전용 경로를 발급하고, 네이티브 파일 응답은 세션 Bearer를 URL에 넣지 않는다. 짧은 Wi-Fi 중단 뒤 Range 재개를 위해 최대 16회만 재사용하며, 경로는 UUID에서만 계산하고 다운로드 시 열린 `O_NOFOLLOW` descriptor의 WAV 구조와 일반 파일 여부를 다시 검사한다.
-- `MindlogicPostprocessor`는 공식 Gateway로만 나가는 bounded HTTP client, strict schema/문장 매핑 검증, 개인정보 형식 가림과 숫자 보호를 담당한다. 후보정 endpoint는 owner/final 상태와 원문 revision을 확인하고 단일 background worker가 별도 correction 행을 처리한다. `/status`에는 key가 아니라 configured/model만 보인다.
+- `MindlogicPostprocessor`는 공식 Gateway로만 나가는 bounded HTTP client, strict schema/문장 매핑 검증, 개인정보 형식 가림과 숫자 보호를 담당한다. 후보정 endpoint는 owner/final 상태와 원문 revision을 확인하고 단일 background worker가 별도 correction 행을 처리한다. worker는 Qwen `inference_lock`과 분리돼 과거 수업 후보정이 다른 수업의 실시간 전사를 막지 않는다. `/status`에는 key가 아니라 configured/model만 보인다.
 - 수업 삭제는 진행 중 import, pending chunk, processing correction이 있으면 `409`로 거절한다. queued correction은 같은 transaction에서 먼저 지운다. 연결된 import metadata를 지우고 durable `deleting` 상태를 먼저 기록한 뒤 WAV와 lecture cascade 데이터를 제거하며, 중간 파일 삭제 실패는 성공으로 표시하지 않고 재시작 때 다시 처리한다.
 - `MODEL_WARMUP=1`이면 lifespan 중 모델을 로드하고 첫 경로를 실행한다.
 
@@ -183,7 +187,8 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - GitHub Pages 프로젝트들은 `https://superwonso.github.io` 출처를 공유하므로 다른 Pages 저장소까지 신뢰해야 하는 구조적 한계가 있다. 전용 Pages 계정/도메인 없이는 완전 격리할 수 없다.
 - AudioWorklet → 스트리밍 resampler → 16 kHz PCM16 WAV 경로다.
 - 입력 소스는 마이크와 `getDisplayMedia`의 공유 오디오다. 브라우저가 요구하는 video track은 종료 감지만 하고 오디오 그래프·WAV·네트워크에 연결하지 않는다. 화면/시스템 오디오는 지원 여부가 브라우저·OS·선택 표면·DRM에 달려 있으며 알림/다른 앱 소리 포함 위험을 UI에 표시한다.
-- 새 음성 8초 이후 조용한 0.24초 지점을 찾고 전체 WAV 최대 15초, 이전 3초 overlap으로 자른다. stop 직후에는 overlap만 남아도 final guard 조각을 보내 마지막 확정을 요청한다.
+- 새 음성 8초 이후 조용한 0.24초 지점을 찾고 전체 WAV 최대 15초, 이전 3초 overlap으로 자른다. 사용자 pause는 acknowledgement 전에 받은 새 PCM만 비최종 청크로 flush하고 worklet 입력을 버리는 상태로 바꾼다. resume은 같은 수업·누적 음성 시간축·3초 overlap으로 이어지며, stop 직후에는 overlap만 남아도 final guard 조각을 보내 마지막 확정을 요청한다.
+- pause 뒤 브라우저가 사라져 final guard를 잃은 미완료 수업은 기존 owner-only `recording-finalize`가 서버 WAV의 마지막 최대 3초를 overlap-only final로 한 번 재추론한다. 비공개 내부 sentinel chunk를 inference 전에 claim하고, GPU 대기 중 DB·recording lock을 놓으며, commit 직전 owner/deleting/pending/import와 WAV frame revision을 다시 확인한다. 완료/응답 유실 재요청은 같은 segment ID를 replay해 끝 문장을 중복하지 않는다.
 - 일시적 네트워크/429/503과 idempotent 처리 중 409는 동일 chunk UUID로 지수 backoff하며 최대 8회, 큐 순서대로 재시도한다.
 - 8회 실패나 영구 오류에는 자동 loop와 녹음을 멈추고 tail을 포함한 WAV 메모리 큐를 남긴다. 사용자는 다시 보내거나 첫 실패 WAV의 다운로드를 요청하고 실제 저장을 별도로 확인한 뒤 그 조각을 건너뛸 수 있다. 건너뛴 구간은 기록에서 빠진다.
 - Quick Tunnel 주소가 바뀌어도 실제 녹음/전송 중이 아니면 후보 주소를 익명 확인할 수 있다. 대기 WAV·UUID·기존 사용자를 유지하고 같은 계정의 재로그인만 허용한 뒤 새 origin으로 전송을 잇는다.
@@ -193,8 +198,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - import polling delay의 abort listener는 매 회 제거한다. 로그아웃/탭 이탈은 watcher만 detach하고 서버 작업을 취소하지 않으며, 취소/완료 경쟁과 오래된 lecture/list 응답은 terminal 상태·generation/sequence로 판별한다.
 - 지난 수업을 `Asia/Seoul` 날짜로 묶고 단일 날짜를 필터링한다. 상세 기록은 UTF-8 TXT 또는 Markdown으로 내보내며 Markdown 제어문자와 파일명 문자를 정리한다.
 - 녹음 WAV 버튼은 `recording_available`인 수업에만 열린다. 미확정 WAV는 owner-only idempotent finalize POST로 받은 범위까지 먼저 닫고, 로그인 Bearer로 ticket을 받은 뒤 같은 API origin의 상대 경로만 세션 토큰 없이 브라우저 네이티브 다운로드로 연다.
-- 후보정 버튼은 final transcript에서만 열고 `queued/processing`을 2.5초마다 확인한다. 원문/AI 후보정본을 명시적으로 전환하고 현재 선택한 버전만 TXT/Markdown으로 내보낸다. 완료 뒤에도 원문이 기본이며 `uncertain_terms`를 최대 5개와 나머지 개수로 표시한다. 수업·계정 전환은 poll timer와 늦은 결과를 generation/sequence로 폐기한다.
+- 완료 수업 후보정은 `queued/processing`을 주기적으로 확인한다. 진행 수업에서 누른 버튼은 캡처를 멈추지 않고 예약만 보관하며, 명시적 종료와 final 저장 성공 뒤 자동 시작한다. 과거 수업 후보정은 다른 수업의 녹음·일시정지와 병행할 수 있다. 원문/AI 후보정본을 명시적으로 전환하고 현재 선택한 버전만 TXT/Markdown으로 내보낸다. 완료 뒤에도 원문이 기본이며 `uncertain_terms`를 최대 5개와 나머지 개수로 표시한다. 수업·계정 전환은 poll timer와 늦은 결과를 generation/sequence로 폐기한다.
 - 후보정 패널은 텍스트만 NOVA로 가고 오디오는 가지 않으며 형식 기반 가림이 이름 등을 보호하지 못한다는 opt-in 안내를 항상 표시한다. 결과는 모두 `textContent`로 렌더링한다.
+- 로그인 세션 만료나 인증 거절은 pause로 취급하지 않는다. 다른 계정으로 메모리 음성이 넘어가지 않도록 캡처를 종료할 수 있으며, 같은 계정 재로그인 뒤 남은 전송 상태만 안전하게 복구한다.
 - 수업 삭제 확인창은 제목과 원문·후보정본·녹음 삭제 범위를 보여 준다. 삭제·다운로드·녹음·파일 변환 중 동작을 상호 잠그고 generation/sequence로 늦게 도착한 이전 수업·계정 응답을 버린다.
 - 로그인 뒤 관리자 권한은 `/admin/overview`의 200/403으로 서버에서 판별한다. 전용 dialog는 10초마다 상태를 갱신하고 자가 세션 종료를 렌더링하지 않는다. 운영 중지·터널 재연결·다른 계정 세션 종료는 확인 단계를 두고, 안전한 운영 재개는 즉시 적용한다.
 - 모든 로그인 브라우저는 15초 heartbeat와 상태 전환 때 최소 presence만 전송한다. 로그아웃·계정/서버 전환은 timer와 늦은 응답을 폐기한다.
@@ -235,8 +241,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - VibeVoice 벤치마크 종료 후 별도 프로세스에서 PyTorch allocated/reserved 0과 free 46.80/47.47 GiB를 확인했다.
 - 실제 NOVA key로 `/models/?type=llm` 200·`solar-pro4` 존재·`/credits/` 200을 확인했다. 모든 아라비아 숫자를 보호 표식으로 바꾸는 최종 코드에서도 비개인 한국어 3문장을 strict JSON Schema로 실제 후보정해 같은 문장 ID/순서, 기존 숫자 `15`, 이메일 placeholder 복원, 띄어쓰기 교정과 새 숫자 표기 로컬 경고를 확인했다. key와 credits 본문은 출력·로그에 남기지 않았다.
 - mocked Gateway에서 청크 문맥이 target 결과에 중복되지 않는지, 한국어 조사에 붙은 이메일/전화·주민·카드·모든 아라비아 숫자 가림과 단일 복원, placeholder/ID/숫자 훼손 거절, 기존 수치를 바꾼 뒤 원래 수치를 덧붙이는 우회 거절, 새 숫자 경고, HTTP 408/425/429/5xx·network transient retry와 402 무재시도, 요청·응답 상한을 검증했다. correction API에서 owner-only, raw 불변, idempotent retry, final gate, processing 중 DELETE 거절, safe status/error를 검증했다.
+- `threading.Event` 기반 격리 API 회귀 테스트에서 correction worker를 멈춰 둔 동안 다른 수업의 전사·녹음 final 저장이 끝나고, 반대로 Qwen fake 추론을 멈춰 둔 동안 완료 수업 후보정이 DB `completed`까지 진행되는 것을 확인했다. 두 수업의 raw segment와 별도 후보정 행은 섞이지 않았다.
 - 코드 검토로 확인한 방어선: ignored 환경설정 기반 서버 측 계정 allow-list·DB exact-set 검사·소유권 검사, exact-origin 제한, chunked body 제한, 계정별 녹음 권한·UUID 경로·WAV 검증, import 원본 권한/삭제 상태, 동일 lecture/chunk/import UUID의 idempotent 응답, 초대 링크의 API 주소 배제, 계정 전체 주소 합산 로그인 제한
-- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장·후보정·관리자 API·터널 제어·Pages 런타임 설정 107개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID/키 비공개 설정, 2~10개 계정 검증과 명시적 계정 추가 rollback, 기존 자격정보·세션·수업 보존, 세 번째 계정의 관리자 조작 거절·수업 격리, presence TTL·비영속성, 세션 해제 경쟁, persisted 운영 중지, 터널 요청 경합·PID/실행 파일 위조 거절, legacy DB 계정 제약 제거와 텍스트 전용 수업 완료 승격, 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정·수업 전환의 오래된 UI 응답, system-audio track 분리도 포함한다.
+- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장·후보정·관리자 API·터널 제어·Pages 런타임 설정 115개 테스트와 Node 웹 테스트 4개 파일(앱 상태 테스트 86개, 오디오 테스트 20개, 정적 웹 경계 테스트 7개) 모두 통과. 실제 ID/키 비공개 설정, 2~10개 계정 검증과 명시적 계정 추가 rollback, 기존 자격정보·세션·수업 보존, 세 번째 계정의 관리자 조작 거절·수업 격리, presence TTL·비영속성, 세션 해제 경쟁, persisted 운영 중지, 터널 요청 경합·PID/실행 파일 위조 거절, legacy DB 계정 제약 제거와 텍스트 전용 수업 완료 승격, 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정·수업 전환의 오래된 UI 응답, system-audio track 분리, pause/resume 경계·제어 경쟁·resume 중 track/context 종료, 진행 수업 후보정 1회 예약, 인증 만료·tunnel 교체 뒤 같은 소유자 예약 복구, 다른 계정 인수 차단, 과거 수업 후보정과 live chunk 격리, final guard의 응답 유실·중복 요청·동시 WAV 변경·소유권 UUID 재사용 방어도 포함한다.
 - 녹음 전용 시험은 overlap PCM 제거, byte-identical retry, bounded silence gap, quota 실패 시 기존 파일 불변, 부분 write rollback, symlink 거부/안전 삭제, 전송 중단 fd close, 60초 ticket Range 재개·만료, 명시적 final 복구, 다른 계정 불변, DELETE/inference 경합과 응답 유실 idempotency를 포함한다.
 - 웹 시험은 KST 자정 경계 날짜 그룹, TXT/Markdown 내용·이스케이프·안전 파일명, 동일 API origin ticket 제한, 마지막 실패 조각 확정과 WAV 없음의 정확한 안내, 507 수동 복구, 다운로드·삭제·계정 전환의 stale 응답 방어를 포함한다. 자동 주소의 익명 health 선행, stale 저장 주소 차단, 24시간 lease 만료 뒤 Bearer·비밀번호·음성 본문 차단, 새 tunnel에서 같은 계정 재로그인 후 큐 재개도 검증했다. Python source `py_compile`, JavaScript `--check`, `git diff --check`도 통과했다.
 - GitHub Actions Pages 배포 성공 후 공개 URL의 `index.html`, `app.js`, `audio.js`, `file-import.js`, `pcm-worklet.js`, `style.css`가 로컬 배포본과 byte-for-byte 일치하고 HTTPS 200임을 확인했다.
@@ -250,6 +257,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 실제 학교 Wi-Fi와 태블릿을 사용한 Quick Tunnel 장기 연결 중단/복구
 - 실사용 종료 버튼, 마이크 강제 중단, 화면 잠금 각각에서 마지막 음절·문장 보존
 - 실제 데스크톱 Chrome/Edge에서 유튜브·강의 플랫폼 탭 오디오 선택, 알림 포함 범위, DRM 차단, 5초 mute 복구, 공유 종료 tail
+- 실제 브라우저·Quick Tunnel에서 마이크와 공유 소리의 pause/resume을 여러 번 또는 45~90분 동안 반복했을 때의 경계 음절·3초 문맥·누적 시간축·메모리 증가, pause/stop 제어 경쟁과 인증 만료 순간의 final tail
+- 첫 입력 50ms 미만에서 pause 직후 탭이 사라지는 경우의 브라우저 전용 PCM. API 최소 WAV보다 짧아 서버에는 아직 없으므로 현재 복구 범위 밖이다.
+- 실제 NOVA Gateway 후보정과 로컬 Qwen 실시간 전사를 장시간 병행하는 외부 end-to-end. 현재 확인은 Event로 제어한 격리 fake 계약까지다.
 - 실제 브라우저→Quick Tunnel로 큰 녹음 파일 업로드/중단/재선택/백그라운드 변환. 로컬 격리 API의 실제 Qwen E2E 한 파일은 통과했지만 활성 계정 외부 E2E는 아직이다.
 - MP3/FLAC/OGG/Opus/WebM/MP4/MKV/MOV 각 실파일의 디코딩 호환성과 실제 압축 강의 음질
 - 새 UUID로 동일 오디오가 다시 생성되는 앱/브라우저 수준의 의미적 중복

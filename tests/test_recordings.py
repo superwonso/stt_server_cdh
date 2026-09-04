@@ -49,6 +49,8 @@ def read_wav(payload: bytes) -> tuple[tuple[int, int, int], np.ndarray]:
 class FakeTranscriber:
     def __init__(self):
         self.calls = 0
+        self.invocations = []
+        self.results = []
         self.block = False
         self.entered = threading.Event()
         self.release = threading.Event()
@@ -58,9 +60,17 @@ class FakeTranscriber:
 
     def transcribe(self, samples, language, overlap_seconds=0, final_chunk=True):
         self.calls += 1
+        self.invocations.append({
+            "samples": np.asarray(samples).copy(),
+            "language": language,
+            "overlap_seconds": overlap_seconds,
+            "final_chunk": final_chunk,
+        })
         self.entered.set()
         if self.block and not self.release.wait(timeout=10):
             raise RuntimeError("test timeout")
+        if self.results:
+            return self.results.pop(0)
         return [{"start": 0, "end": len(samples) / 16_000, "text": "녹음 테스트"}]
 
 
@@ -449,6 +459,7 @@ class RecordingApiTests(unittest.TestCase):
         )
         self.assertEqual(uploaded.status_code, 200, uploaded.text)
         self.assertFalse(uploaded.json()["recording_finalized"])
+        calls_before_other_owner = self.engine.calls
         self.assertEqual(
             self.client.post(
                 f"/lectures/{lecture_id}/recording-finalize",
@@ -456,15 +467,22 @@ class RecordingApiTests(unittest.TestCase):
             ).status_code,
             404,
         )
+        self.assertEqual(self.engine.calls, calls_before_other_owner)
 
         finalized = self.client.post(
             f"/lectures/{lecture_id}/recording-finalize",
             headers=self.headers(),
         )
         self.assertEqual(finalized.status_code, 200, finalized.text)
-        self.assertEqual(
-            finalized.json(),
-            {"recording_available": True, "recording_finalized": True},
+        self.assertTrue(finalized.json()["recording_available"])
+        self.assertTrue(finalized.json()["recording_finalized"])
+        self.assertEqual(len(finalized.json()["segments"]), 1)
+        guard_call = self.engine.invocations[-1]
+        self.assertAlmostEqual(guard_call["overlap_seconds"], 0.05)
+        self.assertTrue(guard_call["final_chunk"])
+        np.testing.assert_allclose(
+            guard_call["samples"],
+            samples.astype(np.float32) / 32768.0,
         )
         ticket = self.client.post(
             f"/lectures/{lecture_id}/recording-download-ticket",
@@ -485,6 +503,242 @@ class RecordingApiTests(unittest.TestCase):
             ).status_code,
             409,
         )
+
+    def test_explicit_finalize_recovers_the_saved_guard_once_without_changing_wav(self):
+        lecture_id = self.create_lecture()
+        samples = (np.arange(4 * 16_000, dtype=np.int32) % 30_000).astype("<i2")
+        self.engine.results = [
+            [{"start": 0.1, "end": 0.5, "text": "앞부분"}],
+            [{"start": 2.5, "end": 2.9, "text": "마지막 문장"}],
+        ]
+        uploaded = self.upload(
+            lecture_id,
+            samples,
+            start=0,
+            overlap=0,
+            final=False,
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        recording = self.app.state.recording_store.path("user-alpha", lecture_id)
+        before = recording.read_bytes()
+
+        finalized = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(),
+        )
+        self.assertEqual(finalized.status_code, 200, finalized.text)
+        result = finalized.json()
+        self.assertTrue(result["recording_available"])
+        self.assertTrue(result["recording_finalized"])
+        self.assertEqual(len(result["segments"]), 1)
+        self.assertEqual(
+            {key: result["segments"][0][key] for key in ("start", "end", "text")},
+            {"start": 3.5, "end": 3.9, "text": "마지막 문장"},
+        )
+        self.assertEqual(len(self.engine.invocations), 2)
+        guard_call = self.engine.invocations[-1]
+        self.assertEqual(guard_call["language"], "ko")
+        self.assertEqual(guard_call["overlap_seconds"], 3)
+        self.assertTrue(guard_call["final_chunk"])
+        np.testing.assert_allclose(
+            guard_call["samples"],
+            samples[-3 * 16_000 :].astype(np.float32) / 32768.0,
+        )
+        self.assertEqual(recording.read_bytes(), before, "overlap-only recovery must not rewrite the WAV")
+
+        guard_id = "server:recording-finalize-guard:v1"
+        with self.database.connect() as connection:
+            guard = connection.execute(
+                "SELECT start_seconds, overlap_seconds, final_chunk, status "
+                "FROM chunks WHERE lecture_id = ? AND chunk_id = ?",
+                (lecture_id, guard_id),
+            ).fetchone()
+            self.assertEqual(
+                dict(guard),
+                {
+                    "start_seconds": 1.0,
+                    "overlap_seconds": 3.0,
+                    "final_chunk": 1,
+                    "status": "done",
+                },
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM segments WHERE lecture_id = ? AND chunk_id = ?",
+                    (lecture_id, guard_id),
+                ).fetchone()[0],
+                1,
+            )
+
+        replayed = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(),
+        )
+        self.assertEqual(replayed.status_code, 200, replayed.text)
+        self.assertEqual(replayed.json(), result)
+        self.assertEqual(len(self.engine.invocations), 2, "a response-loss retry must not infer twice")
+
+        detail = self.client.get(f"/lectures/{lecture_id}", headers=self.headers()).json()
+        recovered = [segment for segment in detail["segments"] if segment["text"] == "마지막 문장"]
+        self.assertEqual(recovered, result["segments"])
+
+    def test_explicit_finalize_replays_a_committed_normal_final_after_response_loss(self):
+        lecture_id = self.create_lecture()
+        self.engine.results = [[{"start": 0.7, "end": 0.95, "text": "응답 유실 문장"}]]
+        final = self.upload(
+            lecture_id,
+            np.full(16_000, 321, dtype="<i2"),
+            start=0,
+            overlap=0,
+            final=True,
+        )
+        self.assertEqual(final.status_code, 200, final.text)
+        calls_after_commit = self.engine.calls
+
+        reconciled = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(),
+        )
+        self.assertEqual(reconciled.status_code, 200, reconciled.text)
+        self.assertEqual(reconciled.json()["segments"], final.json()["segments"])
+        self.assertTrue(reconciled.json()["recording_available"])
+        self.assertTrue(reconciled.json()["recording_finalized"])
+        self.assertEqual(self.engine.calls, calls_after_commit, "reconciliation must only replay DB rows")
+
+    def test_finalize_claim_blocks_duplicate_inference_and_rejects_a_changed_recording(self):
+        lecture_id = self.create_lecture()
+        samples = np.full(16_000, 321, dtype="<i2")
+        uploaded = self.upload(
+            lecture_id,
+            samples,
+            start=0,
+            overlap=0,
+            final=False,
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        calls_before_guard = self.engine.calls
+        self.engine.entered.clear()
+        self.engine.release.clear()
+        self.engine.block = True
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            request = executor.submit(
+                self.client.post,
+                f"/lectures/{lecture_id}/recording-finalize",
+                headers=self.headers(),
+            )
+            try:
+                self.assertTrue(self.engine.entered.wait(timeout=5))
+                duplicate = self.client.post(
+                    f"/lectures/{lecture_id}/recording-finalize",
+                    headers=self.headers(),
+                )
+                self.assertEqual(duplicate.status_code, 409, duplicate.text)
+                self.assertEqual(duplicate.headers.get("Retry-After"), "2")
+                self.assertEqual(self.engine.calls, calls_before_guard + 1)
+
+                # A concurrently completed uploader changes the append-only
+                # recording revision while final-guard inference is running.
+                self.app.state.recording_store.write_chunk(
+                    "user-alpha",
+                    lecture_id,
+                    start_seconds=1,
+                    overlap_seconds=0,
+                    pcm=np.full(800, 654, dtype="<i2").tobytes(),
+                )
+            finally:
+                self.engine.release.set()
+            changed = request.result(timeout=5)
+
+        self.engine.block = False
+        self.assertEqual(changed.status_code, 409, changed.text)
+        self.assertEqual(changed.headers.get("Retry-After"), "2")
+        guard_id = "server:recording-finalize-guard:v1"
+        with self.database.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT recording_finalized FROM lectures WHERE id = ?", (lecture_id,)
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE lecture_id = ? AND chunk_id = ?",
+                    (lecture_id, guard_id),
+                ).fetchone()[0],
+                0,
+                "a failed optimistic commit must release its deterministic pending claim",
+            )
+
+        retried = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(),
+        )
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertTrue(retried.json()["recording_finalized"])
+
+    def test_finalize_without_saved_audio_is_idempotent_and_never_runs_inference(self):
+        lecture_id = self.create_lecture()
+        before = self.engine.calls
+        first = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(),
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(
+            first.json(),
+            {"segments": [], "recording_available": False, "recording_finalized": True},
+        )
+        repeated = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(),
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(repeated.json(), first.json())
+        self.assertEqual(self.engine.calls, before)
+
+    def test_finalize_inference_failure_releases_claim_without_exposing_error(self):
+        lecture_id = self.create_lecture()
+        uploaded = self.upload(
+            lecture_id,
+            np.full(16_000, 321, dtype="<i2"),
+            start=0,
+            overlap=0,
+            final=False,
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        guard_id = "server:recording-finalize-guard:v1"
+        with mock.patch.object(
+            self.engine,
+            "transcribe",
+            side_effect=RuntimeError("private-final-guard-error"),
+        ), self.assertLogs("classroom", level="ERROR"):
+            failed = self.client.post(
+                f"/lectures/{lecture_id}/recording-finalize",
+                headers=self.headers(),
+            )
+        self.assertEqual(failed.status_code, 503, failed.text)
+        self.assertNotIn("private-final-guard-error", failed.text)
+        with self.database.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT recording_finalized FROM lectures WHERE id = ?", (lecture_id,)
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE lecture_id = ? AND chunk_id = ?",
+                    (lecture_id, guard_id),
+                ).fetchone()[0],
+                0,
+            )
+        retried = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(),
+        )
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertTrue(retried.json()["recording_finalized"])
 
     def test_delete_is_owner_only_removes_audio_and_invalidates_ticket(self):
         lecture_id, _ = self.finalized_recording()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import tempfile
 import threading
@@ -9,12 +10,13 @@ import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 from fastapi.testclient import TestClient
 
-from server.app import create_app
+from server.app import create_app, decode_wav as real_decode_wav
 from server.manage import create_invitations
 from server.security import PASSWORD_HASHER, digest
 from server.settings import Settings
@@ -199,6 +201,45 @@ class ApiTests(unittest.TestCase):
         lecture = self.client.get(f"/lectures/{lecture_id}", headers=self.headers(token)).json()
         self.assertEqual(lecture["segments"], first.json()["segments"])
         self.assertEqual(list(self.settings.data_dir.glob("*.wav")), [])
+
+    def test_chunk_replay_rechecks_owner_after_lecture_uuid_is_reused(self):
+        owner = self.activate()
+        self.activate("user-beta")
+        lecture_id = self.lecture(owner)
+        chunk_id = str(uuid.uuid4())
+        payload = wav_audio()
+        swapped = False
+
+        def swap_owner_before_decode(raw_payload):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                with self.database.connect() as connection:
+                    connection.execute("DELETE FROM lectures WHERE id = ?", (lecture_id,))
+                    connection.execute(
+                        "INSERT INTO lectures(id, username, title, language, created_at, recording_finalized) "
+                        "VALUES (?, 'user-beta', '비공개 수업', 'ko', '2026-01-01T00:00:00Z', 1)",
+                        (lecture_id,),
+                    )
+                    connection.execute(
+                        "INSERT INTO chunks(lecture_id, chunk_id, payload_hash, start_seconds, "
+                        "overlap_seconds, final_chunk, status, processing_seconds) "
+                        "VALUES (?, ?, ?, 0, 0, 1, 'done', 9.9)",
+                        (lecture_id, chunk_id, hashlib.sha256(payload).hexdigest()),
+                    )
+                    connection.execute(
+                        "INSERT INTO segments(id, lecture_id, chunk_id, start, end, text) "
+                        "VALUES (?, ?, ?, 0, 1, '다른 계정의 비공개 문장')",
+                        (str(uuid.uuid4()), lecture_id, chunk_id),
+                    )
+            return real_decode_wav(raw_payload)
+
+        with mock.patch("server.app.decode_wav", side_effect=swap_owner_before_decode):
+            replay = self.upload(owner, lecture_id, payload=payload, chunk_id=chunk_id)
+        self.assertTrue(swapped)
+        self.assertEqual(replay.status_code, 404, replay.text)
+        self.assertNotIn("비공개", replay.text)
+        self.assertEqual(self.engine.calls, 0)
 
     def test_lecture_creation_is_idempotent_after_a_lost_response(self):
         token = self.activate()

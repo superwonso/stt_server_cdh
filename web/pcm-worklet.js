@@ -4,12 +4,25 @@ class ClassroomPCMProcessor extends AudioWorkletProcessor {
     super();
     this.block = new Float32Array(2048);
     this.used = 0;
+    this.paused = false;
     this.stopped = false;
     this.port.onmessage = ({ data }) => {
-      if (data?.type !== 'stop' || this.stopped) return;
-      this.flush();
-      this.stopped = true;
-      this.port.postMessage({ type: 'stopped', id: data.id });
+      if (this.stopped) return;
+      if (data?.type === 'pause') {
+        // Stop accepting new render quanta before flushing so the acknowledgement
+        // is an exact boundary: everything before it was sent, everything after
+        // it is discarded until resume.
+        this.paused = true;
+        this.flush();
+        this.port.postMessage({ type: 'paused', id: data.id });
+      } else if (data?.type === 'resume') {
+        this.paused = false;
+        this.port.postMessage({ type: 'resumed', id: data.id });
+      } else if (data?.type === 'stop') {
+        this.flush();
+        this.stopped = true;
+        this.port.postMessage({ type: 'stopped', id: data.id });
+      }
     };
   }
 
@@ -29,17 +42,19 @@ class ClassroomPCMProcessor extends AudioWorkletProcessor {
   process(inputs, outputs) {
     if (this.stopped) return false;
     const channels = inputs[0] || [];
-    const frameCount = channels.reduce((largest, channel) => Math.max(largest, channel.length), 0);
-    for (let frame = 0; frame < frameCount; frame += 1) {
-      let total = 0;
-      let activeChannels = 0;
-      for (const channel of channels) {
-        if (frame < channel.length) {
-          total += channel[frame];
-          activeChannels += 1;
+    if (!this.paused) {
+      const frameCount = channels.reduce((largest, channel) => Math.max(largest, channel.length), 0);
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        let total = 0;
+        let activeChannels = 0;
+        for (const channel of channels) {
+          if (frame < channel.length) {
+            total += channel[frame];
+            activeChannels += 1;
+          }
         }
+        this.append(activeChannels ? total / activeChannels : 0);
       }
-      this.append(activeChannels ? total / activeChannels : 0);
     }
     // The connected output is muted by the main thread; clear it defensively.
     for (const output of outputs || []) {

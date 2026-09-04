@@ -446,7 +446,8 @@ button {
 .secondary-button,
 .danger-button,
 .new-note-button,
-.record-button {
+.record-button,
+.pause-button {
   min-height: 48px;
   border-radius: 11px;
   font-weight: 750;
@@ -669,6 +670,10 @@ button {
   box-shadow: 0 5px 15px rgba(37, 56, 49, 0.06);
 }
 
+.lecture-item.live-capture {
+  border-color: rgba(183, 64, 64, 0.2);
+}
+
 .lecture-item strong {
   overflow: hidden;
   font-size: 13px;
@@ -680,6 +685,17 @@ button {
   margin-top: 2px;
   color: var(--muted);
   font-size: 10px;
+}
+
+.lecture-item .lecture-live-label {
+  width: fit-content;
+  margin-top: 5px;
+  padding: 2px 6px;
+  border-radius: 99px;
+  color: #93403d;
+  background: rgba(216, 90, 85, 0.1);
+  font-size: 9px;
+  font-weight: 750;
 }
 
 .empty-history {
@@ -763,6 +779,54 @@ button {
   color: var(--forest-700);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.live-capture-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: -12px 0 24px;
+  padding: 12px 14px;
+  gap: 16px;
+  border: 1px solid rgba(183, 64, 64, 0.22);
+  border-radius: 12px;
+  background: #fff7f5;
+}
+
+.live-capture-banner[hidden] {
+  display: none;
+}
+
+.live-capture-banner div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.live-capture-banner strong {
+  color: #843b39;
+  font-size: 12px;
+}
+
+.live-capture-banner span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.live-capture-banner button {
+  min-height: 38px;
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border: 1px solid rgba(183, 64, 64, 0.3);
+  color: #843b39;
+  background: white;
+  font-size: 11px;
+}
+
+.live-capture-banner button:hover:not(:disabled) {
+  background: #fff0ed;
 }
 
 .note-heading {
@@ -926,6 +990,13 @@ button {
   animation: pulse 1.4s ease-in-out infinite;
 }
 
+.record-dot.paused {
+  border-color: #b9873d;
+  background: #d7a957;
+  box-shadow: none;
+  animation: none;
+}
+
 .record-copy p {
   margin: 6px 0 13px 20px;
   color: var(--muted);
@@ -953,6 +1024,29 @@ button {
   min-width: 174px;
   padding: 12px 17px;
   border: 1px solid var(--forest-700);
+  color: white;
+  background: var(--forest-700);
+}
+
+.record-actions {
+  display: flex;
+  align-items: stretch;
+  gap: 9px;
+}
+
+.pause-button {
+  min-width: 132px;
+  padding: 12px 15px;
+  border: 1px solid var(--forest-700);
+  color: var(--forest-700);
+  background: white;
+}
+
+.pause-button:hover:not(:disabled) {
+  background: var(--surface-muted);
+}
+
+.pause-button.resume {
   color: white;
   background: var(--forest-700);
 }
@@ -1825,6 +1919,14 @@ button {
     width: 100%;
   }
 
+  .record-actions {
+    width: 100%;
+  }
+
+  .record-actions .record-button {
+    min-width: 0;
+  }
+
   .lesson-fields {
     grid-template-columns: minmax(0, 1fr) minmax(130px, 0.35fr);
   }
@@ -2016,6 +2118,16 @@ button {
     gap: 14px;
   }
 
+  .live-capture-banner {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .live-capture-banner button {
+    width: 100%;
+  }
+
   .note-actions {
     gap: 6px;
   }
@@ -2031,6 +2143,15 @@ button {
 
   .record-panel {
     padding: 22px 18px 18px;
+  }
+
+  .record-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pause-button {
+    width: 100%;
   }
 
   .file-import-panel,
@@ -2152,7 +2273,8 @@ button {
   .transcript-versions,
   .correction-panel,
   .admin-dialog,
-  .view-meta {
+  .view-meta,
+  .live-capture-banner {
     display: none !important;
   }
 

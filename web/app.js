@@ -3,9 +3,10 @@ import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState 
 
 const $ = id => document.getElementById(id);
 let apiUrl = '', token = '', user = '', activation = false, lectures = [], current = null;
-let capture = null, recording = false, starting = false, stopping = false, sending = false, authenticating = false, loggingOut = false;
+let capture = null, recording = false, paused = false, starting = false, pausing = false, resuming = false, stopping = false, sending = false, authenticating = false, loggingOut = false;
 let pending = [], sendError = '', sampleSeconds = 0, timer = null, requestGeneration = 0;
-let draft = null, captureSession = null, stopPromise = null;
+let draft = null, captureSession = null, pausePromise = null, resumePromise = null, stopPromise = null;
+let elapsedActiveMs = 0, elapsedStartedAt = 0;
 let noticeTimer, statusTimer, retryTimer = null, retryAttempt = 0, retryMessage = '';
 let captureWarning = '';
 let fileUploader = null, importJob = null, importProgress = null, importError = '';
@@ -18,6 +19,7 @@ let noteActionSequence = 0;
 let correction = null, correctionView = 'raw', correctionLectureId = '';
 let correctionLoading = false, correctionStarting = false, correctionError = '', correctionCreditExhausted = false;
 let correctionSequence = 0, correctionPollTimer = null;
+const scheduledCorrections = new Map();
 let adminAuthorized = false, adminOverview = null, adminLoading = false, adminError = '', adminAction = '';
 let adminSequence = 0, adminRefreshTimer = null, adminProbeTimer = null, adminConfirmation = null;
 let tunnelRecoveryTimer = null, tunnelRecoveryDeadline = 0, tunnelRecoveryContext = null;
@@ -329,8 +331,8 @@ function installVerifiedServer(candidate, message, {expiresAt = 0} = {}) {
   const before = apiUrl;
   let changed = false;
   if (candidate !== before) {
-    const preserveOwner = !!user && (!!draft || pending.length > 0);
-    const hasExistingSession = !!before || !!token || !!user || !!draft || pending.length > 0;
+    const preserveOwner = !!user && hasOwnerLockedWork();
+    const hasExistingSession = !!before || !!token || !!user || hasOwnerLockedWork();
     if (hasExistingSession) {
       token = '';
       ++requestGeneration;
@@ -411,8 +413,8 @@ async function discoverServer({deadline = 0} = {}) {
 function invalidateExpiredAutomaticServer(server, expiresAt) {
   if (apiUrl !== server || verifiedApiUrl !== server || verifiedApiExpiresAt !== expiresAt) return;
   const owner = user;
-  const preserveOwner = !!owner && (!!draft || pending.length > 0);
-  const hadSession = !!token || !!owner || !!draft || pending.length > 0 || !$('workspace').hidden;
+  const preserveOwner = !!owner && hasOwnerLockedWork();
+  const hadSession = !!token || !!owner || hasOwnerLockedWork() || !$('workspace').hidden;
   clearConnectionLeaseTimer();
   verifiedApiUrl = ''; verifiedApiExpiresAt = 0; token = '';
   if (hadSession) {
@@ -475,17 +477,38 @@ function detachImportWatcher({ clear = true } = {}) {
   importLectureRequest = null; lastImportLectureRefresh = 0; selectImportLecture = false;
   if (clear) { importJob = null; importProgress = null; importError = ''; }
 }
+function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
+  current = null; lectures = []; lectureDateFilter = '';
+  sampleSeconds = 0; elapsedActiveMs = 0; elapsedStartedAt = 0; captureWarning = '';
+  if (!capture && !draft && !pending.length && !sending) captureSession = null;
+  if (!pending.length) { sendError = ''; clearUploadRetry(); }
+  $('recording-file').value = '';
+  $('lecture-title').value = ''; $('language').value = 'ko'; $('elapsed').textContent = '00:00';
+  $('current-user').textContent = '내 계정'; document.querySelector('.user-avatar').textContent = '–';
+  $('delete-lecture-title').textContent = '선택한 수업';
+  $('import-status').hidden = true; $('import-state').textContent = '파일을 준비하고 있어요';
+  $('import-detail').textContent = ''; $('import-progress').value = 0; $('import-progress').textContent = '0%';
+  $('queue-message').textContent = '';
+  clearTimeout(noticeTimer); noticeTimer = null; $('notice').textContent = ''; $('notice').hidden = true;
+  if (clearLoginIdentity) {
+    $('username').value = ''; $('password').value = ''; $('password-confirm').value = ''; $('setup-code').value = '';
+  }
+  resetCorrectionState('');
+  renderCurrent(); renderHistory();
+}
 function showLogin(clear = true) {
   ++requestGeneration;
   ++noteActionSequence;
+  if (clear) scheduledCorrections.clear();
+  else retainScheduledCorrectionsForLogin();
   resetAdminState(); resetPresence();
   recordingDownloadPending = false; recordingFinalizePending = false; deletingLecture = false; deleteTarget = null;
   if ($('delete-dialog').open) $('delete-dialog').close();
-  if (recording || starting) void stopRecording('로그인이 만료되어 받아쓰기를 멈췄어요.');
+  if (recording || paused || starting || pausing || resuming) void stopRecording('로그인이 만료되어 받아쓰기를 멈췄어요.');
   detachImportWatcher();
   $('workspace').hidden = true; $('auth-screen').hidden = false; clearInterval(statusTimer);
-  if (clear) { user = ''; current = null; lectures = []; lectureDateFilter = ''; }
-  resetCorrectionState(current?.id || '');
+  if (clear) { user = ''; scrubAccountWorkspace({clearLoginIdentity:true}); }
+  else resetCorrectionState(current?.id || '');
   setActivation(false);
 }
 $('auth-toggle').onclick = () => setActivation(!activation);
@@ -520,7 +543,7 @@ $('connection-form').onsubmit = async event => {
   event.preventDefault(); let changed = false, sequence = null, controller = null;
   $('connection-error').hidden = true; $('api-url').removeAttribute('aria-invalid');
   try {
-    if (authenticating || loggingOut || recording || starting || stopping || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture) throw new Error('로그인, 로그아웃, 녹음, 다운로드 또는 파일 전송이 끝난 뒤 서버 주소를 바꿔 주세요.');
+    if (authenticating || loggingOut || recording || paused || starting || pausing || resuming || stopping || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture) throw new Error('로그인, 로그아웃, 녹음, 다운로드 또는 파일 전송이 끝난 뒤 서버 주소를 바꿔 주세요.');
     const candidate = normalizeUrl($('api-url').value);
     // A dead Quick Tunnel must not strand the in-memory queue. Stop its old
     // retry timer, verify the candidate anonymously, then require the same
@@ -565,7 +588,7 @@ $('auth-form').onsubmit = async event => {
   const authServer = apiUrl, generation = requestGeneration;
   try {
     const username = $('username').value, password = $('password').value;
-    const ownerLocked = recording || starting || stopping || !!draft || pending.length > 0 || sending;
+    const ownerLocked = hasOwnerLockedWork();
     if (ownerLocked && user && username !== user) throw new Error('전송 대기 중인 음성이 있어요. 이전 계정으로 다시 로그인해 주세요.');
     if (stopPromise) await stopPromise;
     if (activation && password !== $('password-confirm').value) throw new Error('입력한 두 비밀번호가 일치하지 않아요.');
@@ -574,7 +597,12 @@ $('auth-form').onsubmit = async event => {
     if (apiUrl !== authServer || requestGeneration !== generation) throw new Error('서버 연결 상태가 바뀌어 로그인 응답을 적용하지 않았어요. 다시 로그인해 주세요.');
     const previousUser = user;
     token = response.token; user = response.user.username; ++requestGeneration;
-    if (previousUser !== user) { current = null; lectures = []; lectureDateFilter = ''; sampleSeconds = 0; $('elapsed').textContent = '00:00'; }
+    if (previousUser !== user) {
+      scheduledCorrections.clear();
+      scrubAccountWorkspace();
+    } else {
+      rebindScheduledCorrectionsToLogin();
+    }
     $('password').value = ''; $('password-confirm').value = ''; $('setup-code').value = '';
     try { await refreshLectures(); await recoverFileImport(); } catch (error) { notice(errorText(error)); }
     if (!token) return;
@@ -586,7 +614,11 @@ $('auth-form').onsubmit = async event => {
     if (response.user?.is_admin !== false) void loadAdminOverview({probe:true});
     void updateStatus(); clearInterval(statusTimer); statusTimer = setInterval(updateStatus, 20000);
     if (pending.length || draft) { sendError = ''; void retryPending(); }
-  } catch (error) { $('auth-error').textContent = errorText(error); $('auth-error').hidden = false; }
+    resumeFinalizedScheduledCorrections();
+  } catch (error) {
+    $('password').value = ''; $('password-confirm').value = '';
+    $('auth-error').textContent = errorText(error); $('auth-error').hidden = false;
+  }
   finally { authenticating = false; updateAuthControls(); updateControls(); }
 };
 async function updateStatus() {
@@ -758,7 +790,101 @@ async function recoverFileImport() {
   await refreshImportLecture(active, true, generation);
 }
 function queuedCount() { return pending.length + (draft?.buffered.length || 0); }
-function isBusy() { return authenticating || loggingOut || recording || starting || stopping || !!draft || pending.length > 0 || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture; }
+function ownerScheduledCorrectionPending(inFlightOnly = false) {
+  return [...scheduledCorrections.values()].some(scheduled =>
+    scheduled.owner === user && (scheduled.status === 'starting'
+      || (!inFlightOnly && scheduled.status === 'scheduled')));
+}
+function isBusy() { return authenticating || loggingOut || recording || paused || starting || pausing || resuming || stopping || !!draft || pending.length > 0 || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture || ownerScheduledCorrectionPending(true); }
+function hasOwnerLockedWork() {
+  return recording || paused || starting || pausing || resuming || stopping || !!capture
+    || !!draft || pending.length > 0 || sending || recordingFinalizePending || ownerScheduledCorrectionPending();
+}
+function retainScheduledCorrectionsForLogin() {
+  for (const [lectureId,scheduled] of scheduledCorrections) {
+    if (!user || scheduled.owner !== user) {
+      scheduledCorrections.delete(lectureId);
+      continue;
+    }
+    // Keep only the owner/capture reservation while signed out. The expired
+    // bearer and previous origin are neither needed nor retained in memory.
+    scheduled.sessionToken = '';
+    scheduled.server = '';
+    if (scheduled.status === 'starting') {
+      // A changed/expired credential makes the outcome of the old request
+      // unusable. Replaying after the same owner logs in is server-idempotent.
+      scheduled.status = 'scheduled';
+    }
+  }
+}
+function rebindScheduledCorrectionsToLogin() {
+  for (const [lectureId,scheduled] of scheduledCorrections) {
+    if (!user || scheduled.owner !== user) {
+      scheduledCorrections.delete(lectureId);
+      continue;
+    }
+    scheduled.sessionToken = token;
+    scheduled.server = apiUrl;
+    if (scheduled.status === 'starting') scheduled.status = 'scheduled';
+  }
+}
+function resumeFinalizedScheduledCorrections() {
+  for (const lectureId of scheduledCorrections.keys()) {
+    const active = captureSession?.lecture?.id === lectureId ? captureSession.lecture : null;
+    const selected = current?.id === lectureId ? current : null;
+    const summary = lectures.find(lecture => lecture.id === lectureId);
+    if ([active,selected,summary].some(lecture => lecture?.recording_finalized === true)) {
+      void submitScheduledCorrection(lectureId);
+    }
+  }
+}
+function releaseFinalizedCapture(lectureId) {
+  if (captureSession?.lecture?.id !== lectureId) return;
+  const summary = lectures.find(lecture => lecture.id === lectureId);
+  if (summary && summary !== current && Array.isArray(summary.segments)) {
+    summary.segment_count = summary.segments.length;
+    delete summary.segments;
+  }
+  captureSession = null;
+}
+function activeCaptureLectureId() { return captureSession?.lecture?.id || ''; }
+function hasLiveCaptureSession() {
+  return !!activeCaptureLectureId() && !!capture
+    && (recording || paused || starting || pausing || resuming || stopping);
+}
+function stableLiveCapture() {
+  return !!activeCaptureLectureId() && !!capture && (recording || paused)
+    && !starting && !pausing && !resuming && !stopping && !draft;
+}
+function viewingActiveCaptureLecture() {
+  return stableLiveCapture() && current?.id === activeCaptureLectureId();
+}
+function historyNavigationBusy() { return isBusy() && !stableLiveCapture(); }
+function returnToLiveCapture() {
+  if (!stableLiveCapture()) return;
+  const lecture = captureSession.lecture;
+  selectImportLecture = false; ++importLectureSequence; ++requestGeneration;
+  current = {...lecture,segments:[...(lecture.segments || [])]};
+  lectureDateFilter = '';
+  renderCurrent(); renderHistory();
+  $('main-content').focus();
+  if (current.recording_finalized === true && current.segments.length) void loadCorrection(current.id);
+}
+async function selectLecture(lecture) {
+  if (!lecture?.id || historyNavigationBusy()) return;
+  if (stableLiveCapture() && lecture.id === activeCaptureLectureId()) {
+    returnToLiveCapture(); return;
+  }
+  selectImportLecture = false; ++importLectureSequence;
+  const generation = ++requestGeneration;
+  try {
+    const note = await api(`/lectures/${encodeURIComponent(lecture.id)}`);
+    if (generation !== requestGeneration || historyNavigationBusy()) return;
+    current = note; renderCurrent(); renderHistory();
+    $('main-content').focus();
+    if (note.recording_finalized === true && note.segments?.length) void loadCorrection(note.id);
+  } catch (error) { notice(errorText(error)); }
+}
 function renderHistory() {
   const dateCounts = new Map();
   for (const lecture of lectures) {
@@ -796,17 +922,29 @@ function renderHistory() {
     const heading = document.createElement('h3'); heading.textContent = dateLabel(groupLectures[0].created_at);
     const items = document.createElement('div'); items.className = 'lecture-day-items';
     for (const lecture of groupLectures) {
-      const button = document.createElement('button'); button.type = 'button'; button.className = `lecture-item${current?.id === lecture.id ? ' selected' : ''}`; button.disabled = isBusy();
+      const live = hasLiveCaptureSession() && activeCaptureLectureId() === lecture.id;
+      const livePaused = live && paused;
+      const button = document.createElement('button'); button.type = 'button';
+      button.className = `lecture-item${current?.id === lecture.id ? ' selected' : ''}${live ? ' live-capture' : ''}`;
+      button.disabled = historyNavigationBusy();
       if (current?.id === lecture.id) button.setAttribute('aria-current','page');
       const title = document.createElement('strong'); title.textContent = lecture.title;
       const date = document.createElement('span'); date.textContent = dateLabel(lecture.created_at); button.append(title,date);
-      button.onclick = async () => { if (isBusy()) return; selectImportLecture = false; ++importLectureSequence; const generation = ++requestGeneration; try { const note = await api(`/lectures/${lecture.id}`); if (generation !== requestGeneration || isBusy()) return; current = note; renderCurrent(); renderHistory(); if (note.recording_finalized === true && note.segments?.length) void loadCorrection(note.id); } catch (error) { notice(errorText(error)); } };
+      if (live) {
+        const badge = document.createElement('span'); badge.className = 'lecture-live-label';
+        badge.textContent = livePaused ? 'Ⅱ 일시정지' : '● 현재 녹음'; button.append(badge);
+        button.setAttribute('aria-label',livePaused
+          ? `${lecture.title}, 현재 받아쓰기 일시정지`
+          : `${lecture.title}, 현재 녹음 중인 수업`);
+      }
+      button.onclick = () => selectLecture(lecture);
       items.append(button);
     }
     group.append(heading,items); list.append(group);
   }
 }
 $('lecture-date').onchange = () => { lectureDateFilter = $('lecture-date').value; renderHistory(); updateControls(); };
+$('return-live-capture').onclick = returnToLiveCapture;
 function clearCorrectionPoll() {
   if (correctionPollTimer !== null) clearTimeout(correctionPollTimer);
   correctionPollTimer = null;
@@ -871,7 +1009,26 @@ function isCreditExhaustion(value) {
   return value?.status === 402 || ['credit_exhausted','credits_exhausted','quota_exhausted'].includes(code)
     || /(?:credit|quota|크레딧).*(?:exhaust|insufficient|부족|소진)/i.test(message);
 }
+function scheduledCorrectionFor(lectureId = current?.id) {
+  const scheduled = lectureId ? scheduledCorrections.get(lectureId) : null;
+  return scheduled && scheduled.owner === user && scheduled.sessionToken === token
+    && scheduled.server === apiUrl ? scheduled : null;
+}
+function scheduleCurrentCorrection() {
+  if (!viewingActiveCaptureLecture() || !current?.segments?.length || current.recording_finalized === true) return;
+  const lectureId = current.id;
+  if (scheduledCorrectionFor(lectureId)) return;
+  scheduledCorrections.set(lectureId,{
+    lectureId, owner:user, sessionToken:token, server:apiUrl,
+    captureId:captureSession.id, finalized:false, status:'scheduled',
+  });
+  renderCorrection();
+  notice('받아쓰기는 계속합니다. 수업을 종료하고 마지막 음성을 저장한 뒤 AI 후보정을 자동으로 시작할게요.');
+}
 function correctionStatus() {
+  const scheduled = scheduledCorrectionFor();
+  if (scheduled?.status === 'starting') return 'scheduled-starting';
+  if (scheduled) return 'scheduled';
   if (correctionStarting) return 'starting';
   if (correctionLoading && !correction) return 'loading';
   if (correctionCreditExhausted) return 'credit-exhausted';
@@ -883,12 +1040,15 @@ function updateCorrectionControls(noteToolsBusy = isBusy() || importIsActive() |
   const hasTranscript = !!current?.segments?.length;
   const ready = correctionIsReady();
   const status = correctionStatus();
-  const running = ['loading','starting','queued','processing'].includes(status);
+  const running = ['loading','starting','scheduled','scheduled-starting','queued','processing'].includes(status);
+  const liveAction = stableLiveCapture() && !!current?.id;
+  const activeDraft = viewingActiveCaptureLecture() && current?.recording_finalized !== true;
+  const sourceReady = current?.recording_finalized === true || activeDraft;
   $('transcript-versions').hidden = !hasTranscript;
   $('transcript-raw').disabled = !hasTranscript;
   $('transcript-corrected').disabled = !hasTranscript || !ready;
-  $('correct-transcript').disabled = !hasTranscript || current?.recording_finalized !== true
-    || noteToolsBusy || running || ready;
+  $('correct-transcript').disabled = !hasTranscript || !sourceReady
+    || (noteToolsBusy && !liveAction) || running || ready;
 }
 function renderCorrection() {
   const hasTranscript = !!current?.segments?.length;
@@ -902,10 +1062,12 @@ function renderCorrection() {
   $('correction-panel').hidden = !hasTranscript;
   const status = correctionStatus();
   $('correction-panel').setAttribute('data-state',status);
-  $('correction-panel').setAttribute('aria-busy',String(['loading','starting','queued','processing'].includes(status)));
+  $('correction-panel').setAttribute('aria-busy',String(['loading','starting','scheduled-starting','queued','processing'].includes(status)));
   const copies = {
     idle:['AI 후보정','받아쓴 원문은 그대로 두고, 전사 텍스트만 학교 AI 서버에 보내 별도의 후보정본을 만듭니다.','AI 후보정 만들기'],
     unfinished:['수업 기록을 마무리해 주세요','마지막 음성 저장이 끝난 뒤 AI 후보정을 시작할 수 있습니다. 받아쓴 원문은 지금도 내려받을 수 있어요.','마무리 후 사용'],
+    scheduled:['종료 후 자동 후보정 예약됨','받아쓰기는 계속됩니다. 수업을 종료하면 마지막 음성이 서버에 저장된 뒤 후보정을 자동으로 시작합니다.','자동 후보정 예약됨'],
+    'scheduled-starting':['마지막 저장 완료 · 후보정 요청 중','녹음을 종료했고 완전한 원문으로 AI 후보정을 시작하고 있어요.','요청하는 중…'],
     loading:['후보정 확인 중','이 수업에 저장된 후보정본이 있는지 확인하고 있어요.','확인하는 중…'],
     starting:['후보정 요청 중','원문을 보존한 채 후보정 작업을 요청하고 있어요.','요청하는 중…'],
     queued:['후보정 대기 중','학교 AI 서버의 처리 순서를 기다리고 있어요. 이 화면을 벗어나도 서버에서 계속됩니다.','대기 중…'],
@@ -975,8 +1137,13 @@ async function loadCorrection(lectureId, {quiet = false} = {}) {
   }
 }
 async function requestCorrection() {
-  if (!current?.id || !current.segments?.length || correctionStarting || correctionIsReady()
-      || current.recording_finalized !== true || isBusy() || importIsActive() || importStarting) return;
+  if (!current?.id || !current.segments?.length || correctionStarting || correctionIsReady()) return;
+  if (viewingActiveCaptureLecture() && current.recording_finalized !== true) {
+    scheduleCurrentCorrection(); return;
+  }
+  const alongsideLiveCapture = stableLiveCapture() && current.id !== activeCaptureLectureId();
+  if (current.recording_finalized !== true || (isBusy() && !alongsideLiveCapture)
+      || importIsActive() || importStarting) return;
   if (['queued','processing'].includes(correction?.status)) {
     if (correctionError || correctionCreditExhausted) {
       correctionError = ''; correctionCreditExhausted = false;
@@ -1000,6 +1167,51 @@ async function requestCorrection() {
     correctionError = errorText(error); correctionCreditExhausted = isCreditExhaustion(error);
   } finally {
     if (operationIsCurrent()) { correctionStarting = false; renderCurrent(); }
+  }
+}
+
+async function submitScheduledCorrection(lectureId) {
+  const scheduled = scheduledCorrectionFor(lectureId);
+  if (!scheduled || scheduled.status !== 'scheduled') return;
+  if (!scheduled.finalized && scheduled.captureId !== captureSession?.id) {
+    if (scheduledCorrections.get(lectureId) === scheduled) scheduledCorrections.delete(lectureId);
+    return;
+  }
+  scheduled.finalized = true;
+  scheduled.status = 'starting';
+  releaseFinalizedCapture(lectureId);
+  const owner = scheduled.owner, sessionToken = scheduled.sessionToken, server = scheduled.server;
+  const displaySequence = current?.id === lectureId ? ++correctionSequence : null;
+  const sessionIsCurrent = () => owner === user && sessionToken === token && server === apiUrl;
+  if (displaySequence !== null) {
+    correctionError = ''; correctionCreditExhausted = false; renderCorrection();
+  }
+  try {
+    const result = await api(`/lectures/${encodeURIComponent(lectureId)}/correction`,{method:'POST'},30000);
+    if (!sessionIsCurrent()) return;
+    if (scheduledCorrections.get(lectureId) === scheduled) scheduledCorrections.delete(lectureId);
+    const stored = correctionPayload(result);
+    const summary = lectures.find(lecture => lecture.id === lectureId);
+    if (summary) summary.correction = stored;
+    if (captureSession?.lecture?.id === lectureId) captureSession.lecture.correction = stored;
+    if (displaySequence !== null && displaySequence === correctionSequence && current?.id === lectureId) {
+      applyCorrectionResponse(result,lectureId); renderCurrent();
+    } else if (current?.id === lectureId) {
+      void loadCorrection(lectureId);
+    }
+    notice('AI 후보정을 자동으로 시작했어요. 받아쓴 원문은 그대로 보관합니다.');
+  } catch (error) {
+    if (!sessionIsCurrent()) return;
+    if (scheduledCorrections.get(lectureId) === scheduled) scheduledCorrections.delete(lectureId);
+    if (displaySequence !== null && displaySequence === correctionSequence && current?.id === lectureId) {
+      correctionError = errorText(error); correctionCreditExhausted = isCreditExhaustion(error);
+      renderCurrent();
+    } else {
+      notice(`자동 후보정을 시작하지 못했어요. ${errorText(error)}`);
+    }
+  } finally {
+    if (sessionIsCurrent() && displaySequence !== null && displaySequence === correctionSequence
+        && current?.id === lectureId) renderCurrent();
   }
 }
 $('transcript-raw').onclick = () => {
@@ -1453,7 +1665,7 @@ function resetPresence() {
 }
 function presenceActivity() {
   if (document.hidden) return 'away';
-  if (recording || starting) return 'recording';
+  if (recording || paused || starting || pausing || resuming) return 'recording';
   if (importStarting || importJob?.status === 'uploading') return 'uploading';
   if (sending || pending.length || ['queued','processing'].includes(importJob?.status)) return 'transcribing';
   if (correctionStarting || ['queued','processing'].includes(correction?.status)) return 'correcting';
@@ -1524,10 +1736,15 @@ function renderCurrent() {
   const segments = displayedTranscriptSegments();
   const transcript = $('transcript'); transcript.replaceChildren();
   if (!segments.length) {
+    const activeCaptureView = hasLiveCaptureSession() && current?.id === activeCaptureLectureId();
     const empty = document.createElement('div'); empty.className = 'empty-note';
     const mark = document.createElement('span'); mark.className = 'empty-symbol'; mark.ariaHidden = 'true'; mark.textContent = '≋';
-    const heading = document.createElement('h3'); heading.textContent = current && !recording && !starting ? '아직 받아쓴 내용이 없어요.' : '첫 문장을 기다리고 있어요.';
-    const text = document.createElement('p'); text.textContent = recording || starting ? '목소리가 들어오면 이곳에 글이 나타나요.' : '수업 이름을 적고 받아쓰기를 시작해 보세요.'; empty.append(mark,heading,text); transcript.append(empty);
+    const heading = document.createElement('h3'); heading.textContent = activeCaptureView ? '첫 문장을 기다리고 있어요.' : current ? '아직 받아쓴 내용이 없어요.' : '첫 문장을 기다리고 있어요.';
+    const text = document.createElement('p'); text.textContent = activeCaptureView && paused
+      ? '재개하면 같은 수업에 이어서 기록해요.'
+      : activeCaptureView ? '목소리가 들어오면 이곳에 글이 나타나요.'
+        : current ? '이 수업에는 표시할 받아쓰기 문장이 없어요.' : '수업 이름을 적고 받아쓰기를 시작해 보세요.';
+    empty.append(mark,heading,text); transcript.append(empty);
   } else {
     for (const segment of segments) {
       const row = document.createElement('div');
@@ -1555,7 +1772,7 @@ $('audio-source').onchange = () => { updateSourceGuidance(); updateControls(); }
 function resetNewNote({ focus = false } = {}) {
   ++requestGeneration;
   selectImportLecture = false; ++importLectureSequence;
-  current = null; lectureDateFilter = ''; sampleSeconds = 0;
+  current = null; lectureDateFilter = ''; sampleSeconds = 0; elapsedActiveMs = 0; elapsedStartedAt = 0;
   $('lecture-title').value = '';
   $('language').value = 'ko';
   $('elapsed').textContent = '00:00';
@@ -1606,9 +1823,18 @@ function renderImportStatus() {
 }
 function updateControls() {
   const busy = isBusy(), queued = queuedCount(), system = selectedCaptureSource() === 'system', activeImport = importIsActive(); $('new-note').disabled = busy; $('logout').disabled = busy;
+  const liveSession = recording || paused || pausing || resuming;
+  const captureTransition = (starting && !recording && !paused) || pausing || resuming || stopping;
   const noteToolsBusy = busy || activeImport || importStarting || importCancelling;
   const hasTranscript = !!current?.segments?.length;
-  $('lecture-date').disabled = busy;
+  const viewingOtherLecture = hasLiveCaptureSession() && current?.id !== activeCaptureLectureId();
+  $('live-capture-banner').hidden = !viewingOtherLecture;
+  $('live-capture-title').textContent = paused
+    ? '현재 수업은 일시정지 상태로 안전하게 유지 중이에요.'
+    : '지난 기록을 보는 동안에도 현재 수업을 계속 녹음하고 있어요.';
+  $('live-capture-detail').textContent = '음성과 받아쓰기 결과는 현재 녹음 수업에만 저장됩니다.';
+  $('return-live-capture').disabled = !stableLiveCapture();
+  $('lecture-date').disabled = historyNavigationBusy();
   $('export-format').disabled = noteToolsBusy || !hasTranscript;
   $('download').disabled = noteToolsBusy || !hasTranscript;
   $('recording-download').disabled = noteToolsBusy || !current?.recording_available;
@@ -1622,26 +1848,32 @@ function updateControls() {
   $('delete-confirm').textContent = deletingLecture ? '삭제하는 중…' : '수업 영구 삭제';
   $('lecture-title').disabled = busy || !!current; $('language').disabled = busy || !!current;
   $('audio-source').disabled = busy || !!current;
-  $('record-button').disabled = authenticating || loggingOut || (starting && !recording) || stopping || activeImport || importStarting || recordingFinalizePending || (!recording && (!!draft || pending.length > 0 || sending));
-  $('record-button').classList.toggle('stop', recording);
-  $('record-button').textContent = recording ? '■ 받아쓰기 중지' : starting ? (system ? '공유 화면 준비 중…' : '마이크 준비 중…') : stopping ? '마지막 음성 정리 중…' : activeImport || importStarting ? '파일 변환이 끝난 뒤 시작' : current ? '＋ 새 수업 시작' : system ? '● 화면 소리 받아쓰기' : '● 받아쓰기 시작';
+  $('record-button').disabled = authenticating || loggingOut || captureTransition || activeImport || importStarting || recordingFinalizePending || (!liveSession && (!!draft || pending.length > 0 || sending));
+  $('record-button').classList.toggle('stop', liveSession);
+  $('record-button').textContent = stopping ? '마지막 음성 정리 중…' : liveSession ? '■ 받아쓰기 종료' : starting ? (system ? '공유 화면 준비 중…' : '마이크 준비 중…') : activeImport || importStarting ? '파일 변환이 끝난 뒤 시작' : current ? '＋ 새 수업 시작' : system ? '● 화면 소리 받아쓰기' : '● 받아쓰기 시작';
+  $('pause-button').disabled = authenticating || loggingOut || pausing || resuming || stopping
+    || (!recording && !paused) || (paused && (!!sendError || queued >= MAX_PENDING));
+  $('pause-button').classList.toggle('resume', paused);
+  $('pause-button').setAttribute('aria-pressed',String(paused));
+  $('pause-button').textContent = pausing ? '마지막 음성 정리 중…' : resuming ? '재개하는 중…' : paused ? '▶ 받아쓰기 재개' : 'Ⅱ 일시정지';
   $('record-dot').classList.toggle('live', recording);
-  $('record-state').textContent = recording ? (system ? '공유한 화면의 소리를 듣고 있어요' : '수업을 듣고 있어요') : starting ? (system ? '공유할 화면과 오디오를 준비하고 있어요' : '마이크와 노트를 준비하고 있어요') : queued ? '남은 음성을 받아쓰고 있어요' : current ? '수업 기록을 저장했어요' : '시작할 준비가 됐어요';
-  $('record-hint').textContent = recording ? (system ? '선택한 탭이나 화면을 재생해 주세요. 화면 영상은 전송하지 않아요.' : '창을 닫지 않고 수업에 집중해 주세요.') : current ? '새 수업을 시작하거나 기록을 내려받을 수 있어요.' : system ? '시작한 뒤 재생할 탭·화면을 고르고 오디오 공유를 켜세요.' : '약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.';
+  $('record-dot').classList.toggle('paused', paused || pausing);
+  $('record-state').textContent = pausing ? '마지막 음성까지 저장하고 일시정지해요' : resuming ? '같은 수업의 녹음을 재개하고 있어요' : paused ? '받아쓰기를 일시정지했어요' : recording ? (system ? '공유한 화면의 소리를 듣고 있어요' : '수업을 듣고 있어요') : starting ? (system ? '공유할 화면과 오디오를 준비하고 있어요' : '마이크와 노트를 준비하고 있어요') : queued ? '남은 음성을 받아쓰고 있어요' : current ? '수업 기록을 저장했어요' : '시작할 준비가 됐어요';
+  $('record-hint').textContent = paused ? '정지한 동안의 소리는 녹음하거나 전송하지 않으며, 재개하면 같은 수업에 이어집니다.' : recording ? (system ? '선택한 탭이나 화면을 재생해 주세요. 화면 영상은 전송하지 않아요.' : '창을 닫지 않고 수업에 집중해 주세요.') : current ? '새 수업을 시작하거나 기록을 내려받을 수 있어요.' : system ? '시작한 뒤 재생할 탭·화면을 고르고 오디오 공유를 켜세요.' : '약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.';
   $('save-state').textContent = retryMessage ? `${queued}개 음성 · 자동 재전송 대기` : queued ? `${queued}개 음성 처리 대기` : captureWarning ? '마지막 오디오 일부 누락 가능 · 받은 내용만 저장됨' : current ? '서버 컴퓨터에 저장됨' : '서버 컴퓨터에 저장';
-  $('processing').hidden = !recording && !starting && !queued && !sending;
-  $('processing-text').textContent = sendError ? '자동 전송을 멈췄어요. 안내를 확인해 주세요.' : retryMessage || (sending ? '음성을 글로 바꾸고 있어요. 첫 실행은 준비 시간이 필요해요…' : '다음 문장을 듣고 있어요…');
-  $('queue-warning').hidden = !sendError; $('queue-message').textContent = `${sendError} 이 페이지를 닫으면 대기 중인 음성은 사라져요.`; $('retry').disabled = sending || starting || stopping;
+  $('processing').hidden = !recording && !starting && !pausing && !resuming && !queued && !sending;
+  $('processing-text').textContent = sendError ? '자동 전송을 멈췄어요. 안내를 확인해 주세요.' : retryMessage || (pausing ? '일시정지 지점까지 빠짐없이 정리하고 있어요…' : resuming ? '오디오 입력을 다시 연결하고 있어요…' : sending ? '음성을 글로 바꾸고 있어요. 첫 실행은 준비 시간이 필요해요…' : '다음 문장을 듣고 있어요…');
+  $('queue-warning').hidden = !sendError; $('queue-message').textContent = `${sendError} 이 페이지를 닫으면 대기 중인 음성은 사라져요.`; $('retry').disabled = sending || starting || pausing || resuming || stopping;
   $('save-failed').hidden = !sendError || !pending.length;
-  $('save-failed').disabled = sending || starting || stopping || !pending.length;
+  $('save-failed').disabled = sending || starting || pausing || resuming || stopping || !pending.length;
   $('skip-failed').hidden = !sendError || !pending[0]?.downloadRequested;
-  $('skip-failed').disabled = sending || starting || stopping || !pending[0]?.downloadRequested;
+  $('skip-failed').disabled = sending || starting || pausing || resuming || stopping || !pending[0]?.downloadRequested;
   const canResumeImport = importJob?.status === 'uploading' && !fileUploader?.running;
-  const liveAudioBusy = authenticating || loggingOut || recording || starting || stopping || !!draft || pending.length > 0 || sending || recordingFinalizePending;
+  const liveAudioBusy = authenticating || loggingOut || recording || paused || starting || pausing || resuming || stopping || !!draft || pending.length > 0 || sending || recordingFinalizePending;
   $('recording-file').disabled = liveAudioBusy || importStarting || (activeImport && !canResumeImport);
   $('import-button').disabled = liveAudioBusy || importStarting || (activeImport && !canResumeImport) || !$('recording-file').files?.length;
   $('import-button').textContent = canResumeImport ? '같은 파일 이어 올리기' : '파일 올려 변환';
-  for (const button of $('lecture-list').querySelectorAll('button')) button.disabled = busy;
+  for (const button of $('lecture-list').querySelectorAll('button')) button.disabled = historyNavigationBusy();
   updateCorrectionControls(noteToolsBusy);
   renderImportStatus();
   notePresenceStateChange();
@@ -1658,7 +1890,7 @@ async function startOrResumeFileImport() {
   if (authenticating || loggingOut) return;
   const file = $('recording-file').files?.[0];
   if (!file) { notice('먼저 변환할 녹음 파일을 선택해 주세요.'); return; }
-  if (recording || starting || stopping || draft || pending.length || sending) {
+  if (recording || paused || starting || pausing || resuming || stopping || draft || pending.length || sending) {
     notice('실시간 음성 전송이 모두 끝난 뒤 녹음 파일을 올려 주세요.'); return;
   }
   const reconcilingUnknownJob = !importJob && fileUploader?.importId && importError;
@@ -1761,12 +1993,26 @@ async function cancelFileImport() {
 }
 $('import-cancel').onclick = () => { void cancelFileImport(); };
 $('new-note').onclick = () => { if (!isBusy()) resetNewNote({focus:true}); };
-$('record-button').onclick = () => recording ? void stopRecording() : void startRecording();
+function startElapsedClock() {
+  elapsedStartedAt = performance.now();
+  clearInterval(timer);
+  timer = setInterval(() => {
+    $('elapsed').textContent = fmt((elapsedActiveMs + performance.now() - elapsedStartedAt) / 1000);
+  }, 500);
+}
+function stopElapsedClock() {
+  if (timer !== null) {
+    elapsedActiveMs += Math.max(0,performance.now() - elapsedStartedAt);
+    clearInterval(timer); timer = null;
+  }
+}
+$('record-button').onclick = () => recording || paused ? void stopRecording() : void startRecording();
+$('pause-button').onclick = () => paused ? void resumeRecording() : void pauseRecording();
 async function startRecording() {
   if (isBusy() || importIsActive() || importStarting) return;
   if (current) resetNewNote();
   else if (lectureDateFilter) { lectureDateFilter = ''; renderHistory(); }
-  ++requestGeneration; starting = true; sendError = ''; captureWarning = ''; sampleSeconds = 0; $('elapsed').textContent = '00:00'; updateControls();
+  ++requestGeneration; starting = true; paused = false; pausing = false; resuming = false; sendError = ''; captureWarning = ''; sampleSeconds = 0; elapsedActiveMs = 0; elapsedStartedAt = 0; $('elapsed').textContent = '00:00'; updateControls();
   const title = $('lecture-title').value.trim() || `${dateLabel(new Date())} 수업`;
   const language = $('language').value === 'auto' ? null : $('language').value;
   const session = {id:crypto.randomUUID(),lecture:null,buffered:[],title,language,cancelled:false,creating:null};
@@ -1784,8 +2030,7 @@ async function startRecording() {
     await capture.start();
     if (!session.cancelled) {
       recording = true;
-      const startTime = performance.now();
-      timer = setInterval(() => { $('elapsed').textContent = fmt((performance.now() - startTime) / 1000); }, 500);
+      startElapsedClock();
       updateControls();
     }
     await assignLecture(session);
@@ -1797,6 +2042,64 @@ async function startRecording() {
   }
   finally { starting = false; updateControls(); }
 }
+
+function pauseRecording() {
+  if (pausePromise) return pausePromise;
+  if (!recording || pausing || resuming || stopping || !capture) return Promise.resolve();
+  const microphone = capture;
+  pausing = true; stopElapsedClock(); updateControls();
+  const operation = microphone.pause();
+  pausePromise = (async () => {
+    try {
+      await operation;
+      if (capture !== microphone || stopping) return;
+      recording = false; paused = true;
+      elapsedActiveMs = sampleSeconds * 1000;
+      $('elapsed').textContent = fmt(sampleSeconds);
+      renderHistory();
+      notice('받아쓰기를 일시정지했어요. 재개하면 같은 수업에 이어서 기록합니다.');
+    } catch (error) {
+      if (capture !== microphone) return;
+      captureWarning = errorText(error);
+      pausing = false;
+      await stopRecording(`일시정지를 안전하게 확인하지 못해 받아쓰기를 종료했어요. ${errorText(error)}`);
+    } finally {
+      pausing = false;
+      updateControls();
+    }
+  })().finally(() => { pausePromise = null; });
+  return pausePromise;
+}
+
+function resumeRecording() {
+  if (resumePromise) return resumePromise;
+  if (!paused || pausing || resuming || stopping || !capture || sendError || queuedCount() >= MAX_PENDING) return Promise.resolve();
+  const microphone = capture;
+  resuming = true;
+  // Invoke resume immediately in the click gesture so suspended AudioContexts
+  // can be restored on browsers that enforce user activation.
+  const operation = microphone.resume();
+  updateControls();
+  resumePromise = (async () => {
+    try {
+      await operation;
+      if (capture !== microphone || stopping) return;
+      paused = false; recording = true;
+      startElapsedClock();
+      renderHistory();
+    } catch (error) {
+      if (capture !== microphone) return;
+      captureWarning = errorText(error);
+      resuming = false;
+      await stopRecording(`받아쓰기를 재개하지 못해 현재 수업을 종료했어요. ${errorText(error)}`);
+    } finally {
+      resuming = false;
+      updateControls();
+    }
+  })().finally(() => { resumePromise = null; });
+  return resumePromise;
+}
+
 function enqueueChunk(session, chunk) {
   pending.push({...chunk,id:crypto.randomUUID(),lectureId:session.lecture.id});
   void drain();
@@ -1822,19 +2125,20 @@ async function assignLecture(session) {
 }
 function stopRecording(message) {
   if (stopPromise) return stopPromise;
-  if (!recording && !starting && !capture) return Promise.resolve();
+  if (!recording && !paused && !starting && !pausing && !resuming && !capture) return Promise.resolve();
   if (captureSession) captureSession.cancelled = true;
   const microphone = capture;
-  stopping = true; recording = false; clearInterval(timer); updateControls();
+  stopping = true; recording = false; paused = false; stopElapsedClock(); updateControls();
   stopPromise = (async () => {
     let flushWarning = '';
     try { await microphone?.stop(); }
     catch (error) { flushWarning = errorText(error); captureWarning = flushWarning; }
     finally {
       if (capture === microphone) capture = null;
-      stopping = false;
+      recording = false; paused = false; pausing = false; resuming = false; stopping = false;
       $('mic-level').style.width = '0%';
       $('elapsed').textContent = fmt(sampleSeconds);
+      renderHistory();
       updateControls();
       const combined = [message,flushWarning].filter(Boolean).join(' ');
       if (combined) notice(combined);
@@ -1844,7 +2148,10 @@ function stopRecording(message) {
 }
 async function uploadBlob(chunk) {
   if (chunk.durationSeconds >= 0.05) return chunk.blob;
-  // The API requires >= 50 ms. Preserve short final audio and pad only its end.
+  // The API requires >= 50 ms. Only a final tail may be padded: padding a
+  // resumable non-final boundary would advance the stored WAV beyond the real
+  // capture timeline and make the next real samples conflict.
+  if (!chunk.final) return chunk.blob;
   const original = new Uint8Array(await chunk.blob.arrayBuffer());
   const padded = new Uint8Array(Math.max(original.length, 44 + 800 * 2));
   padded.set(original);
@@ -1883,6 +2190,15 @@ function manualUploadError(error) {
     : '예상하지 못한 오류라 자동 재시도를 멈췄어요.';
   return `${errorText(error)} ${reason}`;
 }
+function mergeChunkSegments(lecture, response) {
+  if (!lecture) return;
+  if (!Array.isArray(lecture.segments)) lecture.segments = [];
+  const ids = new Set(lecture.segments.map(segment => segment.id));
+  for (const segment of response?.segments || []) {
+    if (!ids.has(segment.id)) { lecture.segments.push(segment); ids.add(segment.id); }
+  }
+  lecture.segments.sort((a,b) => a.start - b.start);
+}
 async function drain() {
   if (sending || sendError || retryTimer !== null || !token || !pending.length) return;
   sending = true; updateControls();
@@ -1900,25 +2216,24 @@ async function drain() {
         }
         if (retryableUpload(error)) {
           sendError = `${errorText(error)} 자동 재전송 ${MAX_AUTO_UPLOAD_RETRIES}회 후에도 처리되지 않아 멈췄어요.`;
-          if (recording || starting) void stopRecording('서버 오류가 계속되어 녹음을 멈췄어요. 안내를 확인한 뒤 다시 전송해 주세요.');
+          if (recording || paused || starting) void stopRecording('서버 오류가 계속되어 녹음을 멈췄어요. 안내를 확인한 뒤 다시 전송해 주세요.');
           break;
         }
         sendError = manualUploadError(error);
-        if (recording || starting) void stopRecording('서버가 음성을 처리하지 못해 녹음을 멈췄어요. 안내를 확인한 뒤 다시 전송해 주세요.');
+        if (recording || paused || starting) void stopRecording('서버가 음성을 처리하지 못해 녹음을 멈췄어요. 안내를 확인한 뒤 다시 전송해 주세요.');
         break;
       }
-      if (current?.id === chunk.lectureId) {
-        const ids = new Set(current.segments.map(x => x.id));
-        for (const segment of response.segments) if (!ids.has(segment.id)) current.segments.push(segment);
-        current.segments.sort((a,b) => a.start - b.start);
-        current.recording_available = !!response.recording_available;
-        current.recording_finalized = !!response.recording_finalized;
-      }
-      pending.shift(); retryAttempt = 0; retryMessage = ''; renderCurrent();
+      const activeLecture = captureSession?.lecture?.id === chunk.lectureId ? captureSession.lecture : null;
+      mergeChunkSegments(activeLecture,response);
+      if (current?.id === chunk.lectureId && current !== activeLecture) mergeChunkSegments(current,response);
+      applyRecordingFlags(chunk.lectureId,response);
+      pending.shift(); retryAttempt = 0; retryMessage = '';
+      if (current?.id === chunk.lectureId) renderCurrent();
+      else updateControls();
     }
   } catch (error) {
     sendError = manualUploadError(error);
-    if (recording || starting) void stopRecording('음성 전송을 안전하게 멈췄어요. 안내를 확인한 뒤 다시 전송해 주세요.');
+    if (recording || paused || starting) void stopRecording('음성 전송을 안전하게 멈췄어요. 안내를 확인한 뒤 다시 전송해 주세요.');
   } finally {
     sending = false; updateControls();
     // Pick up a final microphone tail that may have arrived while an upload awaited.
@@ -1926,7 +2241,7 @@ async function drain() {
   }
 }
 async function retryPending() {
-  if (sending || starting || stopping) return;
+  if (sending || starting || pausing || resuming || stopping) return;
   clearUploadRetry(); sendError = '';
   if (draft) {
     starting = true; updateControls();
@@ -1938,13 +2253,16 @@ async function retryPending() {
 }
 $('retry').onclick = () => { void retryPending(); };
 async function saveFailedChunk() {
-  if (!sendError || sending || starting || stopping || !pending.length) return;
+  if (!sendError || sending || starting || pausing || resuming || stopping || !pending.length) return;
   const chunk = pending[0];
   try {
     const blob = await uploadBlob(chunk);
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    const title = (current?.title || '수업').replace(/[<>:"/\\|?*\u0000-\u001F]/g,'_').slice(0,80);
+    const failedLecture = current?.id === chunk.lectureId ? current
+      : captureSession?.lecture?.id === chunk.lectureId ? captureSession.lecture
+        : lectures.find(lecture => lecture.id === chunk.lectureId);
+    const title = (failedLecture?.title || '수업').replace(/[<>:"/\\|?*\u0000-\u001F]/g,'_').slice(0,80);
     link.href = url;
     link.download = `${title}_${fmt(chunk.startSeconds).replace(':','-')}_처리실패.wav`;
     link.click();
@@ -1958,6 +2276,16 @@ async function saveFailedChunk() {
 }
 $('save-failed').onclick = () => { void saveFailedChunk(); };
 function applyRecordingFlags(lectureId, result) {
+  // A manual recording finalization can recover the recognizer's withheld
+  // stability tail from the already stored WAV. Merge that additive response
+  // before releasing the live capture or starting its reserved correction, so
+  // both the screen and the correction revision include the final words.
+  const targets = new Set([
+    captureSession?.lecture?.id === lectureId ? captureSession.lecture : null,
+    lectures.find(lecture => lecture.id === lectureId),
+    current?.id === lectureId ? current : null,
+  ].filter(Boolean));
+  for (const lecture of targets) mergeChunkSegments(lecture,result);
   const state = {
     recording_available: !!result?.recording_available,
     recording_finalized: !!result?.recording_finalized,
@@ -1965,16 +2293,45 @@ function applyRecordingFlags(lectureId, result) {
   const summary = lectures.find(lecture => lecture.id === lectureId);
   if (summary) Object.assign(summary,state);
   if (current?.id === lectureId) Object.assign(current,state);
+  if (state.recording_finalized) {
+    const scheduled = scheduledCorrectionFor(lectureId);
+    // The server's owner-checked final response is the durable hand-off point.
+    // Mark the reservation independently of whichever newer capture may now be
+    // in memory, then let the correction endpoint verify the final transcript.
+    if (scheduled) scheduled.finalized = true;
+    void submitScheduledCorrection(lectureId);
+    if (!scheduled) releaseFinalizedCapture(lectureId);
+  }
   return state;
 }
 async function requestRecordingFinalization(lectureId, operationIsCurrent) {
   const path = `/lectures/${encodeURIComponent(lectureId)}/recording-finalize`;
-  try {
-    return await api(path, {method:'POST'});
-  } catch (error) {
-    if (!error?.transient || !operationIsCurrent()) throw error;
+  let retriedLostResponse = false;
+  let contentionRetries = 0;
+  while (operationIsCurrent()) {
+    try {
+      return await api(path, {method:'POST'},UPLOAD_TIMEOUT_MS);
+    } catch (error) {
+      if (!operationIsCurrent()) throw error;
+      // A browser timeout can leave the deterministic server-side final guard
+      // running. Reconcile one lost response immediately; if that retry sees
+      // the guard claim, respect Retry-After instead of starting duplicate GPU
+      // work or reporting a false failure.
+      if (error?.transient && !retriedLostResponse) {
+        retriedLostResponse = true;
+        continue;
+      }
+      if (error?.status === 409 && Number.isFinite(error?.retryAfterMs)
+          && contentionRetries < MAX_AUTO_UPLOAD_RETRIES) {
+        contentionRetries += 1;
+        const delay = Math.max(0,Math.min(error.retryAfterMs,10000));
+        if (delay) await new Promise(resolve => setTimeout(resolve,delay));
+        continue;
+      }
+      throw error;
+    }
   }
-  return api(path, {method:'POST'});
+  throw connectionChangedBeforeRequestError();
 }
 async function finalizeSkippedRecording(lectureId) {
   if (!lectureId || !token || recordingFinalizePending) return;
@@ -1999,7 +2356,7 @@ async function finalizeSkippedRecording(lectureId) {
   }
 }
 function skipFailedChunk() {
-  if (!sendError || sending || starting || stopping || !pending[0]?.downloadRequested) return;
+  if (!sendError || sending || starting || pausing || resuming || stopping || !pending[0]?.downloadRequested) return;
   const skipped = pending.shift();
   clearUploadRetry(); sendError = '';
   notice('파일 저장을 확인한 음성 조각을 건너뛰었어요. 해당 구간은 기록에서 빠집니다.');
@@ -2081,6 +2438,8 @@ async function requestLectureDeletion(target, operationIsCurrent) {
 }
 function finishDeletedLecture(target) {
   lectures = lectures.filter(lecture => lecture.id !== target.id);
+  scheduledCorrections.delete(target.id);
+  if (!capture && captureSession?.lecture?.id === target.id) captureSession = null;
   deleteTarget = null;
   if ($('delete-dialog').open) $('delete-dialog').close();
   if (current?.id === target.id) resetNewNote();

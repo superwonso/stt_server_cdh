@@ -182,6 +182,36 @@ test('worklet mixes mono, flushes its partial block before acknowledgement, and 
   assert.equal(processor.process([[new Float32Array(128)]]), false);
 });
 
+test('worklet pause boundary flushes once, discards paused input, and resumes without silence', async () => {
+  const messages = [];
+  let Processor;
+  const context = vm.createContext({
+    Float32Array,
+    AudioWorkletProcessor: class {
+      constructor() { this.port = { postMessage: (message) => messages.push(message) }; }
+    },
+    registerProcessor: (_name, implementation) => { Processor = implementation; },
+  });
+  vm.runInContext(await readFile(new URL('../web/pcm-worklet.js', import.meta.url), 'utf8'), context);
+  const processor = new Processor();
+  processor.process([[new Float32Array(321).fill(0.25)]]);
+  processor.port.onmessage({ data: { type: 'pause', id: 1 } });
+  assert.equal(messages.at(-1).type,'paused');
+  assert.equal(messages.at(-1).id,1);
+  processor.process([[new Float32Array(500).fill(0.75)]]);
+  processor.port.onmessage({ data: { type: 'resume', id: 2 } });
+  assert.equal(messages.at(-1).type,'resumed');
+  assert.equal(messages.at(-1).id,2);
+  processor.process([[new Float32Array(123).fill(-0.5)]]);
+  processor.port.onmessage({ data: { type: 'stop', id: 3 } });
+  assert.equal(messages.at(-1).type,'stopped');
+  assert.equal(messages.at(-1).id,3);
+  const samples = join(messages.filter(message => message.type === 'samples').map(message => message.samples));
+  assert.equal(samples.length, 444);
+  assert.ok(samples.slice(0,321).every(sample => sample === 0.25));
+  assert.ok(samples.slice(321).every(sample => sample === -0.5));
+});
+
 class FakeEventTarget {
   constructor(kind = '') {
     this.kind = kind;
@@ -207,7 +237,7 @@ class FakeEventTarget {
   stop() { this.stopped = true; this.readyState = 'ended'; }
 }
 
-function installCaptureBrowser({ withAudio = true } = {}) {
+function installCaptureBrowser({ withAudio = true, autoAcknowledge = true } = {}) {
   const originals = new Map();
   const replace = (name, value) => {
     originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
@@ -222,7 +252,10 @@ function installCaptureBrowser({ withAudio = true } = {}) {
   };
   const requests = [];
   let audioGraphStream = null;
+  let audioContext = null;
   let workletNode = null;
+  let sourceNode = null;
+  const controlMessages = [];
 
   class FakeMediaStream {
     constructor(tracks = []) { this.tracks = [...tracks]; }
@@ -238,7 +271,9 @@ function installCaptureBrowser({ withAudio = true } = {}) {
       this.port = {
         onmessage: null,
         postMessage: ({ type, id }) => {
-          if (type === 'stop') this.port.onmessage?.({ data: { type: 'stopped', id } });
+          controlMessages.push({type,id});
+          const acknowledgements = {pause:'paused',resume:'resumed',stop:'stopped'};
+          if (autoAcknowledge && acknowledgements[type]) this.port.onmessage?.({ data: { type: acknowledgements[type], id } });
         },
         close() {},
       };
@@ -250,6 +285,7 @@ function installCaptureBrowser({ withAudio = true } = {}) {
   class FakeAudioContext extends FakeEventTarget {
     constructor() {
       super('context');
+      audioContext = this;
       this.state = 'running';
       this.sampleRate = 48000;
       this.audioWorklet = { addModule: async () => {} };
@@ -258,7 +294,12 @@ function installCaptureBrowser({ withAudio = true } = {}) {
     async resume() {}
     createMediaStreamSource(stream) {
       audioGraphStream = stream;
-      return { connect() {}, disconnect() {} };
+      sourceNode = {
+        connectCalls:0,disconnectCalls:0,
+        connect() { this.connectCalls += 1; },
+        disconnect() { this.disconnectCalls += 1; },
+      };
+      return sourceNode;
     }
     createGain() {
       return { gain: { value: 1 }, connect() {}, disconnect() {} };
@@ -289,8 +330,15 @@ function installCaptureBrowser({ withAudio = true } = {}) {
     videoTrack,
     displayStream,
     requests,
+    get audioContext() { return audioContext; },
     get audioGraphStream() { return audioGraphStream; },
+    get sourceNode() { return sourceNode; },
     get workletNode() { return workletNode; },
+    controlMessages,
+    acknowledge(command) {
+      const acknowledgements = {pause:'paused',resume:'resumed',stop:'stopped'};
+      workletNode?.port.onmessage?.({data:{type:acknowledgements[command.type],id:command.id}});
+    },
     restore() {
       for (const [name, descriptor] of originals) {
         if (descriptor) Object.defineProperty(globalThis, name, descriptor);
@@ -337,6 +385,208 @@ test('system capture requests display audio, excludes video from processing, and
     assert.equal((chunks[0].blob.size - 44) / 2, 1600);
     assert.equal(browser.audioTrack.stopped, true);
     assert.equal(browser.videoTrack.stopped, true);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('pause and resume keep one capture timeline with non-final flush and no duplicated WAV samples', async () => {
+  const browser = installCaptureBrowser();
+  const chunks = [];
+  try {
+    const capture = new MicrophoneCapture({source:'system',onChunk:chunk => chunks.push(chunk)});
+    await capture.start();
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(4800).fill(0.25)},
+    });
+    await capture.pause();
+    assert.equal(capture.recording,false);
+    assert.equal(capture.paused,true);
+    assert.equal(browser.sourceNode.disconnectCalls,1);
+    assert.equal(chunks.length,1);
+    assert.equal(chunks[0].final,false);
+    assert.equal(chunks[0].startSeconds,0);
+    assert.equal(chunks[0].overlapSeconds,0);
+    assert.equal(chunks[0].durationSeconds,0.1);
+
+    await capture.resume();
+    assert.equal(capture.recording,true);
+    assert.equal(capture.paused,false);
+    assert.equal(browser.sourceNode.connectCalls,2);
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(9600).fill(-0.25)},
+    });
+    await capture.stop();
+    assert.deepEqual(chunks.map(item => item.final),[false,true]);
+    assert.equal(chunks[1].startSeconds,0);
+    assert.equal(chunks[1].overlapSeconds,0.1);
+    assert.equal(chunks[1].durationSeconds,0.3);
+    const uniqueSamples = chunks.reduce((sum,item) => sum + pcmSamples(item)
+      - Math.round(item.overlapSeconds * 16000),0);
+    assert.equal(uniqueSamples,4800);
+    assert.equal(chunks[1].startSeconds + chunks[1].durationSeconds,0.3);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('a sub-50ms first pause stays buffered until resumed audio can use the real timeline', async () => {
+  const browser = installCaptureBrowser();
+  const chunks = [];
+  try {
+    const capture = new MicrophoneCapture({source:'system',onChunk:chunk => chunks.push(chunk)});
+    await capture.start();
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(480).fill(0.25)},
+    });
+    await capture.pause();
+    assert.equal(chunks.length,0,'a 10ms non-final WAV must not be padded and committed early');
+
+    await capture.resume();
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(4800).fill(-0.25)},
+    });
+    await capture.stop();
+    assert.equal(chunks.length,1);
+    assert.equal(chunks[0].final,true);
+    assert.equal(chunks[0].startSeconds,0);
+    assert.equal(chunks[0].overlapSeconds,0);
+    assert.equal(chunks[0].durationSeconds,0.11);
+    assert.equal(pcmSamples(chunks[0]),1760);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('a sub-50ms later pause flushes once an overlap makes the WAV valid', async () => {
+  const browser = installCaptureBrowser();
+  const chunks = [];
+  try {
+    const capture = new MicrophoneCapture({source:'system',onChunk:chunk => chunks.push(chunk)});
+    await capture.start();
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(4800).fill(0.25)},
+    });
+    await capture.pause();
+    await capture.resume();
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(480).fill(-0.25)},
+    });
+    await capture.pause();
+
+    assert.equal(chunks.length,2);
+    assert.equal(chunks[1].final,false);
+    assert.equal(chunks[1].startSeconds,0);
+    assert.equal(chunks[1].overlapSeconds,0.1);
+    assert.equal(chunks[1].durationSeconds,0.11);
+
+    await capture.stop();
+    assert.equal(chunks.length,3);
+    assert.equal(chunks[2].final,true);
+    assert.equal(chunks[2].startSeconds,0);
+    assert.equal(chunks[2].overlapSeconds,0.11);
+    assert.equal(chunks[2].durationSeconds,0.11);
+    const uniqueSamples = chunks.reduce((sum,item) => sum + pcmSamples(item)
+      - Math.round(item.overlapSeconds * 16000),0);
+    assert.equal(uniqueSamples,1760);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('a shared-audio track ending while paused is rejected on resume and can still stop safely', async () => {
+  const browser = installCaptureBrowser();
+  try {
+    const capture = new MicrophoneCapture({source:'system',onChunk() {}});
+    await capture.start();
+    await capture.pause();
+    browser.audioTrack.readyState = 'ended';
+    browser.audioTrack.dispatch('ended');
+    await assert.rejects(capture.resume(),/공유 오디오가 종료/);
+    assert.equal(capture.paused,true);
+    await capture.stop();
+    assert.equal(capture.recording,false);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('a shared-audio track ending while context resume is pending rejects instead of going silently live', async () => {
+  const browser = installCaptureBrowser();
+  const interruptions = [];
+  try {
+    const capture = new MicrophoneCapture({
+      source:'system',
+      onChunk() {},
+      onInterrupted:error => interruptions.push(error),
+    });
+    await capture.start();
+    await capture.pause();
+    let releaseResume;
+    browser.audioContext.resume = () => new Promise(resolve => { releaseResume = resolve; });
+
+    const resuming = capture.resume();
+    browser.audioTrack.readyState = 'ended';
+    browser.audioTrack.dispatch('ended');
+    await assert.rejects(resuming,/공유 오디오가 종료/);
+    assert.equal(capture.paused,true);
+    assert.equal(capture.recording,false);
+    assert.equal(browser.sourceNode.connectCalls,1,'a dead source must not be reconnected');
+    assert.equal(interruptions.length,0,'the resume caller owns the stored transition failure');
+    releaseResume();
+    await capture.stop();
+  } finally {
+    browser.restore();
+  }
+});
+
+test('an AudioContext closing while resume is pending rejects and releases capture resources', async () => {
+  const browser = installCaptureBrowser();
+  try {
+    const capture = new MicrophoneCapture({source:'system',onChunk() {}});
+    await capture.start();
+    await capture.pause();
+    let releaseResume;
+    browser.audioContext.resume = () => new Promise(resolve => { releaseResume = resolve; });
+
+    const resuming = capture.resume();
+    browser.audioContext.state = 'closed';
+    browser.audioContext.dispatch('statechange');
+    await assert.rejects(resuming,/(?:오디오 처리가 종료|화면 오디오를 중단)/);
+    assert.equal(capture.paused,true);
+    assert.equal(capture.recording,false);
+    releaseResume();
+    await capture.stop().catch(() => {});
+    assert.equal(browser.audioTrack.stopped,true);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('stop waits for an in-flight pause boundary instead of overwriting its acknowledgement', async () => {
+  const browser = installCaptureBrowser({autoAcknowledge:false});
+  const chunks = [];
+  try {
+    const capture = new MicrophoneCapture({source:'system',onChunk:chunk => chunks.push(chunk)});
+    await capture.start();
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(4800).fill(0.25)},
+    });
+    const pausing = capture.pause();
+    assert.deepEqual(browser.controlMessages.map(item => item.type),['pause']);
+    const stopping = capture.stop();
+    assert.deepEqual(browser.controlMessages.map(item => item.type),['pause']);
+    browser.acknowledge(browser.controlMessages[0]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(browser.controlMessages.map(item => item.type),['pause','stop']);
+    browser.acknowledge(browser.controlMessages[1]);
+    await Promise.all([pausing,stopping]);
+    assert.deepEqual(chunks.map(item => item.final),[false,true]);
+    assert.equal(chunks[0].durationSeconds,0.1);
+    assert.equal(chunks[1].durationSeconds,0.1);
+    assert.equal(chunks[1].overlapSeconds,0.1);
+    assert.equal(capture.recording,false);
+    assert.equal(capture.paused,false);
   } finally {
     browser.restore();
   }

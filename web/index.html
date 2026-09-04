@@ -131,6 +131,14 @@
           <span>내 수업</span><span aria-hidden="true">/</span><strong id="view-label">새 수업</strong>
         </div>
 
+        <div id="live-capture-banner" class="live-capture-banner" role="region" aria-labelledby="live-capture-title" hidden>
+          <div>
+            <strong id="live-capture-title" aria-live="polite">현재 수업은 계속 녹음 중이에요.</strong>
+            <span id="live-capture-detail">지난 기록을 보는 동안에도 음성은 원래 수업에 안전하게 저장됩니다.</span>
+          </div>
+          <button id="return-live-capture" type="button">현재 녹음으로 돌아가기</button>
+        </div>
+
         <header class="note-heading">
           <div>
             <p id="note-date" class="note-date"></p>
@@ -184,7 +192,10 @@
               <p id="record-hint">약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.</p>
               <div class="level-track" aria-hidden="true"><span id="mic-level"></span></div>
             </div>
-            <button id="record-button" class="record-button" type="button">● 받아쓰기 시작</button>
+            <div class="record-actions" role="group" aria-label="받아쓰기 녹음 제어">
+              <button id="pause-button" class="pause-button" type="button" aria-pressed="false" disabled>Ⅱ 일시정지</button>
+              <button id="record-button" class="record-button" type="button">● 받아쓰기 시작</button>
+            </div>
           </div>
 
           <div class="file-import-panel">
