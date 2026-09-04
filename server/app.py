@@ -461,7 +461,7 @@ def create_app(
             "INSERT INTO admin_audit(timestamp, action, result, target) VALUES (?, ?, ?, ?)",
             (now_text(), action, result, target),
         )
-        # A small bounded operational history is enough for two-account use.
+        # A small bounded operational history is enough for this private deployment.
         connection.execute(
             "DELETE FROM admin_audit WHERE id NOT IN "
             "(SELECT id FROM admin_audit ORDER BY timestamp DESC, id DESC LIMIT 500)"

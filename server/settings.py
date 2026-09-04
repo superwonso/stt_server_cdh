@@ -18,16 +18,16 @@ MINDLOGIC_GATEWAY_PATH = "/v1/gateway"
 
 
 def account_usernames(value: str | None) -> tuple[str, ...]:
-    """Parse the two private account IDs without exposing them in source."""
+    """Parse a small private account allowlist without exposing it in source."""
     accounts = tuple(part.strip() for part in (value or "").split(","))
     if (
-        len(accounts) != 2
-        or len(set(accounts)) != 2
+        not 2 <= len(accounts) <= 10
+        or len(set(accounts)) != len(accounts)
         or any(ACCOUNT_USERNAME.fullmatch(account) is None for account in accounts)
     ):
         raise ValueError(
-            "ACCOUNT_USERNAMES must contain exactly two distinct 1-32 character "
-            "lowercase IDs separated by a comma"
+            "ACCOUNT_USERNAMES must contain 2-10 distinct 1-32 character "
+            "lowercase IDs separated by commas"
         )
     return accounts
 
@@ -136,7 +136,7 @@ class Settings:
 
     def __post_init__(self) -> None:
         if account_usernames(",".join(self.accounts)) != self.accounts:
-            raise ValueError("Settings.accounts must contain two normalized account IDs")
+            raise ValueError("Settings.accounts must contain 2-10 normalized account IDs")
         if self.admin_username is not None and (
             ACCOUNT_USERNAME.fullmatch(self.admin_username) is None
             or self.admin_username not in self.accounts

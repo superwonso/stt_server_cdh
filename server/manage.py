@@ -7,22 +7,73 @@ import time
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from dotenv import set_key, unset_key
+from dotenv import dotenv_values, set_key, unset_key
 
 from .db import Database
 from .security import digest, new_secret
-from .settings import LOCAL_API_HOSTS, PROJECT_DIR, Settings, api_origin, url_origin
+from .settings import (
+    LOCAL_API_HOSTS,
+    PROJECT_DIR,
+    Settings,
+    account_usernames,
+    api_origin,
+    url_origin,
+)
 
 
 class AdminSelectionRequired(ValueError):
     """More than one activated account requires a private TTY selection."""
 
 
-def update_private_env(env_path: Path, site_origin: str) -> None:
+POSITION_NAMES = (
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "sixth",
+    "seventh",
+    "eighth",
+    "ninth",
+    "tenth",
+)
+
+
+def account_at_position(accounts: tuple[str, ...], position: str) -> str:
+    """Resolve a private allowlist position without reflecting invalid input."""
+    normalized = position.strip().lower()
+    try:
+        index = POSITION_NAMES.index(normalized)
+    except ValueError:
+        try:
+            number = int(normalized, 10)
+        except ValueError:
+            raise ValueError("Account position must be a number from 1 to 10") from None
+        index = number - 1
+    if not 0 <= index < len(accounts):
+        raise ValueError("Account position is outside the configured account list")
+    return accounts[index]
+
+
+def _ensure_private_env(env_path: Path) -> None:
+    if env_path.is_symlink():
+        raise OSError("The private environment file must not be a symbolic link")
     env_path.parent.mkdir(parents=True, exist_ok=True)
     env_path.touch(exist_ok=True, mode=0o600)
     env_path.chmod(0o600)
-    set_key(str(env_path), "SITE_ORIGINS", site_origin)
+
+
+def _set_private_env_key(env_path: Path, key: str, value: str) -> None:
+    result = set_key(str(env_path), key, value)
+    if not result[0]:
+        raise OSError("Could not update the private environment file")
+    # python-dotenv rewrites through a temporary file; enforce the final mode.
+    env_path.chmod(0o600)
+
+
+def update_private_env(env_path: Path, site_origin: str) -> None:
+    _ensure_private_env(env_path)
+    _set_private_env_key(env_path, "SITE_ORIGINS", site_origin)
     # Older builds stored the ephemeral tunnel here even though the API never
     # consumed it. Remove that misleading coupling; devices receive the live
     # address separately from the invitation link.
@@ -31,7 +82,6 @@ def update_private_env(env_path: Path, site_origin: str) -> None:
         for line in env_path.read_text(encoding="utf-8").splitlines()
     ):
         unset_key(str(env_path), "API_URL")
-    # python-dotenv rewrites through a temporary file; enforce the final mode.
     env_path.chmod(0o600)
 
 
@@ -62,12 +112,109 @@ def configure_admin(
             raise ValueError("The selected administrator must be an activated configured account")
     if username not in database.accounts:
         raise RuntimeError("The activated administrator is not a configured account")
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.touch(exist_ok=True, mode=0o600)
-    env_path.chmod(0o600)
-    set_key(str(env_path), "ADMIN_USERNAME", username)
-    # python-dotenv rewrites through a temporary file; enforce the final mode.
-    env_path.chmod(0o600)
+    _ensure_private_env(env_path)
+    _set_private_env_key(env_path, "ADMIN_USERNAME", username)
+
+
+def add_account(
+    database: Database,
+    env_path: Path,
+    *,
+    selected_username: str,
+) -> None:
+    """Add exactly one inactive account and extend the private allowlist.
+
+    Normal startup still requires an exact set match between the environment
+    and SQLite.  This deliberately narrow maintenance path is the only place
+    that may grow both sets together.
+    """
+    username = selected_username.strip()
+    candidate_accounts = (*database.accounts, username)
+    try:
+        # This validates the ID, distinctness, normalization, and upper bound
+        # without ever including a rejected value in an exception.
+        validated_accounts = account_usernames(",".join(candidate_accounts))
+    except ValueError:
+        raise ValueError(
+            "The new account ID must be a distinct normalized lowercase ID, "
+            "and the deployment may contain at most 10 accounts"
+        ) from None
+
+    _ensure_private_env(env_path)
+    original_env = env_path.read_bytes()
+    try:
+        private_accounts = account_usernames(
+            dotenv_values(env_path, interpolate=False).get("ACCOUNT_USERNAMES")
+        )
+    except (ValueError, UnicodeError):
+        raise RuntimeError(
+            "The private environment account list is missing or invalid"
+        ) from None
+    if private_accounts != database.accounts:
+        raise RuntimeError(
+            "The private environment and database account lists do not match"
+        )
+
+    env_updated = False
+    try:
+        with database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_accounts, _ = database._inspect_users(connection)
+            if existing_accounts != set(database.accounts):
+                raise RuntimeError(
+                    "Configured account IDs do not match the existing database"
+                )
+            connection.execute(
+                "INSERT INTO users(username, password_hash, setup_hash, setup_expires) "
+                "VALUES (?, NULL, NULL, NULL)",
+                (username,),
+            )
+            env_updated = True
+            _set_private_env_key(
+                env_path,
+                "ACCOUNT_USERNAMES",
+                ",".join(validated_accounts),
+            )
+    except BaseException:
+        if env_updated:
+            try:
+                env_path.write_bytes(original_env)
+                env_path.chmod(0o600)
+            except OSError as restore_error:
+                raise RuntimeError(
+                    "Account setup could not restore the private environment; "
+                    "manual review is required before restarting"
+                ) from restore_error
+        raise
+    database.accounts = validated_accounts
+
+
+def account_status_lines(database: Database, *, now: float | None = None) -> tuple[str, ...]:
+    """Return positional activation states without disclosing account IDs."""
+    current_time = time.time() if now is None else now
+    placeholders = ", ".join("?" for _ in database.accounts)
+    with database.connect() as connection:
+        account_rows = connection.execute(
+            "SELECT username, password_hash IS NOT NULL AS active, "
+            "setup_hash IS NOT NULL AS invited, setup_expires FROM users "
+            f"WHERE username IN ({placeholders})",
+            database.accounts,
+        ).fetchall()
+    accounts = {row["username"]: row for row in account_rows}
+    if set(accounts) != set(database.accounts):
+        raise RuntimeError("Account status does not match the configured allowlist")
+    lines = []
+    for position, username in enumerate(database.accounts, start=1):
+        account = accounts[username]
+        invite_state = "none"
+        if account["invited"]:
+            invite_state = (
+                "valid" if (account["setup_expires"] or 0) > current_time else "expired"
+            )
+        lines.append(
+            f"account-{position}: active={bool(account['active'])}, invite={invite_state}"
+        )
+    return tuple(lines)
 
 
 def create_invitations(
@@ -128,7 +275,7 @@ def create_invitations(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare the two private classroom accounts.")
+    parser = argparse.ArgumentParser(description="Prepare private classroom accounts.")
     subcommands = parser.add_subparsers(dest="command", required=True)
     initialize = subcommands.add_parser("init", help="Create fresh invitations for accounts not yet activated")
     initialize.add_argument("--site-url", required=True, help="Full HTTPS GitHub Pages site URL")
@@ -140,17 +287,40 @@ def main():
     )
     configure.add_argument(
         "--position",
-        choices=("first", "second"),
-        help="Select by private ACCOUNT_USERNAMES order without putting an ID in shell history",
+        help=(
+            "Select by private ACCOUNT_USERNAMES position (1-10 or first-tenth) "
+            "without putting an ID in shell history"
+        ),
+    )
+    subcommands.add_parser(
+        "add-account",
+        help="Privately add one inactive account (the ID is entered with echo disabled)",
     )
     arguments = parser.parse_args()
     try:
         settings = Settings.from_env()
         database = Database(settings.database_path, settings.accounts)
         database.initialize()
+        if arguments.command == "add-account":
+            if not sys.stdin.isatty():
+                raise ValueError(
+                    "Account addition requires an interactive WSL terminal so the new ID "
+                    "can be entered with echo disabled"
+                )
+            selected = getpass.getpass("새 계정 ID (입력 내용은 보이지 않음): ")
+            add_account(
+                database,
+                PROJECT_DIR / "server" / ".env",
+                selected_username=selected,
+            )
+            print(
+                "Added one inactive account to private server/.env and SQLite. "
+                "Create its one-time invitation, then restart the local server."
+            )
+            return
         if arguments.command == "configure-admin":
             if arguments.position:
-                selected = settings.accounts[0 if arguments.position == "first" else 1]
+                selected = account_at_position(settings.accounts, arguments.position)
                 configure_admin(
                     database,
                     PROJECT_DIR / "server" / ".env",
@@ -164,7 +334,7 @@ def main():
                         raise ValueError(
                             "Multiple accounts are activated; run this command in an interactive "
                             "WSL terminal to select the administrator without echo, or pass "
-                            "--position first/second"
+                            "--position with its private ACCOUNT_USERNAMES position"
                         ) from None
                     selected = getpass.getpass("관리자로 지정할 활성 계정 ID (입력 내용은 보이지 않음): ")
                     configure_admin(
@@ -175,19 +345,8 @@ def main():
             print("Configured the administrator in private server/.env. Restart the local server to apply it.")
             return
         if arguments.command == "status":
-            now = time.time()
-            with database.connect() as connection:
-                accounts = connection.execute(
-                    "SELECT username, password_hash IS NOT NULL AS active, "
-                    "setup_hash IS NOT NULL AS invited, setup_expires FROM users "
-                    "WHERE username IN (?, ?) ORDER BY username",
-                    settings.accounts,
-                ).fetchall()
-            for account in accounts:
-                invite_state = "none"
-                if account["invited"]:
-                    invite_state = "valid" if (account["setup_expires"] or 0) > now else "expired"
-                print(f"{account['username']}: active={bool(account['active'])}, invite={invite_state}")
+            for line in account_status_lines(database):
+                print(line)
             return
         origin = url_origin(arguments.site_url)
         validated_api_origin = api_origin(arguments.api_url)

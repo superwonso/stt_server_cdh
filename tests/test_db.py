@@ -143,6 +143,31 @@ class DatabaseTests(unittest.TestCase):
             for account in TEST_ACCOUNTS:
                 self.assertNotIn(account, schema)
 
+    def test_three_account_database_initializes_and_keeps_exact_set_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "data" / "classroom.sqlite3"
+            accounts = ("user-alpha", "user-beta", "user-gamma")
+            Database(path, accounts).initialize()
+            Database(path, accounts).initialize()
+            with sqlite3.connect(path) as connection:
+                users = tuple(
+                    row[0] for row in connection.execute("SELECT username FROM users ORDER BY username")
+                )
+            self.assertEqual(users, accounts)
+            with self.assertRaisesRegex(RuntimeError, "do not match"):
+                Database(path, TEST_ACCOUNTS).initialize()
+
+    def test_database_account_count_is_bounded(self):
+        path = Path("unused.sqlite3")
+        invalid = [
+            ("only-one",),
+            tuple(f"private-{position}" for position in range(11)),
+            ("same", "same"),
+        ]
+        for accounts in invalid:
+            with self.subTest(count=len(accounts)), self.assertRaises(ValueError):
+                Database(path, accounts)
+
     def test_legacy_account_check_is_removed_without_losing_private_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "data" / "classroom.sqlite3"

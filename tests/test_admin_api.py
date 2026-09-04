@@ -70,7 +70,7 @@ class AdminApiTests(unittest.TestCase):
         self.settings = Settings(
             data_dir=self.directory / "data",
             model_cache_dir=self.directory / "models",
-            accounts=("user-alpha", "user-beta"),
+            accounts=("user-alpha", "user-beta", "user-gamma"),
             admin_username="user-alpha",
             site_origins=("https://student.github.io",),
         )
@@ -84,6 +84,7 @@ class AdminApiTests(unittest.TestCase):
         self.tokens = {
             "user-alpha": "admin-" + secrets.token_urlsafe(24),
             "user-beta": "student-" + secrets.token_urlsafe(24),
+            "user-gamma": "student-" + secrets.token_urlsafe(24),
         }
         with self.app.state.database.connect() as connection:
             for username, token in self.tokens.items():
@@ -264,6 +265,39 @@ class AdminApiTests(unittest.TestCase):
             "must-not-be-returned",
         ):
             self.assertNotIn(private_value, serialized)
+
+    def test_third_account_is_listed_but_remains_data_isolated_and_non_admin(self):
+        created = self.client.post(
+            "/lectures",
+            json={"title": "세 번째 계정 수업", "language": "ko"},
+            headers=self.headers("user-gamma"),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        lecture_id = created.json()["id"]
+
+        self.assertEqual(
+            self.client.get(f"/lectures/{lecture_id}", headers=self.headers("user-gamma")).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get(f"/lectures/{lecture_id}", headers=self.headers("user-beta")).status_code,
+            404,
+        )
+        # Administrator privileges apply only to operations endpoints and do
+        # not bypass per-account transcript ownership.
+        self.assertEqual(
+            self.client.get(f"/lectures/{lecture_id}", headers=self.headers()).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get("/admin/overview", headers=self.headers("user-gamma")).status_code,
+            403,
+        )
+        overview = self.client.get("/admin/overview", headers=self.headers()).json()
+        self.assertEqual(
+            {account["label"] for account in overview["accounts"]},
+            {"user-alpha", "user-beta", "user-gamma"},
+        )
 
     def test_pausing_persists_and_does_not_cancel_an_inflight_transcription(self):
         lecture = self.client.post(

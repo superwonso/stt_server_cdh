@@ -144,14 +144,14 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 - FastAPI는 `127.0.0.1`에만 bind하며 외부 요청은 Cloudflare 터널로만 받는다.
 - CORS 및 별도 origin middleware가 `SITE_ORIGINS`의 정확한 출처만 허용한다.
-- 실제 계정 ID 두 개는 ignored `server/.env`의 `ACCOUNT_USERNAMES`와 로컬 DB에만 존재한다. 빈 설정이나 기존 DB와의 불일치는 값을 반사하지 않는 오류로 fail closed 한다.
-- 관리자 ID도 ignored `server/.env`의 `ADMIN_USERNAME`에만 두고 `Settings` repr에서 계정 목록과 함께 제외한다. 설정이 없거나 두 계정과 일치하지 않으면 관리자 API는 fail closed 한다.
+- 실제 계정 ID 목록은 ignored `server/.env`의 `ACCOUNT_USERNAMES`와 로컬 DB에만 존재한다. 2~10개의 서로 다른 정규화된 ID만 허용하며, 빈 설정이나 기존 DB와의 불일치는 값을 반사하지 않는 오류로 fail closed 한다. 일반 서버 시작은 계정을 자동 추가하지 않고 명시적인 로컬 `add-account` 경로만 기존 집합을 한 개 늘릴 수 있다.
+- 관리자 ID도 ignored `server/.env`의 `ADMIN_USERNAME`에만 두고 `Settings` repr에서 계정 목록과 함께 제외한다. 설정이 없거나 구성된 계정 중 하나와 일치하지 않으면 관리자 API는 fail closed 한다.
 - `POST /presence`는 인증 계정별 `idle/viewing/recording/uploading/transcribing/correcting/away` 하나만 프로세스 메모리에 45초 TTL로 보관한다. IP·UA·수업 ID/제목/본문을 받거나 DB에 저장하지 않는다.
 - `GET /admin/overview`는 관리자에게만 uptime/model, `/proc` RAM/RSS/load, 디스크, 이미 로드된 PyTorch의 ROCm VRAM, 작업 수, 계정 활성화/세션/최소 presence와 최근 안전한 조작 이력을 반환한다. 계정 조작 참조는 프로세스마다 새 무작위 token이며 실제 ID는 관리자 응답의 label에만 있다.
 - persisted `operational_state`를 끄면 인증과 health/presence/admin/status는 유지하되 새 lecture/import/녹음 다운로드 요청을 `503`으로 차단한다. 요청 안에서 이미 시작한 추론과 background import/correction은 중간에 죽이지 않는다.
 - 관리자는 자기 세션을 실수로 끊을 수 없고 다른 계정의 모든 세션만 해제할 수 있다. 터널 재연결은 202를 먼저 반환한 뒤 고정 script argv로 비동기 실행하며 임의 hook 메시지·PID·URL·로그를 API에 반사하지 않는다.
 - body-size middleware가 `Content-Length` 유무와 chunked 전송 모두에서 과대한 JSON/WAV/파일 조각 요청을 parsing 전에 차단한다.
-- 계정 ID 두 개는 Git에서 제외된 `server/.env`의 `ACCOUNT_USERNAMES`로만 설정하며 앱에서도 그 목록으로 제한한다.
+- 계정 ID는 Git에서 제외된 `server/.env`의 `ACCOUNT_USERNAMES`로만 설정하며 앱에서도 그 목록으로 제한한다.
 - 초대 코드는 7일/1회용이고 원문은 `.data/invitations.txt`에만 쓴다. 초대 URL에는 API 주소를 넣지 않으며, 활성화 후 DB의 setup hash도 제거된다.
 - 새 비밀번호 정책은 사용자 요청에 따라 4~128자이며 Argon2로 저장한다. 세션·초대 코드는 SHA-256 digest로 저장하고 인증 오류 응답에 비밀번호나 초대 값을 반사하지 않는다.
 - 로그인/초기 설정 시 IP별 30회/5분, IP+계정별 10회/5분과 별도로 모든 주소를 합산한 계정별 50회/30분 제한을 적용한다.
@@ -164,7 +164,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 녹음 파일은 `POST /imports` → 고정 480 KiB `PUT /imports/{id}` → `POST .../complete` 계약으로 계정별 `0700` 폴더의 UUID 파일(`0600`)에 올린다. 최대 1 GiB, 디코딩 음성 4시간, 계정당 활성 작업 1개다.
 - 브라우저와 서버는 모든 480 KiB 조각의 SHA-256을 순서대로 묶은 v2 지문으로 재선택 파일 전체를 검증한다. 브라우저/서버 모두 전체 파일을 메모리에 펼치지 않는다.
 - PyAV 18.1.0이 첫 오디오 스트림만 16 kHz mono s16으로 스트리밍 디코딩한다. nested URL/playlist I/O, 비정상 채널·sample rate·frame duration을 거절하고 디코딩 뒤 최대 15초 PCM만 유지한다.
-- PyAV/FFmpeg 네이티브 디코더는 API 프로세스 안에서 실행된다. 두 명의 인증된 사용자가 신뢰할 수 있는 수업 파일만 올린다는 운영 가정이며, 악의적으로 만든 미디어의 네이티브 hang/crash까지 OS sandbox로 격리한 구조는 아니다.
+- PyAV/FFmpeg 네이티브 디코더는 API 프로세스 안에서 실행된다. 허용된 소수의 인증 사용자가 신뢰할 수 있는 수업 파일만 올린다는 운영 가정이며, 악의적으로 만든 미디어의 네이티브 hang/crash까지 OS sandbox로 격리한 구조는 아니다.
 - 결정적 import chunk UUID와 기존 chunk idempotency로 정상 종료 뒤 재시작 시 완료 청크를 재사용한다. 단일 background worker는 loop 예외를 재시도하고 GET/list가 죽은 worker를 다시 확인한다.
 - 완료·취소·실패 DB 상태와 별도로 `raw_deleted`를 기록한다. unlink 실패를 삭제 성공으로 표시하지 않으며 60초 maintenance/list 조회에서 재시도한다. 7일간 멈춘 업로드는 서버를 재시작하지 않아도 정리한다.
 - 녹음 다운로드는 소유권·완료 상태를 확인한 인증 POST가 60초짜리 무작위 전용 경로를 발급하고, 네이티브 파일 응답은 세션 Bearer를 URL에 넣지 않는다. 짧은 Wi-Fi 중단 뒤 Range 재개를 위해 최대 16회만 재사용하며, 경로는 UUID에서만 계산하고 다운로드 시 열린 `O_NOFOLLOW` descriptor의 WAV 구조와 일반 파일 여부를 다시 검사한다.
@@ -209,8 +209,8 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - `scripts/status.sh`: PID 소유권, 로컬 health, 실행 중인 tunnel URL과 외부 HTTPS health 표시. 죽은 터널의 마지막 URL은 현재 주소와 구분
 - `scripts/stop.sh`: tunnel 먼저, 서버 다음으로 SIGTERM 종료; PID가 다른 프로세스를 가리키면 건드리지 않음
 - `scripts/backup.sh`: SQLite online backup으로 WAL의 최신 커밋까지 일관된 스냅샷 생성; 기존 대상은 덮어쓰지 않음. 보존 WAV는 포함하지 않으므로 음성 백업은 서버를 끈 상태에서 `.data/recordings/`를 같은 암호화 저장소에 별도로 복사해야 함
-- `server/manage.py`: private `ACCOUNT_USERNAMES`의 두 미활성 계정 invite 생성과 `SITE_ORIGINS` 갱신. 서버 주소와 초대 링크를 같은 로컬 파일에 쓰되 링크 자체나 서버 설정에는 임시 API 주소를 결합하지 않음
-- `server/manage.py configure-admin`: 활성 계정이 하나면 자동 선택하고 둘이면 TTY echo를 끈 입력 또는 `--position first/second`로 선택해 실제 ID를 출력·shell history에 남기지 않고 `ADMIN_USERNAME`을 기록
+- `server/manage.py`: private `ACCOUNT_USERNAMES`의 미활성 계정 invite 생성과 `SITE_ORIGINS` 갱신. `add-account`는 TTY echo를 끈 입력으로 기존 환경설정·DB 집합에 비활성 계정 하나만 함께 추가하며, 일반 시작의 exact-set 검사는 유지함. 서버 주소와 초대 링크를 같은 로컬 파일에 쓰되 링크 자체나 서버 설정에는 임시 API 주소를 결합하지 않음
+- `server/manage.py configure-admin`: 활성 계정이 하나면 자동 선택하고 여럿이면 TTY echo를 끈 입력 또는 `--position 1` 같은 비공개 목록 위치로 선택해 실제 ID를 출력·shell history에 남기지 않고 `ADMIN_USERNAME`을 기록
 - `server/tunnel_control.py`: fixed project script·argv, process/script ownership, in-process lock와 script flock을 겹쳐 검증하고 12초 응답 유예 뒤 Quick Tunnel stop/start를 수행. 물리적 stop은 원격 재시작 경로도 없앤다는 상태를 명시하며 웹에는 restart만 연결
 
 ## 검증 범위
@@ -236,7 +236,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 실제 NOVA key로 `/models/?type=llm` 200·`solar-pro4` 존재·`/credits/` 200을 확인했다. 모든 아라비아 숫자를 보호 표식으로 바꾸는 최종 코드에서도 비개인 한국어 3문장을 strict JSON Schema로 실제 후보정해 같은 문장 ID/순서, 기존 숫자 `15`, 이메일 placeholder 복원, 띄어쓰기 교정과 새 숫자 표기 로컬 경고를 확인했다. key와 credits 본문은 출력·로그에 남기지 않았다.
 - mocked Gateway에서 청크 문맥이 target 결과에 중복되지 않는지, 한국어 조사에 붙은 이메일/전화·주민·카드·모든 아라비아 숫자 가림과 단일 복원, placeholder/ID/숫자 훼손 거절, 기존 수치를 바꾼 뒤 원래 수치를 덧붙이는 우회 거절, 새 숫자 경고, HTTP 408/425/429/5xx·network transient retry와 402 무재시도, 요청·응답 상한을 검증했다. correction API에서 owner-only, raw 불변, idempotent retry, final gate, processing 중 DELETE 거절, safe status/error를 검증했다.
 - 코드 검토로 확인한 방어선: ignored 환경설정 기반 서버 측 계정 allow-list·DB exact-set 검사·소유권 검사, exact-origin 제한, chunked body 제한, 계정별 녹음 권한·UUID 경로·WAV 검증, import 원본 권한/삭제 상태, 동일 lecture/chunk/import UUID의 idempotent 응답, 초대 링크의 API 주소 배제, 계정 전체 주소 합산 로그인 제한
-- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장·후보정·관리자 API·터널 제어·Pages 런타임 설정 99개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID/키 비공개 설정, 일반 계정의 관리자 조작 거절, presence TTL·비영속성, 세션 해제 경쟁, persisted 운영 중지, 터널 요청 경합·PID/실행 파일 위조 거절, legacy DB 계정 제약 제거와 텍스트 전용 수업 완료 승격, 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정·수업 전환의 오래된 UI 응답, system-audio track 분리도 포함한다.
+- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장·후보정·관리자 API·터널 제어·Pages 런타임 설정 107개 테스트와 Node 웹 테스트 4개 파일 모두 통과. 실제 ID/키 비공개 설정, 2~10개 계정 검증과 명시적 계정 추가 rollback, 기존 자격정보·세션·수업 보존, 세 번째 계정의 관리자 조작 거절·수업 격리, presence TTL·비영속성, 세션 해제 경쟁, persisted 운영 중지, 터널 요청 경합·PID/실행 파일 위조 거절, legacy DB 계정 제약 제거와 텍스트 전용 수업 완료 승격, 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정·수업 전환의 오래된 UI 응답, system-audio track 분리도 포함한다.
 - 녹음 전용 시험은 overlap PCM 제거, byte-identical retry, bounded silence gap, quota 실패 시 기존 파일 불변, 부분 write rollback, symlink 거부/안전 삭제, 전송 중단 fd close, 60초 ticket Range 재개·만료, 명시적 final 복구, 다른 계정 불변, DELETE/inference 경합과 응답 유실 idempotency를 포함한다.
 - 웹 시험은 KST 자정 경계 날짜 그룹, TXT/Markdown 내용·이스케이프·안전 파일명, 동일 API origin ticket 제한, 마지막 실패 조각 확정과 WAV 없음의 정확한 안내, 507 수동 복구, 다운로드·삭제·계정 전환의 stale 응답 방어를 포함한다. 자동 주소의 익명 health 선행, stale 저장 주소 차단, 24시간 lease 만료 뒤 Bearer·비밀번호·음성 본문 차단, 새 tunnel에서 같은 계정 재로그인 후 큐 재개도 검증했다. Python source `py_compile`, JavaScript `--check`, `git diff --check`도 통과했다.
 - GitHub Actions Pages 배포 성공 후 공개 URL의 `index.html`, `app.js`, `audio.js`, `file-import.js`, `pcm-worklet.js`, `style.css`가 로컬 배포본과 byte-for-byte 일치하고 HTTPS 200임을 확인했다.
@@ -253,7 +253,8 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 실제 브라우저→Quick Tunnel로 큰 녹음 파일 업로드/중단/재선택/백그라운드 변환. 로컬 격리 API의 실제 Qwen E2E 한 파일은 통과했지만 활성 계정 외부 E2E는 아직이다.
 - MP3/FLAC/OGG/Opus/WebM/MP4/MKV/MOV 각 실파일의 디코딩 호환성과 실제 압축 강의 음질
 - 새 UUID로 동일 오디오가 다시 생성되는 앱/브라우저 수준의 의미적 중복
-- 실제 두 활성 계정의 외부 로그인·기록 격리 end-to-end
+- 실제 구성 계정들의 외부 로그인·기록 격리 end-to-end
+- 새로 추가한 비활성 계정의 실제 초대 링크 열기, 4자 이상 비밀번호 설정과 로그인. 운영 초대는 1회용이므로 자동 검증에서 소비하지 않았다.
 - Quick Tunnel을 통한 실제 활성 계정 로그인, 실시간 WAV/녹음 파일 업로드, 기록 조회·다운로드. 외부 `/health`와 CORS까지만 확인했다.
 - 실제 브라우저와 Quick Tunnel에서 새 녹음 WAV 다운로드를 중단·재개하거나, 다운로드 도중 같은 수업을 삭제하는 동작
 - 기능 추가 전에 만든 과거 수업에는 원본 음성이 남아 있지 않으므로 녹음 다운로드를 제공할 수 없음
@@ -270,7 +271,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 3. 같은 기준문으로 Qwen 원문과 Solar 후보정본의 CER 및 숫자·수식·고유명사 의미 왜곡을 비교한다.
 4. 중간에 tunnel을 끊고 복구해 DB chunk 수, segment 순서, 중복 텍스트를 확인한다.
 5. 녹음 종료·마이크 강제 중단·화면 잠금으로 final tail을 각각 검증한다.
-6. 두 계정으로 같은 lecture UUID 접근을 시도해 404와 기록 분리를 재확인한다.
+6. 서로 다른 구성 계정으로 같은 lecture UUID 접근을 시도해 404와 기록 분리를 재확인한다.
 
 ## 복구 이력
 
@@ -293,11 +294,13 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 사용자가 지정한 원격은 <https://github.com/superwonso/stt_server_cdh>이고 Pages 주소는 <https://superwonso.github.io/stt_server_cdh/>다. `superwonso` GitHub 인증을 연결해 공개 앱을 `main`에 push했고, Pages source는 GitHub Actions로 설정됐다. `Deploy classroom to GitHub Pages` 실행과 공개 자산 비교가 성공했다.
 
-2026-09-04 관리자 기능 적용 전 `.data/backups/pre-admin-console-20260904.sqlite3`에 권한 `0600`의 일관된 백업을 만들었다. 운영 DB는 schema v5로 migration한 뒤 integrity/FK를 확인했고 두 계정은 모두 활성화돼 있다. 사용자가 선택한 `ACCOUNT_USERNAMES` 순서의 첫 번째 계정을 private `ADMIN_USERNAME`으로 설정했으며 실제 ID는 문서·Git에 기록하지 않는다. 동적 터널 주소도 Git 커밋에 고정하지 않고 실행 중에는 `.data/tunnel-url.txt`와 공개 Pages 런타임 설정에만 둔다.
+2026-09-04 관리자 기능 적용 전 `.data/backups/pre-admin-console-20260904.sqlite3`에 권한 `0600`의 일관된 백업을 만들었다. 운영 DB는 schema v5로 migration한 뒤 당시 구성된 계정은 모두 활성화돼 있었고 integrity/FK를 확인했다. 사용자가 선택한 `ACCOUNT_USERNAMES` 순서의 첫 번째 계정을 private `ADMIN_USERNAME`으로 설정했으며 실제 ID는 문서·Git에 기록하지 않는다. 동적 터널 주소도 Git 커밋에 고정하지 않고 실행 중에는 `.data/tunnel-url.txt`와 공개 Pages 런타임 설정에만 둔다.
 
 후보정 구현 커밋 `ea1a934`의 Pages 실행 `33780005582`가 성공했다. 공개 `index.html`, JavaScript, CSS, favicon 7개를 로컬 파일과 SHA-256으로 비교해 모두 일치했고, 런타임 설정도 현재 터널을 `online`으로 가리켰다. 같은 외부 edge에서 health 200, 무인증 후보정 401, 외부 Origin 403, Pages Origin CORS 허용을 다시 확인했다.
 
 관리자 콘솔 구현 커밋 `df7203d`도 `main`에 push했다. Pages push 실행 `33829281812`와 현재 터널 런타임 설정 재게시 실행 `33829478729`가 모두 성공했다. 새 관리자 설정으로 로컬 Qwen 서버를 warmup 재시작한 뒤 외부 edge health 200, 무인증 관리자 API 401, 허용하지 않은 Origin 403, Pages Origin의 presence preflight 허용을 확인했다. 공개 자산 7개는 로컬 `web/`과 byte-for-byte 일치했고, 공개 `config.json`은 현재 tunnel origin과 일치하며 만료 전이고 `version/state/apiUrl/publishedAt/expiresAt` 외 필드가 없었다. 관리자 비밀번호를 보거나 운영 DB에 시험 세션을 주입하지 않았으므로 실제 관리자 로그인 뒤 dialog 조작은 사용자 브라우저 확인 범위로 남긴다.
+
+2026-09-04 계정 추가 전 `.data/backups/pre-account-add-20260904.sqlite3`와 `.env` 사본을 각각 `0600`으로 만들었다. 계정 수를 2~10개로 일반화하되 일반 시작의 exact-set 검사는 유지하고, echo-disabled `add-account`만 기존 DB와 private env를 한 계정씩 늘리도록 했다. 운영 목록에는 세 계정이 있고 기존 두 계정은 활성 상태, 새 계정은 7일짜리 초대가 있는 비활성 상태다. 기존 두 사용자 행과 다른 모든 DB 테이블이 백업과 같고, 첫 번째 관리자 지정·목록 순서·환경설정·integrity/FK가 보존됐음을 실제 값 출력 없이 확인했다. 새 초대 링크 하나는 권한 `0600`의 `.data/invitations.txt`에만 있으며 API 주소 매개변수를 포함하지 않는다. Qwen warmup 서버와 Quick Tunnel을 다시 연결한 뒤 local/external health 200, 무인증 관리자 401, 잘못된 Origin 403, Pages CORS와 현재 런타임 설정 일치를 확인했다.
 
 푸시 전에 반드시 확인할 것:
 
@@ -310,7 +313,7 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 ## 다음 단계 우선순위
 
 1. 비공개 `ADMIN_USERNAME` 지정은 완료됐다. 서버를 재시작한 뒤 실제 관리자 계정으로 외부 dialog를 확인한다.
-2. 두 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 두 계정 격리를 확인한다.
+2. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
 3. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
 4. 사용자에게 개인정보를 제거한 실제 한국어 수업 음성 5~10분 샘플과 가능하면 교정문을 요청해 Qwen 원문 품질·경계 누락/중복과 Solar 후보정 전후 CER·의미 보존을 함께 검증한다.
 5. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.

@@ -7,8 +7,8 @@ from pathlib import Path
 
 class Database:
     def __init__(self, path: Path, accounts: tuple[str, ...]):
-        if len(accounts) != 2 or len(set(accounts)) != 2:
-            raise ValueError("Database requires exactly two distinct account IDs")
+        if not 2 <= len(accounts) <= 10 or len(set(accounts)) != len(accounts):
+            raise ValueError("Database requires 2-10 distinct account IDs")
         self.path = Path(path)
         self.accounts = accounts
 

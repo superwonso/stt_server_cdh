@@ -5,8 +5,16 @@ import tempfile
 from unittest import mock
 from pathlib import Path
 
+from dotenv import dotenv_values
+
 from server.db import Database
-from server.manage import configure_admin, update_private_env
+from server.manage import (
+    account_at_position,
+    account_status_lines,
+    add_account,
+    configure_admin,
+    update_private_env,
+)
 from server.settings import (
     PROJECT_DIR,
     Settings,
@@ -18,18 +26,23 @@ from server.settings import (
 
 
 class UrlValidationTests(unittest.TestCase):
-    def test_two_private_account_ids_are_parsed_and_normalized(self):
+    def test_private_account_allowlist_is_parsed_and_normalized(self):
         self.assertEqual(
             account_usernames(" user-alpha , user-beta "),
             ("user-alpha", "user-beta"),
         )
+        self.assertEqual(
+            account_usernames(" user-alpha , user-beta, user-gamma "),
+            ("user-alpha", "user-beta", "user-gamma"),
+        )
+        ten_accounts = tuple(f"private-{position}" for position in range(10))
+        self.assertEqual(account_usernames(",".join(ten_accounts)), ten_accounts)
 
     def test_invalid_account_configuration_fails_without_reflecting_values(self):
         invalid = [
             None,
             "",
             "only-one",
-            "one,two,three",
             "one,,two",
             "one,two,",
             "same,same",
@@ -37,6 +50,7 @@ class UrlValidationTests(unittest.TestCase):
             "../escape,valid",
             ".hidden,valid",
             "a" * 33 + ",valid",
+            ",".join(f"private-{position}" for position in range(11)),
         ]
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(ValueError) as raised:
@@ -137,10 +151,198 @@ class UrlValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires one activated account"):
                 configure_admin(database, env_path)
 
+    def test_account_position_supports_all_configured_accounts_without_ids(self):
+        accounts = ("user-alpha", "user-beta", "user-gamma")
+        self.assertEqual(account_at_position(accounts, "first"), accounts[0])
+        self.assertEqual(account_at_position(accounts, "3"), accounts[2])
+        self.assertEqual(account_at_position(accounts, "third"), accounts[2])
+        for invalid in ("0", "4", "eleventh", "private-secret"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError) as raised:
+                account_at_position(accounts, invalid)
+            self.assertNotIn(invalid, str(raised.exception))
+
+    def test_add_account_updates_private_env_and_creates_only_an_inactive_user(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_accounts = ("user-alpha", "user-beta")
+            expanded_accounts = (*original_accounts, "user-gamma")
+            database = Database(root / "data" / "classroom.sqlite3", original_accounts)
+            database.initialize()
+            env_path = root / "server" / ".env"
+            env_path.parent.mkdir(parents=True)
+            env_path.write_text(
+                "ACCOUNT_USERNAMES='user-alpha,user-beta'\n"
+                "ADMIN_USERNAME='user-alpha'\n"
+                "MINDLOGIC_API_KEY='test-private-key'\n",
+                encoding="utf-8",
+            )
+            with database.connect() as connection:
+                connection.execute(
+                    "UPDATE users SET password_hash = 'existing-password-hash' "
+                    "WHERE username = 'user-alpha'"
+                )
+                connection.execute(
+                    "UPDATE users SET setup_hash = 'existing-setup-hash', setup_expires = 12345 "
+                    "WHERE username = 'user-beta'"
+                )
+                connection.execute(
+                    "INSERT INTO sessions(token_hash, username, expires_at, created_at) "
+                    "VALUES ('existing-session', 'user-alpha', 99999, 11111)"
+                )
+                connection.execute(
+                    "INSERT INTO lectures(id, username, title, language, created_at) "
+                    "VALUES ('existing-lecture', 'user-beta', 'private title', 'ko', "
+                    "'2026-01-01T00:00:00Z')"
+                )
+                original_users = [
+                    tuple(row)
+                    for row in connection.execute(
+                        "SELECT username, password_hash, setup_hash, setup_expires "
+                        "FROM users ORDER BY username"
+                    )
+                ]
+                original_owned_data = (
+                    tuple(
+                        connection.execute(
+                            "SELECT token_hash, username, expires_at, created_at FROM sessions"
+                        ).fetchone()
+                    ),
+                    tuple(
+                        connection.execute(
+                            "SELECT id, username, title, language, created_at FROM lectures"
+                        ).fetchone()
+                    ),
+                )
+            add_account(database, env_path, selected_username="user-gamma")
+
+            self.assertEqual(database.accounts, expanded_accounts)
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            private_env = dotenv_values(env_path, interpolate=False)
+            self.assertEqual(
+                private_env["ACCOUNT_USERNAMES"],
+                "user-alpha,user-beta,user-gamma",
+            )
+            self.assertEqual(private_env["ADMIN_USERNAME"], "user-alpha")
+            self.assertEqual(private_env["MINDLOGIC_API_KEY"], "test-private-key")
+            with database.connect() as connection:
+                users = [
+                    tuple(row)
+                    for row in connection.execute(
+                        "SELECT username, password_hash, setup_hash, setup_expires "
+                        "FROM users ORDER BY username"
+                    )
+                ]
+                preserved_owned_data = (
+                    tuple(
+                        connection.execute(
+                            "SELECT token_hash, username, expires_at, created_at FROM sessions"
+                        ).fetchone()
+                    ),
+                    tuple(
+                        connection.execute(
+                            "SELECT id, username, title, language, created_at FROM lectures"
+                        ).fetchone()
+                    ),
+                )
+            self.assertEqual(users[:2], original_users)
+            self.assertEqual(users[2], ("user-gamma", None, None, None))
+            self.assertEqual(preserved_owned_data, original_owned_data)
+            Database(database.path, expanded_accounts).initialize()
+            with self.assertRaisesRegex(RuntimeError, "do not match"):
+                Database(database.path, original_accounts).initialize()
+
+    def test_add_account_rolls_back_sqlite_when_private_env_update_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_accounts = ("user-alpha", "user-beta")
+            database = Database(root / "data" / "classroom.sqlite3", original_accounts)
+            database.initialize()
+            env_path = root / "server" / ".env"
+            env_path.parent.mkdir(parents=True)
+            original_env = b"ACCOUNT_USERNAMES='user-alpha,user-beta'\nPRIVATE='preserved'\n"
+            env_path.write_bytes(original_env)
+
+            with mock.patch(
+                "server.manage._set_private_env_key",
+                side_effect=OSError("simulated private write failure"),
+            ):
+                with self.assertRaises(OSError):
+                    add_account(database, env_path, selected_username="user-gamma")
+
+            self.assertEqual(database.accounts, original_accounts)
+            self.assertEqual(env_path.read_bytes(), original_env)
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            with database.connect() as connection:
+                users = tuple(
+                    row[0] for row in connection.execute("SELECT username FROM users ORDER BY username")
+                )
+            self.assertEqual(users, original_accounts)
+
+    def test_add_account_fails_closed_on_env_mismatch_and_invalid_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = Database(
+                root / "data" / "classroom.sqlite3",
+                ("user-alpha", "user-beta"),
+            )
+            database.initialize()
+            env_path = root / "server" / ".env"
+            env_path.parent.mkdir(parents=True)
+            env_path.write_text(
+                "ACCOUNT_USERNAMES='user-beta,user-alpha'\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "do not match"):
+                add_account(database, env_path, selected_username="user-gamma")
+            with database.connect() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+                    2,
+                )
+
+            invalid = "MUST-NOT-BE-REFLECTED"
+            with self.assertRaises(ValueError) as raised:
+                add_account(database, env_path, selected_username=invalid)
+            self.assertNotIn(invalid, str(raised.exception))
+
+    def test_three_account_status_uses_positions_and_never_prints_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            accounts = ("user-alpha", "user-beta", "user-gamma")
+            database = Database(Path(temporary) / "data" / "classroom.sqlite3", accounts)
+            database.initialize()
+            with database.connect() as connection:
+                connection.execute(
+                    "UPDATE users SET password_hash = 'activated' WHERE username = ?",
+                    (accounts[0],),
+                )
+                connection.execute(
+                    "UPDATE users SET setup_hash = 'valid', setup_expires = 200 "
+                    "WHERE username = ?",
+                    (accounts[1],),
+                )
+                connection.execute(
+                    "UPDATE users SET setup_hash = 'expired', setup_expires = 50 "
+                    "WHERE username = ?",
+                    (accounts[2],),
+                )
+            lines = account_status_lines(database, now=100)
+            self.assertEqual(
+                lines,
+                (
+                    "account-1: active=True, invite=none",
+                    "account-2: active=False, invite=valid",
+                    "account-3: active=False, invite=expired",
+                ),
+            )
+            output = "\n".join(lines)
+            for username in accounts:
+                self.assertNotIn(username, output)
+
     def test_audio_body_limit_cannot_be_configured_below_the_static_part_contract(self):
-        with mock.patch.dict(
+        with mock.patch("server.settings.load_dotenv"), mock.patch.dict(
             "os.environ",
             {"MAX_UPLOAD_BYTES": "64000", "ACCOUNT_USERNAMES": "user-alpha,user-beta"},
+            clear=True,
         ):
             self.assertEqual(Settings.from_env().max_upload_bytes, 480 * 1024)
 

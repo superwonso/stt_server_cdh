@@ -148,7 +148,7 @@ class ApiTests(unittest.TestCase):
             200,
         )
 
-    def test_only_the_two_configured_accounts_can_authenticate(self):
+    def test_only_configured_accounts_can_authenticate(self):
         # Application authorization remains closed even if a legacy or
         # manually altered database happens to contain another user/session.
         password = "rogue-account-password"
