@@ -87,6 +87,7 @@
         <button id="login-button" class="primary-button" type="submit" disabled>로그인 ↗</button>
       </form>
 
+      <button id="auth-capture-stop" class="danger-button auth-capture-stop" type="button" hidden>■ 이 기기의 녹음 종료</button>
       <button id="auth-toggle" class="text-button" type="button">처음이라면 · 비밀번호 설정하기</button>
       <p class="session-note"><span aria-hidden="true">○</span> 로그인 정보는 이 탭을 닫으면 사라집니다.</p>
     </section>
@@ -168,7 +169,7 @@
               <select id="language" name="language">
                 <option value="ko" selected>한국어</option>
                 <option value="en">영어</option>
-                <option value="auto">자동 감지</option>
+                <option id="language-auto" value="auto">자동 감지</option>
               </select>
             </div>
             <div class="field compact-field source-field">
@@ -178,8 +179,17 @@
                 <option value="system">컴퓨터·브라우저 탭 소리</option>
               </select>
             </div>
+            <div class="field compact-field provider-field">
+              <label for="asr-provider">마이크 음성 인식</label>
+              <select id="asr-provider" name="asr-provider" aria-describedby="provider-guidance provider-privacy">
+                <option id="asr-provider-qwen" value="qwen" selected>이 PC의 Qwen · 로컬</option>
+                <option id="asr-provider-clova" value="clova" disabled>NAVER CLOVA Speech · 서버 설정 필요</option>
+              </select>
+            </div>
             <p id="source-guidance" class="source-guidance">마이크로 주변의 수업 소리를 받아씁니다.</p>
             <p id="source-privacy" class="source-privacy" hidden>공유 대상으로 선택한 범위의 알림·다른 앱 소리도 함께 전송될 수 있습니다. 수업 외 소리는 끄고 공유 범위를 확인하세요.</p>
+            <p id="provider-guidance" class="provider-guidance">마이크 음성을 이 PC의 Qwen으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.</p>
+            <p id="provider-privacy" class="provider-privacy" hidden>선택한 마이크 음성과 인식 결과는 브라우저 → 이 서버 → NAVER Cloud로 전송되며 사용량에 따라 비용이 청구될 수 있습니다. 스트리밍 인식 결과는 해당 도메인의 고객 Object Storage에 자동 저장되며, 이 앱에서 수업을 삭제해도 그 클라우드 사본은 삭제되지 않습니다.</p>
           </div>
 
           <div class="record-panel">
@@ -201,7 +211,7 @@
           <div class="file-import-panel">
             <div class="file-import-copy">
               <strong>녹음 파일 가져오기</strong>
-              <p>WAV, MP3, M4A, AAC, FLAC, OGG, Opus, WebM과 오디오가 든 MP4·MKV·MOV 파일을 올려 새 수업 기록으로 변환합니다.</p>
+              <p>WAV, MP3, M4A, AAC, FLAC, OGG, Opus, WebM과 오디오가 든 MP4·MKV·MOV 파일을 올려 이 PC의 Qwen으로 새 수업 기록을 만듭니다.</p>
               <small>파일은 Cloudflare를 거쳐 이 서버에 임시 저장되며, 변환 완료·취소·실패 시 원본을 삭제합니다. 최대 1 GiB·4시간입니다.</small>
             </div>
             <div class="file-import-actions">
@@ -282,7 +292,7 @@
         <label for="api-url">서버 주소</label>
         <input id="api-url" name="api-url" type="url" required inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" aria-describedby="connection-description connection-privacy connection-error" placeholder="https://…trycloudflare.com">
       </div>
-      <p id="connection-privacy" class="connection-privacy">주소만 이 기기에 저장됩니다. 비밀번호, 초대 코드, 음성은 브라우저 저장소에 보관하지 않습니다.</p>
+      <p id="connection-privacy" class="connection-privacy">서버 주소와 아직 서버가 확인하지 않은 음성 조각만 이 기기의 브라우저 저장소에 임시 보관합니다. 전송이 확인되면 음성을 지우며 비밀번호, 로그인 토큰, 초대 코드는 저장하지 않습니다.</p>
       <p id="connection-error" class="form-error" role="alert" hidden></p>
       <button id="connection-save" class="primary-button" type="submit">연결 확인하고 저장</button>
     </form>

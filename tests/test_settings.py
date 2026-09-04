@@ -13,9 +13,11 @@ from server.manage import (
     account_status_lines,
     add_account,
     configure_admin,
+    configure_clova,
     update_private_env,
 )
 from server.settings import (
+    CLOVA_SPEECH_GRPC_TARGET,
     PROJECT_DIR,
     Settings,
     account_usernames,
@@ -366,16 +368,107 @@ class UrlValidationTests(unittest.TestCase):
 
     def test_api_key_is_not_represented_and_public_example_keeps_it_blank(self):
         secret = "test-only-secret-that-must-not-appear"
+        clova_secret = "test-only-clova-secret-that-must-not-appear"
         settings = Settings(
             data_dir=Path("/tmp/test-data"),
             model_cache_dir=Path("/tmp/test-models"),
             mindlogic_api_key=secret,
+            clova_speech_secret_key=clova_secret,
             admin_username="user-alpha",
         )
         self.assertNotIn(secret, repr(settings))
+        self.assertNotIn(clova_secret, repr(settings))
         self.assertNotIn("admin_username", repr(settings))
         content = (PROJECT_DIR / "server" / "env.example").read_text(encoding="utf-8")
         self.assertIn("MINDLOGIC_API_KEY=\n", content)
+        self.assertIn("CLOVA_SPEECH_SECRET_KEY=\n", content)
+        self.assertNotIn(clova_secret, content)
+
+    def test_clova_secret_is_private_env_only_and_target_is_not_overridable(self):
+        secret = "test-only-clova-domain-secret"
+        with mock.patch("server.settings.load_dotenv"), mock.patch.dict(
+            "os.environ",
+            {
+                "ACCOUNT_USERNAMES": "user-alpha,user-beta",
+                "CLOVA_SPEECH_SECRET_KEY": secret,
+                "CLOVA_STREAM_RESPONSE_TIMEOUT_SECONDS": "1",
+                "CLOVA_STREAM_MAX_AGE_SECONDS": "999",
+                "CLOVA_STREAM_IDLE_SECONDS": "2",
+                "CLOVA_EPD_GAP_MS": "10",
+                "CLOVA_EPD_DURATION_MS": "999999",
+                "CLOVA_SPEECH_GRPC_TARGET": "attacker.example:443",
+            },
+            clear=True,
+        ):
+            settings = Settings.from_env()
+        self.assertEqual(settings.clova_speech_secret_key, secret)
+        self.assertEqual(settings.clova_stream_response_timeout_seconds, 10.0)
+        self.assertEqual(settings.clova_stream_max_age_seconds, 270.0)
+        self.assertEqual(settings.clova_stream_idle_seconds, 5.0)
+        self.assertEqual(settings.clova_epd_gap_ms, 250)
+        self.assertEqual(settings.clova_epd_duration_ms, 30_000)
+        self.assertEqual(CLOVA_SPEECH_GRPC_TARGET, "clovaspeech-gw.ncloud.com:50051")
+        self.assertNotIn(secret, repr(settings))
+        self.assertNotIn("attacker.example", repr(settings))
+
+    def test_invalid_clova_secret_fails_without_reflecting_it(self):
+        invalid = "MUST NOT LEAK THIS PRIVATE VALUE"
+        with self.assertRaises(ValueError) as raised:
+            Settings(
+                data_dir=Path("/tmp/test-data"),
+                model_cache_dir=Path("/tmp/test-models"),
+                clova_speech_secret_key=invalid,
+            )
+        self.assertNotIn(invalid, str(raised.exception))
+
+    def test_configure_clova_preserves_private_env_and_round_trips_secret(self):
+        secret = "test-only-valid-clova-domain-secret"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env_path = root / "server" / ".env"
+            env_path.parent.mkdir(parents=True)
+            env_path.write_text(
+                "ACCOUNT_USERNAMES='user-alpha,user-beta'\n"
+                "ADMIN_USERNAME='user-alpha'\n"
+                "MINDLOGIC_API_KEY='preserve-existing-private-value'\n",
+                encoding="utf-8",
+            )
+
+            configure_clova(env_path, secret_key=secret)
+
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            private_env = dotenv_values(env_path, interpolate=False)
+            self.assertEqual(
+                private_env,
+                {
+                    "ACCOUNT_USERNAMES": "user-alpha,user-beta",
+                    "ADMIN_USERNAME": "user-alpha",
+                    "MINDLOGIC_API_KEY": "preserve-existing-private-value",
+                    "CLOVA_SPEECH_SECRET_KEY": secret,
+                },
+            )
+            with mock.patch("server.settings.PROJECT_DIR", root), mock.patch.dict(
+                "os.environ", {}, clear=True
+            ):
+                loaded = Settings.from_env()
+            self.assertEqual(loaded.clova_speech_secret_key, secret)
+            self.assertNotIn(secret, repr(loaded))
+
+    def test_configure_clova_rejects_invalid_secret_without_file_or_error_leak(self):
+        invalid_values = (
+            "too-short",
+            "private secret with spaces must never be reflected",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            env_path = Path(temporary) / "server" / ".env"
+            env_path.parent.mkdir(parents=True)
+            original = b"ACCOUNT_USERNAMES='user-alpha,user-beta'\nPRIVATE='preserved'\n"
+            env_path.write_bytes(original)
+            for invalid in invalid_values:
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError) as raised:
+                    configure_clova(env_path, secret_key=invalid)
+                self.assertNotIn(invalid, str(raised.exception))
+                self.assertEqual(env_path.read_bytes(), original)
 
 
 if __name__ == "__main__":

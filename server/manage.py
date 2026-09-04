@@ -116,6 +116,23 @@ def configure_admin(
     _set_private_env_key(env_path, "ADMIN_USERNAME", username)
 
 
+def configure_clova(env_path: Path, *, secret_key: str) -> None:
+    """Store a CLOVA domain Secret Key without ever printing it.
+
+    This deliberately accepts only the credential itself.  The gRPC target is
+    fixed in code, so a copied URL cannot redirect the bearer token or audio to
+    an unrelated host.
+    """
+    key = secret_key.strip()
+    if (
+        not 16 <= len(key) <= 512
+        or any(character.isspace() or ord(character) < 0x20 for character in key)
+    ):
+        raise ValueError("The CLOVA Speech Secret Key has an invalid format")
+    _ensure_private_env(env_path)
+    _set_private_env_key(env_path, "CLOVA_SPEECH_SECRET_KEY", key)
+
+
 def add_account(
     database: Database,
     env_path: Path,
@@ -296,8 +313,28 @@ def main():
         "add-account",
         help="Privately add one inactive account (the ID is entered with echo disabled)",
     )
+    subcommands.add_parser(
+        "configure-clova",
+        help="Privately save a CLOVA Speech domain Secret Key (entered with echo disabled)",
+    )
     arguments = parser.parse_args()
     try:
+        if arguments.command == "configure-clova":
+            if not sys.stdin.isatty():
+                raise ValueError(
+                    "CLOVA setup requires an interactive WSL terminal so the Secret Key "
+                    "can be entered with echo disabled"
+                )
+            secret_key = getpass.getpass("CLOVA Speech 도메인 Secret Key (입력 내용은 보이지 않음): ")
+            configure_clova(
+                PROJECT_DIR / "server" / ".env",
+                secret_key=secret_key,
+            )
+            print(
+                "Stored the CLOVA Speech credential in private server/.env. "
+                "Restart the local server to apply it."
+            )
+            return
         settings = Settings.from_env()
         database = Database(settings.database_path, settings.accounts)
         database.initialize()

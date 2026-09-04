@@ -6,6 +6,8 @@ numpy==2.4.6
 qwen-asr==0.0.6
 webrtcvad-wheels==2.0.14
 httpx==0.28.1
+grpcio==1.81.1
+protobuf==5.29.6
 # Used directly for bounded, streaming decode of uploaded recordings.  Keep it
 # explicit even though qwen-omni-utils currently brings it in transitively.
 av==18.1.0

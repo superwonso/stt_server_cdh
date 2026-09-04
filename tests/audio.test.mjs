@@ -216,6 +216,7 @@ class FakeEventTarget {
   constructor(kind = '') {
     this.kind = kind;
     this.readyState = 'live';
+    this.muted = false;
     this.stopped = false;
     this.listeners = new Map();
   }
@@ -291,7 +292,7 @@ function installCaptureBrowser({ withAudio = true, autoAcknowledge = true } = {}
       this.audioWorklet = { addModule: async () => {} };
       this.destination = {};
     }
-    async resume() {}
+    async resume() { this.state = 'running'; }
     createMediaStreamSource(stream) {
       audioGraphStream = stream;
       sourceNode = {
@@ -309,12 +310,15 @@ function installCaptureBrowser({ withAudio = true, autoAcknowledge = true } = {}
 
   const documentTarget = new FakeEventTarget('document');
   documentTarget.visibilityState = 'visible';
+  const pageTarget = new FakeEventTarget('page');
   replace('isSecureContext', true);
   replace('MediaStream', FakeMediaStream);
   replace('AudioContext', FakeAudioContext);
   replace('webkitAudioContext', undefined);
   replace('AudioWorkletNode', FakeAudioWorkletNode);
   replace('document', documentTarget);
+  replace('addEventListener', pageTarget.addEventListener.bind(pageTarget));
+  replace('removeEventListener', pageTarget.removeEventListener.bind(pageTarget));
   replace('navigator', {
     mediaDevices: {
       getUserMedia: async () => { throw new Error('getUserMedia must not be used'); },
@@ -335,6 +339,7 @@ function installCaptureBrowser({ withAudio = true, autoAcknowledge = true } = {}
     get sourceNode() { return sourceNode; },
     get workletNode() { return workletNode; },
     controlMessages,
+    pageTarget,
     acknowledge(command) {
       const acknowledgements = {pause:'paused',resume:'resumed',stop:'stopped'};
       workletNode?.port.onmessage?.({data:{type:acknowledgements[command.type],id:command.id}});
@@ -348,14 +353,16 @@ function installCaptureBrowser({ withAudio = true, autoAcknowledge = true } = {}
   };
 }
 
-test('system capture requests display audio, excludes video from processing, and flushes after sharing ends', async () => {
+test('system capture requests display audio and an ended share asks for reconnect without finalizing', async () => {
   const browser = installCaptureBrowser();
-  const chunks = [], interruptions = [];
+  const chunks = [], unavailable = [], reconnects = [], legacyInterruptions = [];
   try {
     const capture = new MicrophoneCapture({
       source: 'system',
       onChunk: chunk => chunks.push(chunk),
-      onInterrupted: error => interruptions.push(error),
+      onInputUnavailable: (error,details) => unavailable.push({error,details}),
+      onReconnectNeeded: (error,details) => reconnects.push({error,details}),
+      onInterrupted: error => legacyInterruptions.push(error),
     });
     const starting = capture.start();
     assert.equal(browser.requests.length, 1, 'display picker is requested synchronously from the button gesture');
@@ -375,14 +382,22 @@ test('system capture requests display audio, excludes video from processing, and
     });
     browser.videoTrack.dispatch('ended');
     browser.audioTrack.dispatch('ended');
-    assert.equal(interruptions.length, 1, 'one browser stop produces one interruption callback');
-    assert.match(interruptions[0].message, /화면 공유가 종료/);
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(unavailable.length,1,'one permanent input failure opens one unavailable episode');
+    assert.equal(unavailable[0].details.reconnectNeeded,true);
+    assert.equal(reconnects.length,1,'the UI is asked to reconnect the same lecture');
+    assert.match(reconnects[0].error.message,/화면 공유가 종료/);
+    assert.equal(capture.reconnectNeeded,true);
+    assert.equal(legacyInterruptions.length,0,'legacy interruption callbacks must not auto-finalize');
+    assert.deepEqual(chunks.map(chunk => chunk.final),[false],
+      'the disconnected graph may checkpoint accepted PCM but cannot create a final chunk');
 
     await capture.stop();
-    assert.equal(chunks.length, 1);
-    assert.equal(chunks[0].final, true);
+    assert.deepEqual(chunks.map(chunk => chunk.final),[false,true]);
     assert.equal(chunks[0].durationSeconds, 0.1);
-    assert.equal((chunks[0].blob.size - 44) / 2, 1600);
+    assert.equal(chunks[1].overlapSeconds,0.1);
+    assert.equal((chunks[1].blob.size - 44) / 2, 1600);
     assert.equal(browser.audioTrack.stopped, true);
     assert.equal(browser.videoTrack.stopped, true);
   } finally {
@@ -494,17 +509,30 @@ test('a sub-50ms later pause flushes once an overlap makes the WAV valid', async
   }
 });
 
-test('a shared-audio track ending while paused is rejected on resume and can still stop safely', async () => {
+test('a shared-audio track ending while paused requests reconnect and only explicit stop finalizes', async () => {
   const browser = installCaptureBrowser();
+  const chunks = [], reconnects = [];
   try {
-    const capture = new MicrophoneCapture({source:'system',onChunk() {}});
+    const capture = new MicrophoneCapture({
+      source:'system',
+      onChunk:chunk => chunks.push(chunk),
+      onReconnectNeeded:(error,details) => reconnects.push({error,details}),
+    });
     await capture.start();
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(4800).fill(0.25)},
+    });
     await capture.pause();
     browser.audioTrack.readyState = 'ended';
     browser.audioTrack.dispatch('ended');
-    await assert.rejects(capture.resume(),/공유 오디오가 종료/);
-    assert.equal(capture.paused,true);
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(capture.reconnectNeeded,true);
+    assert.equal(reconnects.length,1);
+    assert.equal(reconnects[0].details.reason,'track-ended');
+    assert.deepEqual(chunks.map(chunk => chunk.final),[false]);
     await capture.stop();
+    assert.deepEqual(chunks.map(chunk => chunk.final),[false,true]);
     assert.equal(capture.recording,false);
   } finally {
     browser.restore();
@@ -513,12 +541,13 @@ test('a shared-audio track ending while paused is rejected on resume and can sti
 
 test('a shared-audio track ending while context resume is pending rejects instead of going silently live', async () => {
   const browser = installCaptureBrowser();
-  const interruptions = [];
+  const reconnects = [], legacyInterruptions = [];
   try {
     const capture = new MicrophoneCapture({
       source:'system',
       onChunk() {},
-      onInterrupted:error => interruptions.push(error),
+      onReconnectNeeded:error => reconnects.push(error),
+      onInterrupted:error => legacyInterruptions.push(error),
     });
     await capture.start();
     await capture.pause();
@@ -528,12 +557,14 @@ test('a shared-audio track ending while context resume is pending rejects instea
     const resuming = capture.resume();
     browser.audioTrack.readyState = 'ended';
     browser.audioTrack.dispatch('ended');
+    releaseResume();
     await assert.rejects(resuming,/공유 오디오가 종료/);
-    assert.equal(capture.paused,true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(capture.reconnectNeeded,true);
     assert.equal(capture.recording,false);
     assert.equal(browser.sourceNode.connectCalls,1,'a dead source must not be reconnected');
-    assert.equal(interruptions.length,0,'the resume caller owns the stored transition failure');
-    releaseResume();
+    assert.equal(reconnects.length,1);
+    assert.equal(legacyInterruptions.length,0);
     await capture.stop();
   } finally {
     browser.restore();
@@ -552,10 +583,10 @@ test('an AudioContext closing while resume is pending rejects and releases captu
     const resuming = capture.resume();
     browser.audioContext.state = 'closed';
     browser.audioContext.dispatch('statechange');
-    await assert.rejects(resuming,/(?:오디오 처리가 종료|화면 오디오를 중단)/);
-    assert.equal(capture.paused,true);
-    assert.equal(capture.recording,false);
     releaseResume();
+    await assert.rejects(resuming,/(?:공유 오디오가 종료|오디오 처리가 종료|화면 오디오를 중단)/);
+    assert.equal(capture.reconnectNeeded,true);
+    assert.equal(capture.recording,false);
     await capture.stop().catch(() => {});
     assert.equal(browser.audioTrack.stopped,true);
   } finally {
@@ -606,21 +637,36 @@ test('system capture rejects a display choice without shared audio and releases 
 
 test('a transient system-track mute that recovers does not end a long capture', async () => {
   const browser = installCaptureBrowser();
-  const interruptions = [];
+  const chunks = [], unavailable = [], recovered = [], legacyInterruptions = [];
   try {
     const capture = new MicrophoneCapture({
       source: 'system',
-      onChunk() {},
-      onInterrupted: error => interruptions.push(error),
+      onChunk:chunk => chunks.push(chunk),
+      onInputUnavailable:(error,details) => unavailable.push({error,details}),
+      onInputRecovered:details => recovered.push(details),
+      onInterrupted:error => legacyInterruptions.push(error),
     });
     await capture.start();
+    browser.workletNode.port.onmessage({
+      data:{type:'samples',samples:new Float32Array(4800).fill(0.25)},
+    });
     browser.audioTrack.muted = true;
     browser.audioTrack.dispatch('mute');
+    assert.equal(capture.recording,true);
+    assert.equal(unavailable.length,1);
+    assert.equal(unavailable[0].details.reconnectNeeded,false);
+    assert.ok(chunks.every(chunk => chunk.final === false),
+      'temporary input loss may checkpoint audio but must not finalize the lecture');
+    assert.equal(legacyInterruptions.length,0);
+
     browser.audioTrack.muted = false;
     browser.audioTrack.dispatch('unmute');
-    assert.equal(interruptions.length, 0);
+    assert.equal(recovered.length,1);
+    assert.equal(capture.recording,true);
+    assert.ok(chunks.every(chunk => chunk.final === false));
     await capture.stop();
-    assert.equal(interruptions.length, 0);
+    assert.equal(chunks.at(-1).final,true,'only explicit stop creates the final chunk');
+    assert.equal(legacyInterruptions.length,0);
   } finally {
     browser.restore();
   }

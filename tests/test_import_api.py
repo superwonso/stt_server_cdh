@@ -58,6 +58,23 @@ class FakeTranscriber:
         return [{"start": 0, "end": len(samples) / 16_000, "text": "파일 받아쓰기"}]
 
 
+class FakeClovaTranscriber:
+    configured = True
+
+    def __init__(self):
+        self.calls = 0
+
+    def transcribe(self, *args, **kwargs):
+        self.calls += 1
+        raise AssertionError("file imports must never be sent to CLOVA Speech")
+
+    def close_session(self, username, lecture_id):
+        return None
+
+    def close(self):
+        return None
+
+
 class ImportApiTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -69,7 +86,12 @@ class ImportApiTests(unittest.TestCase):
             model_warmup=False,
         )
         self.engine = FakeTranscriber()
-        self.app = create_app(self.settings, self.engine)
+        self.clova = FakeClovaTranscriber()
+        self.app = create_app(
+            self.settings,
+            self.engine,
+            clova_transcriber=self.clova,
+        )
         self.client = TestClient(self.app)
         self.tokens = {}
         for username, character in (("user-alpha", "a"), ("user-beta", "b")):
@@ -191,7 +213,10 @@ class ImportApiTests(unittest.TestCase):
         self.assertFalse(path.exists())
         lecture = self.client.get(f"/lectures/{completed['lecture_id']}", headers=self.headers())
         self.assertEqual(lecture.status_code, 200)
+        self.assertEqual(lecture.json()["asr_provider"], "qwen")
         self.assertEqual(len(lecture.json()["segments"]), 1)
+        self.assertGreater(self.engine.calls, 0)
+        self.assertEqual(self.clova.calls, 0)
         self.assertTrue(lecture.json()["recording_available"])
         self.assertTrue(lecture.json()["recording_finalized"])
         recording = (

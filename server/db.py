@@ -131,7 +131,9 @@ class Database:
                     created_at TEXT NOT NULL,
                     deleting INTEGER NOT NULL DEFAULT 0 CHECK (deleting IN (0, 1)),
                     recording_finalized INTEGER NOT NULL DEFAULT 0
-                        CHECK (recording_finalized IN (0, 1))
+                        CHECK (recording_finalized IN (0, 1)),
+                    asr_provider TEXT NOT NULL DEFAULT 'qwen'
+                        CHECK (asr_provider IN ('qwen', 'clova'))
                 );
                 CREATE INDEX IF NOT EXISTS lectures_user ON lectures(username, created_at);
                 CREATE TABLE IF NOT EXISTS chunks (
@@ -244,6 +246,14 @@ class Database:
                     "ALTER TABLE lectures ADD COLUMN recording_finalized INTEGER NOT NULL DEFAULT 0 "
                     "CHECK (recording_finalized IN (0, 1))"
                 )
+            if "asr_provider" not in lecture_columns:
+                # Every pre-provider lecture was transcribed locally. Persist
+                # that fact so a later configuration change can never send an
+                # old recording to an external provider implicitly.
+                connection.execute(
+                    "ALTER TABLE lectures ADD COLUMN asr_provider TEXT NOT NULL DEFAULT 'qwen' "
+                    "CHECK (asr_provider IN ('qwen', 'clova'))"
+                )
             if "overlap_seconds" not in chunk_columns:
                 connection.execute("ALTER TABLE chunks ADD COLUMN overlap_seconds REAL NOT NULL DEFAULT 0")
             if "final_chunk" not in chunk_columns:
@@ -298,5 +308,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 5:
-                connection.execute("PRAGMA user_version = 5")
+            if schema_version < 6:
+                connection.execute("PRAGMA user_version = 6")

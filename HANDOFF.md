@@ -2,9 +2,15 @@
 
 기준일: 2026-09-04 (Asia/Seoul)
 
+실시간 입력의 영속 대기열·무기한 재전송·입력 재연결·탭 간 잠금과 CLOVA 선택 변경은 2026-09-04 전체 자동 회귀를 통과했다. 배포 커밋과 API/Pages/Quick Tunnel 외부 확인 결과는 아래 `저장소·배포 체크포인트`에 이어서 기록한다. 실제 브라우저·학교 Wi-Fi·교실 음성 및 CLOVA 실계정 검증은 `아직 확인하지 못함`과 구분한다.
+
 ## 현재 결론
 
 현재 기본 엔진은 `Qwen/Qwen3-ASR-1.7B`의 Transformers 경로(`qwen-asr==0.0.6`, BF16, SDPA)와 `Qwen3-ForcedAligner-0.6B`다. 브라우저 마이크와 `getDisplayMedia`의 오디오 트랙은 16 kHz 모노 PCM을 모아 새 음성이 8초 이상이고 최근 0.24초가 조용하면 자르며, 조용한 지점이 없으면 전체 WAV 15초에서 자른다. 첫 조각 뒤에는 이전 3초를 겹쳐 보낸다. 업로드 파일도 PyAV로 스트리밍 디코딩한 뒤 같은 분할 규칙을 쓴다. 서버는 0.6초 stability guard와 단어 정렬 시각으로 각 조각에서 확정할 범위를 정한다. Qwen의 vLLM 네이티브 스트리밍은 현재 코드에서 사용하지 않는다.
+
+마이크 실시간 수업에는 `qwen`(기본·로컬)과 NAVER Cloud `clova`(명시적 opt-in) 선택을 추가했다. provider는 lecture에 불변 저장하고 청크 요청에서 바꿀 수 없다. 공유 화면/탭 소리와 파일 import는 계속 Qwen으로 강제한다. CLOVA는 공식 bidirectional gRPC 한 스트림을 수업별로 유지하며 healthy 연결에서는 브라우저 overlap을 잘라 새 PCM만 전송한다. 5분 연결 제한 전 회전·idle/단절 후 새 스트림에서는 현재 청크의 최대 3초 overlap을 문맥으로 다시 넣고 align timestamp가 그 구간인 결과는 버린다. 화면 갱신은 기존 8~15초 브라우저 청크 주기를 그대로 사용하므로 단어 단위 초저지연 UI로 바뀐 것은 아니다.
+
+CLOVA 선택 시 경로는 `브라우저 → Cloudflare → 이 PC → clovaspeech-gw.ncloud.com:50051`이며 음성과 결과가 NAVER Cloud로 간다. 공식 문서상 스트리밍 결과는 고객 Object Storage에 자동 저장된다. 로컬 수업 삭제는 그 클라우드 사본을 삭제하지 않는다. Basic Stream은 15초당 5원(VAT 별도)이고 Free 도메인은 실시간 gRPC를 지원하지 않는다. 따라서 CLOVA를 품질 우위로 단정하거나 자동 fallback으로 쓰지 않고 같은 실제 한국어 수업 음성으로 Qwen과 비교해야 한다.
 
 정확도 보조 기능으로 완료된 원문을 충북대 NOVA Gateway의 `solar-pro4`에 보내는 명시적 opt-in 후보정을 추가했다. Qwen 모델은 바꾸지 않았고 음성은 후보정 제공자에게 보내지 않는다. 원문과 후보정본은 분리 저장하며 화면은 원문을 기본으로 연다. 문장 ID·순서·개수, 기존 숫자, 개인정보 임시 표식과 응답 크기가 맞지 않으면 후보정본을 저장하지 않고, 새 숫자 표기가 생기면 원문 비교 경고를 붙인다. 따라서 이 기능은 원문을 대체하는 정답 생성기가 아니라 검토 가능한 별도 초안이다.
 
@@ -27,7 +33,7 @@ VibeVoice-ASR-Streaming-7B는 이 PC에서도 BF16/SDPA로 실제 로드되고 �
 | GPU | Radeon 8060S, gfx1151, 40 CU | NVIDIA CUDA 전용 경로를 그대로 쓸 수 없음 |
 | GPU 메모리 | ROCm/PyTorch가 약 47.48 GiB를 주소 가능 | 별도 전용 VRAM이 아니라 통합/공유 메모리이므로 모델 이름만 보고 여유 있다고 단정하면 안 됨 |
 | ROCm | 7.2.4 | `/dev/dxg`를 통한 WSL GPU |
-| PyTorch | 2.10.0 ROCm 7.2.4 빌드 | `/home/wonso/miniconda3/envs/torch-rocm/bin/python` |
+| PyTorch | 2.10.0 ROCm 7.2.4 빌드 | `$HOME/miniconda3/envs/torch-rocm/bin/python` |
 
 샌드박스 내부에서는 GPU 장치가 가려질 수 있었기 때문에 실제 GPU 확인과 벤치마크는 WSL 호스트 권한이 보이는 셸에서 수행했다.
 
@@ -162,6 +168,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 모든 lecture·실시간 chunk·파일 import 조회/변경은 인증 사용자의 소유권을 검사한다.
 - 수업 생성은 브라우저가 보낸 UUID와 소유자·제목·언어를 확인해 응답 손실 뒤 재요청도 idempotent하게 처리한다.
 - 한 모델과 inference lock을 사용하며 running+waiting 요청은 기본 2개로 제한한다.
+- `lectures.asr_provider`는 schema v6에서 `qwen|clova` allowlist로 저장한다. 기존 수업과 import-created 수업은 `qwen`으로 migration/생성되며 같은 lecture UUID를 다른 provider로 재생성하면 `409`다. `/status`는 인증 뒤 두 provider의 고정 label/configured boolean만 반환하고 adapter endpoint·key·session 진단은 반사하지 않는다.
+- `ClovaStreamingTranscriber`는 공식 TLS host/port와 `authorization: Bearer …` metadata, CONFIG 성공 확인, headerless PCM16 16 kHz mono 32,000-byte DATA, 마지막 DATA의 nonzero `seqId`+`epFlag=true` acknowledgement를 사용한다. response의 `position`으로 누적 텍스트를 조립하고 `alignInfos` timestamp로 현재 청크 결과만 정한다. 수업/계정별 세션, 성공 payload cache, idle/4분 회전과 종료를 bounded하게 관리한다.
+- CLOVA의 모호한 timeout/단절은 provider 원문을 로그·응답에 싣지 않고 `424`로 바꾼다. 브라우저는 CLOVA 청크를 자동 retry하거나 Qwen으로 fallback하지 않는다. 같은 프로세스에서 응답 이후 DB 쓰기가 실패한 동일 payload는 adapter 성공 cache로 외부 재호출을 피하지만, 프로세스가 정확히 그 사이 죽는 경우까지 외부 exactly-once 과금은 보장하지 않는다.
 - WAV는 최대 512,000 bytes, 0.05~15초, 16 kHz mono PCM16만 받는다. VAD가 침묵 hallucination 저장을 줄인다.
 - 새로 처리한 실시간·파일 import 음성은 overlap을 제거한 16 kHz mono PCM WAV로 `.data/recordings/<private-account>/<lecture UUID>.wav`에 보존한다. 계정 폴더는 `0700`, 파일은 `0600`이며 과거에 이미 버린 음성은 소급 복구하지 않는다.
 - WAV 저장은 시간축에 이미 있는 PCM과 byte 단위로 대조해 같은 요청/응답 유실 재시도가 파일을 늘리지 않게 한다. 제한된 건너뛴 구간은 무음으로 채우고, 4시간·전체 20 GiB·최소 여유 1 GiB 한도를 적용한다.
@@ -180,19 +189,28 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 - GitHub Pages에는 `web/`에서 복사한 공개 파일과 Actions가 생성한 런타임 `config.json`만 격리 staging을 거쳐 배포하며, 외부 스크립트·폰트·분석 코드를 쓰지 않는다.
 - 클라이언트에는 계정 allow-list가 없다. 초대 링크의 opaque `username`/`setup_code`만 폼에 복원한 직후 URL fragment에서 지운다. 초대 링크의 `api=` 값은 무시한다.
-- 서버 주소 변경 폼은 후보 주소의 anonymous health를 먼저 확인하고, 성공하기 전에는 기존 API 주소와 token을 섞어 쓰지 않는다. 로그인 요청 중에는 변경을 막고, 늦은 인증 응답은 요청 당시 origin/generation이 달라졌으면 폐기한다.
+- 서버 주소 변경 폼은 후보 주소의 anonymous health를 먼저 확인한다. 확인 중에도 기존에 검증된 origin만 현재 token의 대상으로 유지해 진행 중 업로드를 끊지 않고, 성공하기 전에는 후보 API 주소와 token을 섞어 쓰지 않는다. 로그인 요청 중에는 변경을 막고, 늦은 인증 응답은 요청 당시 origin/generation이 달라졌으면 폐기한다.
 - 로그인 token은 JS 메모리에만 있고 API origin만 localStorage에 저장한다.
 - Quick Tunnel이 준비되면 운영 스크립트가 `version/state/apiUrl/publishedAt/expiresAt`으로 된 정확한 공개 JSON 전체를 GitHub Actions 저장소 변수에 원자적으로 넣고 Pages를 다시 배포한다. Git의 `web/config.json`은 비어 있으며 ID·초대 코드·비밀번호·token·수업 정보는 게시기가 읽지 않는다.
 - 웹은 로그인 전에 같은 Pages 출처의 런타임 설정을 엄격히 검사하고 Bearer 없는 `/health`를 통과한 origin만 설치한다. 새 유효 설정은 stale localStorage보다 우선하며, offline·만료·잘못된 설정은 fail closed 한다. 수동 입력은 자동 게시 장애 복구용으로만 남긴다.
 - GitHub Pages 프로젝트들은 `https://superwonso.github.io` 출처를 공유하므로 다른 Pages 저장소까지 신뢰해야 하는 구조적 한계가 있다. 전용 Pages 계정/도메인 없이는 완전 격리할 수 없다.
 - AudioWorklet → 스트리밍 resampler → 16 kHz PCM16 WAV 경로다.
 - 입력 소스는 마이크와 `getDisplayMedia`의 공유 오디오다. 브라우저가 요구하는 video track은 종료 감지만 하고 오디오 그래프·WAV·네트워크에 연결하지 않는다. 화면/시스템 오디오는 지원 여부가 브라우저·OS·선택 표면·DRM에 달려 있으며 알림/다른 앱 소리 포함 위험을 UI에 표시한다.
+- 서버가 아직 확인하지 않은 실시간 WAV 조각은 같은 GitHub Pages 출처의 IndexedDB에 순서·동일 UUID와 함께 임시 보관하고, 서버 ACK 뒤 해당 조각을 삭제한다. 브라우저를 새로 열어 같은 계정으로 로그인하면 남은 조각을 복구한다. 큐에는 비밀번호·로그인 token·초대 코드·API 주소를 넣지 않는다. 저장 실패 때는 메모리 fallback과 사용자 경고를 사용하므로 디스크 여유·브라우저 quota를 운영 전에 확인해야 한다.
+- IndexedDB는 origin 단위 저장소다. 이 앱과 같은 `github.io` origin의 다른 Pages 저장소 스크립트도 같은 신뢰 경계 안에 있으므로, 미확인 음성과 수업 메타데이터를 보호하려면 그 저장소들까지 신뢰하거나 전용 Pages 계정/도메인으로 분리해야 한다. 서버 ACK 뒤 정상 삭제되지만 비정상 종료·브라우저 정리 실패 뒤에는 남을 수 있어 앱의 복구/정리 상태를 확인한다.
+- 네트워크·서버 혼잡·터널 지연처럼 재전송해도 안전한 오류는 동일 chunk UUID를 유지한 채 상한이 있는 지수 backoff 간격으로 횟수 제한 없이 큐 순서대로 재시도한다. 캡처는 계속되고 대기 음성이 IndexedDB에 쌓이므로 지연이 길면 브라우저 저장공간을 확인한다. 결과 수신 여부가 모호한 CLOVA 오류는 중복 기록·과금 가능성 때문에 이 자동 재시도 대상이 아니며 해당 조각을 명시적으로 보류한다.
+- 페이지가 정상적으로 실행 중인 동안의 일시적인 `AudioContext` `suspended`/`interrupted`와 live track `mute`는 수업을 끝내지 않고 입력 복구를 기다린다. mute가 오래 지속돼도 앱이 임의로 그래프를 닫지 않으며, 사용자가 **입력 복구 시도**를 누른 경우에만 같은 수업에서 입력 재연결로 전환한다. 영구적인 track `ended`/context `closed`도 수업·큐·누적 시간축을 끝내지 않고 사용자 동작으로 입력만 다시 연결하며, 실제 **종료**에서만 final 조각을 만든다.
+- 브라우저나 OS가 백그라운드 탭·화면 잠금 상태에서 프로세스나 마이크 캡처 자체를 멈춘 동안의 소리는 앱이 나중에 복구할 수 없다. 특히 모바일·태블릿에서는 수업 중 화면을 켜고 앱 탭을 전면에 유지하는 것을 권장하며, 재연결 뒤에는 중단 구간이 기록되지 않았음을 전제로 끝부분을 확인해야 한다.
+- 마이크 provider selector는 Qwen을 기본으로 하고 인증된 `/status`가 CLOVA configured를 true로 알린 경우에만 CLOVA를 연다. 선택은 localStorage에 저장하지 않고 로그아웃/계정 scrub과 새 노트에서 Qwen으로 돌아간다. system audio를 고르면 selector도 Qwen으로 고정된다. CLOVA 선택 화면에는 음성·결과의 NAVER 전송, 사용량 과금, 고객 Object Storage 자동 저장, 앱 삭제와 클라우드 삭제가 다르다는 내용을 표시한다.
+- lecture 생성 전에 provider를 session에 snapshot하고 생성 body와 모든 queued chunk에 유지한다. CLOVA는 한국어/영어 직접 선택만 허용한다. CLOVA 조각은 HTTP 요청 전에 IndexedDB에서 `queued → inflight`를 영속화하고, 응답 전 탭 종료나 네트워크/HTTP `424`처럼 결과가 모호한 경우 자동 retry 없이 해당 조각을 보류한다. 실패 WAV 보관과 위험을 명시한 수동 재전송만 제공하며 캡처와 후속 조각의 로컬 보관은 계속된다.
 - 새 음성 8초 이후 조용한 0.24초 지점을 찾고 전체 WAV 최대 15초, 이전 3초 overlap으로 자른다. 사용자 pause는 acknowledgement 전에 받은 새 PCM만 비최종 청크로 flush하고 worklet 입력을 버리는 상태로 바꾼다. resume은 같은 수업·누적 음성 시간축·3초 overlap으로 이어지며, stop 직후에는 overlap만 남아도 final guard 조각을 보내 마지막 확정을 요청한다.
 - pause 뒤 브라우저가 사라져 final guard를 잃은 미완료 수업은 기존 owner-only `recording-finalize`가 서버 WAV의 마지막 최대 3초를 overlap-only final로 한 번 재추론한다. 비공개 내부 sentinel chunk를 inference 전에 claim하고, GPU 대기 중 DB·recording lock을 놓으며, commit 직전 owner/deleting/pending/import와 WAV frame revision을 다시 확인한다. 완료/응답 유실 재요청은 같은 segment ID를 replay해 끝 문장을 중복하지 않는다.
-- 일시적 네트워크/429/503과 idempotent 처리 중 409는 동일 chunk UUID로 지수 backoff하며 최대 8회, 큐 순서대로 재시도한다.
-- 8회 실패나 영구 오류에는 자동 loop와 녹음을 멈추고 tail을 포함한 WAV 메모리 큐를 남긴다. 사용자는 다시 보내거나 첫 실패 WAV의 다운로드를 요청하고 실제 저장을 별도로 확인한 뒤 그 조각을 건너뛸 수 있다. 건너뛴 구간은 기록에서 빠진다.
-- Quick Tunnel 주소가 바뀌어도 실제 녹음/전송 중이 아니면 후보 주소를 익명 확인할 수 있다. 대기 WAV·UUID·기존 사용자를 유지하고 같은 계정의 재로그인만 허용한 뒤 새 origin으로 전송을 잇는다.
-- 최대 정상 큐는 8개이며 final tail은 보존을 위해 한 개 더 들어갈 수 있다. 새로고침·탭 종료 전까지의 메모리 보존일 뿐 영구 저장은 아니다.
+- 일시적 네트워크/429/503과 idempotent 처리 중 409는 동일 chunk UUID로 상한이 있는 지수 backoff를 적용해 횟수 제한 없이 큐 순서대로 재시도한다.
+- 형식·권한 오류와 모호한 CLOVA 결과처럼 자동 재전송이 안전하지 않은 오류는 해당 조각을 blocked 상태로 두고 캡처와 후속 WAV의 로컬 보관은 계속한다. 사용자는 다시 보내거나 첫 실패 WAV의 다운로드를 요청하고 실제 저장을 별도로 확인한 뒤 그 조각을 건너뛸 수 있다. 건너뛴 구간은 기록에서 빠진다.
+- Quick Tunnel 주소가 바뀌면 녹음·전송 중에도 same-origin 런타임 설정의 후보 주소를 Bearer 없이 익명 확인할 수 있다. 새 origin에는 기존 token을 절대 보내지 않고 대기 WAV·UUID·기존 소유자 binding을 유지한 채 같은 계정의 재로그인을 요구한 뒤 전송을 잇는다.
+- 인증 화면으로 돌아간 뒤에도 캡처가 살아 있으면 별도 **이 기기의 녹음 종료** 버튼을 제공한다. Web Locks 지원 브라우저에서는 owner fingerprint 기반 capture lock을 수업 전체에 유지하고 uploader lock으로 같은 계정의 탭을 직렬화한다. 저장 실패로 현재 탭 RAM에만 남은 조각이 있으면 명시적 종료 뒤에도 그 조각의 서버 ACK 또는 다운로드 확인 후 건너뛰기까지 capture lock을 유지한다. 삭제·녹음 마무리는 capture lock을 즉시 얻은 뒤 uploader lock까지 차례로 얻고, 그 안에서 메모리 큐와 공유 IndexedDB에 해당 수업의 미전송 조각이 0개임을 다시 확인한 경우에만 실행한다. 큐를 읽지 못해도 fail-closed한다. API가 있는데 lock 요청 자체가 실패하면 capture·파괴 작업은 fail-closed하고, 아직 HTTP를 시작하지 않은 uploader lock 실패만 backoff 재시도한다. Web Locks 미지원 시에는 같은 탭만 조정할 수 있어 UI 경고와 한 계정 한 실시간 탭 운영 규칙이 필요하다.
+- `recording`/`paused`로 복구된 IndexedDB 세션을 다른 탭이 자동 종료하거나 삭제하지 않는다. crash가 남긴 미완료 수업은 완료로 표시하지 않고 지속 경고하며, 다른 탭의 녹음 여부를 확인한 사용자가 해당 수업의 **녹음 WAV 마무리**를 실행해야 final guard를 복구한다. 다른 기기까지 막는 서버 capture lease는 아직 없다.
+- 큐는 개수 8개에서 강제 중단하지 않고 미확인 조각을 IndexedDB에 보존한다. 서버 지연이 길수록 저장량이 계속 늘 수 있으며 quota/디스크 고갈은 별도 실패 조건이다.
 - 서버 응답 segment ID도 다시 검사해 같은 응답 렌더링을 중복 append하지 않는다.
 - `RecordingFileUploader`는 파일을 480 KiB씩 지문 확인·해시·순차 업로드하고 서버 offset으로 재개한다. 업로드 중 탭을 닫으면 같은 전체 지문의 파일 재선택이 필요하지만 queued/processing은 파일 참조 없이 polling을 복구한다.
 - import polling delay의 abort listener는 매 회 제거한다. 로그아웃/탭 이탈은 watcher만 detach하고 서버 작업을 취소하지 않으며, 취소/완료 경쟁과 오래된 lecture/list 응답은 terminal 상태·generation/sequence로 판별한다.
@@ -200,7 +218,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 녹음 WAV 버튼은 `recording_available`인 수업에만 열린다. 미확정 WAV는 owner-only idempotent finalize POST로 받은 범위까지 먼저 닫고, 로그인 Bearer로 ticket을 받은 뒤 같은 API origin의 상대 경로만 세션 토큰 없이 브라우저 네이티브 다운로드로 연다.
 - 완료 수업 후보정은 `queued/processing`을 주기적으로 확인한다. 진행 수업에서 누른 버튼은 캡처를 멈추지 않고 예약만 보관하며, 명시적 종료와 final 저장 성공 뒤 자동 시작한다. 과거 수업 후보정은 다른 수업의 녹음·일시정지와 병행할 수 있다. 원문/AI 후보정본을 명시적으로 전환하고 현재 선택한 버전만 TXT/Markdown으로 내보낸다. 완료 뒤에도 원문이 기본이며 `uncertain_terms`를 최대 5개와 나머지 개수로 표시한다. 수업·계정 전환은 poll timer와 늦은 결과를 generation/sequence로 폐기한다.
 - 후보정 패널은 텍스트만 NOVA로 가고 오디오는 가지 않으며 형식 기반 가림이 이름 등을 보호하지 못한다는 opt-in 안내를 항상 표시한다. 결과는 모두 `textContent`로 렌더링한다.
-- 로그인 세션 만료나 인증 거절은 pause로 취급하지 않는다. 다른 계정으로 메모리 음성이 넘어가지 않도록 캡처를 종료할 수 있으며, 같은 계정 재로그인 뒤 남은 전송 상태만 안전하게 복구한다.
+- 로그인 세션 만료나 인증 거절은 pause로 취급하지 않는다. 현재 캡처와 영속 큐는 소유자 binding을 유지하고, 같은 계정으로 재로그인해야 남은 전송을 재개한다. 다른 계정은 그 큐를 인수하거나 전송할 수 없다.
 - 수업 삭제 확인창은 제목과 원문·후보정본·녹음 삭제 범위를 보여 준다. 삭제·다운로드·녹음·파일 변환 중 동작을 상호 잠그고 generation/sequence로 늦게 도착한 이전 수업·계정 응답을 버린다.
 - 로그인 뒤 관리자 권한은 `/admin/overview`의 200/403으로 서버에서 판별한다. 전용 dialog는 10초마다 상태를 갱신하고 자가 세션 종료를 렌더링하지 않는다. 운영 중지·터널 재연결·다른 계정 세션 종료는 확인 단계를 두고, 안전한 운영 재개는 즉시 적용한다.
 - 모든 로그인 브라우저는 15초 heartbeat와 상태 전환 때 최소 presence만 전송한다. 로그아웃·계정/서버 전환은 timer와 늦은 응답을 폐기한다.
@@ -217,11 +235,21 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - `scripts/backup.sh`: SQLite online backup으로 WAL의 최신 커밋까지 일관된 스냅샷 생성; 기존 대상은 덮어쓰지 않음. 보존 WAV는 포함하지 않으므로 음성 백업은 서버를 끈 상태에서 `.data/recordings/`를 같은 암호화 저장소에 별도로 복사해야 함
 - `server/manage.py`: private `ACCOUNT_USERNAMES`의 미활성 계정 invite 생성과 `SITE_ORIGINS` 갱신. `add-account`는 TTY echo를 끈 입력으로 기존 환경설정·DB 집합에 비활성 계정 하나만 함께 추가하며, 일반 시작의 exact-set 검사는 유지함. 서버 주소와 초대 링크를 같은 로컬 파일에 쓰되 링크 자체나 서버 설정에는 임시 API 주소를 결합하지 않음
 - `server/manage.py configure-admin`: 활성 계정이 하나면 자동 선택하고 여럿이면 TTY echo를 끈 입력 또는 `--position 1` 같은 비공개 목록 위치로 선택해 실제 ID를 출력·shell history에 남기지 않고 `ADMIN_USERNAME`을 기록
+- `server/manage.py configure-clova`: Basic 스트리밍/장문 도메인의 Secret Key를 TTY echo 없이 받아 권한 `0600`의 ignored `server/.env`에 저장한다. gRPC 목적지는 입력받지 않고 공식 host에 고정한다.
 - `server/tunnel_control.py`: fixed project script·argv, process/script ownership, in-process lock와 script flock을 겹쳐 검증하고 12초 응답 유예 뒤 Quick Tunnel stop/start를 수행. 물리적 stop은 원격 재시작 경로도 없앤다는 상태를 명시하며 웹에는 restart만 연결
 
 ## 검증 범위
 
-### 확인됨
+### 현재 변경분에서 확인
+
+- 제한 없는 호스트 환경에서 `./.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v`: 서버/API/DB/설정/전사기/importer/녹음·후보정·관리자·터널·CLOVA fake 계약 152개가 27.349초에 모두 통과했다. CLOVA 계약에는 공식 영어 응답 형태의 띄어쓰기 보존과 한국어 overlap 부분 문자열 검사가 포함된다. 테스트가 의도적으로 만든 원본 삭제 실패 로그 외 실패·오류는 없었다.
+- VS Code Server의 Node.js 24.18.0으로 `node --test --test-isolation=none tests/*.test.mjs`: 앱 상태 93개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 130개가 모두 통과했다. 문서의 격리 실행 `node --test tests/*.test.mjs`도 4개 test file 모두 통과했다.
+- 앱 테스트 대역도 실제 UUID·owner·provider·capture 시간축·CLOVA `inflight` 전이·final-last·영속 삭제 계약을 검사하도록 강화했고, PCM 없는 종료에 합성 final WAV를 넣지 않는다. 따라서 새 내구성 경로의 실패를 기대값만 완화해 숨기지 않았다.
+- Python 전체 compile, 웹/테스트 JavaScript 10개 파일 `node --check`, `git diff --check`, 비공개 경로 ignore 및 실제 구성 계정·키 값의 현재 공개 트리/기존 Git 이력 불포함을 확인했다. 운영 DB는 배포 전 ignored `.data/backups/`에 일관된 SQLite snapshot으로 백업했다.
+
+### 이전까지 확인된 누적 기록
+
+아래 결과에는 이번 영속 대기열·입력 재연결·탭 간 잠금 보완 직전 또는 그보다 이전 코드에서 실행한 실제 모델·장시간 검증이 포함된다. 최신 자동 회귀 결과는 바로 위에 적었고, 이번 변경 뒤의 외부·실기기 미실행 범위는 다음 절에 별도로 적는다.
 
 - Windows 11/WSL2, Ryzen AI MAX+ 395, Radeon 8060S(gfx1151), WSL RAM 47 GiB, ROCm 7.2.4/PyTorch 2.10 환경을 직접 확인했다.
 - 대상 Radeon/ROCm에서 Qwen3-ASR-1.7B BF16/SDPA 로드와 한국어 FLEURS 10개 추론
@@ -243,22 +271,24 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - mocked Gateway에서 청크 문맥이 target 결과에 중복되지 않는지, 한국어 조사에 붙은 이메일/전화·주민·카드·모든 아라비아 숫자 가림과 단일 복원, placeholder/ID/숫자 훼손 거절, 기존 수치를 바꾼 뒤 원래 수치를 덧붙이는 우회 거절, 새 숫자 경고, HTTP 408/425/429/5xx·network transient retry와 402 무재시도, 요청·응답 상한을 검증했다. correction API에서 owner-only, raw 불변, idempotent retry, final gate, processing 중 DELETE 거절, safe status/error를 검증했다.
 - `threading.Event` 기반 격리 API 회귀 테스트에서 correction worker를 멈춰 둔 동안 다른 수업의 전사·녹음 final 저장이 끝나고, 반대로 Qwen fake 추론을 멈춰 둔 동안 완료 수업 후보정이 DB `completed`까지 진행되는 것을 확인했다. 두 수업의 raw segment와 별도 후보정 행은 섞이지 않았다.
 - 코드 검토로 확인한 방어선: ignored 환경설정 기반 서버 측 계정 allow-list·DB exact-set 검사·소유권 검사, exact-origin 제한, chunked body 제한, 계정별 녹음 권한·UUID 경로·WAV 검증, import 원본 권한/삭제 상태, 동일 lecture/chunk/import UUID의 idempotent 응답, 초대 링크의 API 주소 배제, 계정 전체 주소 합산 로그인 제한
-- 최종 회귀 실행: Python 서버/API/DB/설정/전사기/importer/녹음 저장·후보정·관리자 API·터널 제어·Pages 런타임 설정 115개 테스트와 Node 웹 테스트 4개 파일(앱 상태 테스트 86개, 오디오 테스트 20개, 정적 웹 경계 테스트 7개) 모두 통과. 실제 ID/키 비공개 설정, 2~10개 계정 검증과 명시적 계정 추가 rollback, 기존 자격정보·세션·수업 보존, 세 번째 계정의 관리자 조작 거절·수업 격리, presence TTL·비영속성, 세션 해제 경쟁, persisted 운영 중지, 터널 요청 경합·PID/실행 파일 위조 거절, legacy DB 계정 제약 제거와 텍스트 전용 수업 완료 승격, 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정·수업 전환의 오래된 UI 응답, system-audio track 분리, pause/resume 경계·제어 경쟁·resume 중 track/context 종료, 진행 수업 후보정 1회 예약, 인증 만료·tunnel 교체 뒤 같은 소유자 예약 복구, 다른 계정 인수 차단, 과거 수업 후보정과 live chunk 격리, final guard의 응답 유실·중복 요청·동시 WAV 변경·소유권 UUID 재사용 방어도 포함한다.
+- 이번 내구성 변경 직전의 회귀 기록: 당시 Python 서버/API/DB/설정/전사기/importer/녹음 저장·후보정·관리자 API·터널 제어·Pages 런타임 설정 115개 테스트와 Node 웹 테스트 4개 파일(앱 상태 테스트 86개, 오디오 테스트 20개, 정적 웹 경계 테스트 7개)가 통과했다. 실제 ID/키 비공개 설정, 2~10개 계정 검증과 명시적 계정 추가 rollback, 기존 자격정보·세션·수업 보존, 세 번째 계정의 관리자 조작 거절·수업 격리, presence TTL·비영속성, 세션 해제 경쟁, persisted 운영 중지, 터널 요청 경합·PID/실행 파일 위조 거절, legacy DB 계정 제약 제거와 텍스트 전용 수업 완료 승격, 행·FK 보존, 설정 불일치 무변경 거절, 3자 비밀번호 거절·4자 허용, 파일 전체 지문, offset 재개, 소유권, raw 삭제 실패·재시도, 7일 정리, 취소/완료 경쟁, 로그인·로그아웃·계정·수업 전환의 오래된 UI 응답, system-audio track 분리, pause/resume 경계·제어 경쟁, 진행 수업 후보정 예약, 당시 인증 만료·tunnel 교체 복구, 다른 계정 인수 차단, 과거 수업 후보정과 live chunk 격리, final guard의 응답 유실·중복 요청·동시 WAV 변경·소유권 UUID 재사용 방어가 포함됐다. 이후 수정된 경로에는 이 통과 기록을 적용하지 않는다.
 - 녹음 전용 시험은 overlap PCM 제거, byte-identical retry, bounded silence gap, quota 실패 시 기존 파일 불변, 부분 write rollback, symlink 거부/안전 삭제, 전송 중단 fd close, 60초 ticket Range 재개·만료, 명시적 final 복구, 다른 계정 불변, DELETE/inference 경합과 응답 유실 idempotency를 포함한다.
-- 웹 시험은 KST 자정 경계 날짜 그룹, TXT/Markdown 내용·이스케이프·안전 파일명, 동일 API origin ticket 제한, 마지막 실패 조각 확정과 WAV 없음의 정확한 안내, 507 수동 복구, 다운로드·삭제·계정 전환의 stale 응답 방어를 포함한다. 자동 주소의 익명 health 선행, stale 저장 주소 차단, 24시간 lease 만료 뒤 Bearer·비밀번호·음성 본문 차단, 새 tunnel에서 같은 계정 재로그인 후 큐 재개도 검증했다. Python source `py_compile`, JavaScript `--check`, `git diff --check`도 통과했다.
+- 당시 웹 시험은 KST 자정 경계 날짜 그룹, TXT/Markdown 내용·이스케이프·안전 파일명, 동일 API origin ticket 제한, 마지막 실패 조각 확정과 WAV 없음의 정확한 안내, 507 수동 복구, 다운로드·삭제·계정 전환의 stale 응답 방어를 포함했다. 자동 주소의 익명 health 선행, stale 저장 주소 차단, 24시간 lease 만료 뒤 민감 본문 차단, 새 tunnel 재로그인 복구도 검증했으며 최신 정적 회귀 결과는 위 절에 갱신했다.
 - GitHub Actions Pages 배포 성공 후 공개 URL의 `index.html`, `app.js`, `audio.js`, `file-import.js`, `pcm-worklet.js`, `style.css`가 로컬 배포본과 byte-for-byte 일치하고 HTTPS 200임을 확인했다.
 - 실제 Quick Tunnel edge를 통해 `/health` 200, Pages Origin의 CORS 헤더와 새 파일 조각 `PUT` preflight를 확인했고, 허용하지 않은 Origin은 서버 경계에서 403으로 거절됐다. cloudflared의 DNS·UDP/QUIC·TCP·Cloudflare API 사전 점검도 모두 PASS였다.
 
 ### 아직 확인하지 못함
 
+- Windows Chrome의 네이티브 임시 프로필과 localhost 합성 WAV 하네스로 IndexedDB/Web Locks 실동작 확인을 시도했다. WSL UNC 프로필의 Chrome DB 잠금 오류는 Windows 네이티브 프로필로 분리했지만, `--dump-dom` 실행기가 비동기 완료 상태를 폴링하지 못해 제품 성공·실패를 판정할 결과 마커를 얻지 못했다. 운영 origin·계정·API에는 접근하지 않았고 제품 실패로 판정된 항목도 없다. 따라서 영속 IndexedDB 대기열의 페이지 재실행 복구, Web Locks의 두 탭 상호 배제, 새 Quick Tunnel 재로그인, AudioContext 재개와 영구 track 종료 뒤 입력 재연결을 함께 반복하는 실제 브라우저 장시간 시험은 아직 하지 않았다. 자동 상태/오디오 계약은 위 130개 Node 회귀에 포함된다.
 - 사용자가 실제로 들을 45~90분 한국어 수업 샘플의 인식 품질
 - 교실 거리·잔향·잡음·여러 화자·전문용어 조건
 - 90분 연속 실행 중 thermal throttling과 WSL 공유 메모리 회수
 - 실제 학교 Wi-Fi와 태블릿을 사용한 Quick Tunnel 장기 연결 중단/복구
 - 실사용 종료 버튼, 마이크 강제 중단, 화면 잠금 각각에서 마지막 음절·문장 보존
-- 실제 데스크톱 Chrome/Edge에서 유튜브·강의 플랫폼 탭 오디오 선택, 알림 포함 범위, DRM 차단, 5초 mute 복구, 공유 종료 tail
+- 실제 데스크톱 Chrome/Edge에서 유튜브·강의 플랫폼 탭 오디오 선택, 알림 포함 범위, DRM 차단, 일시 mute·AudioContext 중단 복구, 영구 공유 종료 뒤 재연결 tail
 - 실제 브라우저·Quick Tunnel에서 마이크와 공유 소리의 pause/resume을 여러 번 또는 45~90분 동안 반복했을 때의 경계 음절·3초 문맥·누적 시간축·메모리 증가, pause/stop 제어 경쟁과 인증 만료 순간의 final tail
-- 첫 입력 50ms 미만에서 pause 직후 탭이 사라지는 경우의 브라우저 전용 PCM. API 최소 WAV보다 짧아 서버에는 아직 없으므로 현재 복구 범위 밖이다.
+- Web Locks 지원/미지원 브라우저 각각에서 같은 계정의 두 탭을 열었을 때 두 번째 capture 차단, uploader 인계, ACK 뒤 stale 메타데이터 정리, 삭제·finalize 차단을 실제 확인해야 한다. 운영 지침은 지원 여부와 관계없이 실시간 수업을 한 탭에서만 진행하는 것이다.
+- 첫 입력 50ms 미만에서 pause 직후 페이지 프로세스가 사라지는 경우의 브라우저 전용 PCM. API 최소 WAV보다 짧고 IndexedDB enqueue 전이면 서버와 영속 큐 모두에 없어 현재 복구 범위 밖이다.
 - 실제 NOVA Gateway 후보정과 로컬 Qwen 실시간 전사를 장시간 병행하는 외부 end-to-end. 현재 확인은 Event로 제어한 격리 fake 계약까지다.
 - 실제 브라우저→Quick Tunnel로 큰 녹음 파일 업로드/중단/재선택/백그라운드 변환. 로컬 격리 API의 실제 Qwen E2E 한 파일은 통과했지만 활성 계정 외부 E2E는 아직이다.
 - MP3/FLAC/OGG/Opus/WebM/MP4/MKV/MOV 각 실파일의 디코딩 호환성과 실제 압축 강의 음질
@@ -273,6 +303,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - NOVA/Mindlogic proxy 자체의 요청 보관·삭제 세부 정책과 외부 요청의 idempotency key 지원. 확인 전에는 완전한 비보관·비학습이나 exactly-once 과금이라고 주장하지 않는다.
 - 실제 관리자 계정으로 Quick Tunnel을 거쳐 관리자 dialog를 열고 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 누르는 브라우저 end-to-end. 현재는 격리 API와 Node UI 계약까지만 검증했다.
 - 실제 운영 Quick Tunnel의 관리자 **재연결** 버튼. 단위 테스트는 고정 argv·응답 유예·동시 요청·실패 복구를 통과했지만, 임시 주소가 바뀌는 외부 작업은 관리자 계정 설정 뒤 별도로 확인해야 한다.
+- 실제 CLOVA Secret Key 인증과 Basic 스트리밍 도메인 연결, 실제 한국어 음성 응답은 아직 확인하지 않았다. 따라서 Qwen보다 한국어 수업 정확도가 높은지, 실제 지연·15초 과금 단위·Object Storage 결과와 로컬 segment가 일치하는지는 미검증이다.
+- 실제 CLOVA에서 5분 전 connection rotation, 45~90분 수업, 여러 번 pause/resume, 학교 Wi-Fi 단절을 거쳤을 때 문맥·마지막 문장·중복·누락·메모리/스레드/channel 회수는 fake gRPC 계약을 넘어선 검증이 필요하다.
+- CLOVA 무음 ACK, dead-stream 재연결, control 응답, 종료 경합은 fake gRPC를 포함한 최신 Python 전체 회귀에 들어갔다. 실제 Secret Key 인증과 외부 음성 응답은 위와 같이 별도 미검증이다.
 
 실제 수업 음성 샘플이 제공되면 원본은 `.samples/`에만 두고 다음 순서로 검증한다.
 
@@ -312,6 +345,8 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 2026-09-04 계정 추가 전 `.data/backups/pre-account-add-20260904.sqlite3`와 `.env` 사본을 각각 `0600`으로 만들었다. 계정 수를 2~10개로 일반화하되 일반 시작의 exact-set 검사는 유지하고, echo-disabled `add-account`만 기존 DB와 private env를 한 계정씩 늘리도록 했다. 운영 목록에는 세 계정이 있고 기존 두 계정은 활성 상태, 새 계정은 7일짜리 초대가 있는 비활성 상태다. 기존 두 사용자 행과 다른 모든 DB 테이블이 백업과 같고, 첫 번째 관리자 지정·목록 순서·환경설정·integrity/FK가 보존됐음을 실제 값 출력 없이 확인했다. 새 초대 링크 하나는 권한 `0600`의 `.data/invitations.txt`에만 있으며 API 주소 매개변수를 포함하지 않는다. Qwen warmup 서버와 Quick Tunnel을 다시 연결한 뒤 local/external health 200, 무인증 관리자 401, 잘못된 Origin 403, Pages CORS와 현재 런타임 설정 일치를 확인했다.
 
+같은 날 사용자의 요청으로 세 번째 구성 계정의 초대를 다시 발급했다. 변경 전 DB는 `.data/backups/pre-account3-invite-reset-20260904.sqlite3`에 보존했고, 해당 계정의 자격정보·세션·설정 상태만 초기화했으며 기존 수업은 보존했다. 새 일회용 링크는 권한 `0600`의 `.data/invitations.txt`에만 있고 이전 링크와 비밀번호는 무효다. 이 작업에서는 실행 중 서버와 터널을 중단하거나 재시작하지 않았다.
+
 푸시 전에 반드시 확인할 것:
 
 - 평탄화 잔여 루트 파일이 staging에 없음
@@ -322,11 +357,12 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 ## 다음 단계 우선순위
 
-1. 비공개 `ADMIN_USERNAME` 지정은 완료됐다. 서버를 재시작한 뒤 실제 관리자 계정으로 외부 dialog를 확인한다.
-2. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
-3. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
-4. 사용자에게 개인정보를 제거한 실제 한국어 수업 음성 5~10분 샘플과 가능하면 교정문을 요청해 Qwen 원문 품질·경계 누락/중복과 Solar 후보정 전후 CER·의미 보존을 함께 검증한다.
-5. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
+1. 실제 CLOVA 키를 비공개 설정한 뒤 CONFIG, 연속 음성 두 청크, 완전 무음 ACK, pause/resume, 강제 재연결·4분 회전을 비개인 샘플로 확인한다.
+2. 같은 실제 한국어 수업 샘플로 CLOVA와 Qwen의 누락·고유명사·경계 중복 및 비용을 비교한다.
+3. 실제 관리자 계정으로 외부 dialog를 열어 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 확인한다.
+4. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
+5. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
+6. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
 
 ## 재현 명령
 

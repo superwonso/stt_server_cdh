@@ -15,6 +15,7 @@ QUICK_TUNNEL_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 ACCOUNT_USERNAME = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,30}[a-z0-9])?")
 MINDLOGIC_GATEWAY_HOST = "factchat-cloud.mindlogic.ai"
 MINDLOGIC_GATEWAY_PATH = "/v1/gateway"
+CLOVA_SPEECH_GRPC_TARGET = "clovaspeech-gw.ncloud.com:50051"
 
 
 def account_usernames(value: str | None) -> tuple[str, ...]:
@@ -123,6 +124,18 @@ class Settings:
     max_import_seconds: int = 4 * 60 * 60
     max_recordings_bytes: int = 20 * 1024 * 1024 * 1024
     recording_free_reserve_bytes: int = 1024 * 1024 * 1024
+    # CLOVA Speech streaming credentials never leave this process. The target
+    # is intentionally not configurable so a typo or injected environment
+    # value cannot send a bearer credential and private audio to another host.
+    clova_speech_secret_key: str | None = field(default=None, repr=False)
+    clova_stream_response_timeout_seconds: float = 45.0
+    # NAVER documents a five-minute gRPC connection lifetime. Rotate early at
+    # a flushed chunk boundary and use the browser's retained overlap when a
+    # replacement stream starts.
+    clova_stream_max_age_seconds: float = 240.0
+    clova_stream_idle_seconds: float = 45.0
+    clova_epd_gap_ms: int = 1500
+    clova_epd_duration_ms: int = 15000
     mindlogic_api_key: str | None = field(default=None, repr=False)
     mindlogic_base_url: str = f"https://{MINDLOGIC_GATEWAY_HOST}{MINDLOGIC_GATEWAY_PATH}"
     mindlogic_model: str = "solar-pro4"
@@ -145,6 +158,11 @@ class Settings:
             raise ValueError("ADMIN_USERNAME must identify one configured account")
         normalized_gateway = mindlogic_gateway_base_url(self.mindlogic_base_url)
         object.__setattr__(self, "mindlogic_base_url", normalized_gateway)
+        if self.clova_speech_secret_key is not None and (
+            not 16 <= len(self.clova_speech_secret_key) <= 512
+            or any(character.isspace() or ord(character) < 0x20 for character in self.clova_speech_secret_key)
+        ):
+            raise ValueError("CLOVA_SPEECH_SECRET_KEY has an invalid format")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -186,6 +204,20 @@ class Settings:
             recording_free_reserve_bytes=max(
                 256 * 1024 * 1024,
                 min(int(os.getenv("RECORDING_FREE_RESERVE_BYTES", str(1024 * 1024 * 1024))), 20 * 1024 * 1024 * 1024),
+            ),
+            clova_speech_secret_key=(os.getenv("CLOVA_SPEECH_SECRET_KEY") or "").strip() or None,
+            clova_stream_response_timeout_seconds=max(
+                10.0, min(float(os.getenv("CLOVA_STREAM_RESPONSE_TIMEOUT_SECONDS", "45")), 120.0)
+            ),
+            clova_stream_max_age_seconds=max(
+                60.0, min(float(os.getenv("CLOVA_STREAM_MAX_AGE_SECONDS", "240")), 270.0)
+            ),
+            clova_stream_idle_seconds=max(
+                5.0, min(float(os.getenv("CLOVA_STREAM_IDLE_SECONDS", "45")), 120.0)
+            ),
+            clova_epd_gap_ms=max(250, min(int(os.getenv("CLOVA_EPD_GAP_MS", "1500")), 10000)),
+            clova_epd_duration_ms=max(
+                1000, min(int(os.getenv("CLOVA_EPD_DURATION_MS", "15000")), 30000)
             ),
             mindlogic_api_key=(os.getenv("MINDLOGIC_API_KEY") or "").strip() or None,
             mindlogic_base_url=mindlogic_gateway_base_url(

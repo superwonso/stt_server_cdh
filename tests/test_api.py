@@ -17,6 +17,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from server.app import create_app, decode_wav as real_decode_wav
+from server.clova_transcriber import ClovaTranscriptionError
 from server.manage import create_invitations
 from server.security import PASSWORD_HASHER, digest
 from server.settings import Settings
@@ -61,6 +62,57 @@ class FakeTranscriber:
         return [{"start": 0, "end": len(samples) / 16000, "text": " 수업 받아쓰기입니다. "}]
 
 
+class FakeClovaTranscriber:
+    def __init__(self, *, configured=False):
+        self.configured = configured
+        self.calls = 0
+        self.invocations = []
+        self.closed_sessions = []
+        self.error = None
+
+    def status(self):
+        # This deliberately sensitive-looking adapter data must never be
+        # reflected by the generic authenticated status endpoint.
+        return {
+            "endpoint": "private-clova-endpoint.example",
+            "secret_key": "private-clova-secret",
+            "session_ids": ["private-session"],
+        }
+
+    def transcribe(
+        self,
+        samples,
+        language,
+        overlap_seconds=0,
+        final_chunk=True,
+        *,
+        lecture_id,
+        username,
+        start_seconds,
+        payload_hash,
+    ):
+        self.calls += 1
+        self.invocations.append({
+            "sample_count": len(samples),
+            "language": language,
+            "overlap_seconds": overlap_seconds,
+            "final_chunk": final_chunk,
+            "lecture_id": lecture_id,
+            "username": username,
+            "start_seconds": start_seconds,
+            "payload_hash": payload_hash,
+        })
+        if self.error is not None:
+            raise self.error
+        return [{"start": 0.1, "end": min(0.9, len(samples) / 16000), "text": " 클로바 결과 "}]
+
+    def close_session(self, username, lecture_id):
+        self.closed_sessions.append((username, lecture_id))
+
+    def close(self):
+        return None
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -72,7 +124,12 @@ class ApiTests(unittest.TestCase):
             site_origins=("https://student.github.io",),
             max_pending_chunks=1,
         )
-        self.app = create_app(self.settings, self.engine)
+        self.clova = FakeClovaTranscriber()
+        self.app = create_app(
+            self.settings,
+            self.engine,
+            clova_transcriber=self.clova,
+        )
         self.client = TestClient(self.app)
         self.database = self.app.state.database
         self.codes = {"user-alpha": "a" * 43, "user-beta": "b" * 43}
@@ -100,11 +157,23 @@ class ApiTests(unittest.TestCase):
     def headers(self, token):
         return {"Authorization": f"Bearer {token}"}
 
-    def lecture(self, token, title="테스트 수업", lecture_id=None):
+    def lecture(
+        self,
+        token,
+        title="테스트 수업",
+        lecture_id=None,
+        *,
+        language="ko",
+        asr_provider="qwen",
+    ):
         headers = self.headers(token)
         if lecture_id:
             headers["X-Lecture-Id"] = lecture_id
-        response = self.client.post("/lectures", json={"title": title, "language": "ko"}, headers=headers)
+        response = self.client.post(
+            "/lectures",
+            json={"title": title, "language": language, "asr_provider": asr_provider},
+            headers=headers,
+        )
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["id"]
 
@@ -177,6 +246,186 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/lectures").status_code, 401)
         self.assertEqual(self.client.get("/status").status_code, 401)
         self.assertEqual(self.engine.calls, 0)
+
+    def test_qwen_is_the_default_provider_and_only_uses_the_local_engine(self):
+        token = self.activate()
+        created = self.client.post(
+            "/lectures",
+            json={"title": "기본 로컬 수업", "language": "ko"},
+            headers=self.headers(token),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        lecture_id = created.json()["id"]
+        self.assertEqual(created.json()["asr_provider"], "qwen")
+        self.assertEqual(
+            self.client.get(f"/lectures/{lecture_id}", headers=self.headers(token)).json()[
+                "asr_provider"
+            ],
+            "qwen",
+        )
+        self.assertEqual(
+            self.client.get("/lectures", headers=self.headers(token)).json()[0]["asr_provider"],
+            "qwen",
+        )
+
+        uploaded = self.upload(token, lecture_id)
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        self.assertEqual(self.engine.calls, 1)
+        self.assertEqual(self.clova.calls, 0)
+
+    def test_clova_provider_is_explicit_owned_and_immutable(self):
+        owner = self.activate()
+        other = self.activate("user-beta")
+        self.clova.configured = True
+        lecture_id = str(uuid.uuid4())
+        created_id = self.lecture(
+            owner,
+            "클로바 수업",
+            lecture_id,
+            asr_provider="clova",
+        )
+        self.assertEqual(created_id, lecture_id)
+        detail = self.client.get(
+            f"/lectures/{lecture_id}", headers=self.headers(owner)
+        ).json()
+        self.assertEqual(detail["asr_provider"], "clova")
+
+        replayed = self.client.post(
+            "/lectures",
+            json={"title": "클로바 수업", "language": "ko", "asr_provider": "clova"},
+            headers=self.headers(owner) | {"X-Lecture-Id": lecture_id},
+        )
+        self.assertEqual(replayed.status_code, 201, replayed.text)
+        self.assertEqual(replayed.json()["id"], lecture_id)
+        changed = self.client.post(
+            "/lectures",
+            json={"title": "클로바 수업", "language": "ko", "asr_provider": "qwen"},
+            headers=self.headers(owner) | {"X-Lecture-Id": lecture_id},
+        )
+        self.assertEqual(changed.status_code, 409, changed.text)
+
+        hidden = self.upload(other, lecture_id)
+        self.assertEqual(hidden.status_code, 404, hidden.text)
+        self.assertEqual(self.clova.calls, 0)
+        uploaded = self.upload(
+            owner,
+            lecture_id,
+            start="12.5",
+            extra_headers={"X-Overlap-Seconds": "0.25", "X-Final-Chunk": "false"},
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        self.assertEqual(self.engine.calls, 0)
+        self.assertEqual(self.clova.calls, 1)
+        invocation = self.clova.invocations[0]
+        self.assertEqual(invocation["language"], "ko")
+        self.assertEqual(invocation["overlap_seconds"], 0.25)
+        self.assertFalse(invocation["final_chunk"])
+        self.assertEqual(invocation["lecture_id"], lecture_id)
+        self.assertEqual(invocation["username"], "user-alpha")
+        self.assertEqual(invocation["start_seconds"], 12.5)
+        self.assertRegex(invocation["payload_hash"], r"^[0-9a-f]{64}$")
+        self.assertEqual(uploaded.json()["segments"][0]["start"], 12.6)
+
+    def test_clova_requires_configuration_and_an_explicit_supported_language(self):
+        token = self.activate()
+        unconfigured = self.client.post(
+            "/lectures",
+            json={"title": "설정 전", "language": "ko", "asr_provider": "clova"},
+            headers=self.headers(token),
+        )
+        self.assertEqual(unconfigured.status_code, 503, unconfigured.text)
+        self.clova.configured = True
+        automatic = self.client.post(
+            "/lectures",
+            json={"title": "자동 언어", "language": None, "asr_provider": "clova"},
+            headers=self.headers(token),
+        )
+        self.assertEqual(automatic.status_code, 422, automatic.text)
+        invalid_provider = self.client.post(
+            "/lectures",
+            json={"title": "잘못된 공급자", "language": "ko", "asr_provider": "external"},
+            headers=self.headers(token),
+        )
+        self.assertEqual(invalid_provider.status_code, 422, invalid_provider.text)
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM lectures").fetchone()[0], 0)
+        self.assertEqual(self.engine.calls, 0)
+        self.assertEqual(self.clova.calls, 0)
+
+    def test_clova_finalize_closes_without_resending_or_running_qwen(self):
+        token = self.activate()
+        self.clova.configured = True
+        lecture_id = self.lecture(token, asr_provider="clova")
+        uploaded = self.upload(
+            token,
+            lecture_id,
+            extra_headers={"X-Final-Chunk": "false"},
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        before = self.clova.calls
+        finalized = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(token),
+        )
+        self.assertEqual(finalized.status_code, 200, finalized.text)
+        self.assertEqual(finalized.json()["segments"], [])
+        self.assertTrue(finalized.json()["recording_available"])
+        self.assertTrue(finalized.json()["recording_finalized"])
+        self.assertEqual(self.clova.calls, before)
+        self.assertEqual(self.engine.calls, 0)
+        self.assertEqual(self.clova.closed_sessions, [("user-alpha", lecture_id)])
+
+        replayed = self.client.post(
+            f"/lectures/{lecture_id}/recording-finalize",
+            headers=self.headers(token),
+        )
+        self.assertEqual(replayed.status_code, 200, replayed.text)
+        self.assertEqual(self.clova.calls, before)
+
+    def test_clova_failure_is_a_sanitized_non_retryable_http_response(self):
+        token = self.activate()
+        self.clova.configured = True
+        lecture_id = self.lecture(token, asr_provider="clova")
+        error = ClovaTranscriptionError("provider_timeout", retryable=True)
+        error.remote_detail = "private-secret-provider-diagnostic"
+        self.clova.error = error
+        with self.assertLogs("classroom", level="WARNING") as captured:
+            failed = self.upload(
+                token,
+                lecture_id,
+                extra_headers={"X-Final-Chunk": "false"},
+            )
+        self.assertEqual(failed.status_code, 424, failed.text)
+        self.assertNotIn("Retry-After", failed.headers)
+        combined = failed.text + "\n" + "\n".join(captured.output)
+        self.assertNotIn("private-secret", combined)
+        self.assertNotIn("diagnostic", combined)
+        self.assertNotIn("clovaspeech-gw", combined)
+        self.assertEqual(self.engine.calls, 0)
+        with self.database.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE lecture_id = ?", (lecture_id,)
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_status_whitelists_provider_availability_without_adapter_details(self):
+        token = self.activate()
+        self.clova.configured = True
+        response = self.client.get("/status", headers=self.headers(token))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["transcription_providers"],
+            {
+                "qwen": {"configured": True, "label": "이 PC의 Qwen"},
+                "clova": {"configured": True, "label": "NAVER Cloud CLOVA Speech"},
+            },
+        )
+        self.assertNotIn("private-clova", response.text)
+        self.assertNotIn("endpoint", response.text.casefold())
+        self.assertNotIn("secret", response.text.casefold())
+        self.assertNotIn("session_ids", response.text.casefold())
 
     def test_chunk_retry_is_idempotent_and_rejects_changed_payload(self):
         token = self.activate()

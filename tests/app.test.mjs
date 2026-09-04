@@ -12,6 +12,18 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
     const RecordingFileUploader = TestFileUploader;
     const isTerminalImportState = state => ['completed','failed','cancelled'].includes(state?.status);
   `)
+  .replace("import { liveCoordination } from './live-coordination.js';", 'const liveCoordination = TestLiveCoordination;')
+  .replace(`import {
+  DurableLiveQueue,
+  estimateStorage,
+  isLiveQueueUnavailableError,
+  requestPersistentStorage,
+} from './live-queue.js';`, `
+    const DurableLiveQueue = TestDurableLiveQueue;
+    const estimateStorage = async () => ({supported:true,usage:0,quota:1024 ** 3,remaining:1024 ** 3});
+    const isLiveQueueUnavailableError = () => false;
+    const requestPersistentStorage = async () => ({supported:true,persisted:true,requested:false});
+  `)
   .replace('void init();', '');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const response = (value, status = 200, headers = {}) => ({
@@ -22,6 +34,15 @@ const chunk = (startSeconds, durationSeconds = 8, overlapSeconds = 0, final = fa
   blob:encodeWav(new Float32Array(Math.max(1, Math.round(durationSeconds * 16000))).fill(0.25)),
   startSeconds,durationSeconds,overlapSeconds,final,
 });
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const requireUuid = (value, label) => {
+  if (typeof value !== 'string' || !UUID.test(value)) throw new TypeError(`${label} must be a UUID`);
+  return value.toLowerCase();
+};
+const requireOwner = value => {
+  if (typeof value !== 'string' || value !== value.trim() || !value) throw new TypeError('owner is invalid');
+  return value;
+};
 const isoSeconds = milliseconds => new Date(Math.floor(milliseconds / 1000) * 1000).toISOString().replace('.000Z','Z');
 function runtimeConfig({state = 'online', apiUrl = 'https://fresh-tunnel.trycloudflare.com', publishedMs = Date.now() - 60000, expiresMs = publishedMs + 86400000} = {}) {
   return {version:1,state,apiUrl,publishedAt:isoSeconds(publishedMs),expiresAt:isoSeconds(expiresMs)};
@@ -77,7 +98,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
     return node;
   };
   const element = name => {
-    const initialValue = name === 'language' ? 'ko' : name === 'export-format' ? 'text' : '';
+    const initialValue = name === 'language' ? 'ko' : name === 'asr-provider' ? 'qwen' : name === 'audio-source' ? 'microphone' : name === 'export-format' ? 'text' : '';
     if (!elements.has(name)) elements.set(name, makeElement(name,initialValue));
     return elements.get(name);
   };
@@ -89,6 +110,36 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
     const values = createdElements.get(tag) || [];
     values.push(node); createdElements.set(tag,values);
     return node;
+  };
+  const coordination = {
+    captureOwners:[], uploaderOwners:[], destructiveCalls:[], releasedCaptureLeases:0,
+    async acquireLiveCapture(owner) {
+      requireOwner(owner);
+      this.captureOwners.push(owner);
+      let released = false;
+      return {
+        supported:true,acquired:true,reason:null,
+        get released() { return released; },
+        release:async () => {
+          if (released) return;
+          released = true;
+          coordination.releasedCaptureLeases += 1;
+        },
+      };
+    },
+    async runUploader(owner,work) {
+      requireOwner(owner);
+      if (typeof work !== 'function') throw new TypeError('uploader work is invalid');
+      this.uploaderOwners.push(owner);
+      return {supported:true,value:await work()};
+    },
+    async runDestructiveLectureAction(owner,lectureId,work,{hasActiveSession} = {}) {
+      requireOwner(owner); requireUuid(lectureId,'lectureId');
+      if (typeof work !== 'function') throw new TypeError('destructive work is invalid');
+      this.destructiveCalls.push({owner,lectureId});
+      if (hasActiveSession?.()) return {supported:true,executed:false,reason:'capture-active'};
+      return {supported:true,executed:true,value:await work()};
+    },
   };
   const document = {
     hidden:false,getElementById:element,querySelector:element,createElement,
@@ -125,13 +176,120 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
         if (this.resumeError) throw this.resumeError;
         this.paused = false; this.recording = true;
       }
+      async resumeInput() {
+        this.resumeInputCalls = (this.resumeInputCalls || 0) + 1;
+        if (this.resumeInputError) throw this.resumeInputError;
+        return this.inputStillUnavailable ? false : true;
+      }
+      async reconnect() {
+        this.reconnectCalls = (this.reconnectCalls || 0) + 1;
+        if (this.reconnectError) throw this.reconnectError;
+        this.reconnectNeeded = false; this.paused = false; this.recording = true;
+      }
       async stop() {
         if (!this.recording && !this.paused) return;
         this.recording = false; this.paused = false; this.stopCalls = (this.stopCalls || 0) + 1;
-        this.callbacks.onChunk(this.tail || {blob:encodeWav(new Float32Array(160).fill(0.25)),startSeconds:0,durationSeconds:0.01,overlapSeconds:0,final:true});
+        if (this.tail) this.callbacks.onChunk(this.tail);
         if (this.stopError) throw this.stopError;
       }
     },
+    TestDurableLiveQueue:class {
+      constructor() { this.sessions = new Map(); this.chunks = new Map(); }
+      async open() { return this; }
+      async createSession(value) {
+        requireUuid(value.id,'captureId'); requireOwner(value.owner);
+        if (!['qwen','clova'].includes(value.asrProvider)) throw new TypeError('provider is invalid');
+        const existing = this.sessions.get(value.id);
+        if (existing) {
+          if (existing.owner !== value.owner || existing.asrProvider !== value.asrProvider) throw new Error('session conflict');
+          return {...existing};
+        }
+        const stored = {...value,state:'recording',lectureCreated:false,finalQueued:false,nextSequence:0,capturedSamples:0};
+        this.sessions.set(value.id,stored); return {...stored};
+      }
+      async updateSession(owner,id,updates) {
+        requireOwner(owner); requireUuid(id,'captureId');
+        const stored = this.sessions.get(id); if (!stored || stored.owner !== owner) throw new Error('missing session');
+        Object.assign(stored,updates); return {...stored};
+      }
+      async enqueueChunk(owner,captureId,value) {
+        requireOwner(owner); requireUuid(captureId,'captureId'); requireUuid(value.id,'chunkId');
+        const session = this.sessions.get(captureId); if (!session || session.owner !== owner) throw new Error('missing session');
+        if (session.finalQueued || session.state === 'completed') throw new Error('session already finalized');
+        if (value.startSamples + value.overlapSamples !== session.capturedSamples) throw new Error('chunk timeline conflict');
+        const stored = {...value,owner,captureId,lectureId:captureId,asrProvider:session.asrProvider,
+          sessionCreatedAt:session.createdAt,sequence:session.nextSequence++,byteLength:value.blob.size,
+          state:'queued',attempts:0,errorKind:'',downloadRequested:false,inflightAt:null};
+        session.capturedSamples = value.startSamples + value.durationSamples;
+        if (value.final) { session.finalQueued = true; session.state = 'stopped'; }
+        this.chunks.set(value.id,stored); return {...stored};
+      }
+      async getChunk(owner,id) {
+        requireOwner(owner); requireUuid(id,'chunkId');
+        const item = this.chunks.get(id); return item?.owner === owner ? {...item} : null;
+      }
+      async ackChunk(owner,id) {
+        requireOwner(owner); requireUuid(id,'chunkId');
+        const item = this.chunks.get(id); if (!item || item.owner !== owner) return null;
+        if (item.asrProvider === 'clova' && item.state !== 'inflight' && !item.downloadRequested) throw new Error('unsafe CLOVA ack');
+        if (item.final && [...this.chunks.values()].filter(chunk => chunk.owner === owner && chunk.captureId === item.captureId).length !== 1) {
+          throw new Error('final chunk is not last');
+        }
+        this.chunks.delete(id);
+        if (item.final) this.sessions.delete(item.captureId);
+        return {chunk:{...item}};
+      }
+      async markChunkInflight(owner,id) {
+        requireOwner(owner); requireUuid(id,'chunkId');
+        const item = this.chunks.get(id); if (!item || item.owner !== owner) throw new Error('missing chunk');
+        if (item.asrProvider !== 'clova' || item.state !== 'queued') throw new Error('invalid inflight transition');
+        item.state = 'inflight'; item.inflightAt = new Date().toISOString();
+        item.attempts += 1;
+        this.markInflightCalls = (this.markInflightCalls || 0) + 1;
+        return {...item};
+      }
+      async markChunkBlocked(owner,id,errorKind) {
+        requireOwner(owner); requireUuid(id,'chunkId');
+        const item = this.chunks.get(id); if (!item || item.owner !== owner) throw new Error('missing chunk');
+        if (item.state !== 'inflight') item.attempts += 1;
+        Object.assign(item,{state:'blocked',errorKind});
+      }
+      async markChunkQueued(owner,id) {
+        requireOwner(owner); requireUuid(id,'chunkId');
+        const item = this.chunks.get(id); if (!item || item.owner !== owner) throw new Error('missing chunk');
+        Object.assign(item,{state:'queued',errorKind:'',inflightAt:null});
+      }
+      async setDownloadRequested(owner,id,requested) {
+        requireOwner(owner); requireUuid(id,'chunkId');
+        const item = this.chunks.get(id); if (!item || item.owner !== owner) throw new Error('missing chunk');
+        item.downloadRequested = requested;
+      }
+      async getStats(owner) { const items = [...this.chunks.values()].filter(item => item.owner === owner); return {count:items.length,bytes:items.reduce((sum,item) => sum + item.byteLength,0),queued:items.filter(item => item.state === 'queued').length,inflight:items.filter(item => item.state === 'inflight').length,blocked:items.filter(item => item.state === 'blocked').length}; }
+      async recoverOwner() { return {sessions:[],chunks:[],inflightChunks:[],stats:{count:0,bytes:0,queued:0,inflight:0,blocked:0}}; }
+      async hasWorkForOtherOwner(owner) {
+        requireOwner(owner);
+        return [...this.chunks.values()].some(item => item.owner !== owner)
+          || [...this.sessions.values()].some(item => item.owner !== owner && item.state !== 'completed');
+      }
+      async hasPendingChunks(owner,captureId) {
+        requireOwner(owner); requireUuid(captureId,'captureId');
+        return [...this.chunks.values()].some(item => item.owner === owner && item.captureId === captureId);
+      }
+      async deleteSession(owner,id) {
+        requireOwner(owner); requireUuid(id,'captureId');
+        const session = this.sessions.get(id);
+        if (!session) return {deletedChunks:0,deletedBytes:0};
+        if (session.owner !== owner) throw new Error('session ownership mismatch');
+        let deletedChunks = 0, deletedBytes = 0;
+        for (const [chunkId,item] of this.chunks) {
+          if (item.owner === owner && item.captureId === id) {
+            deletedChunks += 1; deletedBytes += item.byteLength; this.chunks.delete(chunkId);
+          }
+        }
+        this.sessions.delete(id); return {deletedChunks,deletedBytes};
+      }
+    },
+    TestLiveCoordination:coordination,
     TestFileUploader:FileUploader,
   });
   vm.runInContext(source, context);
@@ -154,7 +312,39 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
   const created = tag => createdElements.get(tag)?.at(-1);
   const createdAll = tag => createdElements.get(tag) || [];
   const objectUrlBlob = value => objectUrls.get(value);
-  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,runInterval,dispatchDocument,document,location,historyCalls,storedServer:() => storedServerValue,microphone:() => mic};
+  const seedDurableFailedFinal = async ({lectureId,error = '마지막 조각 실패'} = {}) => {
+    const chunkId = webcrypto.randomUUID();
+    context.TestSeed = {lectureId,chunkId,audio:chunk(0,0.05,0,true),error};
+    try {
+      await run(`(async () => {
+        const fixture=TestSeed, lecture=current?.id === fixture.lectureId
+          ? current : lectures.find(item => item.id === fixture.lectureId);
+        const session={id:fixture.lectureId,owner:user,lecture,buffered:[],title:lecture?.title || '수업',
+          language:lecture?.language || 'ko',source:'microphone',asrProvider:'qwen',cancelled:true,
+          creating:null,assignmentTimer:null,assignmentAttempt:0,persistChain:Promise.resolve(),
+          storeReady:Promise.resolve(),captureLease:null,discardAudio:false,createdAt:Date.now(),
+          nextRuntimeSequence:1,durable:true,recovered:false};
+        liveSessions.set(session.id,session); captureSession=session;
+        await openLiveQueue();
+        await liveQueue.createSession({id:session.id,owner:session.owner,title:session.title,
+          language:session.language,source:session.source,asrProvider:session.asrProvider,createdAt:session.createdAt});
+        await liveQueue.updateSession(session.owner,session.id,{lectureCreated:true});
+        const stored=await liveQueue.enqueueChunk(session.owner,session.id,{id:fixture.chunkId,
+          startSamples:0,durationSamples:800,overlapSamples:0,final:true,blob:fixture.audio.blob});
+        await liveQueue.markChunkBlocked(session.owner,fixture.chunkId,'upload_error');
+        await liveQueue.setDownloadRequested(session.owner,fixture.chunkId,true);
+        pending=[{...fixture.audio,id:fixture.chunkId,captureId:session.id,lectureId:session.id,
+          owner:session.owner,asrProvider:session.asrProvider,sessionCreatedAt:stored.sessionCreatedAt,
+          sequence:stored.sequence,lectureReady:true,durable:true,byteLength:stored.byteLength,
+          persistPromise:Promise.resolve(),downloadRequested:true,blocked:true,inflight:false}];
+        sendError=fixture.error; updateControls();
+      })()`);
+    } finally {
+      delete context.TestSeed;
+    }
+    return chunkId;
+  };
+  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,runInterval,dispatchDocument,document,location,historyCalls,storedServer:() => storedServerValue,microphone:() => mic,coordination,seedDurableFailedFinal};
 }
 
 test('activation presents and enforces the four-character minimum in the browser', () => {
@@ -165,57 +355,202 @@ test('activation presents and enforces the four-character minimum in the browser
   assert.match(app.element('password-label').textContent, /4자 이상/);
 });
 
-test('interruption during lecture creation stops once and preserves the short tail without restarting a timer', async () => {
+test('temporary input loss during lecture creation keeps capture open until an explicit stop', async () => {
   const creation = deferred(), uploads = [];
+  let lectureId = '';
   const app = setup(async (url, options) => {
-    if (url.endsWith('/lectures')) return creation.promise;
+    if (url.endsWith('/lectures')) {
+      lectureId = options.headers.get('X-Lecture-Id');
+      return creation.promise;
+    }
     uploads.push(options); return response({segments:[]});
   });
-  const start = app.run('startRecording()');
+  await app.run('startRecording()');
   await tick();
   assert.equal(app.run('recording'), true);
   assert.equal(app.element('record-button').disabled, false);
-  app.microphone().callbacks.onInterrupted(new Error('중단됨'));
+  app.microphone().callbacks.onInputUnavailable(new Error('입력이 잠시 중단됨'),{
+    reason:'track-muted',reconnectNeeded:false,source:'microphone',
+  });
   await tick();
-  creation.resolve(response({id:'lesson',title:'수업',created_at:new Date().toISOString(),segments:[]}));
-  await start; await tick();
+  assert.equal(app.run('recording'), true);
+  assert.equal(app.run('inputUnavailable'), true);
+  assert.equal(app.microphone().stopCalls, undefined);
+  assert.equal(uploads.length, 0);
+  assert.equal(app.intervals.size, 0, 'elapsed time pauses while no input is arriving');
+
+  creation.resolve(response({id:lectureId,title:'수업',created_at:new Date().toISOString(),segments:[]}));
+  await tick(); await tick();
+  app.microphone().callbacks.onInputRecovered({reason:'track-unmuted',source:'microphone'});
+  await tick();
+  assert.equal(app.run('inputUnavailable'), false);
+  assert.equal(app.run('recording'), true);
+  assert.equal(app.intervals.size, 1);
+
+  await app.run('stopRecording()');
+  await tick(); await tick();
   assert.equal(app.run('recording || starting || stopping'), false);
-  assert.equal(app.intervals.size, 0);
-  assert.equal(uploads.length, 1);
-  assert.equal(uploads[0].body.size, 1644);
-  const audio = new DataView(await uploads[0].body.arrayBuffer());
-  assert.equal(audio.getInt16(44, true), 8192);
-  assert.equal(audio.getInt16(44 + 160 * 2, true), 0);
+  assert.equal(app.microphone().stopCalls, 1);
+  assert.equal(uploads.length, 0, 'stopping without any accepted PCM must not synthesize audio');
   assert.equal(app.run('pending.length'), 0);
 });
 
 test('the selected computer-audio source is passed to capture without a preceding network request', async () => {
   const requests = [];
   const app = setup(async (url, options) => {
-    requests.push({url,method:options.method || 'GET'});
-    if (url.endsWith('/lectures')) return response({id:'system-lesson',title:'온라인 강의',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+    requests.push({url,method:options.method || 'GET',body:options.body});
+    if (url.endsWith('/lectures')) return response({id:options.headers.get('X-Lecture-Id'),title:'온라인 강의',language:'ko',asr_provider:'qwen',created_at:new Date().toISOString(),segments:[]},201);
     return response({segments:[]});
   });
+  app.run('transcriptionProviders.clova.configured=true');
+  app.element('asr-provider').value = 'clova';
+  app.element('asr-provider').onchange();
   app.element('audio-source').value = 'system';
   app.element('audio-source').onchange();
   assert.equal(app.element('source-privacy').hidden, false);
+  assert.equal(app.element('asr-provider').value, 'qwen');
+  assert.equal(app.element('asr-provider').disabled, true);
+  assert.match(app.element('provider-guidance').textContent, /항상 이 PC의 Qwen/);
   const starting = app.run('startRecording()');
   assert.equal(app.microphone().callbacks.source, 'system');
   assert.equal(requests.length, 0, 'capture is opened synchronously before lecture creation');
   await starting;
+  assert.equal(JSON.parse(requests.find(request => request.url.endsWith('/lectures')).body).asr_provider,'qwen');
   await app.run('stopRecording()');
   await tick();
+  assert.deepEqual(app.coordination.captureOwners,['user-alpha']);
+  assert.deepEqual(app.coordination.uploaderOwners,[],
+    'a capture with no PCM has no durable chunk to serialize through the uploader lock');
+  assert.equal(app.coordination.releasedCaptureLeases,1);
+});
+
+test('authenticated status enables only the advertised CLOVA choice and ignores provider-supplied display or secret fields', async () => {
+  const app = setup(async url => url.endsWith('/status') ? response({
+    model_state:'ready',
+    transcription_providers:{
+      qwen:{configured:true,label:'untrusted local label'},
+      clova:{configured:true,label:'untrusted cloud label',secret_key:'must-not-render'},
+    },
+  }) : response({}));
+  assert.equal(app.element('asr-provider').value,'qwen');
+  await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider-clova').disabled,false);
+  assert.match(app.element('asr-provider-clova').textContent,/NAVER CLOVA Speech/);
+  assert.doesNotMatch(app.element('asr-provider-clova').textContent,/untrusted|must-not-render/);
+  assert.doesNotMatch(app.run('JSON.stringify(transcriptionProviders)'),/secret|label|must-not-render/);
+
+  app.element('language').value = 'auto';
+  app.element('asr-provider').value = 'clova';
+  app.element('asr-provider').onchange();
+  assert.equal(app.element('language').value,'ko');
+  assert.equal(app.element('provider-privacy').hidden,false);
+  assert.match(app.element('provider-privacy').textContent,/NAVER Cloud/);
+  assert.match(app.element('provider-privacy').textContent,/비용이 청구/);
+  assert.match(app.element('provider-privacy').textContent,/Object Storage/);
+  assert.match(app.element('provider-privacy').textContent,/자동 저장/);
+  assert.match(app.element('provider-privacy').textContent,/삭제해도 그 클라우드 사본은 삭제되지/);
+});
+
+test('an unavailable CLOVA provider cannot start capture and falls back only by an explicit UI selection', async () => {
+  const app = setup(async url => url.endsWith('/status') ? response({
+    model_state:'ready',transcription_providers:{qwen:{configured:true},clova:{configured:false}},
+  }) : response({}));
+  await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider-clova').disabled,true);
+  app.element('asr-provider').value = 'clova';
+  await app.run('startRecording()');
+  assert.equal(app.microphone(),undefined);
+  assert.equal(app.run('draft'),null);
+  assert.match(app.element('notice').textContent,/설정되지 않았/);
+  assert.equal(app.element('asr-provider').value,'clova','start does not silently switch engines');
+});
+
+test('a CLOVA microphone lecture snapshots its provider in creation and every queued chunk', async () => {
+  const requests = [];
+  const app = setup(async (url,options = {}) => {
+    requests.push({url,options});
+    if (url.endsWith('/lectures')) return response({
+      id:options.headers.get('X-Lecture-Id'),title:'클로바 수업',language:'ko',asr_provider:'clova',created_at:new Date().toISOString(),segments:[],
+    },201);
+    return response({segments:[]});
+  });
+  app.run('transcriptionProviders.clova.configured=true');
+  app.element('asr-provider').value = 'clova';
+  app.element('language').value = 'auto';
+  app.element('asr-provider').onchange();
+  await app.run('startRecording()');
+  const creation = requests.find(request => request.url.endsWith('/lectures'));
+  assert.deepEqual(JSON.parse(creation.options.body),{
+    title:app.run('captureSession.title'),language:'ko',asr_provider:'clova',
+  });
+  assert.equal(app.run('captureSession.asrProvider'),'clova');
+  assert.equal(app.element('asr-provider').disabled,true);
+  assert.equal(app.element('asr-provider').value,'clova');
+
+  app.element('asr-provider').value = 'qwen';
+  app.microphone().callbacks.onChunk(chunk(0));
+  assert.equal(app.run("pending[0]?.asrProvider || 'sent'"),'clova');
+  await tick(); await tick();
+  app.microphone().tail = chunk(5,3,3,true);
+  await app.run('stopRecording()');
+  await tick(); await tick();
+  assert.ok(requests.filter(request => request.url.includes('/chunks')).length >= 1);
+});
+
+test('a mismatched server lecture provider blocks upload without ending capture', async () => {
+  const requests = [];
+  const app = setup(async (url,options = {}) => {
+    requests.push({url,options});
+    if (url.endsWith('/lectures')) return response({
+      id:options.headers.get('X-Lecture-Id'),title:'수업',language:'ko',asr_provider:'clova',created_at:new Date().toISOString(),segments:[],
+    },201);
+    return response({segments:[]});
+  });
+  await app.run('startRecording()');
+  await tick(); await tick();
+
+  assert.equal(requests.filter(request => request.url.includes('/chunks')).length,0);
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.microphone().stopCalls,undefined);
+  assert.equal(app.run('draft.asrProvider'),'qwen');
+  assert.equal(app.run('draft.lecture'),null);
+  assert.match(app.run('sendError'),/다른 수업을 반환/);
+
+  app.microphone().callbacks.onChunk(chunk(0));
+  await tick(); await tick();
+  await app.run('saveFailedChunk()');
+  await app.run('skipFailedChunk()');
+  await tick(); await tick();
+  assert.equal(app.run('pending.length'),0);
+  assert.equal(app.run('recording'),true);
+  assert.ok(app.run('sendError'),'the assignment gate remains visible while capture continues');
+  assert.notEqual(app.run('draft'),null);
+
+  app.microphone().tail = chunk(5,3,3,true);
+  await app.run('stopRecording()');
+  await tick(); await tick();
+  assert.equal(app.microphone().stopCalls,1);
+  assert.equal(app.run('pending.length'),1);
+  await app.run('saveFailedChunk()');
+  await app.run('skipFailedChunk()');
+  await tick(); await tick();
+  assert.equal(app.run('pending.length'),0);
+  assert.equal(app.run('draft'),null);
+  assert.equal(app.run('captureSession'),null);
+  assert.equal(app.run('isBusy()'),false,'explicitly discarding the saved orphan must allow a new class');
 });
 
 test('pause flushes a non-final boundary and resume continues the same lecture and timeline', async () => {
   let lectureCreates = 0;
+  let lectureId = '';
   const uploads = [];
   const app = setup(async (url,options = {}) => {
     if (url.endsWith('/lectures')) {
       lectureCreates += 1;
-      return response({id:'pause-lesson',title:'수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+      lectureId = options.headers.get('X-Lecture-Id');
+      return response({id:lectureId,title:'수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
     }
-    if (url.includes('/lectures/pause-lesson/chunks')) {
+    if (lectureId && url.includes(`/lectures/${lectureId}/chunks`)) {
       uploads.push({
         url,
         start:options.headers.get('X-Start-Seconds'),
@@ -255,7 +590,7 @@ test('pause flushes a non-final boundary and resume continues the same lecture a
   assert.deepEqual(uploads.map(item => item.final),['false','true']);
   assert.deepEqual(uploads.map(item => item.start),['0','1']);
   assert.deepEqual(uploads.map(item => item.overlap),['0','3']);
-  assert.ok(uploads.every(item => item.url.includes('/lectures/pause-lesson/chunks')));
+  assert.ok(uploads.every(item => item.url.includes(`/lectures/${lectureId}/chunks`)));
   assert.equal(app.run('current.recording_finalized'),true);
   assert.equal(app.run('recording || paused || starting || pausing || resuming || stopping'),false);
   historyButton = app.element('lecture-list').querySelectorAll('button')[0];
@@ -274,9 +609,9 @@ test('a defensive short non-final upload is never zero-padded beyond its real ti
   assert.equal(result.size,364);
 });
 
-test('a paused session remains busy and recording-present, and auth expiry stops its final guard', async () => {
-  const app = setup(async url => url.endsWith('/lectures')
-    ? response({id:'paused-auth-lesson',title:'수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201)
+test('auth expiry keeps a paused capture open and offers an explicit local stop', async () => {
+  const app = setup(async (url,options = {}) => url.endsWith('/lectures')
+    ? response({id:options.headers.get('X-Lecture-Id'),title:'수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201)
     : response({segments:[],recording_available:true,recording_finalized:true}));
   await app.run('startRecording()');
   app.microphone().pauseTail = chunk(0,2,0,false);
@@ -286,9 +621,16 @@ test('a paused session remains busy and recording-present, and auth expiry stops
   assert.equal(app.run('presenceActivity()'),'recording');
   app.run('showLogin()');
   await tick(); await tick();
+  assert.equal(app.microphone().stopCalls,undefined);
+  assert.equal(app.run('paused'),true);
+  assert.equal(app.element('auth-capture-stop').hidden,false);
+  assert.equal(app.element('workspace').hidden,true);
+
+  app.element('auth-capture-stop').onclick();
+  await tick(); await tick();
   assert.equal(app.microphone().stopCalls,1);
   assert.equal(app.run('recording || paused || stopping'),false);
-  assert.equal(app.element('workspace').hidden,true);
+  assert.equal(app.element('auth-capture-stop').hidden,true);
 });
 
 test('an explicit caller abort reaches fetch and is not mislabeled as a timeout', async () => {
@@ -452,8 +794,12 @@ test('lecture history groups and filters by the fixed Korean calendar date', () 
 
 test('starting a new recording clears an older date filter before the new lecture arrives', async () => {
   const creation = deferred();
+  let lectureId = '';
   const app = setup((url, options = {}) => {
-    if (url.endsWith('/lectures') && options.method === 'POST') return creation.promise;
+    if (url.endsWith('/lectures') && options.method === 'POST') {
+      lectureId = options.headers.get('X-Lecture-Id');
+      return creation.promise;
+    }
     return response({segments:[],recording_available:true,recording_finalized:true});
   });
   app.run(`
@@ -464,9 +810,11 @@ test('starting a new recording clears an older date filter before the new lectur
   const starting = app.run('startRecording()');
   assert.equal(app.run('lectureDateFilter'), '');
   assert.equal(app.element('lecture-date').value, '');
-  creation.resolve(response({id:'new',title:'새 수업',created_at:'2026-02-01T00:00:00Z',segments:[]},201));
   await starting;
-  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), ['new','old']);
+  await tick();
+  creation.resolve(response({id:lectureId,title:'새 수업',created_at:'2026-02-01T00:00:00Z',segments:[]},201));
+  await tick(); await tick();
+  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), [lectureId,'old']);
   assert.equal(app.element('lecture-list').children.length, 2, 'the new date must not stay hidden by the old filter');
   await app.run('stopRecording()');
   await tick(); await tick();
@@ -624,11 +972,13 @@ test('AI correction is blocked until the lecture is finalized and reports exhaus
 test('a live lecture schedules exactly one correction after its final chunk without stopping capture', async () => {
   const events = [];
   let correctionPosts = 0;
+  let liveLectureId = '';
   const app = setup(async (url, options = {}) => {
     if (url.endsWith('/lectures') && options.method === 'POST') {
-      return response({id:'live-correction',title:'현재 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+      liveLectureId = options.headers.get('X-Lecture-Id');
+      return response({id:liveLectureId,title:'현재 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
     }
-    if (url.endsWith('/lectures/live-correction/chunks')) {
+    if (liveLectureId && url.endsWith(`/lectures/${liveLectureId}/chunks`)) {
       const final = options.headers.get('X-Final-Chunk') === 'true';
       const start = Number(options.headers.get('X-Start-Seconds'));
       events.push(final ? 'final-chunk' : 'chunk');
@@ -637,9 +987,9 @@ test('a live lecture schedules exactly one correction after its final chunk with
         recording_available:true,recording_finalized:final,
       });
     }
-    if (url.endsWith('/lectures/live-correction/correction') && options.method === 'POST') {
+    if (liveLectureId && url.endsWith(`/lectures/${liveLectureId}/correction`) && options.method === 'POST') {
       correctionPosts += 1; events.push('correction');
-      return response({lecture_id:'live-correction',status:'queued',raw_revision:'a'.repeat(64)});
+      return response({lecture_id:liveLectureId,status:'queued',raw_revision:'a'.repeat(64)});
     }
     return response({});
   });
@@ -655,7 +1005,7 @@ test('a live lecture schedules exactly one correction after its final chunk with
   assert.equal(correctionPosts,0,'a changing transcript must not be sent before finalization');
   assert.equal(app.microphone().stopCalls,undefined);
   assert.equal(app.run('recording'),true);
-  assert.equal(app.run("scheduledCorrections.get('live-correction').status"),'scheduled');
+  assert.equal(app.run(`scheduledCorrections.get(${JSON.stringify(liveLectureId)}).status`),'scheduled');
   assert.equal(app.element('correction-panel')['data-state'],'scheduled');
   assert.match(app.element('correction-detail').textContent,/계속됩니다/);
 
@@ -732,12 +1082,13 @@ test('a tunnel replacement between live chunks retains the capture owner and fin
   const oldUrl = 'https://old-live.trycloudflare.com';
   const newUrl = 'https://new-live.trycloudflare.com';
   const events = [];
-  let loginPosts = 0, correctionPosts = 0;
+  let loginPosts = 0, correctionPosts = 0, movingLiveId = '';
   const app = setup((url, options = {}) => {
     if (url === `${oldUrl}/lectures` && options.method === 'POST') {
-      return response({id:'moving-live',title:'현재 수업',language:'ko',created_at:'2026-01-01T00:00:00Z',segments:[]},201);
+      movingLiveId = options.headers.get('X-Lecture-Id');
+      return response({id:movingLiveId,title:'현재 수업',language:'ko',asr_provider:'qwen',created_at:'2026-01-01T00:00:00Z',segments:[]},201);
     }
-    if (url === `${oldUrl}/lectures/moving-live/chunks`) {
+    if (movingLiveId && url === `${oldUrl}/lectures/${movingLiveId}/chunks`) {
       return response({segments:[{id:'first',start:0,end:2,text:'첫 문장'}],recording_available:true,recording_finalized:false});
     }
     if (url === `${newUrl}/auth/login`) {
@@ -745,20 +1096,20 @@ test('a tunnel replacement between live chunks retains the capture owner and fin
       return response({token:'new-live-token',user:{username:'user-alpha',is_admin:false}});
     }
     if (url === `${newUrl}/lectures` && !options.method) {
-      return response([{id:'moving-live',title:'현재 수업',language:'ko',created_at:'2026-01-01T00:00:00Z',
+      return response([{id:movingLiveId,title:'현재 수업',language:'ko',asr_provider:'qwen',created_at:'2026-01-01T00:00:00Z',
         segments:[{id:'first',start:0,end:2,text:'첫 문장'}],recording_available:true,recording_finalized:false}]);
     }
     if (url === `${newUrl}/imports`) return response([]);
     if (url === `${newUrl}/status`) return response({model_state:'ready'});
-    if (url === `${newUrl}/lectures/moving-live/chunks`) {
+    if (movingLiveId && url === `${newUrl}/lectures/${movingLiveId}/chunks`) {
       assert.equal(options.headers.get('Authorization'),'Bearer new-live-token');
       assert.equal(options.headers.get('X-Final-Chunk'),'true');
       events.push('final');
       return response({segments:[{id:'tail',start:6,end:9,text:'마지막 문장'}],recording_available:true,recording_finalized:true});
     }
-    if (url === `${newUrl}/lectures/moving-live/correction` && options.method === 'POST') {
+    if (movingLiveId && url === `${newUrl}/lectures/${movingLiveId}/correction` && options.method === 'POST') {
       correctionPosts += 1; events.push('correction');
-      return response({lecture_id:'moving-live',status:'queued'});
+      return response({lecture_id:movingLiveId,status:'queued'});
     }
     throw new Error(`unexpected request: ${url}`);
   });
@@ -775,9 +1126,11 @@ test('a tunnel replacement between live chunks retains the capture owner and fin
   assert.equal(app.run('apiUrl'),newUrl);
   assert.equal(app.run('token'),'');
   assert.equal(app.run('user'),'user-alpha');
-  assert.equal(app.run('pending.length'),1);
-  assert.equal(app.run("scheduledCorrections.get('moving-live').sessionToken"),'');
-  assert.equal(app.run("scheduledCorrections.get('moving-live').server"),'');
+  assert.equal(app.run('pending.length'),0,'changing the tunnel does not stop capture or synthesize its final tail');
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.microphone().stopCalls,undefined);
+  assert.equal(app.run(`scheduledCorrections.get(${JSON.stringify(movingLiveId)}).sessionToken`),'');
+  assert.equal(app.run(`scheduledCorrections.get(${JSON.stringify(movingLiveId)}).server`),'');
   assert.equal(app.element('username').value,'user-alpha');
 
   app.element('username').value = 'user-beta';
@@ -789,6 +1142,7 @@ test('a tunnel replacement between live chunks retains the capture owner and fin
   app.element('username').value = 'user-alpha';
   app.element('password').value = 'same-account';
   await app.element('auth-form').onsubmit({preventDefault(){}});
+  await app.run('stopRecording()');
   for (let index = 0; index < 6; index += 1) await tick();
   assert.equal(loginPosts,1);
   assert.equal(app.run('pending.length'),0);
@@ -799,7 +1153,7 @@ test('a tunnel replacement between live chunks retains the capture owner and fin
 
 test('a finalized past lecture can be corrected while live chunks stay attached to the active lecture', async () => {
   const chunkUrls = [];
-  let pastCorrectionPosts = 0;
+  let pastCorrectionPosts = 0, activeLiveId = '';
   const past = {
     id:'past-finalized',title:'지난 수업',language:'ko',created_at:'2026-01-01T00:00:00Z',
     recording_available:true,recording_finalized:true,
@@ -807,9 +1161,10 @@ test('a finalized past lecture can be corrected while live chunks stay attached 
   };
   const app = setup(async (url, options = {}) => {
     if (url.endsWith('/lectures') && options.method === 'POST') {
-      return response({id:'active-live',title:'현재 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+      activeLiveId = options.headers.get('X-Lecture-Id');
+      return response({id:activeLiveId,title:'현재 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
     }
-    if (url.endsWith('/lectures/active-live/chunks')) {
+    if (activeLiveId && url.endsWith(`/lectures/${activeLiveId}/chunks`)) {
       chunkUrls.push(url);
       const start = Number(options.headers.get('X-Start-Seconds'));
       return response({
@@ -859,38 +1214,40 @@ test('a finalized past lecture can be corrected while live chunks stay attached 
   app.microphone().callbacks.onChunk(chunk(6,10,2));
   await tick(); await tick();
   assert.ok(chunkUrls.length >= 2);
-  assert.ok(chunkUrls.every(url => url.endsWith('/lectures/active-live/chunks')));
+  assert.ok(chunkUrls.every(url => url.endsWith(`/lectures/${activeLiveId}/chunks`)));
   assert.equal(app.run('current.id'),'past-finalized');
   assert.equal(app.run("captureSession.lecture.segments.length"),2);
   assert.equal(app.element('transcript').children[0],pastTranscriptNode,
     'background live chunks must not rebuild the past transcript being read');
 
   app.element('return-live-capture').onclick();
-  assert.equal(app.run('current.id'),'active-live');
+  assert.equal(app.run('current.id'),activeLiveId);
   assert.equal(app.run('current.segments.length'),2,'returning must retain chunks received while viewing history');
   assert.equal(app.element('live-capture-banner').hidden,true);
   assert.equal(app.element('main-content').focused,true);
+  app.microphone().tail = chunk(13,3,3,true);
   await app.run('stopRecording()');
   await tick(); await tick();
 });
 
 test('paused capture supports both current-lecture scheduling and past-lecture correction', async () => {
-  let activeCorrectionPosts = 0, pastCorrectionPosts = 0;
+  let activeCorrectionPosts = 0, pastCorrectionPosts = 0, pausedLiveId = '';
   const past = {
     id:'paused-past',title:'지난 기록',language:'ko',created_at:'2026-01-01T00:00:00Z',recording_finalized:true,
     segments:[{id:'old',start:0,end:1,text:'지난 원문'}],
   };
   const app = setup(async (url, options = {}) => {
     if (url.endsWith('/lectures') && options.method === 'POST') {
-      return response({id:'paused-live',title:'일시정지 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
+      pausedLiveId = options.headers.get('X-Lecture-Id');
+      return response({id:pausedLiveId,title:'일시정지 수업',language:'ko',created_at:new Date().toISOString(),segments:[]},201);
     }
-    if (url.endsWith('/lectures/paused-live/chunks')) {
+    if (pausedLiveId && url.endsWith(`/lectures/${pausedLiveId}/chunks`)) {
       const start = Number(options.headers.get('X-Start-Seconds'));
       return response({segments:[{id:`p-${start}`,start,end:start + 1,text:'현재 원문'}],recording_available:true,
         recording_finalized:options.headers.get('X-Final-Chunk') === 'true'});
     }
-    if (url.endsWith('/lectures/paused-live/correction') && options.method === 'POST') {
-      activeCorrectionPosts += 1; return response({lecture_id:'paused-live',status:'queued'});
+    if (pausedLiveId && url.endsWith(`/lectures/${pausedLiveId}/correction`) && options.method === 'POST') {
+      activeCorrectionPosts += 1; return response({lecture_id:pausedLiveId,status:'queued'});
     }
     if (url.endsWith('/lectures/paused-past/correction')) {
       if (options.method === 'POST') {
@@ -912,7 +1269,7 @@ test('paused capture supports both current-lecture scheduling and past-lecture c
   assert.equal(app.element('correct-transcript').disabled,false);
   app.element('correct-transcript').onclick();
   assert.equal(activeCorrectionPosts,0);
-  assert.equal(app.run("scheduledCorrections.has('paused-live')"),true);
+  assert.equal(app.run(`scheduledCorrections.has(${JSON.stringify(pausedLiveId)})`),true);
   assert.equal(app.microphone().stopCalls,undefined);
 
   app.run(`lectures.push(${JSON.stringify(past)}); renderHistory(); updateControls()`);
@@ -929,7 +1286,7 @@ test('paused capture supports both current-lecture scheduling and past-lecture c
   assert.equal(app.microphone().stopCalls,undefined);
 
   app.element('return-live-capture').onclick();
-  assert.equal(app.run('current.id'),'paused-live');
+  assert.equal(app.run('current.id'),pausedLiveId);
   assert.equal(app.element('correction-panel')['data-state'],'scheduled');
   app.microphone().tail = chunk(6,2,2,true);
   await app.run('stopRecording()');
@@ -983,7 +1340,8 @@ test('a late automatically scheduled correction cannot alter another account', a
   await tick();
   assert.equal(app.run("scheduledCorrections.get('old-auto').status"),'starting');
   app.run(`
-    showLogin(); token='next-token'; user='next-user';
+    showLogin(); const previousUser=user; token='next-token'; user='next-user';
+    if (previousUser !== user) { scheduledCorrections.clear(); scrubAccountWorkspace(); }
     current={id:'next-lesson',title:'다음 수업',created_at:'2026-01-02T00:00:00Z',recording_finalized:true,
       segments:[{id:'next',start:0,end:1,text:'다음 원문'}]}; lectures=[current]; renderCurrent();
   `);
@@ -1277,6 +1635,7 @@ test('recording download exchanges bearer auth for a same-origin native ticket l
 });
 
 test('recording download repairs an unfinished saved WAV before requesting its ticket', async () => {
+  const lectureId = webcrypto.randomUUID();
   const ticketPath = `/recording-downloads/${'b'.repeat(43)}`;
   const requests = [];
   const app = setup(async (url, options = {}) => {
@@ -1288,15 +1647,15 @@ test('recording download repairs an unfinished saved WAV before requesting its t
     return response({});
   });
   app.run(`
-    current={id:'unfinished',title:'복구 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    current={id:${JSON.stringify(lectureId)},title:'복구 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
     lectures=[{...current}]; renderCurrent(); renderHistory();
   `);
   assert.equal(app.element('recording-download').disabled, false);
   assert.match(app.element('recording-download').textContent, /마무리/);
   await app.run('downloadRecording()');
   assert.deepEqual(requests.map(request => request.url.replace('https://classroom.example','')), [
-    '/lectures/unfinished/recording-finalize',
-    '/lectures/unfinished/recording-download-ticket',
+    `/lectures/${lectureId}/recording-finalize`,
+    `/lectures/${lectureId}/recording-download-ticket`,
   ]);
   assert.ok(requests.every(request => request.method === 'POST' && request.authorization === 'Bearer old-token'));
   assert.equal(app.run('current.recording_finalized'), true);
@@ -1306,22 +1665,23 @@ test('recording download repairs an unfinished saved WAV before requesting its t
 });
 
 test('deletion requires confirmation and invalidates an older lecture response', async () => {
+  const targetId = webcrypto.randomUUID(), remainingId = webcrypto.randomUUID();
   const lateLecture = deferred();
   const lateList = deferred();
   const requests = [];
   const app = setup((url, options = {}) => {
     requests.push({url,method:options.method || 'GET'});
     if (url.endsWith('/lectures') && !options.method) return lateList.promise;
-    if (url.endsWith('/lectures/second') && !options.method) return lateLecture.promise;
-    if (url.endsWith('/lectures/first') && options.method === 'DELETE') return response(null,204);
+    if (url.endsWith(`/lectures/${remainingId}`) && !options.method) return lateLecture.promise;
+    if (url.endsWith(`/lectures/${targetId}`) && options.method === 'DELETE') return response(null,204);
     return response({});
   });
   app.run(`
     lectures=[
-      {id:'first',title:'지울 수업',created_at:'2026-01-02T00:00:00Z'},
-      {id:'second',title:'늦은 수업',created_at:'2026-01-01T00:00:00Z'},
+      {id:${JSON.stringify(targetId)},title:'지울 수업',created_at:'2026-01-02T00:00:00Z'},
+      {id:${JSON.stringify(remainingId)},title:'늦은 수업',created_at:'2026-01-01T00:00:00Z'},
     ];
-    current={id:'first',title:'지울 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
+    current={id:${JSON.stringify(targetId)},title:'지울 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
     renderCurrent(); renderHistory();
   `);
   const groups = app.element('lecture-list').children;
@@ -1336,21 +1696,22 @@ test('deletion requires confirmation and invalidates an older lecture response',
   await app.element('delete-confirm').onclick();
   assert.equal(app.element('delete-dialog').open, false);
   assert.equal(app.run('current'), null);
-  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), ['second']);
-  assert.ok(requests.some(item => item.method === 'DELETE' && item.url.endsWith('/lectures/first')));
+  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), [remainingId]);
+  assert.ok(requests.some(item => item.method === 'DELETE' && item.url.endsWith(`/lectures/${targetId}`)));
 
-  lateLecture.resolve(response({id:'second',title:'늦게 온 내용',created_at:'2026-01-01T00:00:00Z',segments:[]}));
+  lateLecture.resolve(response({id:remainingId,title:'늦게 온 내용',created_at:'2026-01-01T00:00:00Z',segments:[]}));
   lateList.resolve(response([
-    {id:'first',title:'삭제 전 목록',created_at:'2026-01-02T00:00:00Z'},
-    {id:'second',title:'남은 수업',created_at:'2026-01-01T00:00:00Z'},
+    {id:targetId,title:'삭제 전 목록',created_at:'2026-01-02T00:00:00Z'},
+    {id:remainingId,title:'남은 수업',created_at:'2026-01-01T00:00:00Z'},
   ]));
   await selecting;
   await refreshing;
   assert.equal(app.run('current'), null, 'the response started before deletion must not restore a note');
-  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), ['second'], 'a stale list must not restore the deleted note');
+  assert.deepEqual(Array.from(app.run('lectures.map(lecture => lecture.id)')), [remainingId], 'a stale list must not restore the deleted note');
 });
 
 test('deletion safely retries once after a lost response', async () => {
+  const lectureId = webcrypto.randomUUID();
   let deleteCalls = 0;
   let app;
   app = setup(async (_url, options = {}) => {
@@ -1360,7 +1721,7 @@ test('deletion safely retries once after a lost response', async () => {
     return response({status:'deleted'});
   });
   app.run(`
-    current={id:'lost-response',title:'응답이 끊긴 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
+    current={id:${JSON.stringify(lectureId)},title:'응답이 끊긴 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
     lectures=[current]; renderCurrent(); renderHistory();
   `);
   app.element('delete-lecture').onclick();
@@ -1372,12 +1733,13 @@ test('deletion safely retries once after a lost response', async () => {
 });
 
 test('deleting an unfinished recovered lesson clears its local correction reservation', async () => {
+  const lectureId = webcrypto.randomUUID();
   const app = setup((url, options = {}) => options.method === 'DELETE'
     ? response(null,204) : response({}));
   app.run(`
-    current={id:'delete-reserved',title:'지울 미완료 수업',created_at:'2026-01-01T00:00:00Z',
+    current={id:${JSON.stringify(lectureId)},title:'지울 미완료 수업',created_at:'2026-01-01T00:00:00Z',
       segments:[{id:'saved',start:0,end:1,text:'저장됨'}],recording_available:true,recording_finalized:false};
-    lectures=[current]; captureSession={id:'ended-capture',lecture:current};
+    lectures=[current]; captureSession={id:current.id,lecture:current};
     scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
       captureId:captureSession.id,finalized:false,status:'scheduled'});
     updateControls();
@@ -1391,6 +1753,7 @@ test('deleting an unfinished recovered lesson clears its local correction reserv
 });
 
 test('an explicit deletion failure keeps the lecture available for a later retry', async () => {
+  const lectureId = webcrypto.randomUUID();
   let deleteCalls = 0;
   const app = setup(async (_url, options = {}) => {
     if (options.method === 'DELETE') {
@@ -1400,26 +1763,27 @@ test('an explicit deletion failure keeps the lecture available for a later retry
     return response({});
   });
   app.run(`
-    current={id:'cleanup-failed',title:'남겨 둘 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
+    current={id:${JSON.stringify(lectureId)},title:'남겨 둘 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
     lectures=[current]; renderCurrent(); renderHistory();
   `);
   app.element('delete-lecture').onclick();
   await app.element('delete-confirm').onclick();
   assert.equal(deleteCalls, 1, 'an explicit server failure must not be blindly retried');
-  assert.equal(app.run('current.id'), 'cleanup-failed');
-  assert.equal(app.run('lectures[0].id'), 'cleanup-failed');
+  assert.equal(app.run('current.id'), lectureId);
+  assert.equal(app.run('lectures[0].id'), lectureId);
   assert.equal(app.element('delete-dialog').open, false);
   assert.match(app.element('notice').textContent, /삭제하지 못했습니다/);
 });
 
 test('closing deletion confirmation makes no request and an old account response cannot clear the next account', async () => {
+  const oldLectureId = webcrypto.randomUUID(), nextLectureId = webcrypto.randomUUID();
   const deletion = deferred();
   let deleteCalls = 0;
   const app = setup((url, options = {}) => {
     if (options.method === 'DELETE') { deleteCalls += 1; return deletion.promise; }
     return response({});
   });
-  app.run(`current={id:'old-lesson',title:'기존 수업',created_at:'2026-01-01T00:00:00Z',segments:[]}; lectures=[current]; renderCurrent(); renderHistory()`);
+  app.run(`current={id:${JSON.stringify(oldLectureId)},title:'기존 수업',created_at:'2026-01-01T00:00:00Z',segments:[]}; lectures=[current]; renderCurrent(); renderHistory()`);
   app.element('delete-lecture').onclick();
   app.element('delete-cancel').onclick();
   assert.equal(app.element('delete-dialog').open, false);
@@ -1431,13 +1795,13 @@ test('closing deletion confirmation makes no request and an old account response
   assert.equal(deleteCalls, 1);
   app.run(`
     showLogin(); token='next-token'; user='user-beta';
-    current={id:'next-lesson',title:'다음 계정 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
+    current={id:${JSON.stringify(nextLectureId)},title:'다음 계정 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
     lectures=[current];
   `);
   deletion.resolve(response(null,204));
   await removing;
-  assert.equal(app.run('current.id'), 'next-lesson');
-  assert.equal(app.run('lectures[0].id'), 'next-lesson');
+  assert.equal(app.run('current.id'), nextLectureId);
+  assert.equal(app.run('lectures[0].id'), nextLectureId);
   assert.equal(app.run('deletingLecture'), false);
 });
 
@@ -1508,7 +1872,8 @@ test('explicit logout scrubs the previous account profile, notes, draft, and sel
   Object.defineProperty(selected,'name',{value:'private-lesson.wav'});
   app.element('recording-file').files = [selected];
   app.run(`
-    current={id:'private-note',title:'이전 계정 비공개 수업',language:'en',created_at:'2026-01-01T00:00:00Z',
+    transcriptionProviders.clova.configured=true;
+    current={id:'private-note',title:'이전 계정 비공개 수업',language:'en',asr_provider:'clova',created_at:'2026-01-01T00:00:00Z',
       segments:[{id:'secret',start:0,end:1,text:'이전 계정만 볼 문장'}]};
     lectures=[current]; captureSession={id:'completed-capture',lecture:current};
     document.getElementById('username').value='user-alpha';
@@ -1536,6 +1901,10 @@ test('explicit logout scrubs the previous account profile, notes, draft, and sel
   assert.equal(app.element('recording-file').files.length,0);
   assert.equal(app.element('lecture-title').value,'');
   assert.equal(app.element('language').value,'ko');
+  assert.equal(app.element('audio-source').value,'microphone');
+  assert.equal(app.element('asr-provider').value,'qwen');
+  assert.equal(app.run('transcriptionProviders.clova.configured'),false);
+  assert.equal(app.element('provider-privacy').hidden,true);
   assert.equal(app.element('current-user').textContent,'내 계정');
   assert.equal(app.element('.user-avatar').textContent,'–');
   assert.equal(app.element('delete-lecture-title').textContent,'선택한 수업');
@@ -1626,8 +1995,8 @@ test('selecting an import while viewing an English note opens an editable Korean
 });
 
 test('a microphone flush failure remains visible and is not replaced by a generic stop message', async () => {
-  const app = setup(async url => url.endsWith('/lectures')
-    ? response({id:'flush-warning-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201)
+  const app = setup(async (url,options = {}) => url.endsWith('/lectures')
+    ? response({id:options.headers.get('X-Lecture-Id'),title:'수업',created_at:new Date().toISOString(),segments:[]},201)
     : response({segments:[]}));
   await app.run('startRecording()');
   app.microphone().stopError = new Error('마지막 오디오 조각을 확인하지 못했습니다.');
@@ -1642,25 +2011,37 @@ test('a microphone flush failure remains visible and is not replaced by a generi
 test('failed lecture creation retains captured audio for retry', async () => {
   let attempts = 0, uploads = 0;
   const lectureIds = [];
-  const app = setup(async (url, options) => {
+  let app;
+  app = setup(async (url, options) => {
     if (url.endsWith('/lectures')) {
-      lectureIds.push(options.headers.get('X-Lecture-Id'));
+      const lectureId = options.headers.get('X-Lecture-Id');
+      lectureIds.push(lectureId);
       attempts += 1;
-      if (attempts === 1) throw new TypeError('offline');
-      return response({id:'retry-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]});
+      if (attempts === 1) throw app.run("new TypeError('offline')");
+      return response({id:lectureId,title:'수업',asr_provider:'qwen',created_at:new Date().toISOString(),segments:[]});
     }
-    uploads += 1; return response({segments:[]});
+    if (url.includes('/chunks')) uploads += 1;
+    return response({segments:[]});
   });
   await app.run('startRecording()');
-  assert.equal(app.run('draft.buffered.length'), 1);
+  app.microphone().callbacks.onChunk(chunk(0));
+  for (let index = 0; index < 20
+      && ![...app.timeouts.values()].some(timer => timer.delay === 1000); index += 1) await tick();
+  assert.ok([...app.timeouts.values()].some(timer => timer.delay === 1000),
+    'the transient lecture-creation failure schedules its deterministic retry');
+  assert.equal(app.run('pending.length'), 1);
   assert.equal(app.run('isBusy()'), true);
-  assert.ok(app.run('sendError'));
-  await app.run('retryPending()'); await tick();
+  assert.equal(app.run('recording'), true);
+  assert.match(app.run('retryMessage'), /기기에 보관/);
+  await app.run('retryPending()'); await tick(); await tick();
   assert.equal(uploads, 1);
   assert.equal(lectureIds.length, 2);
   assert.equal(lectureIds[0], lectureIds[1]);
   assert.equal(app.run('draft'), null);
   assert.equal(app.run('pending.length'), 0);
+  assert.equal(app.run('recording'), true);
+  app.microphone().tail = chunk(5,3,3,true);
+  await app.run('stopRecording()');
 });
 
 test('a late unauthorized response cannot log out a newer login', async () => {
@@ -1734,14 +2115,35 @@ test('a stale successful login response cannot install a token after the server 
   assert.equal(app.run('authenticating'), false);
 });
 
-test('server changes are blocked throughout recording even before the first audio chunk', async () => {
-  let requests = 0;
-  const app = setup(async () => { requests += 1; return response({}); });
+test('a verified server change keeps recording active and checks the candidate without the token', async () => {
+  const candidateHealth = deferred();
+  const requests = [];
+  const app = setup(async (url,options = {}) => {
+    requests.push({url,authorization:options.headers.get('Authorization')});
+    if (url === 'https://replacement.trycloudflare.com/health') return candidateHealth.promise;
+    if (url === 'https://classroom.example/status') return response({model_state:'ready'});
+    throw new Error(`unexpected request: ${url}`);
+  });
   app.run('recording=true');
-  app.element('api-url').value = 'https://other.example';
-  await app.element('connection-form').onsubmit({preventDefault(){}});
-  assert.equal(requests, 0);
+  app.element('api-url').value = 'https://replacement.trycloudflare.com';
+  const saving = app.element('connection-form').onsubmit({preventDefault(){}});
+  await tick();
+  assert.equal(app.run('connectionState'),'checking');
+  await app.run("api('/status')");
+  assert.deepEqual(requests,[
+    {url:'https://replacement.trycloudflare.com/health',authorization:null},
+    {url:'https://classroom.example/status',authorization:'Bearer old-token'},
+  ]);
   assert.equal(app.run('apiUrl'), 'https://classroom.example');
+  assert.equal(app.run('token'), 'old-token');
+  assert.equal(app.run('recording'), true);
+
+  candidateHealth.resolve(response({status:'ok'}));
+  await saving;
+  assert.equal(app.run('apiUrl'), 'https://replacement.trycloudflare.com');
+  assert.equal(app.run('token'), '');
+  assert.equal(app.run('user'), 'user-alpha');
+  assert.equal(app.run('recording'), true);
 });
 
 test('checking a new server never exposes the active token before the origin changes', async () => {
@@ -1772,7 +2174,7 @@ test('a new tunnel can replace a dead one without losing a queued chunk or its o
     requests.push({url,authorization:options.headers.get('Authorization')});
     return response({status:'ok'});
   });
-  app.run("pending=[{blob:new Blob([new Uint8Array(1644)],{type:'audio/wav'}),startSeconds:0,durationSeconds:0.05,overlapSeconds:0,final:false,id:'stable-id',lectureId:'lesson'}]; sendError='old tunnel failed'");
+  app.run("pending=[{blob:new Blob([new Uint8Array(1644)],{type:'audio/wav'}),startSeconds:0,durationSeconds:0.05,overlapSeconds:0,final:false,id:'stable-id',lectureId:'lesson',owner:'user-alpha'}]; sendError='old tunnel failed'");
   app.element('api-url').value = 'https://replacement.trycloudflare.com';
   await app.element('connection-form').onsubmit({preventDefault(){}});
   assert.equal(app.run('apiUrl'), 'https://replacement.trycloudflare.com');
@@ -2002,8 +2404,9 @@ test('a renewed lease with a new tunnel preserves queued-audio ownership until s
   app.run(`
     apiUrl=${JSON.stringify(oldUrl)}; verifiedApiUrl=apiUrl; verifiedApiExpiresAt=Date.now()-1;
     connectionState='connected'; token='old-token'; user='user-alpha';
-    current={id:'lesson',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[]}; lectures=[current];
-    pending=[{blob:new Blob([new Uint8Array(1644)],{type:'audio/wav'}),startSeconds:0,durationSeconds:0.05,overlapSeconds:0,final:false,id:'stable-id',lectureId:'lesson'}];
+    current={id:'lesson',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],asr_provider:'qwen'}; lectures=[current];
+    liveSessions.set('lesson',{id:'lesson',owner:'user-alpha',asrProvider:'qwen',lecture:current});
+    pending=[{blob:new Blob([new Uint8Array(1644)],{type:'audio/wav'}),startSeconds:0,durationSeconds:0.05,overlapSeconds:0,final:false,id:'stable-id',captureId:'lesson',lectureId:'lesson',owner:'user-alpha',asrProvider:'qwen',lectureReady:true}];
     setConnectionState('connected'); renderCurrent();
   `);
   await app.run('drain()');
@@ -2129,8 +2532,9 @@ test('temporary upload failures use exponential retry with one stable chunk id a
   let attempt = 0;
   const app = setup(async (url, options) => {
     if (url.endsWith('/lectures')) {
-      return response({id:'resilient-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201);
+      return response({id:options.headers.get('X-Lecture-Id'),title:'수업',created_at:new Date().toISOString(),segments:[]},201);
     }
+    if (!url.includes('/chunks')) return response({});
     attempt += 1;
     uploads.push({
       id:options.headers.get('X-Chunk-Id'),
@@ -2193,12 +2597,109 @@ test('temporary upload failures use exponential retry with one stable chunk id a
   assert.equal(app.element('recording-download').disabled, false);
 });
 
+test('an ambiguous CLOVA chunk failure never auto-retries or silently switches to Qwen', async () => {
+  let uploads = 0;
+  const app = setup(async (url,options = {}) => {
+    if (url.endsWith('/lectures')) return response({
+      id:options.headers.get('X-Lecture-Id'),title:'클로바 수업',language:'ko',asr_provider:'clova',created_at:new Date().toISOString(),segments:[],
+    },201);
+    if (url.includes('/chunks')) {
+      uploads += 1;
+      throw new TypeError('connection lost after upload');
+    }
+    return response({});
+  });
+  app.run('transcriptionProviders.clova.configured=true');
+  app.element('asr-provider').value = 'clova';
+  await app.run('startRecording()');
+  app.microphone().tail = chunk(6,2.2,2,true);
+  app.microphone().callbacks.onChunk(chunk(0));
+  await tick(); await tick(); await tick();
+
+  assert.equal(uploads,1);
+  assert.equal(app.run('liveQueue.markInflightCalls'),1,
+    'CLOVA ambiguity is persisted before the request leaves the browser');
+  assert.equal(app.run('retryTimer'),null);
+  assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 1000 || timer.delay === 2000));
+  assert.equal(app.run('recording'),true,'an ambiguous response must not end microphone capture');
+  assert.equal(app.microphone().stopCalls,undefined);
+  assert.equal(app.run('pending.length'),1,'the failed chunk stays available for manual recovery');
+  assert.ok(app.run("pending.every(item => item.asrProvider === 'clova')"));
+  assert.match(app.run('sendError'),/자동 재전송하지 않았/);
+  assert.match(app.run('sendError'),/중복 기록이나 추가 과금/);
+  assert.match(app.element('retry').textContent,/위험 이해.*수동 재전송/);
+  assert.doesNotMatch(app.run('sendError'),/Qwen으로/);
+
+  await app.run('stopRecording()');
+  await tick(); await tick();
+  assert.equal(app.microphone().stopCalls,1);
+  assert.equal(app.run('pending.length'),2,'an explicit stop appends the final tail behind the blocked chunk');
+});
+
+test('re-login preserves the manual CLOVA retry gate until the user explicitly resubmits', async () => {
+  let uploads = 0;
+  let lecture = null;
+  const app = setup(async (url,options = {}) => {
+    if (url.endsWith('/auth/login')) return response({token:'renewed-clova-token',user:{username:'user-alpha',is_admin:false}});
+    if (url.endsWith('/lectures') && options.method === 'POST') {
+      lecture = {id:options.headers.get('X-Lecture-Id'),title:'클로바 수업',language:'ko',asr_provider:'clova',created_at:new Date().toISOString(),segments:[]};
+      return response({...lecture},201);
+    }
+    if (url.endsWith('/lectures') && !options.method) return response([{...lecture,segment_count:0}]);
+    if (url.endsWith('/imports')) return response([]);
+    if (url.endsWith('/status')) return response({model_state:'ready',transcription_providers:{qwen:{configured:true},clova:{configured:true}}});
+    if (lecture && url.includes(`/lectures/${lecture.id}/chunks`)) {
+      uploads += 1;
+      if (uploads === 1) throw new TypeError('ambiguous response loss');
+      return response({segments:[],recording_available:true,recording_finalized:options.headers.get('X-Final-Chunk') === 'true'});
+    }
+    return response({});
+  });
+  app.run('transcriptionProviders.clova.configured=true');
+  app.element('asr-provider').value = 'clova';
+  await app.run('startRecording()');
+  app.microphone().tail = chunk(6,2.2,2,true);
+  app.microphone().callbacks.onChunk(chunk(0));
+  await tick(); await tick(); await tick();
+  assert.equal(uploads,1);
+  assert.ok(app.run("sendError.includes('자동 재전송하지 않았')"));
+  assert.equal(app.run('recording'),true);
+  await app.run('stopRecording()');
+  await tick(); await tick();
+  assert.equal(app.run('pending.length'),2);
+
+  app.run("token=''; showLogin(false)");
+  app.element('username').value = 'user-alpha';
+  app.element('password').value = 'same-account-password';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  for (let index = 0; index < 4; index += 1) await tick();
+  assert.equal(app.run('token'),'renewed-clova-token');
+  assert.equal(uploads,1,'successful re-login must not implicitly resend an ambiguous CLOVA chunk');
+  assert.equal(app.run('pending.length'),2);
+  assert.ok(app.run("sendError.includes('추가 과금')"));
+  assert.match(app.element('retry').textContent,/위험 이해.*수동 재전송/);
+
+  app.element('retry').onclick();
+  for (let index = 0; index < 5; index += 1) await tick();
+  assert.equal(uploads,3,'only the explicit manual action sends the failed head and saved final tail');
+  assert.equal(app.run('pending.length'),0);
+  assert.equal(app.run('sendError'),'');
+});
+
+test('CLOVA provider failures including HTTP 424 remain manual while Qwen retry policy is unchanged', async () => {
+  const app = setup(async () => response({}));
+  assert.equal(app.run('PERMANENT_UPLOAD_STATUSES.has(424)'),true);
+  assert.equal(app.run("retryableUpload({status:424})"),false);
+  assert.equal(app.run("retryableUpload({status:503})"),true);
+  assert.equal(app.run("retryableUpload({transient:true})"),true);
+});
+
 test('an in-flight idempotent 409 retries while a changed-payload 409 remains manual', async () => {
   let attempt = 0;
   const ids = [];
   const app = setup(async (url, options) => {
     if (url.endsWith('/lectures')) {
-      return response({id:'racing-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201);
+      return response({id:options.headers.get('X-Lecture-Id'),title:'수업',created_at:new Date().toISOString(),segments:[]},201);
     }
     attempt += 1;
     ids.push(options.headers.get('X-Chunk-Id'));
@@ -2217,8 +2718,8 @@ test('an in-flight idempotent 409 retries while a changed-payload 409 remains ma
   assert.equal(app.run('pending.length'), 0);
   assert.equal(ids[0], ids[1]);
 
-  const rejected = setup(async url => url.endsWith('/lectures')
-    ? response({id:'changed-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201)
+  const rejected = setup(async (url,options = {}) => url.endsWith('/lectures')
+    ? response({id:options.headers.get('X-Lecture-Id'),title:'수업',created_at:new Date().toISOString(),segments:[]},201)
     : response({detail:'같은 ID의 내용이 다릅니다.'},409));
   await rejected.run('startRecording()');
   rejected.microphone().callbacks.onChunk(chunk(0));
@@ -2232,11 +2733,11 @@ test('an in-flight idempotent 409 retries while a changed-payload 409 remains ma
   assert.equal(rejected.run("retryableUpload({status:507})"), false);
 });
 
-test('permanent upload failure stops safely without an automatic loop and retains the tail for manual recovery', async () => {
+test('permanent upload failure blocks sending without ending capture and retains an explicit final tail', async () => {
   const uploads = [];
   const app = setup(async (url, options) => {
     if (url.endsWith('/lectures')) {
-      return response({id:'rejected-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201);
+      return response({id:options.headers.get('X-Lecture-Id'),title:'수업',created_at:new Date().toISOString(),segments:[]},201);
     }
     uploads.push(options.headers.get('X-Chunk-Id'));
     return response({detail:'녹음 저장 공간이 부족합니다.'},507);
@@ -2247,9 +2748,16 @@ test('permanent upload failure stops safely without an automatic loop and retain
   app.microphone().callbacks.onChunk(chunk(0));
   await tick(); await tick();
 
-  assert.equal(app.run('recording || starting || stopping'), false);
-  assert.equal(app.microphone().stopCalls, 1);
+  assert.equal(app.run('recording'), true);
+  assert.equal(app.microphone().stopCalls, undefined);
   assert.equal(uploads.length, 1);
+  assert.equal(app.run('pending.length'), 1);
+  assert.equal(app.run('retryTimer'), null);
+  assert.match(app.run('sendError'), /자동 재시도를 멈췄어요/);
+
+  await app.run('stopRecording()');
+  await tick(); await tick();
+  assert.equal(app.microphone().stopCalls, 1);
   assert.equal(app.run('pending.length'), 2);
   assert.notEqual(app.run('pending[0].id'), app.run('pending[1].id'));
   assert.equal(app.run('pending[1].startSeconds'), 6);
@@ -2261,10 +2769,10 @@ test('permanent upload failure stops safely without an automatic loop and retain
   assert.equal(app.element('queue-warning').hidden, false);
 });
 
-test('temporary outage keeps recording below the queue limit and stops once backpressure reaches the limit', async () => {
-  const app = setup(async (url) => {
+test('temporary outage keeps recording after the former queue cap and persists an explicit final tail', async () => {
+  const app = setup(async (url,options = {}) => {
     if (url.endsWith('/lectures')) {
-      return response({id:'backpressure-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201);
+      return response({id:options.headers.get('X-Lecture-Id'),title:'수업',created_at:new Date().toISOString(),segments:[]},201);
     }
     return response({detail:'잠시 사용할 수 없습니다.'},503);
   });
@@ -2279,25 +2787,33 @@ test('temporary outage keeps recording below the queue limit and stops once back
   assert.equal(app.run('recording'), true);
   assert.equal(app.microphone().stopCalls, undefined);
 
-  app.microphone().tail = chunk(62, 2.2, 2, true);
+  app.microphone().tail = chunk(70, 2.2, 2, true);
   app.microphone().callbacks.onChunk(chunk(54, 10, 2));
+  app.microphone().callbacks.onChunk(chunk(62, 10, 2));
   await tick(); await tick();
-  assert.equal(app.run('recording || starting || stopping'), false);
-  assert.equal(app.microphone().stopCalls, 1);
-  assert.equal(app.run('pending.length'), 9, 'the required final tail is retained beyond the normal queue cap');
-  assert.equal(app.run('pending[8].startSeconds'), 62);
-  assert.equal(app.run('pending[8].overlapSeconds'), 2);
-  assert.equal(app.run('pending[8].final'), true);
+  assert.equal(app.run('recording'), true);
+  assert.equal(app.microphone().stopCalls, undefined);
+  assert.equal(app.run('pending.length'), 9, 'queued audio may grow beyond the former in-memory stop threshold');
+
+  await app.run('stopRecording()');
+  await tick(); await tick();
+  assert.equal(app.run('pending.length'), 10, 'the explicit final tail is retained after all outage chunks');
+  assert.equal(app.run('pending[9].startSeconds'), 70);
+  assert.equal(app.run('pending[9].overlapSeconds'), 2);
+  assert.equal(app.run('pending[9].final'), true);
 });
 
-test('repeated 503 responses stop after the bounded automatic retry budget', async () => {
+test('repeated 503 responses keep capture alive and cap delay rather than the retry count', async () => {
   let uploads = 0;
-  const app = setup(async url => {
+  const app = setup(async (url,options = {}) => {
     if (url.endsWith('/lectures')) {
-      return response({id:'failing-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201);
+      return response({id:options.headers.get('X-Lecture-Id'),title:'수업',created_at:new Date().toISOString(),segments:[]},201);
     }
-    uploads += 1;
-    return response({detail:'모델 처리 실패'},503,{'Retry-After':'0'});
+    if (url.includes('/chunks')) {
+      uploads += 1;
+      return response({detail:'모델 처리 실패'},503,{'Retry-After':'0'});
+    }
+    return response({});
   });
   await app.run('startRecording()');
   app.microphone().tail = chunk(6, 2.2, 2, true);
@@ -2308,37 +2824,44 @@ test('repeated 503 responses stop after the bounded automatic retry budget', asy
     await app.runTimeout(delay);
   }
   assert.equal(uploads, 9, 'one initial attempt plus eight automatic retries');
-  assert.equal(app.run('retryTimer'), null);
-  assert.match(app.run('sendError'), /자동 재전송 8회/);
-  assert.equal(app.run('recording || starting || stopping'), false);
-  assert.equal(app.microphone().stopCalls, 1);
-  assert.equal(app.run('pending.length'), 2, 'the failed head and final microphone tail remain recoverable');
+  assert.notEqual(app.run('retryTimer'), null);
+  assert.ok([...app.timeouts.values()].some(timer => timer.delay === 30000));
+  assert.equal(app.run('sendError'), '');
+  assert.equal(app.run('recording'), true);
+  assert.equal(app.microphone().stopCalls, undefined);
+  assert.equal(app.run('pending.length'), 1);
+
+  await app.run('stopRecording()');
+  await tick(); await tick();
+  assert.equal(app.run('pending.length'), 2, 'the failed head and explicit final microphone tail remain recoverable');
 });
 
 test('skipping the last failed chunk finalizes the saved recording and applies its flags', async () => {
   const finalization = deferred();
+  const lectureId = webcrypto.randomUUID();
   let request;
   const app = setup((url, options = {}) => {
-    if (url.endsWith('/lectures/recoverable-lesson/recording-finalize')) {
+    if (url.endsWith(`/lectures/${lectureId}/recording-finalize`)) {
       request = {url,options};
       return finalization.promise;
     }
     return response({});
   });
   app.run(`
-    current={id:'recoverable-lesson',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    current={id:${JSON.stringify(lectureId)},title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
     lectures=[{...current}];
-    pending=[{id:'failed-final',lectureId:'recoverable-lesson',final:true,downloadRequested:true}];
-    sendError='마지막 조각 실패'; renderCurrent();
+    renderCurrent();
   `);
-  app.run('skipFailedChunk()');
+  await app.seedDurableFailedFinal({lectureId});
+  await app.run('skipFailedChunk()');
+  await tick();
   assert.equal(app.run('pending.length'), 0);
   assert.equal(app.run('recordingFinalizePending'), true);
   assert.equal(app.run('isBusy()'), true);
   for (const id of ['new-note','record-button','recording-file','download','recording-download','delete-lecture']) {
     assert.equal(app.element(id).disabled, true, `${id} must lock while finalizing the recording`);
   }
-  assert.match(request.url, /\/lectures\/recoverable-lesson\/recording-finalize$/);
+  assert.equal(request.url, `https://classroom.example/lectures/${lectureId}/recording-finalize`);
   assert.equal(request.options.method, 'POST');
   assert.equal(request.options.headers.get('Authorization'), 'Bearer old-token');
   assert.ok([...app.timeouts.values()].some(timer => timer.delay === 60000),
@@ -2354,32 +2877,33 @@ test('skipping the last failed chunk finalizes the saved recording and applies i
 });
 
 test('a skipped final chunk starts its reserved correction once after recording finalization', async () => {
+  const lectureId = webcrypto.randomUUID();
   let finalizations = 0, correctionPosts = 0, correctionSawRecoveredTail = false;
   let app;
   app = setup((url, options = {}) => {
-    if (url.endsWith('/lectures/skipped-correction/recording-finalize')) {
+    if (url.endsWith(`/lectures/${lectureId}/recording-finalize`)) {
       finalizations += 1;
       return response({recording_available:true,recording_finalized:true,
         segments:[{id:'recovered-tail',start:4,end:4.6,text:'복구된 마지막 문장'}]});
     }
-    if (url.endsWith('/lectures/skipped-correction/correction') && options.method === 'POST') {
+    if (url.endsWith(`/lectures/${lectureId}/correction`) && options.method === 'POST') {
       correctionPosts += 1;
       correctionSawRecoveredTail = app.run("current.segments.some(segment => segment.id === 'recovered-tail')");
-      return response({lecture_id:'skipped-correction',status:'queued'});
+      return response({lecture_id:lectureId,status:'queued'});
     }
     return response({});
   });
   app.run(`
-    current={id:'skipped-correction',title:'복구 수업',created_at:'2026-01-01T00:00:00Z',
+    current={id:${JSON.stringify(lectureId)},title:'복구 수업',created_at:'2026-01-01T00:00:00Z',
       segments:[{id:'saved',start:0,end:4,text:'저장된 원문'}],recording_available:true,recording_finalized:false};
     lectures=[current];
-    captureSession={id:'capture-for-skip',lecture:current};
+  `);
+  await app.seedDurableFailedFinal({lectureId});
+  app.run(`
     scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
       captureId:captureSession.id,status:'scheduled'});
-    pending=[{id:'failed-final',lectureId:current.id,final:true,downloadRequested:true}];
-    sendError='마지막 조각 실패'; renderCurrent();
-    skipFailedChunk();
   `);
+  await app.run('skipFailedChunk()');
   await tick(); await tick(); await tick();
   assert.equal(finalizations,1);
   assert.equal(correctionPosts,1);
@@ -2387,7 +2911,7 @@ test('a skipped final chunk starts its reserved correction once after recording 
   assert.equal(app.run("current.segments.filter(segment => segment.id === 'recovered-tail').length"),1);
   assert.equal(app.run('scheduledCorrections.size'),0);
   assert.equal(app.run('current.recording_finalized'),true);
-  app.run("applyRecordingFlags('skipped-correction',{recording_available:true,recording_finalized:true,segments:[{id:'recovered-tail',start:4,end:4.6,text:'복구된 마지막 문장'}]})");
+  app.run(`applyRecordingFlags(${JSON.stringify(lectureId)},{recording_available:true,recording_finalized:true,segments:[{id:'recovered-tail',start:4,end:4.6,text:'복구된 마지막 문장'}]})`);
   await tick(); await tick();
   assert.equal(correctionPosts,1,'repeated finalized state must not submit the reservation again');
   assert.equal(app.run("current.segments.filter(segment => segment.id === 'recovered-tail').length"),1,
@@ -2395,55 +2919,59 @@ test('a skipped final chunk starts its reserved correction once after recording 
 });
 
 test('a failed recording finalization leaves its correction reserved without locking recovery controls', async () => {
+  const lectureId = webcrypto.randomUUID();
+  const newerCaptureId = webcrypto.randomUUID();
+  const newerLectureId = webcrypto.randomUUID();
   let correctionPosts = 0;
   const app = setup((url, options = {}) => {
     if (url.endsWith('/recording-finalize')) {
       return response({detail:'마지막 음성 인식을 마무리하지 못했습니다.'},503,{'Retry-After':'5'});
     }
-    if (url.endsWith('/lectures/retry-recovery/correction') && options.method === 'POST') {
+    if (url.endsWith(`/lectures/${lectureId}/correction`) && options.method === 'POST') {
       correctionPosts += 1;
-      return response({lecture_id:'retry-recovery',status:'queued'});
+      return response({lecture_id:lectureId,status:'queued'});
     }
     return response({});
   });
   app.run(`
-    current={id:'retry-recovery',title:'복구 수업',created_at:'2026-01-01T00:00:00Z',
+    current={id:${JSON.stringify(lectureId)},title:'복구 수업',created_at:'2026-01-01T00:00:00Z',
       segments:[{id:'saved',start:0,end:4,text:'저장된 원문'}],recording_available:true,recording_finalized:false};
-    lectures=[current]; captureSession={id:'capture-recovery',lecture:current};
+    lectures=[current];
+  `);
+  await app.seedDurableFailedFinal({lectureId});
+  app.run(`
     scheduledCorrections.set(current.id,{lectureId:current.id,owner:user,sessionToken:token,server:apiUrl,
       captureId:captureSession.id,finalized:false,status:'scheduled'});
-    pending=[{id:'failed-final',lectureId:current.id,final:true,downloadRequested:true}];
-    sendError='마지막 조각 실패';
-    skipFailedChunk();
   `);
+  await app.run('skipFailedChunk()');
   await tick(); await tick();
   assert.equal(app.run('recordingFinalizePending'),false);
-  assert.equal(app.run("scheduledCorrections.get('retry-recovery').status"),'scheduled');
+  assert.equal(app.run(`scheduledCorrections.get(${JSON.stringify(lectureId)}).status`),'scheduled');
   assert.equal(app.run('hasOwnerLockedWork()'),true,'same-owner reauthentication must retain the reservation');
   assert.equal(app.run('isBusy()'),false,'a stored retryable reservation must not deadlock the workspace');
   assert.equal(app.element('recording-download').disabled,false,'the user can retry finalization from the WAV button');
   assert.equal(app.element('logout').disabled,false);
 
   app.run(`
-    captureSession={id:'newer-capture',lecture:{id:'newer-lesson',segments:[]}};
-    applyRecordingFlags('retry-recovery',{recording_available:true,recording_finalized:true,segments:[]});
+    captureSession={id:${JSON.stringify(newerCaptureId)},owner:user,asrProvider:'qwen',lecture:{id:${JSON.stringify(newerLectureId)},segments:[]}};
+    applyRecordingFlags(${JSON.stringify(lectureId)},{recording_available:true,recording_finalized:true,segments:[]});
   `);
   await tick(); await tick();
   assert.equal(correctionPosts,1,'a later successful finalization still honors the old reservation');
-  assert.equal(app.run('captureSession.id'),'newer-capture','finalizing an older lesson must not release a newer capture');
+  assert.equal(app.run('captureSession.id'),newerCaptureId,'finalizing an older lesson must not release a newer capture');
 });
 
 test('skipping the only failed chunk never claims that a server WAV exists', async () => {
+  const lectureId = webcrypto.randomUUID();
   const app = setup((url) => url.endsWith('/recording-finalize')
     ? response({recording_available:false,recording_finalized:true})
     : response({}));
   app.run(`
-    current={id:'empty-recording',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:false,recording_finalized:false};
+    current={id:${JSON.stringify(lectureId)},title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:false,recording_finalized:false};
     lectures=[{...current}];
-    pending=[{id:'failed-only',lectureId:'empty-recording',final:true,downloadRequested:true}];
-    sendError='첫 조각 실패';
-    skipFailedChunk();
   `);
+  await app.seedDurableFailedFinal({lectureId,error:'첫 조각 실패'});
+  await app.run('skipFailedChunk()');
   await tick(); await tick();
   assert.equal(app.run('current.recording_available'), false);
   assert.equal(app.run('current.recording_finalized'), true);
@@ -2453,6 +2981,7 @@ test('skipping the only failed chunk never claims that a server WAV exists', asy
 });
 
 test('recording finalization retries once after a transient response loss', async () => {
+  const lectureId = webcrypto.randomUUID();
   let finalizeCalls = 0;
   let app;
   app = setup(async (url) => {
@@ -2462,12 +2991,11 @@ test('recording finalization retries once after a transient response loss', asyn
     return response({recording_available:true,recording_finalized:true});
   });
   app.run(`
-    current={id:'retry-finalize',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    current={id:${JSON.stringify(lectureId)},title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
     lectures=[{...current}];
-    pending=[{id:'failed-final',lectureId:'retry-finalize',final:true,downloadRequested:true}];
-    sendError='마지막 조각 실패';
-    skipFailedChunk();
   `);
+  await app.seedDurableFailedFinal({lectureId});
+  await app.run('skipFailedChunk()');
   await tick(); await tick();
   assert.equal(finalizeCalls, 2);
   assert.equal(app.run('recordingFinalizePending'), false);
@@ -2475,6 +3003,7 @@ test('recording finalization retries once after a transient response loss', asyn
 });
 
 test('recording finalization waits for an already running deterministic guard', async () => {
+  const lectureId = webcrypto.randomUUID();
   let finalizeCalls = 0;
   const app = setup(async (url) => {
     if (!url.endsWith('/recording-finalize')) return response({});
@@ -2485,12 +3014,11 @@ test('recording finalization waits for an already running deterministic guard', 
     return response({recording_available:true,recording_finalized:true,segments:[]});
   });
   app.run(`
-    current={id:'busy-finalize',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    current={id:${JSON.stringify(lectureId)},title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
     lectures=[{...current}];
-    pending=[{id:'failed-final',lectureId:'busy-finalize',final:true,downloadRequested:true}];
-    sendError='마지막 조각 실패';
-    skipFailedChunk();
   `);
+  await app.seedDurableFailedFinal({lectureId});
+  await app.run('skipFailedChunk()');
   await tick(); await tick();
   assert.equal(finalizeCalls,1);
   assert.equal(app.run('recordingFinalizePending'),true);
@@ -2502,35 +3030,38 @@ test('recording finalization waits for an already running deterministic guard', 
 
 test('a stale recording-finalize response cannot alter the next account', async () => {
   const finalization = deferred();
+  const oldLectureId = webcrypto.randomUUID();
+  const nextLectureId = webcrypto.randomUUID();
   const app = setup((url) => url.endsWith('/recording-finalize') ? finalization.promise : response({}));
   app.run(`
-    current={id:'old-lesson',title:'이전 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
+    current={id:${JSON.stringify(oldLectureId)},title:'이전 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:true,recording_finalized:false};
     lectures=[{...current}];
-    pending=[{id:'failed-final',lectureId:'old-lesson',final:true,downloadRequested:true}];
-    sendError='마지막 조각 실패';
-    skipFailedChunk();
   `);
+  await app.seedDurableFailedFinal({lectureId:oldLectureId});
+  await app.run('skipFailedChunk()');
+  await tick();
   assert.equal(app.run('recordingFinalizePending'), true);
   app.run(`
-    showLogin(); token='next-token'; user='next-user';
-    current={id:'next-lesson',title:'다음 수업',created_at:'2026-01-02T00:00:00Z',segments:[],recording_available:false,recording_finalized:false};
+    showLogin(); const previousUser=user; token='next-token'; user='next-user';
+    if (previousUser !== user) { scheduledCorrections.clear(); scrubAccountWorkspace(); }
+    current={id:${JSON.stringify(nextLectureId)},title:'다음 수업',created_at:'2026-01-02T00:00:00Z',segments:[],recording_available:false,recording_finalized:false};
     lectures=[{...current}];
   `);
   finalization.resolve(response({recording_available:true,recording_finalized:true,
     segments:[{id:'old-tail',start:3,end:4,text:'다른 계정에 보이면 안 됨'}]}));
   await tick(); await tick();
-  assert.equal(app.run('current.id'), 'next-lesson');
+  assert.equal(app.run('current.id'), nextLectureId);
   assert.equal(app.run('current.recording_available || current.recording_finalized'), false);
   assert.equal(app.run("current.segments.some(segment => segment.id === 'old-tail')"),false);
-  assert.equal(app.run('lectures[0].id'), 'next-lesson');
+  assert.equal(app.run('lectures[0].id'), nextLectureId);
   assert.equal(app.run('recordingFinalizePending'), false);
 });
 
 test('a failed head requires a separate download request and save confirmation before skipping', async () => {
   let uploads = 0;
-  const app = setup(async url => {
+  const app = setup(async (url,options = {}) => {
     if (url.endsWith('/lectures')) {
-      return response({id:'recoverable-lesson',title:'수업',created_at:new Date().toISOString(),segments:[]},201);
+      return response({id:options.headers.get('X-Lecture-Id'),title:'수업',created_at:new Date().toISOString(),segments:[]},201);
     }
     uploads += 1;
     if (uploads === 1) return response({detail:'결정적 모델 오류'},422);
@@ -2538,6 +3069,10 @@ test('a failed head requires a separate download request and save confirmation b
   });
   await app.run('startRecording()');
   app.microphone().callbacks.onChunk(chunk(0));
+  await tick(); await tick();
+  assert.equal(app.run('recording'),true);
+  app.microphone().tail = chunk(5,3,3,true);
+  await app.run('stopRecording()');
   await tick(); await tick();
   assert.equal(app.run('pending.length'), 2);
   assert.ok(app.run('sendError'));

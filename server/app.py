@@ -28,6 +28,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .db import Database
+from .clova_transcriber import ClovaStreamingTranscriber, ClovaTranscriptionError
 from .importer import ImportDurationError, ImportInterrupted, ImportMediaError, iter_audio_chunks
 from .recordings import (
     BYTES_PER_FRAME,
@@ -65,6 +66,7 @@ class LectureBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
     language: Literal["ko", "en"] | None = "ko"
+    asr_provider: Literal["qwen", "clova"] = "qwen"
 
 
 class ImportBody(BaseModel):
@@ -246,6 +248,7 @@ def create_app(
     transcriber=None,
     postprocessor=None,
     *,
+    clova_transcriber=None,
     tunnel_status=None,
     tunnel_restart=None,
 ) -> FastAPI:
@@ -264,6 +267,7 @@ def create_app(
     database = Database(settings.database_path, settings.accounts)
     database.initialize()
     engine = transcriber or LocalTranscriber(settings)
+    clova_engine = clova_transcriber or ClovaStreamingTranscriber(settings)
     correction_engine = postprocessor or MindlogicPostprocessor(settings)
     limiter = RateLimiter()
     inference_lock = threading.Lock()
@@ -333,6 +337,8 @@ def create_app(
             shutdown_deadline = time.monotonic() + 18
             correction_stopped = stop_correction_worker(timeout=8)
             stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
+            if hasattr(clova_engine, "close"):
+                clova_engine.close()
             if correction_stopped and hasattr(correction_engine, "close"):
                 correction_engine.close()
 
@@ -340,6 +346,7 @@ def create_app(
     app.state.settings = settings
     app.state.database = database
     app.state.transcriber = engine
+    app.state.clova_transcriber = clova_engine
     app.state.postprocessor = correction_engine
     app.state.recording_store = recording_store
     app.state.tunnel_status = tunnel_status
@@ -871,8 +878,8 @@ def create_app(
         deleting_clause = "" if include_deleting else " AND deleting = 0"
         with database.connect() as connection:
             lecture = connection.execute(
-                "SELECT id, username, title, language, created_at, deleting, recording_finalized FROM lectures "
-                f"WHERE id = ? AND username = ?{deleting_clause}",
+                "SELECT id, username, title, language, created_at, deleting, recording_finalized, asr_provider "
+                f"FROM lectures WHERE id = ? AND username = ?{deleting_clause}",
                 (lecture_id, username),
             ).fetchone()
         if lecture is None:
@@ -880,7 +887,10 @@ def create_app(
         return dict(lecture)
 
     def lecture_result(lecture: dict, *, segments: list[dict] | None = None) -> dict:
-        result = {key: lecture[key] for key in ("id", "title", "language", "created_at")}
+        result = {
+            key: lecture[key]
+            for key in ("id", "title", "language", "created_at", "asr_provider")
+        }
         result["recording_available"] = recording_store.available(lecture["username"], lecture["id"])
         result["recording_finalized"] = bool(lecture["recording_finalized"])
         if segments is not None:
@@ -936,7 +946,25 @@ def create_app(
 
     @app.get("/status")
     def status(user: dict = Depends(identity)):
-        result = dict(engine.status())
+        # Let the external adapter retire idle or failed channels during the
+        # browser's normal status poll, but never reflect its diagnostic map.
+        # The adapter performs this maintenance non-blockingly while a speech
+        # request is active.
+        try:
+            clova_engine.status()
+        except Exception:
+            pass
+        # Do not reflect arbitrary adapter status dictionaries. A provider
+        # implementation can contain endpoints or diagnostics that are not
+        # appropriate for any browser response.
+        result = safe_engine_status()
+        result["transcription_providers"] = {
+            "qwen": {"configured": True, "label": "이 PC의 Qwen"},
+            "clova": {
+                "configured": bool(getattr(clova_engine, "configured", False)),
+                "label": "NAVER Cloud CLOVA Speech",
+            },
+        }
         result["postprocessing"] = {
             "configured": correction_configured(),
             "model": getattr(correction_engine, "model", settings.mindlogic_model),
@@ -947,8 +975,8 @@ def create_app(
     def list_lectures(user: dict = Depends(data_identity)):
         with database.connect() as connection:
             rows = connection.execute(
-                "SELECT id, username, title, language, created_at, deleting, recording_finalized FROM lectures "
-                "WHERE username = ? AND deleting = 0 ORDER BY created_at DESC, id DESC",
+                "SELECT id, username, title, language, created_at, deleting, recording_finalized, asr_provider "
+                "FROM lectures WHERE username = ? AND deleting = 0 ORDER BY created_at DESC, id DESC",
                 (user["username"],),
             ).fetchall()
         return [lecture_result(dict(row)) for row in rows]
@@ -966,7 +994,7 @@ def create_app(
 
         def replay_or_conflict(connection):
             existing = connection.execute(
-                "SELECT id, username, title, language, created_at, deleting, recording_finalized "
+                "SELECT id, username, title, language, created_at, deleting, recording_finalized, asr_provider "
                 "FROM lectures WHERE id = ?",
                 (lecture_id,),
             ).fetchone()
@@ -976,6 +1004,7 @@ def create_app(
                 existing["username"] != user["username"]
                 or existing["title"] != body.title
                 or existing["language"] != body.language
+                or existing["asr_provider"] != body.asr_provider
             ):
                 raise HTTPException(409, "같은 수업 ID로 다른 내용을 만들 수 없습니다.")
             if existing["deleting"]:
@@ -986,12 +1015,18 @@ def create_app(
             replay = replay_or_conflict(connection)
         if replay is not None:
             return lecture_result(replay)
+        if body.asr_provider == "clova":
+            if body.language not in {"ko", "en"}:
+                raise HTTPException(422, "CLOVA Speech에서는 한국어 또는 영어를 직접 선택하세요.")
+            if not bool(getattr(clova_engine, "configured", False)):
+                raise HTTPException(503, "CLOVA Speech가 아직 서버에 설정되지 않았습니다.")
         if not limiter.allow(("lecture", user["username"]), 30, 300):
             raise HTTPException(429, "잠시 후 다시 수업을 생성하세요.", headers={"Retry-After": "300"})
         lecture = {
             "id": lecture_id,
             "title": body.title,
             "language": body.language,
+            "asr_provider": body.asr_provider,
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         with database.connect() as connection:
@@ -999,8 +1034,16 @@ def create_app(
             replay = replay_or_conflict(connection)
             if replay is None:
                 connection.execute(
-                    "INSERT INTO lectures(id, username, title, language, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (lecture["id"], user["username"], lecture["title"], lecture["language"], lecture["created_at"]),
+                    "INSERT INTO lectures(id, username, title, language, created_at, asr_provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        lecture["id"],
+                        user["username"],
+                        lecture["title"],
+                        lecture["language"],
+                        lecture["created_at"],
+                        lecture["asr_provider"],
+                    ),
                 )
         if replay is not None:
             return lecture_result(replay)
@@ -1349,6 +1392,36 @@ def create_app(
         """Close an interrupted lesson and recover its withheld final ASR guard."""
 
         lecture = owned_lecture(lecture_id, user["username"])
+        if lecture["asr_provider"] == "clova":
+            # Every CLOVA upload is explicitly flushed with epFlag+seqId, so
+            # unlike local Qwen there is no stability-guard transcript hidden
+            # in the retained overlap. Mark an interrupted recording complete
+            # without sending the same private tail (and billing it) again.
+            with recording_store.lock:
+                with database.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = connection.execute(
+                        "SELECT recording_finalized FROM lectures "
+                        "WHERE id = ? AND username = ? AND deleting = 0",
+                        (lecture_id, user["username"]),
+                    ).fetchone()
+                    if current is None:
+                        raise HTTPException(404, "수업을 찾을 수 없습니다.")
+                    if not current["recording_finalized"]:
+                        ensure_recording_can_finalize(connection, lecture_id)
+                        connection.execute(
+                            "UPDATE lectures SET recording_finalized = 1 WHERE id = ?",
+                            (lecture_id,),
+                        )
+            try:
+                clova_engine.close_session(user["username"], lecture_id)
+            except Exception:
+                log.warning("Could not close a completed CLOVA Speech session")
+            return {
+                "segments": [],
+                "recording_available": recording_store.available(user["username"], lecture_id),
+                "recording_finalized": True,
+            }
         guard_chunk_id = final_guard_chunk_id()
         with database.connect() as connection:
             if lecture["recording_finalized"]:
@@ -1730,19 +1803,43 @@ def create_app(
             if replay is not None:
                 return replay_response(lecture_id, replay)
             started = time.perf_counter()
-            if interrupted is None:
-                inference_lock.acquire()
-            else:
-                while not inference_lock.acquire(timeout=0.25):
+            provider = lecture.get("asr_provider", "qwen")
+            if provider == "qwen":
+                if interrupted is None:
+                    inference_lock.acquire()
+                else:
+                    while not inference_lock.acquire(timeout=0.25):
+                        if interrupted():
+                            raise ImportInterrupted("import stopped while waiting for inference")
                     if interrupted():
-                        raise ImportInterrupted("import stopped while waiting for inference")
-                if interrupted():
+                        inference_lock.release()
+                        raise ImportInterrupted("import stopped before inference")
+                try:
+                    raw_segments = engine.transcribe(
+                        samples,
+                        lecture["language"],
+                        overlap_seconds,
+                        final_chunk,
+                    )
+                finally:
                     inference_lock.release()
-                    raise ImportInterrupted("import stopped before inference")
-            try:
-                raw_segments = engine.transcribe(samples, lecture["language"], overlap_seconds, final_chunk)
-            finally:
-                inference_lock.release()
+            elif provider == "clova":
+                if interrupted is not None:
+                    # Imports are deliberately local-only. Reaching this branch
+                    # indicates corrupted metadata rather than an opt-in cloud job.
+                    raise RuntimeError("External provider is not allowed for imports")
+                raw_segments = clova_engine.transcribe(
+                    samples,
+                    lecture["language"],
+                    overlap_seconds,
+                    final_chunk,
+                    lecture_id=lecture_id,
+                    username=lecture["username"],
+                    start_seconds=start_seconds,
+                    payload_hash=payload_hash,
+                )
+            else:
+                raise RuntimeError("Unsupported persisted transcription provider")
             processing_seconds = round(time.perf_counter() - started, 3)
             segments = normalized_segments(raw_segments, start_seconds, duration)
             with recording_store.lock:
@@ -1798,6 +1895,21 @@ def create_app(
             }
         except (HTTPException, ImportInterrupted):
             raise
+        except ClovaTranscriptionError as error:
+            # A gRPC timeout or disconnect can be ambiguous after audio left
+            # this PC. Do not let the browser's generic 5xx retry loop resend
+            # and potentially bill the same audio repeatedly. The adapter's
+            # error code is a closed, non-secret enum; provider bodies and RPC
+            # diagnostic strings are never logged.
+            safe_code = "provider_error"
+            candidate = getattr(error, "code", "")
+            if isinstance(candidate, str) and candidate.replace("_", "").isalnum():
+                safe_code = candidate[:40]
+            log.warning("CLOVA Speech transcription failed (%s)", safe_code)
+            raise HTTPException(
+                424,
+                "CLOVA Speech 응답을 안전하게 확정하지 못했습니다. 다시 보내면 같은 음성이 중복 과금될 수 있습니다.",
+            ) from None
         except Exception as error:
             log.exception("Local transcription failed")
             raise HTTPException(503, "이 PC에서 음성 인식을 실행하지 못했습니다. 서버 상태를 확인하고 다시 시도하세요.", headers={"Retry-After": "5"}) from error
@@ -1956,6 +2068,12 @@ def create_app(
     def finalize_lecture_deletion(lecture_id: str, username: str) -> bool:
         """Remove private audio before committing the final metadata deletion."""
 
+        try:
+            clova_engine.close_session(username, lecture_id)
+        except Exception:
+            # Never reflect a provider/channel diagnostic while deleting
+            # private data. A failed channel close must not retain local data.
+            log.warning("Could not close a CLOVA Speech session during deletion")
         try:
             recording_store.delete(username, lecture_id)
         except (OSError, RecordingCorruptError):
@@ -2224,6 +2342,9 @@ def create_app(
             "username": job["username"],
             "title": job["title"],
             "language": job["language"],
+            # Uploaded files deliberately remain on the local model even when
+            # the user has enabled CLOVA for microphone lessons.
+            "asr_provider": "qwen",
             "created_at": job["created_at"],
         }
 
@@ -2709,7 +2830,8 @@ def create_app(
                     os.close(descriptor)
                     made_file = True
                     connection.execute(
-                        "INSERT INTO lectures(id, username, title, language, created_at) VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO lectures(id, username, title, language, created_at, asr_provider) "
+                        "VALUES (?, ?, ?, ?, ?, 'qwen')",
                         (lecture_id, user["username"], body.title, body.language, created),
                     )
                     connection.execute(

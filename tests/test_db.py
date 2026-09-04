@@ -86,14 +86,19 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             with database.connect() as connection:
                 migrated = connection.execute(
-                    "SELECT c.overlap_seconds, c.final_chunk, l.recording_finalized "
+                    "SELECT c.overlap_seconds, c.final_chunk, l.recording_finalized, l.asr_provider "
                     "FROM chunks c JOIN lectures l ON l.id = c.lecture_id "
                     "WHERE c.lecture_id = ? AND c.chunk_id = ?",
                     (lecture_id, chunk_id),
                 ).fetchone()
             self.assertEqual(
                 dict(migrated),
-                {"overlap_seconds": 0.0, "final_chunk": 1, "recording_finalized": 1},
+                {
+                    "overlap_seconds": 0.0,
+                    "final_chunk": 1,
+                    "recording_finalized": 1,
+                    "asr_provider": "qwen",
+                },
             )
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -126,7 +131,7 @@ class DatabaseTests(unittest.TestCase):
                 ).fetchone()
                 schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(tuple(state), (0, 0))
-            self.assertEqual(schema_version, 5)
+            self.assertEqual(schema_version, 6)
 
     def test_accounts_are_data_not_hardcoded_in_the_users_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -244,6 +249,7 @@ class DatabaseTests(unittest.TestCase):
                     "2026-01-01T00:00:00Z",
                     0,
                     0,
+                    "qwen",
                 ),
             )
             self.assertNotIn("CHECK", schema.upper())

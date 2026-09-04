@@ -483,6 +483,11 @@ button {
   text-decoration: underline;
 }
 
+.auth-capture-stop {
+  width: 100%;
+  margin-top: .8rem;
+}
+
 .form-error {
   margin: 0;
   padding: 11px 13px;
@@ -924,20 +929,23 @@ button {
 .lesson-fields {
   display: grid;
   padding: 21px 23px;
-  grid-template-columns: minmax(0, 1fr) minmax(130px, 0.22fr) minmax(190px, 0.34fr);
+  grid-template-columns: minmax(0, 1fr) minmax(125px, 0.2fr) minmax(180px, 0.3fr) minmax(180px, 0.3fr);
   gap: 16px;
   border-bottom: 1px solid var(--line);
 }
 
 .source-guidance,
-.source-privacy {
+.source-privacy,
+.provider-guidance,
+.provider-privacy {
   margin: -6px 0 0;
   grid-column: 1 / -1;
   color: var(--muted);
   font-size: 11px;
 }
 
-.source-privacy {
+.source-privacy,
+.provider-privacy {
   margin-top: -10px;
   color: #8a563f;
 }
@@ -1931,7 +1939,8 @@ button {
     grid-template-columns: minmax(0, 1fr) minmax(130px, 0.35fr);
   }
 
-  .source-field {
+  .source-field,
+  .provider-field {
     grid-column: 1 / -1;
   }
 
@@ -2137,7 +2146,8 @@ button {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .source-field {
+  .source-field,
+  .provider-field {
     grid-column: auto;
   }
 
