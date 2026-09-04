@@ -2,7 +2,7 @@
 
 기준일: 2026-09-05 (Asia/Seoul)
 
-실시간 입력의 영속 대기열·무기한 재전송·입력 재연결·탭 간 잠금과 CLOVA 선택 변경은 2026-09-04 전체 자동 회귀를 통과했다. 2026-09-05에는 CLOVA 실계정 Basic 스트림으로 짧은 비개인 한국어 음성과 강제 회전 경계를 확인했다. 배포 커밋과 API/Pages/Quick Tunnel 외부 확인 결과는 아래 `저장소·배포 체크포인트`에 이어서 기록하며, 최신 경계 보완은 아직 로컬에만 있다. 실제 브라우저·학교 Wi-Fi·교실 음성 및 장시간 CLOVA 검증은 `아직 확인하지 못함`과 구분한다.
+실시간 입력의 영속 대기열·무기한 재전송·입력 재연결·탭 간 잠금과 CLOVA 선택 변경은 2026-09-04 전체 자동 회귀를 통과했다. 2026-09-05에는 CLOVA 실계정 Basic 스트림으로 짧은 비개인 한국어 음성과 강제 회전 경계를 확인하고 최신 보완을 `main`에 배포했다. 배포 커밋과 API/Pages/Quick Tunnel 외부 확인 결과는 아래 `저장소·배포 체크포인트`에 이어서 기록한다. 실제 브라우저·학교 Wi-Fi·교실 음성 및 장시간 CLOVA 검증은 `아직 확인하지 못함`과 구분한다.
 
 ## 현재 결론
 
@@ -245,9 +245,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 제한 없는 호스트 환경에서 `./.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v`: 서버/API/DB/설정/전사기/importer/녹음·후보정·관리자·터널·CLOVA 계약 173개가 27.424초에 모두 통과했다. 이 체크포인트의 CLOVA module 48개는 healthy-stream 지연 경계, 강제 회전 replay, timestamp drift, 실제 새 반복 발화, 구두점·Unicode 정규화, 소유자 격리와 세션/continuity 정리를 포함한다.
 - 실제 Secret Key와 Basic 스트리밍 도메인으로 공개 KSS 한국어 낭독 12.645초를 보냈고, 대기하지 않고 clock을 강제로 241초 전진시켜 4분 rotation 경로를 실행했다. 최종 코드의 wall time은 12.281초, native transport는 2개였으며 두 번째 스트림이 overlap 안의 `이다.`를 회수해 목표 문장이 전체 결과에 정확히 한 번 남았다. final 뒤 adapter의 활성 session과 reader thread는 모두 0이었다. 이는 짧은 단일 화자·강제 시각 시험이지 자연 경과 4분 또는 장시간 수업 시험은 아니다.
 - 수정 전 구현의 300.818초 진단 실행도 native transport 2개와 프로세스 RSS 약 12.6 MiB 증가로 끝났지만, 바로 그 실행에서 회전 경계의 정확한 누락을 재현했다. 따라서 이 이전 결과를 최신 경계 보완의 5분 통과 기록으로 취급하면 안 된다.
-- 프런트엔드는 이번 경계 보완에서 변경하지 않았다. 직전 VS Code Server Node.js 24.18.0 실행에서는 `node --test --test-isolation=none tests/*.test.mjs`의 앱 상태 98개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 135개가 모두 통과했다. 현재 셸에는 Node 실행 파일이 없어 최신 작업에서 다시 실행하지 않았으므로 이 기록을 서버 변경 뒤의 신규 웹 실행으로 해석하지 않는다.
+- 프런트엔드는 경계 보완 커밋에서 변경하지 않았지만, 함께 push한 `d2505ec`에는 설정된 CLOVA를 새 마이크 수업의 기본값으로 고르는 UI 변경이 있다. 직전 VS Code Server Node.js 24.18.0 실행에서는 `node --test --test-isolation=none tests/*.test.mjs`의 앱 상태 98개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 135개가 모두 통과했다. 현재 셸에는 Node 실행 파일이 없어 로컬에서 다시 실행하지 못했지만, 최종 GitHub Pages workflow의 동일 웹 테스트 단계는 통과했다.
 - 앱 테스트 대역도 실제 UUID·owner·provider·capture 시간축·CLOVA `inflight` 전이·final-last·영속 삭제 계약을 검사하도록 강화했고, PCM 없는 종료에 합성 final WAV를 넣지 않는다. 따라서 새 내구성 경로의 실패를 기대값만 완화해 숨기지 않았다.
-- 최신 서버 변경에는 Python compile과 `git diff --check`를 다시 수행했다. 웹/테스트 JavaScript 10개 파일의 `node --check`, 비공개 경로 ignore·공개 트리/기존 Git 이력 점검과 운영 DB snapshot은 직전 배포 체크포인트의 기록이며 이번 작업에서 새 배포나 DB 변경은 하지 않았다.
+- 최신 서버 변경에는 Python compile과 `git diff --check`, private env의 실제 계정 ID·CLOVA/NOVA 키가 현재 추적 파일에 없는지 값 비공개 검사를 수행했다. 이번 변경은 DB schema나 운영 데이터를 바꾸지 않는다. 최종 배포 뒤 공개 정적 파일 9개를 로컬 `web/`과 byte-for-byte 비교했고 모두 일치했다.
 
 ### 이전까지 확인된 누적 기록
 
@@ -351,7 +351,7 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 2026-09-04 실시간 영속 대기열·입력 재연결·탭 간 잠금·선택형 CLOVA 구현 커밋 `5489afd`를 `main`에 push했고 Pages 실행 `33860357377`이 성공했다. 적용 전 운영 DB는 `.data/backups/pre-durable-queue-clova-deploy-20260904.sqlite3`에 권한 `0600`으로 백업했다. 최종 Python 회귀 152개와 Node 회귀 130개, Python/JavaScript/Bash 구문 및 `git diff --check`를 통과했다. API 서버를 최종 코드로 Qwen warmup 재시작했고 DB schema v6, integrity, FK, 대기 chunk/import/correction 0건을 읽기 전용으로 확인했다. 공개 자산 9개는 로컬 `web/`과 byte-for-byte 일치하고, 공개 `config.json`은 허용된 다섯 필드만 가지며 현재 tunnel origin과 일치하고 만료 전이었다. 외부 edge에서 health 200, 무인증 수업 API 401, 허용하지 않은 Origin 403, Pages Origin의 authorization 포함 preflight 허용을 확인했다. 이 프로젝트를 같은 loopback API에 노출하던 이전 고아 cloudflared 하나는 정확한 PID·cwd·고정 target을 확인한 뒤 SIGTERM으로 종료했고, 현재 관리되는 터널 하나와 외부 health 200을 다시 확인했다. CLOVA 비밀 키는 아직 운영 설정에 없으므로 화면에서 해당 선택은 비활성이고 실계정 gRPC 호출은 검증하지 않았다.
 
-2026-09-05 CLOVA 경계 continuity/reconciliation 보완은 로컬 작업 트리에만 있으며 아직 commit·push·Pages/API 배포하지 않았다. 실제 Basic/KSS 강제 rotation 결과는 ignored `.data/test-results/`에 권한 `0600`으로만 두었고, 비밀 키·계정 ID·음성은 추적 파일에 추가하지 않았다. 이 체크포인트에서 API 서버와 Quick Tunnel은 모두 중지 상태이며 이번 테스트를 위해 다시 열지 않았다. 위 2026-09-04 문단의 CLOVA 미설정·실계정 미검증 내용은 당시 배포 상태를 기록한 것이며 현재 로컬 검증 상태를 뜻하지 않는다.
+2026-09-05 새 마이크 수업에서 CLOVA를 우선하는 `d2505ec`와 경계 continuity/reconciliation 보완 `93ebcfa`를 `main`에 push했다. Pages push 실행 `33891354210`과 현재 Quick Tunnel 주소를 게시한 workflow dispatch 실행 `33891506118`이 모두 같은 `93ebcfa`에서 성공했다. 최신 코드로 API 서버를 Qwen fallback warmup과 함께 재시작했고 Quick Tunnel을 연결했다. 로컬/외부 health 200, 무인증 `/status` 401, 허용하지 않은 Origin 403, Pages runtime config의 현재 tunnel origin·online lease 일치와 공개 정적 파일 9개의 byte-for-byte 일치를 확인했다. 실제 Basic/KSS 강제 rotation 결과는 ignored `.data/test-results/`에 권한 `0600`으로만 두었고, 비밀 키·계정 ID·음성은 추적 파일에 추가하지 않았다. 위 2026-09-04 문단의 CLOVA 미설정·실계정 미검증 내용은 당시 배포 상태를 기록한 것이며 현재 상태를 뜻하지 않는다.
 
 푸시 전에 반드시 확인할 것:
 
@@ -363,13 +363,12 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 ## 다음 단계 우선순위
 
-1. 최신 경계 보완을 검토한 뒤 요청이 있을 때만 commit·push·배포하고 API/Quick Tunnel을 다시 연다.
-2. 실계정 CLOVA에서 자연 경과 4분 이상 스트림, 완전 무음 ACK, pause/resume과 실제 단절·재연결을 비개인 샘플로 확인한다.
-3. 같은 실제 한국어 수업 샘플로 CLOVA와 Qwen의 누락·고유명사·경계 중복 및 비용을 비교한다.
-4. 실제 관리자 계정으로 외부 dialog를 열어 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 확인한다.
-5. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
-6. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
-7. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
+1. 실계정 CLOVA에서 자연 경과 4분 이상 스트림, 완전 무음 ACK, pause/resume과 실제 단절·재연결을 비개인 샘플로 확인한다.
+2. 같은 실제 한국어 수업 샘플로 CLOVA와 Qwen의 누락·고유명사·경계 중복 및 비용을 비교한다.
+3. 실제 관리자 계정으로 외부 dialog를 열어 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 확인한다.
+4. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
+5. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
+6. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
 
 ## 재현 명령
 
