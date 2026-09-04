@@ -7,6 +7,7 @@ import math
 import queue
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -40,6 +41,14 @@ MAX_PENDING_TEXT = 256 * 1024
 MAX_CACHE_RESULT_TEXT = 32 * 1024
 MAX_TIMELINE_SECONDS = 24 * 60 * 60
 RESPONSE_TIMESTAMP_SLOP_SECONDS = 0.1
+BOUNDARY_TIMESTAMP_SLOP_SECONDS = 0.15
+TIMELINE_SAMPLE_TOLERANCE_SECONDS = 2 / SAMPLE_RATE
+BOUNDARY_REPLAY_MIN_LEAD_SECONDS = BOUNDARY_TIMESTAMP_SLOP_SECONDS
+MIN_BOUNDARY_TEXT_ANCHOR_CHARACTERS = 2
+MAX_CONTINUITY_ENTRIES = 32
+MAX_CONTINUITY_ENTRIES_PER_USER = 16
+MAX_CONTINUITY_TAIL_CHARACTERS = 4 * 1024
+CONTINUITY_TTL_SECONDS = 2 * 60 * 60
 CLOSE_JOIN_SECONDS = 0.25
 _QUEUE_END = object()
 
@@ -125,6 +134,27 @@ class _CacheEntry:
     result: tuple[tuple[float, float, str], ...]
 
 
+@dataclass(frozen=True)
+class _Continuity:
+    language: str | None
+    audio_end: float
+    emitted_end: float | None
+    normalized_tail: str = field(repr=False)
+    last_used: float = 0.0
+
+
+@dataclass(frozen=True)
+class _LocalCandidate:
+    text: str = field(repr=False)
+    start: float
+    end: float
+    # Normalized character offsets followed by the aligned local time span.
+    alignment_points: tuple[tuple[int, int, float, float], ...] = field(
+        repr=False
+    )
+    ambiguous_prefix_characters: int = 0
+
+
 def _number(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ClovaTranscriptionError("invalid_response")
@@ -183,6 +213,91 @@ def _safe_json_object(raw: Any) -> dict[str, Any]:
 
 def _copy_result(result: tuple[tuple[float, float, str], ...]) -> list[dict]:
     return [{"start": start, "end": end, "text": text} for start, end, text in result]
+
+
+def _normalized_boundary_text(text: str) -> str:
+    normalized = []
+    for character in text:
+        for value in unicodedata.normalize("NFKC", character).lower():
+            # Ignore layout whitespace, but retain punctuation and symbols so
+            # an already-returned full stop is distinguishable from a newly
+            # supplied one at the replacement boundary.
+            if value.isalnum() or unicodedata.category(value)[0] in {"P", "S"}:
+                normalized.append(value)
+    return "".join(normalized)
+
+
+def _suffix_prefix_overlap(
+    tail: str,
+    prefix: str,
+    maximum: int,
+    valid_prefix_lengths: set[int],
+    *,
+    certain_replay_length: int = 0,
+) -> int:
+    matches = [
+        length
+        for length in range(1, min(len(tail), len(prefix), maximum) + 1)
+        if length in valid_prefix_lengths and tail.endswith(prefix[:length])
+    ]
+    if not matches:
+        return 0
+
+    # Periodic speech can have more than one valid overlap.  For example, the
+    # old tail and replacement prefix may both be ``정말 정말`` while only the
+    # first occurrence is replay and the second is newly spoken.  The longest
+    # string match would silently erase that new occurrence.  Timestamp
+    # evidence bounds how much we may safely remove.  When the text is
+    # periodic and has several matches, keep the longest match that does not
+    # cross that bound.  Rounding a longer match upward can consume the start
+    # of a genuinely repeated utterance whose provider timestamp drifted just
+    # behind the frontier.  A sole, non-periodic anchor remains useful even
+    # when only its beginning is temporally certain.
+    if len(matches) == 1:
+        return matches[0]
+    if certain_replay_length > 0:
+        bounded = [
+            length for length in matches if length <= certain_replay_length
+        ]
+        if bounded:
+            return bounded[-1]
+
+    # Without a bounded match, choose the shortest useful lexical anchor and
+    # bias toward a visible duplicate over an omission. A one-character match
+    # is handled by the caller only when its timestamp proves it is old.
+    for length in matches:
+        if sum(character.isalnum() for character in prefix[:length]) >= (
+            MIN_BOUNDARY_TEXT_ANCHOR_CHARACTERS
+        ):
+            return length
+    return matches[-1]
+
+
+def _drop_normalized_prefix(text: str, count: int) -> str:
+    if count <= 0:
+        return text.strip()
+    remaining = count
+    cut = 0
+    for index, character in enumerate(text):
+        width = len(_normalized_boundary_text(character))
+        if width:
+            if remaining < width:
+                # A compatibility character can normalize to multiple code
+                # points. Keep it whole rather than corrupting the original.
+                break
+            remaining -= width
+        cut = index + 1
+        if remaining == 0:
+            break
+    if remaining:
+        return ""
+    # Any punctuation not covered by the matched anchor may be new information
+    # supplied by the replacement decode. A leading combining mark, however,
+    # belongs to the removed character and cannot stand on its own.
+    suffix = text[cut:].lstrip()
+    while suffix and unicodedata.category(suffix[0]).startswith("M"):
+        suffix = suffix[1:].lstrip()
+    return suffix
 
 
 class ClovaStreamingTranscriber:
@@ -245,6 +360,12 @@ class ClovaStreamingTranscriber:
         self._opening: dict[tuple[str, str], _Session] = {}
         self._operation_tokens: dict[tuple[str, str], set[object]] = {}
         self._cache: OrderedDict[tuple[str, str, str], _CacheEntry] = OrderedDict()
+        # Keep a small, owner-scoped description of the audio/text frontier.
+        # It recovers words finalized just behind an HTTP chunk boundary and
+        # also reconciles overlap when a native stream is replaced before
+        # NAVER's five-minute lifetime. This state never appears in status or
+        # logs.
+        self._continuity: OrderedDict[tuple[str, str], _Continuity] = OrderedDict()
         self._next_seq_id = 1
         self._closed = False
         self._state = "ready" if self.configured else "unconfigured"
@@ -358,9 +479,11 @@ class ClovaStreamingTranscriber:
                     self._cache.move_to_end(cache_key)
                     return _copy_result(cached.result)
                 session = self._sessions.get(owner_key)
+                continuity = self._continuity.get(owner_key)
             now = self._now()
             overlap_samples = round(overlap * SAMPLE_RATE)
             rotate = False
+            discontinuous = False
             if session is not None:
                 if session.language != language:
                     raise ClovaTranscriptionError("chunk_conflict")
@@ -388,6 +511,7 @@ class ClovaStreamingTranscriber:
                         fingerprint=fingerprint,
                         result=(),
                     )
+                    self._continuity.pop(owner_key, None)
                     self._cache.move_to_end(cache_key)
                     while len(self._cache) > MAX_CACHE_ENTRIES:
                         self._cache.popitem(last=False)
@@ -427,6 +551,34 @@ class ClovaStreamingTranscriber:
             provider_start = session.sent_seconds
             sent_local_start = send_from / SAMPLE_RATE
             context_seconds = overlap if is_new_session else 0.0
+            context_emitted_until: float | None = None
+            context_tail = ""
+            if (
+                overlap > 0
+                and not discontinuous
+                and continuity is not None
+                and continuity.language == language
+                and abs((start + overlap) - continuity.audio_end) <= (2 / SAMPLE_RATE)
+            ):
+                if continuity.emitted_end is None:
+                    context_emitted_until = 0.0
+                elif continuity.emitted_end <= start:
+                    # Nothing previously returned intersects this overlap.
+                    # Let the replacement stream recover the whole window,
+                    # but never compare it with text from before the window:
+                    # a later utterance may legitimately repeat that text.
+                    context_emitted_until = 0.0
+                elif continuity.emitted_end <= start + overlap + BOUNDARY_TIMESTAMP_SLOP_SECONDS:
+                    context_emitted_until = min(
+                        overlap,
+                        max(0.0, continuity.emitted_end - start),
+                    )
+                    # Within one native stream, response ``position`` already
+                    # distinguishes replay from newly appended text.  Only a
+                    # replacement stream resets that namespace and needs a
+                    # cross-stream text anchor.
+                    if is_new_session:
+                        context_tail = continuity.normalized_tail
             try:
                 responses, provider_end = self._send_and_wait(
                     session,
@@ -440,6 +592,8 @@ class ClovaStreamingTranscriber:
                     provider_end=provider_end,
                     sent_local_start=sent_local_start,
                     context_seconds=context_seconds,
+                    context_emitted_until=context_emitted_until,
+                    context_tail=context_tail,
                     duration=duration,
                 )
                 session.expected_fresh_start = start + duration
@@ -468,6 +622,18 @@ class ClovaStreamingTranscriber:
                     code = "closed" if self._closed else "provider_unavailable"
                     raise ClovaTranscriptionError(code, retryable=not self._closed)
                 self._cache[cache_key] = _CacheEntry(fingerprint=fingerprint, result=packed)
+                if final_chunk:
+                    self._continuity.pop(owner_key, None)
+                else:
+                    self._commit_continuity_locked(
+                        owner_key,
+                        language=language,
+                        start=start,
+                        overlap=overlap,
+                        duration=duration,
+                        result=result,
+                        now=session.last_used,
+                    )
                 self._cache.move_to_end(cache_key)
                 while len(self._cache) > MAX_CACHE_ENTRIES:
                     self._cache.popitem(last=False)
@@ -491,6 +657,7 @@ class ClovaStreamingTranscriber:
             ]
             for cache_key in cache_keys:
                 self._cache.pop(cache_key, None)
+            self._continuity.pop(key, None)
         if session is not None:
             self._shutdown(session)
         if opening is not None and opening is not session:
@@ -506,6 +673,7 @@ class ClovaStreamingTranscriber:
             self._opening.clear()
             self._operation_tokens.clear()
             self._cache.clear()
+            self._continuity.clear()
             self._state = "closed"
         unique = {id(session): session for session in sessions}
         for session in unique.values():
@@ -594,9 +762,66 @@ class ClovaStreamingTranscriber:
             if not self._closed:
                 self._state = value
 
+    def _commit_continuity_locked(
+        self,
+        owner_key: tuple[str, str],
+        *,
+        language: str | None,
+        start: float,
+        overlap: float,
+        duration: float,
+        result: list[dict],
+        now: float,
+    ) -> None:
+        previous = self._continuity.get(owner_key)
+        contiguous = (
+            previous is not None
+            and previous.language == language
+            and abs((start + overlap) - previous.audio_end) <= (2 / SAMPLE_RATE)
+        )
+        new_text = _normalized_boundary_text(" ".join(item["text"] for item in result))
+        if contiguous:
+            tail = previous.normalized_tail + new_text
+            emitted_end = previous.emitted_end
+        else:
+            tail = new_text
+            emitted_end = None
+        if result:
+            newest_end = start + max(float(item["end"]) for item in result)
+            emitted_end = newest_end if emitted_end is None else max(emitted_end, newest_end)
+        self._continuity[owner_key] = _Continuity(
+            language=language,
+            audio_end=start + duration,
+            emitted_end=emitted_end,
+            normalized_tail=tail[-MAX_CONTINUITY_TAIL_CHARACTERS:],
+            last_used=now,
+        )
+        self._continuity.move_to_end(owner_key)
+        self._prune_continuity_locked(now, current=owner_key)
+
+    def _prune_continuity_locked(
+        self,
+        now: float,
+        *,
+        current: tuple[str, str] | None = None,
+    ) -> None:
+        for key, value in list(self._continuity.items()):
+            if key != current and now - value.last_used >= CONTINUITY_TTL_SECONDS:
+                self._continuity.pop(key, None)
+
+        if current is not None:
+            username = current[0]
+            same_user = [key for key in self._continuity if key[0] == username]
+            while len(same_user) > MAX_CONTINUITY_ENTRIES_PER_USER:
+                self._continuity.pop(same_user.pop(0), None)
+
+        while len(self._continuity) > MAX_CONTINUITY_ENTRIES:
+            self._continuity.popitem(last=False)
+
     def _cleanup_idle(self) -> None:
         now = self._now()
         with self._state_lock:
+            self._prune_continuity_locked(now)
             stale = []
             for key, session in self._sessions.items():
                 with session.condition:
@@ -1140,21 +1365,43 @@ class ClovaStreamingTranscriber:
         provider_end: float,
         sent_local_start: float,
         context_seconds: float,
+        context_emitted_until: float | None,
+        context_tail: str,
         duration: float,
     ) -> list[dict]:
         fresh_provider_start = provider_start + context_seconds
         local_offset = sent_local_start - provider_start
-        result: list[dict] = []
-        seen: set[tuple[float, float, str]] = set()
-        result_characters = 0
+        emitted_provider_end = (
+            None
+            if context_emitted_until is None
+            else context_emitted_until - local_offset
+        )
+        fresh_local_start = sent_local_start + context_seconds
+        candidates: list[_LocalCandidate] = []
         for response in responses:
-            kept = [
-                item
-                for item in response.alignments
-                if fresh_provider_start
-                <= (item.start + item.end) / 2
-                < provider_end + RESPONSE_TIMESTAMP_SLOP_SECONDS
-            ]
+            if emitted_provider_end is None:
+                kept = [
+                    item
+                    for item in response.alignments
+                    if fresh_provider_start
+                    <= (item.start + item.end) / 2
+                    < provider_end + RESPONSE_TIMESTAMP_SLOP_SECONDS
+                ]
+            else:
+                # Start after the last alignment this process actually
+                # returned, not blindly at the fresh-audio boundary: a prior
+                # DATA acknowledgement may have ended in the middle of a word.
+                # An alignment crossing that frontier remains a candidate. On
+                # a replacement native stream, exact replay is removed by the
+                # text comparison below.
+                kept = [
+                    item
+                    for item in response.alignments
+                    if item.end
+                    > emitted_provider_end - BOUNDARY_TIMESTAMP_SLOP_SECONDS
+                    and (item.start + item.end) / 2
+                    < provider_end + RESPONSE_TIMESTAMP_SLOP_SECONDS
+                ]
             text_alignments = [item for item in kept if item.word.strip()]
             if not text_alignments:
                 continue
@@ -1165,7 +1412,216 @@ class ClovaStreamingTranscriber:
                 continue
             start = max(0.0, min(duration, text_alignments[0].start + local_offset))
             end = max(start, min(duration, text_alignments[-1].end + local_offset))
-            packed = (round(start, 6), round(end, 6), text)
+
+            normalized_cursor = 0
+            points: list[tuple[int, int, float, float]] = []
+            ambiguous_characters = 0
+            ambiguous = emitted_provider_end is not None
+            boundary_anchored = False
+            for item in text_alignments:
+                token_length = len(_normalized_boundary_text(item.word))
+                if not token_length:
+                    continue
+                local_start = max(0.0, min(duration, item.start + local_offset))
+                local_end = max(local_start, min(duration, item.end + local_offset))
+                points.append(
+                    (
+                        normalized_cursor,
+                        normalized_cursor + token_length,
+                        local_start,
+                        local_end,
+                    )
+                )
+                if (
+                    ambiguous
+                    and context_emitted_until is not None
+                    and local_start
+                    < fresh_local_start + BOUNDARY_TIMESTAMP_SLOP_SECONDS
+                ):
+                    # Text de-duplication is allowed only when the candidate
+                    # actually touches the last returned timestamp.  Once
+                    # anchored there, compare through the remaining overlap:
+                    # a newly decoded stream can shift the end of the same
+                    # phrase by several hundred milliseconds. Require its
+                    # first alignment to lead the frontier by more than the
+                    # timestamp slop; equality inside that dead zone may be a
+                    # genuinely repeated utterance and must survive.
+                    if boundary_anchored:
+                        within_boundary = True
+                    else:
+                        within_boundary = (
+                            local_start
+                            < context_emitted_until
+                            - BOUNDARY_REPLAY_MIN_LEAD_SECONDS
+                        )
+                        boundary_anchored = within_boundary
+                    if within_boundary:
+                        ambiguous_characters += token_length
+                    else:
+                        ambiguous = False
+                else:
+                    ambiguous = False
+                normalized_cursor += token_length
+
+            candidates.append(
+                _LocalCandidate(
+                    text=text,
+                    start=start,
+                    end=end,
+                    alignment_points=tuple(points),
+                    ambiguous_prefix_characters=ambiguous_characters,
+                )
+            )
+
+        candidates.sort(key=lambda item: (item.start, item.end, item.text))
+        candidate_text = "".join(
+            _normalized_boundary_text(item.text) for item in candidates
+        )
+        # NFKC can expand one source code point into several normalized code
+        # points (for example a compatibility symbol).  Only cut at an
+        # original character boundary; a partial expansion would otherwise
+        # discard the entire candidate while trying to avoid corruption.
+        valid_prefix_lengths: set[int] = set()
+        valid_lexical_prefix_lengths: set[int] = set()
+        lexical_to_surface_length: dict[int, int] = {}
+        normalized_prefix_length = 0
+        lexical_prefix_length = 0
+        for candidate in candidates:
+            for character in candidate.text:
+                normalized_character = _normalized_boundary_text(character)
+                width = len(normalized_character)
+                if width:
+                    normalized_prefix_length += width
+                    valid_prefix_lengths.add(normalized_prefix_length)
+                lexical_width = sum(value.isalnum() for value in normalized_character)
+                if lexical_width:
+                    lexical_prefix_length += lexical_width
+                    valid_lexical_prefix_lengths.add(lexical_prefix_length)
+                    lexical_to_surface_length[lexical_prefix_length] = (
+                        normalized_prefix_length
+                    )
+        ambiguous_limit = 0
+        for candidate in candidates:
+            normalized_length = len(_normalized_boundary_text(candidate.text))
+            ambiguous_limit += candidate.ambiguous_prefix_characters
+            if candidate.ambiguous_prefix_characters < normalized_length:
+                break
+        certain_replay_limit = 0
+        certain_replay_complete = context_emitted_until is not None
+        for candidate in candidates:
+            if not certain_replay_complete:
+                break
+            for normalized_start, normalized_end, _start, aligned_end in candidate.alignment_points:
+                if (
+                    aligned_end
+                    <= context_emitted_until
+                    + TIMELINE_SAMPLE_TOLERANCE_SECONDS
+                ):
+                    certain_replay_limit += normalized_end - normalized_start
+                else:
+                    certain_replay_complete = False
+                    break
+        duplicate_characters = _suffix_prefix_overlap(
+            context_tail,
+            candidate_text,
+            ambiguous_limit,
+            valid_prefix_lengths,
+            certain_replay_length=certain_replay_limit,
+        )
+        # A single Korean syllable is a complete word surprisingly often.
+        # Treating a one-character equality as replay can silently erase a
+        # genuine adjacent utterance; prefer a visible duplicate in that
+        # irreducibly ambiguous case.
+        duplicate_strength = sum(
+            character.isalnum()
+            for character in candidate_text[:duplicate_characters]
+        )
+        if (
+            duplicate_strength < MIN_BOUNDARY_TEXT_ANCHOR_CHARACTERS
+            and duplicate_characters > certain_replay_limit
+        ):
+            duplicate_characters = 0
+
+        # A replacement decode may change only the punctuation of an already
+        # returned phrase (``안녕!`` -> ``안녕?``).  Fall back to a lexical
+        # anchor so the words are not repeated.  If the old phrase already
+        # ended in punctuation, also discard the replacement punctuation;
+        # append-only results cannot replace it without producing ``!?``.
+        if duplicate_characters == 0:
+            candidate_lexical = "".join(
+                character for character in candidate_text if character.isalnum()
+            )
+            context_lexical = "".join(
+                character for character in context_tail if character.isalnum()
+            )
+            ambiguous_lexical_limit = sum(
+                character.isalnum()
+                for character in candidate_text[:ambiguous_limit]
+            )
+            certain_replay_lexical_limit = sum(
+                character.isalnum()
+                for character in candidate_text[:certain_replay_limit]
+            )
+            duplicate_lexical = _suffix_prefix_overlap(
+                context_lexical,
+                candidate_lexical,
+                ambiguous_lexical_limit,
+                valid_lexical_prefix_lengths,
+                certain_replay_length=certain_replay_lexical_limit,
+            )
+            lexical_surface_cut = lexical_to_surface_length.get(
+                duplicate_lexical,
+                0,
+            )
+            if (
+                duplicate_lexical >= MIN_BOUNDARY_TEXT_ANCHOR_CHARACTERS
+                or (
+                    duplicate_lexical > 0
+                    and lexical_surface_cut <= certain_replay_limit
+                )
+            ):
+                duplicate_characters = lexical_surface_cut
+                if context_tail and not context_tail[-1].isalnum():
+                    for length in sorted(valid_prefix_lengths):
+                        if length <= duplicate_characters:
+                            continue
+                        if all(
+                            not character.isalnum()
+                            for character in candidate_text[
+                                duplicate_characters:length
+                            ]
+                        ):
+                            duplicate_characters = length
+                        else:
+                            break
+
+        result: list[dict] = []
+        seen: set[tuple[float, float, str]] = set()
+        result_characters = 0
+        remaining_duplicate = duplicate_characters
+        for candidate in candidates:
+            normalized_length = len(_normalized_boundary_text(candidate.text))
+            drop = min(remaining_duplicate, normalized_length)
+            remaining_duplicate -= drop
+            if normalized_length and drop == normalized_length:
+                continue
+            text = _drop_normalized_prefix(candidate.text, drop)
+            if not text:
+                continue
+            start = candidate.start
+            if drop:
+                for normalized_start, normalized_end, aligned_start, aligned_end in candidate.alignment_points:
+                    if normalized_end <= drop:
+                        continue
+                    if normalized_start < drop:
+                        fraction = (drop - normalized_start) / (
+                            normalized_end - normalized_start
+                        )
+                        start = aligned_start + (aligned_end - aligned_start) * fraction
+                    else:
+                        start = aligned_start
+                    break
+            packed = (round(start, 6), round(candidate.end, 6), text)
             if packed in seen:
                 continue
             seen.add(packed)

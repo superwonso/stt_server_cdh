@@ -351,6 +351,119 @@ class ClovaStreamingTranscriberTests(unittest.TestCase):
         self.assertEqual(result, [{"start": 0.6, "end": 0.8, "text": "뒤"}])
         engine.close()
 
+    def test_healthy_session_recovers_text_finalized_after_the_chunk_boundary(self):
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "비교하",
+                    0,
+                    [("비", 8.0, 8.4), ("교", 8.4, 8.8), ("하", 8.8, 9.6)],
+                    seq_id=seq,
+                )
+            ]
+
+        def second(seq, _start, _end):
+            return [
+                transcript(
+                    "는 것이다.",
+                    3,
+                    [
+                        ("는", 9.62, 9.75),
+                        ("것", 9.76, 9.94),
+                        ("이", 10.05, 10.15),
+                        ("다", 10.15, 10.34),
+                        (".", 10.34, 10.36),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first, second]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("healthy-boundary-first"),
+        )
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("healthy-boundary-second"),
+        )
+
+        self.assertEqual(len(factory.stubs), 1)
+        self.assertEqual(second_result, [{"start": 2.62, "end": 3.36, "text": "는 것이다."}])
+        self.assertEqual(
+            first_result[0]["text"] + second_result[0]["text"],
+            "비교하는 것이다.",
+        )
+        engine.close()
+
+    def test_healthy_session_keeps_a_new_repeated_phrase_at_the_boundary(self):
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "정말",
+                    0,
+                    [("정", 9.40, 9.50), ("말", 9.50, 9.60)],
+                    seq_id=seq,
+                )
+            ]
+
+        def second(seq, _start, _end):
+            return [
+                transcript(
+                    "정말 맞다",
+                    2,
+                    [
+                        ("정", 9.59, 9.67),
+                        ("말", 9.67, 9.78),
+                        ("맞", 10.04, 10.16),
+                        ("다", 10.16, 10.30),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first, second]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("healthy-repeat-first"),
+        )
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("healthy-repeat-second"),
+        )
+
+        self.assertEqual(len(factory.stubs), 1)
+        self.assertEqual(first_result[0]["text"], "정말")
+        self.assertEqual(
+            second_result,
+            [{"start": 2.59, "end": 3.3, "text": "정말 맞다"}],
+        )
+        engine.close()
+
     def test_overlap_only_final_closes_without_duplicate_provider_data(self):
         def first(seq, _start, _end):
             return [transcript("앞", 0, [("앞", 0.1, 0.2)], seq_id=seq)]
@@ -398,14 +511,14 @@ class ClovaStreamingTranscriberTests(unittest.TestCase):
         clock = FakeClock()
 
         def first(seq, _start, _end):
-            return [transcript("앞", 0, [("앞", 0.1, 0.2)], seq_id=seq)]
+            return [transcript("앞", 0, [("앞", 0.8, 0.9)], seq_id=seq)]
 
         def rotated(seq, _start, _end):
             return [
                 transcript(
                     "앞 뒤",
                     0,
-                    [("앞", 0.1, 0.25), (" ", 0.25, 0.55), ("뒤", 0.7, 0.9)],
+                    [("앞", 0.2, 0.4), (" ", 0.4, 0.55), ("뒤", 0.7, 0.9)],
                     seq_id=seq,
                 )
             ]
@@ -426,6 +539,1150 @@ class ClovaStreamingTranscriberTests(unittest.TestCase):
         sent = sum(len(value.data.chunk) for value in factory.stubs[1].data_groups[0])
         self.assertEqual(sent, 48_000)  # fresh session receives overlap as context
         self.assertEqual(result, [{"start": 0.7, "end": 0.9, "text": "뒤"}])
+        engine.close()
+
+    def test_rotation_recovers_unemitted_context_suffix_exactly_once(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "비교하",
+                    0,
+                    [("비", 8.0, 8.4), ("교", 8.4, 8.8), ("하", 8.8, 9.6)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "비교하는 것이다.",
+                    0,
+                    [
+                        ("비", 0.50, 0.80),
+                        ("교", 0.80, 1.10),
+                        ("하", 1.10, 2.55),
+                        ("는", 2.56, 2.70),
+                        ("것", 2.75, 2.92),
+                        ("이", 3.05, 3.15),
+                        ("다", 3.15, 3.40),
+                        (".", 3.40, 3.45),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("boundary-first"),
+        )
+        clock.value = 241
+        second_kwargs = dict(
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("boundary-second"),
+        )
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            **second_kwargs,
+        )
+
+        self.assertEqual(first_result[0]["text"], "비교하")
+        self.assertEqual(second_result[0]["text"], "는 것이다.")
+        self.assertGreaterEqual(second_result[0]["start"], 2.56)
+        self.assertLess(second_result[0]["start"], 3.0)
+        self.assertEqual(
+            first_result[0]["text"] + second_result[0]["text"],
+            "비교하는 것이다.",
+        )
+        self.assertEqual(len(factory.stubs), 2)
+        self.assertTrue(factory.channels[0].closed.is_set())
+        self.assertTrue(factory.channels[1].closed.is_set())
+        self.assertNotIn(("owner", "lecture"), engine._continuity)
+
+        replay = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            **second_kwargs,
+        )
+        self.assertEqual(replay, second_result)
+        self.assertEqual(len(factory.stubs), 2)
+        self.assertNotIn(("owner", "lecture"), engine._continuity)
+        engine.close()
+
+    def test_rotation_text_anchor_removes_replay_despite_timestamp_drift(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "경계",
+                    0,
+                    [("경", 9.70, 9.82), ("계", 9.82, 9.95)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "경계 새 내용",
+                    0,
+                    [
+                        ("경", 2.70, 3.05),
+                        ("계", 3.05, 3.16),
+                        ("새", 3.17, 3.30),
+                        ("내", 3.31, 3.45),
+                        ("용", 3.45, 3.60),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("drift-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("drift-second"),
+        )
+
+        self.assertEqual(result, [{"start": 3.17, "end": 3.6, "text": "새 내용"}])
+        engine.close()
+
+    def test_rotation_matches_replay_through_the_rest_of_the_overlap(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "비교하는 것",
+                    0,
+                    [
+                        ("비", 8.30, 8.42),
+                        ("교", 8.44, 8.55),
+                        ("하", 8.56, 8.65),
+                        ("는", 8.65, 8.70),
+                        ("것", 8.70, 8.74),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "교하는 것이다.",
+                    0,
+                    [
+                        ("교", 2.44, 2.57),
+                        ("하", 2.57, 2.68),
+                        ("는", 2.68, 2.79),
+                        ("것", 2.80, 2.92),
+                        ("이", 3.05, 3.14),
+                        ("다", 3.14, 3.28),
+                        (".", 3.28, 3.30),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(round(9.1 * 16_000), dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("long-shift-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(round(6.5 * 16_000), dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=6.1,
+            payload_hash=digest("long-shift-second"),
+        )
+
+        self.assertEqual(result, [{"start": 3.05, "end": 3.3, "text": "이다."}])
+        engine.close()
+
+    def test_rotation_promotes_unemitted_context_without_a_text_anchor(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "비교하",
+                    0,
+                    [("비", 8.0, 8.4), ("교", 8.4, 8.8), ("하", 8.8, 9.6)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "는 것이다.",
+                    0,
+                    [
+                        ("는", 2.56, 2.70),
+                        ("것", 2.75, 2.92),
+                        ("이", 3.05, 3.15),
+                        ("다", 3.15, 3.40),
+                        (".", 3.40, 3.45),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("anchorless-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("anchorless-second"),
+        )
+
+        self.assertEqual(
+            result,
+            [{"start": 2.56, "end": 3.45, "text": "는 것이다."}],
+        )
+        engine.close()
+
+    def test_rotation_recovers_unemitted_suffix_with_negative_timestamp_drift(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "비교하",
+                    0,
+                    [("비", 8.2, 8.5), ("교", 8.5, 8.9), ("하", 8.9, 9.8)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "는 것이다.",
+                    0,
+                    [
+                        ("는", 2.62, 2.74),
+                        ("것", 2.75, 2.88),
+                        ("이", 3.04, 3.14),
+                        ("다", 3.14, 3.31),
+                        (".", 3.31, 3.33),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("negative-drift-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("negative-drift-second"),
+        )
+
+        self.assertEqual(
+            result,
+            [{"start": 2.62, "end": 3.33, "text": "는 것이다."}],
+        )
+        engine.close()
+
+    def test_rotation_does_not_drop_new_one_character_prefix_collision(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [transcript("가", 0, [("가", 9.4, 9.6)], seq_id=seq)]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "가나다",
+                    0,
+                    [
+                        ("가", 2.61, 2.72),
+                        ("나", 2.73, 2.86),
+                        ("다", 3.02, 3.18),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("one-character-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("one-character-second"),
+        )
+
+        self.assertEqual(result, [{"start": 2.61, "end": 3.18, "text": "가나다"}])
+        engine.close()
+
+    def test_rotation_keeps_a_new_repeated_phrase_inside_timestamp_dead_zone(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "정말",
+                    0,
+                    [("정", 9.40, 9.50), ("말", 9.50, 9.60)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "정말 맞다",
+                    0,
+                    [
+                        ("정", 2.59, 2.67),
+                        ("말", 2.67, 2.78),
+                        ("맞", 3.04, 3.16),
+                        ("다", 3.16, 3.30),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("rotation-repeat-first"),
+        )
+        clock.value = 241
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("rotation-repeat-second"),
+        )
+
+        self.assertEqual(first_result[0]["text"], "정말")
+        self.assertEqual(
+            second_result,
+            [{"start": 2.59, "end": 3.3, "text": "정말 맞다"}],
+        )
+        engine.close()
+
+    def test_rotation_keeps_a_new_repeat_after_a_certain_replay_prefix(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "정말 정말",
+                    0,
+                    [
+                        ("정", 8.80, 8.90),
+                        ("말", 8.90, 9.00),
+                        ("정", 9.30, 9.45),
+                        ("말", 9.45, 9.60),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "정말 정말 맞다",
+                    0,
+                    [
+                        # This first phrase is replayed overlap, while the
+                        # identical phrase at the timestamp frontier is new.
+                        ("정", 2.30, 2.40),
+                        ("말", 2.40, 2.50),
+                        ("정", 2.61, 2.70),
+                        ("말", 2.70, 2.80),
+                        ("맞", 3.05, 3.15),
+                        ("다", 3.15, 3.28),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("periodic-repeat-first"),
+        )
+        clock.value = 241
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("periodic-repeat-second"),
+        )
+
+        self.assertEqual(first_result[0]["text"], "정말 정말")
+        self.assertEqual(
+            second_result,
+            [{"start": 2.61, "end": 3.28, "text": "정말 맞다"}],
+        )
+        engine.close()
+
+    def test_rotation_keeps_a_new_repeat_after_a_crossing_replay_word(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "정말 정말",
+                    0,
+                    [("정말", 8.80, 9.00), ("정말", 9.30, 9.60)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "정말 정말 맞다",
+                    0,
+                    [
+                        # The replayed word crosses the 2.60-second frontier,
+                        # so none of it is temporally certain. The next equal
+                        # word is nevertheless a new utterance and must remain.
+                        ("정말", 2.30, 2.70),
+                        ("정말", 2.72, 2.92),
+                        ("맞다", 3.05, 3.28),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("crossing-repeat-first"),
+        )
+        clock.value = 241
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("crossing-repeat-second"),
+        )
+
+        self.assertEqual(first_result[0]["text"], "정말 정말")
+        self.assertEqual(
+            second_result,
+            [{"start": 2.72, "end": 3.28, "text": "정말 맞다"}],
+        )
+        engine.close()
+
+    def test_rotation_does_not_extend_certain_replay_into_a_new_repeat(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "정말 정말",
+                    0,
+                    [
+                        ("정", 8.80, 8.90),
+                        ("말", 8.90, 9.00),
+                        ("정", 9.30, 9.45),
+                        ("말", 9.45, 9.60),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "정말 정말 맞다",
+                    0,
+                    [
+                        # Negative timestamp drift puts the first character of
+                        # the new repeat before the 2.60-second frontier. Thus
+                        # temporal certainty is three characters, between the
+                        # two valid two- and four-character text overlaps.
+                        ("정", 2.20, 2.46),
+                        ("말", 2.46, 2.50),
+                        ("정", 2.50, 2.58),
+                        ("말", 2.61, 2.75),
+                        ("맞", 3.05, 3.15),
+                        ("다", 3.15, 3.28),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("partial-certain-repeat-first"),
+        )
+        clock.value = 241
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("partial-certain-repeat-second"),
+        )
+
+        self.assertEqual(first_result[0]["text"], "정말 정말")
+        self.assertEqual(
+            second_result,
+            [{"start": 2.5, "end": 3.28, "text": "정말 맞다"}],
+        )
+        engine.close()
+
+    def test_rotation_lexical_fallback_keeps_a_new_punctuated_repeat(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "정말! 정말!",
+                    0,
+                    [
+                        ("정", 8.80, 8.89),
+                        ("말", 8.89, 8.98),
+                        ("!", 8.98, 9.00),
+                        ("정", 9.30, 9.43),
+                        ("말", 9.43, 9.58),
+                        ("!", 9.58, 9.60),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "정말? 정말? 맞다",
+                    0,
+                    [
+                        # Different punctuation forces lexical fallback. Only
+                        # this first phrase is replay; the equal phrase at the
+                        # timestamp frontier is newly spoken.
+                        ("정", 2.30, 2.39),
+                        ("말", 2.39, 2.48),
+                        ("?", 2.48, 2.50),
+                        ("정", 2.61, 2.70),
+                        ("말", 2.70, 2.78),
+                        ("?", 2.78, 2.80),
+                        ("맞", 3.05, 3.15),
+                        ("다", 3.15, 3.28),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("lexical-repeat-first"),
+        )
+        clock.value = 241
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("lexical-repeat-second"),
+        )
+
+        self.assertEqual(first_result[0]["text"], "정말! 정말!")
+        self.assertEqual(
+            second_result,
+            [{"start": 2.61, "end": 3.28, "text": "정말? 맞다"}],
+        )
+        engine.close()
+
+    def test_rotation_lexical_fallback_does_not_extend_certain_replay(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "정말! 정말!",
+                    0,
+                    [
+                        ("정", 8.80, 8.89),
+                        ("말", 8.89, 8.98),
+                        ("!", 8.98, 9.00),
+                        ("정", 9.30, 9.43),
+                        ("말", 9.43, 9.58),
+                        ("!", 9.58, 9.60),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "정말? 정말? 맞다",
+                    0,
+                    [
+                        # Exact matching fails on punctuation. After removing
+                        # it, temporal certainty is three lexical characters,
+                        # between the two- and four-character overlaps.
+                        ("정", 2.20, 2.46),
+                        ("말", 2.46, 2.49),
+                        ("?", 2.49, 2.50),
+                        ("정", 2.50, 2.58),
+                        ("말", 2.61, 2.70),
+                        ("?", 2.70, 2.72),
+                        ("맞", 3.05, 3.15),
+                        ("다", 3.15, 3.28),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        first_result = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("partial-certain-lexical-first"),
+        )
+        clock.value = 241
+        second_result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("partial-certain-lexical-second"),
+        )
+
+        self.assertEqual(first_result[0]["text"], "정말! 정말!")
+        self.assertEqual(
+            second_result,
+            [{"start": 2.5, "end": 3.28, "text": "정말? 맞다"}],
+        )
+        engine.close()
+
+    def test_rotation_does_not_count_punctuation_as_a_second_anchor_character(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "가?",
+                    0,
+                    [("가", 9.40, 9.58), ("?", 9.58, 9.61)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "가? 나",
+                    0,
+                    [
+                        ("가", 2.61, 2.70),
+                        ("?", 2.70, 2.72),
+                        ("나", 3.04, 3.18),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("short-punctuated-anchor-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("short-punctuated-anchor-second"),
+        )
+
+        self.assertEqual(result, [{"start": 2.61, "end": 3.18, "text": "가? 나"}])
+        engine.close()
+
+    def test_rotation_never_splits_an_nfkc_expansion_while_deduplicating(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "株式",
+                    0,
+                    [("株", 9.40, 9.50), ("式", 9.50, 9.60)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "㍿ 새",
+                    0,
+                    [("㍿", 2.60, 3.02), ("새", 3.08, 3.20)],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("nfkc-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("nfkc-second"),
+        )
+
+        self.assertEqual(result, [{"start": 2.6, "end": 3.2, "text": "㍿ 새"}])
+        engine.close()
+
+    def test_rotation_does_not_leave_an_orphaned_combining_mark(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "ab",
+                    0,
+                    [("a", 9.40, 9.50), ("b", 9.50, 9.60)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "ab\u0301 new",
+                    0,
+                    [
+                        ("a", 2.40, 2.50),
+                        ("b\u0301", 2.50, 2.72),
+                        ("new", 3.08, 3.22),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "en",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("combining-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "en",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("combining-second"),
+        )
+
+        self.assertEqual(result, [{"start": 3.08, "end": 3.22, "text": "new"}])
+        engine.close()
+
+    def test_rotation_after_silence_does_not_apply_stale_text_anchor(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [transcript("가", 0, [("가", 1.0, 1.2)], seq_id=seq)]
+
+        def silent(seq, _start, _end):
+            return [transcript("", 1, [], seq_id=seq)]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "가나다",
+                    0,
+                    [
+                        ("가", 0.05, 0.18),
+                        ("나", 0.19, 0.31),
+                        ("다", 0.32, 0.45),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first, silent], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("before-silence"),
+        )
+        quiet = engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("silence"),
+        )
+        self.assertEqual(quiet, [])
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=14,
+            payload_hash=digest("after-silence"),
+        )
+
+        self.assertEqual(result, [{"start": 0.05, "end": 0.45, "text": "가나다"}])
+        engine.close()
+
+    def test_rotation_preserves_new_punctuation_after_replay_anchor(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "안녕",
+                    0,
+                    [("안", 9.70, 9.82), ("녕", 9.82, 9.95)],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "안녕? 왜",
+                    0,
+                    [
+                        ("안", 2.70, 3.05),
+                        ("녕", 3.05, 3.16),
+                        ("?", 3.16, 3.17),
+                        ("왜", 3.18, 3.30),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("punctuation-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("punctuation-second"),
+        )
+
+        self.assertEqual(result, [{"start": 3.16, "end": 3.3, "text": "? 왜"}])
+        engine.close()
+
+    def test_rotation_does_not_repeat_punctuation_already_in_anchor(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "안녕?",
+                    0,
+                    [
+                        ("안", 9.70, 9.82),
+                        ("녕", 9.82, 9.95),
+                        ("?", 9.95, 10.0),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "안녕? 왜",
+                    0,
+                    [
+                        ("안", 2.70, 3.05),
+                        ("녕", 3.05, 3.12),
+                        ("?", 3.12, 3.14),
+                        ("왜", 3.15, 3.30),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("existing-punctuation-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("existing-punctuation-second"),
+        )
+
+        self.assertEqual(result, [{"start": 3.15, "end": 3.3, "text": "왜"}])
+        engine.close()
+
+    def test_rotation_deduplicates_words_when_provider_repunctuates_anchor(self):
+        clock = FakeClock()
+
+        def first(seq, _start, _end):
+            return [
+                transcript(
+                    "안녕!",
+                    0,
+                    [
+                        ("안", 9.70, 9.82),
+                        ("녕", 9.82, 9.95),
+                        ("!", 9.95, 10.0),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        def rotated(seq, _start, _end):
+            return [
+                transcript(
+                    "안녕? 왜",
+                    0,
+                    [
+                        ("안", 2.70, 3.05),
+                        ("녕", 3.05, 3.12),
+                        ("?", 3.12, 3.14),
+                        ("왜", 3.15, 3.30),
+                    ],
+                    seq_id=seq,
+                )
+            ]
+
+        factory = FakeFactory([[first], [rotated]])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory, clock=clock)
+        engine.transcribe(
+            np.zeros(10 * 16_000, dtype=np.float32),
+            "ko",
+            final_chunk=False,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=0,
+            payload_hash=digest("repunctuation-first"),
+        )
+        clock.value = 241
+        result = engine.transcribe(
+            np.zeros(5 * 16_000, dtype=np.float32),
+            "ko",
+            overlap_seconds=3,
+            final_chunk=True,
+            lecture_id="lecture",
+            username="owner",
+            start_seconds=7,
+            payload_hash=digest("repunctuation-second"),
+        )
+
+        self.assertEqual(result, [{"start": 3.15, "end": 3.3, "text": "왜"}])
         engine.close()
 
     def test_rotation_age_reserves_the_configured_response_timeout(self):
@@ -572,12 +1829,17 @@ class ClovaStreamingTranscriberTests(unittest.TestCase):
                 np.zeros(16_000, dtype=np.float32), "ko", final_chunk=False,
                 lecture_id="same", username=owner, start_seconds=0, payload_hash=digest(word),
             )
+        self.assertIn(("owner-a", "same"), engine._continuity)
+        self.assertIn(("owner-b", "same"), engine._continuity)
         engine.close_session("owner-a", "same")
         engine.close_session("owner-a", "same")
+        self.assertNotIn(("owner-a", "same"), engine._continuity)
+        self.assertIn(("owner-b", "same"), engine._continuity)
         self.assertTrue(factory.channels[0].closed.is_set())
         self.assertFalse(factory.channels[1].closed.is_set())
         self.assertEqual(engine.status()["active_sessions"], 1)
         engine.close()
+        self.assertEqual(engine._continuity, {})
         self.assertTrue(factory.channels[1].closed.is_set())
 
     def test_close_session_purges_only_that_lectures_cached_transcripts(self):
@@ -736,7 +1998,7 @@ class ClovaStreamingTranscriberTests(unittest.TestCase):
     def test_disconnect_between_acknowledged_chunks_rotates_before_new_audio(self):
         def first(seq, _start, _end):
             return [
-                transcript("앞", 0, [("앞", 0.1, 0.2)], seq_id=seq),
+                transcript("앞", 0, [("앞", 0.8, 0.9)], seq_id=seq),
                 DISCONNECT,
             ]
 
@@ -745,7 +2007,7 @@ class ClovaStreamingTranscriberTests(unittest.TestCase):
                 transcript(
                     "앞 뒤",
                     0,
-                    [("앞", 0.1, 0.2), (" ", 0.2, 0.5), ("뒤", 0.7, 0.9)],
+                    [("앞", 0.2, 0.4), (" ", 0.4, 0.5), ("뒤", 0.7, 0.9)],
                     seq_id=seq,
                 )
             ]

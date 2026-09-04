@@ -1,14 +1,14 @@
 # 개발 인수인계
 
-기준일: 2026-09-04 (Asia/Seoul)
+기준일: 2026-09-05 (Asia/Seoul)
 
-실시간 입력의 영속 대기열·무기한 재전송·입력 재연결·탭 간 잠금과 CLOVA 선택 변경은 2026-09-04 전체 자동 회귀를 통과했다. 배포 커밋과 API/Pages/Quick Tunnel 외부 확인 결과는 아래 `저장소·배포 체크포인트`에 이어서 기록한다. 실제 브라우저·학교 Wi-Fi·교실 음성 및 CLOVA 실계정 검증은 `아직 확인하지 못함`과 구분한다.
+실시간 입력의 영속 대기열·무기한 재전송·입력 재연결·탭 간 잠금과 CLOVA 선택 변경은 2026-09-04 전체 자동 회귀를 통과했다. 2026-09-05에는 CLOVA 실계정 Basic 스트림으로 짧은 비개인 한국어 음성과 강제 회전 경계를 확인했다. 배포 커밋과 API/Pages/Quick Tunnel 외부 확인 결과는 아래 `저장소·배포 체크포인트`에 이어서 기록하며, 최신 경계 보완은 아직 로컬에만 있다. 실제 브라우저·학교 Wi-Fi·교실 음성 및 장시간 CLOVA 검증은 `아직 확인하지 못함`과 구분한다.
 
 ## 현재 결론
 
 현재 로컬 엔진은 `Qwen/Qwen3-ASR-1.7B`의 Transformers 경로(`qwen-asr==0.0.6`, BF16, SDPA)와 `Qwen3-ForcedAligner-0.6B`다. 브라우저 마이크와 `getDisplayMedia`의 오디오 트랙은 16 kHz 모노 PCM을 모아 새 음성이 8초 이상이고 최근 0.24초가 조용하면 자르며, 조용한 지점이 없으면 전체 WAV 15초에서 자른다. 첫 조각 뒤에는 이전 3초를 겹쳐 보낸다. 업로드 파일도 PyAV로 스트리밍 디코딩한 뒤 같은 분할 규칙을 쓴다. 서버는 0.6초 stability guard와 단어 정렬 시각으로 각 조각에서 확정할 범위를 정한다. Qwen의 vLLM 네이티브 스트리밍은 현재 코드에서 사용하지 않는다.
 
-마이크 실시간 수업에는 `qwen`(로컬)과 NAVER Cloud `clova` 선택을 추가했다. 인증된 `/status`에서 CLOVA 설정을 확인하면 새 마이크 수업은 CLOVA를 우선 선택하고, 미설정·상태 확인 실패 때는 Qwen을 선택한다. 사용자가 이번 계정 세션에서 Qwen 또는 CLOVA를 직접 고르면 새 수업·기록 화면 왕복과 상태 polling에서도 그 선호를 유지하되, CLOVA를 일시 사용할 수 없을 때의 새 수업만 Qwen으로 표시하고 회복 시 선호를 복원한다. 진행 중 수업은 절대 자동 전환하지 않는다. provider는 lecture에 불변 저장하고 청크 요청에서 바꿀 수 없다. 공유 화면/탭 소리와 파일 import는 계속 Qwen으로 강제한다. CLOVA는 공식 bidirectional gRPC 한 스트림을 수업별로 유지하며 healthy 연결에서는 브라우저 overlap을 잘라 새 PCM만 전송한다. 5분 연결 제한 전 회전·idle/단절 후 새 스트림에서는 현재 청크의 최대 3초 overlap을 문맥으로 다시 넣고 align timestamp가 그 구간인 결과는 버린다. 화면 갱신은 기존 8~15초 브라우저 청크 주기를 그대로 사용하므로 단어 단위 초저지연 UI로 바뀐 것은 아니다.
+마이크 실시간 수업에는 `qwen`(로컬)과 NAVER Cloud `clova` 선택을 추가했다. 인증된 `/status`에서 CLOVA 설정을 확인하면 새 마이크 수업은 CLOVA를 우선 선택하고, 미설정·상태 확인 실패 때는 Qwen을 선택한다. 사용자가 이번 계정 세션에서 Qwen 또는 CLOVA를 직접 고르면 새 수업·기록 화면 왕복과 상태 polling에서도 그 선호를 유지하되, CLOVA를 일시 사용할 수 없을 때의 새 수업만 Qwen으로 표시하고 회복 시 선호를 복원한다. 진행 중 수업은 절대 자동 전환하지 않는다. provider는 lecture에 불변 저장하고 청크 요청에서 바꿀 수 없다. 공유 화면/탭 소리와 파일 import는 계속 Qwen으로 강제한다. CLOVA는 공식 bidirectional gRPC 한 스트림을 수업별로 유지하며 healthy 연결에서는 브라우저 overlap을 잘라 새 PCM만 전송하되, 수업별 확정 시각 frontier를 유지해 다음 ACK에 뒤늦게 붙은 경계 텍스트도 회수한다. 5분 연결 제한 전 회전·idle/단절 후 새 스트림에서는 현재 청크의 최대 3초 overlap을 문맥으로 다시 넣고 timestamp와 정규화된 직전 텍스트를 함께 대조한다. 이미 확정된 replay라는 근거가 강한 부분만 제거하고 frontier 주변 ±0.15초의 모호한 새 반복 발화는 보존한다. 화면 갱신은 기존 8~15초 브라우저 청크 주기를 그대로 사용하므로 단어 단위 초저지연 UI로 바뀐 것은 아니다.
 
 CLOVA 선택 시 경로는 `브라우저 → Cloudflare → 이 PC → clovaspeech-gw.ncloud.com:50051`이며 음성과 결과가 NAVER Cloud로 간다. 공식 문서상 스트리밍 결과는 고객 Object Storage에 자동 저장된다. 로컬 수업 삭제는 그 클라우드 사본을 삭제하지 않는다. Basic Stream은 15초당 5원(VAT 별도)이고 Free 도메인은 실시간 gRPC를 지원하지 않는다. 따라서 CLOVA를 품질 우위로 단정하거나 자동 fallback으로 쓰지 않고 같은 실제 한국어 수업 음성으로 Qwen과 비교해야 한다.
 
@@ -169,7 +169,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 수업 생성은 브라우저가 보낸 UUID와 소유자·제목·언어를 확인해 응답 손실 뒤 재요청도 idempotent하게 처리한다.
 - 한 모델과 inference lock을 사용하며 running+waiting 요청은 기본 2개로 제한한다.
 - `lectures.asr_provider`는 schema v6에서 `qwen|clova` allowlist로 저장한다. 기존 수업과 import-created 수업은 `qwen`으로 migration/생성되며 같은 lecture UUID를 다른 provider로 재생성하면 `409`다. `/status`는 인증 뒤 두 provider의 고정 label/configured boolean만 반환하고 adapter endpoint·key·session 진단은 반사하지 않는다.
-- `ClovaStreamingTranscriber`는 공식 TLS host/port와 `authorization: Bearer …` metadata, CONFIG 성공 확인, headerless PCM16 16 kHz mono 32,000-byte DATA, 마지막 DATA의 nonzero `seqId`+`epFlag=true` acknowledgement를 사용한다. response의 `position`으로 누적 텍스트를 조립하고 `alignInfos` timestamp로 현재 청크 결과만 정한다. 수업/계정별 세션, 성공 payload cache, idle/4분 회전과 종료를 bounded하게 관리한다.
+- `ClovaStreamingTranscriber`는 공식 TLS host/port와 `authorization: Bearer …` metadata, CONFIG 성공 확인, headerless PCM16 16 kHz mono 32,000-byte DATA, 마지막 DATA의 nonzero `seqId`+`epFlag=true` acknowledgement를 사용한다. response의 `position`과 `alignInfos`를 수업·소유자별 bounded continuity state의 텍스트 tail·확정 시각 frontier와 대조한다. healthy 스트림의 지연 경계와 새 스트림의 최대 3초 replay를 구분해 누락과 중복을 함께 줄이며, idle/4분 회전·종료 시 세션·continuity를 bounded하게 정리한다.
 - CLOVA의 모호한 timeout/단절은 provider 원문을 로그·응답에 싣지 않고 `424`로 바꾼다. 브라우저는 CLOVA 청크를 자동 retry하거나 Qwen으로 fallback하지 않는다. 같은 프로세스에서 응답 이후 DB 쓰기가 실패한 동일 payload는 adapter 성공 cache로 외부 재호출을 피하지만, 프로세스가 정확히 그 사이 죽는 경우까지 외부 exactly-once 과금은 보장하지 않는다.
 - WAV는 최대 512,000 bytes, 0.05~15초, 16 kHz mono PCM16만 받는다. VAD가 침묵 hallucination 저장을 줄인다.
 - 새로 처리한 실시간·파일 import 음성은 overlap을 제거한 16 kHz mono PCM WAV로 `.data/recordings/<private-account>/<lecture UUID>.wav`에 보존한다. 계정 폴더는 `0700`, 파일은 `0600`이며 과거에 이미 버린 음성은 소급 복구하지 않는다.
@@ -242,10 +242,12 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 ### 현재 변경분에서 확인
 
-- 제한 없는 호스트 환경에서 `./.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v`: 서버/API/DB/설정/전사기/importer/녹음·후보정·관리자·터널·CLOVA fake 계약 152개가 27.349초에 모두 통과했다. CLOVA 계약에는 공식 영어 응답 형태의 띄어쓰기 보존과 한국어 overlap 부분 문자열 검사가 포함된다. 테스트가 의도적으로 만든 원본 삭제 실패 로그 외 실패·오류는 없었다.
-- VS Code Server의 Node.js 24.18.0으로 `node --test --test-isolation=none tests/*.test.mjs`: 앱 상태 98개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 135개가 모두 통과했다. 로그인 첫 status 완료 전 작업공간 잠금과 status 401의 재인증 유지, 늦은 이전 status 응답 폐기, 설정된 CLOVA 자동 선택, 상태 실패 시 새 수업 Qwen fallback·회복, 명시적 Qwen 선호 보존, 시스템 소리 Qwen 고정, 진행 중 CLOVA 불변 계약을 포함한다. 문서의 격리 실행 `node --test tests/*.test.mjs`도 4개 test file 모두 통과했다.
+- 제한 없는 호스트 환경에서 `./.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v`: 서버/API/DB/설정/전사기/importer/녹음·후보정·관리자·터널·CLOVA 계약 173개가 27.424초에 모두 통과했다. 이 체크포인트의 CLOVA module 48개는 healthy-stream 지연 경계, 강제 회전 replay, timestamp drift, 실제 새 반복 발화, 구두점·Unicode 정규화, 소유자 격리와 세션/continuity 정리를 포함한다.
+- 실제 Secret Key와 Basic 스트리밍 도메인으로 공개 KSS 한국어 낭독 12.645초를 보냈고, 대기하지 않고 clock을 강제로 241초 전진시켜 4분 rotation 경로를 실행했다. 최종 코드의 wall time은 12.281초, native transport는 2개였으며 두 번째 스트림이 overlap 안의 `이다.`를 회수해 목표 문장이 전체 결과에 정확히 한 번 남았다. final 뒤 adapter의 활성 session과 reader thread는 모두 0이었다. 이는 짧은 단일 화자·강제 시각 시험이지 자연 경과 4분 또는 장시간 수업 시험은 아니다.
+- 수정 전 구현의 300.818초 진단 실행도 native transport 2개와 프로세스 RSS 약 12.6 MiB 증가로 끝났지만, 바로 그 실행에서 회전 경계의 정확한 누락을 재현했다. 따라서 이 이전 결과를 최신 경계 보완의 5분 통과 기록으로 취급하면 안 된다.
+- 프런트엔드는 이번 경계 보완에서 변경하지 않았다. 직전 VS Code Server Node.js 24.18.0 실행에서는 `node --test --test-isolation=none tests/*.test.mjs`의 앱 상태 98개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 135개가 모두 통과했다. 현재 셸에는 Node 실행 파일이 없어 최신 작업에서 다시 실행하지 않았으므로 이 기록을 서버 변경 뒤의 신규 웹 실행으로 해석하지 않는다.
 - 앱 테스트 대역도 실제 UUID·owner·provider·capture 시간축·CLOVA `inflight` 전이·final-last·영속 삭제 계약을 검사하도록 강화했고, PCM 없는 종료에 합성 final WAV를 넣지 않는다. 따라서 새 내구성 경로의 실패를 기대값만 완화해 숨기지 않았다.
-- Python 전체 compile, 웹/테스트 JavaScript 10개 파일 `node --check`, `git diff --check`, 비공개 경로 ignore 및 실제 구성 계정·키 값의 현재 공개 트리/기존 Git 이력 불포함을 확인했다. 운영 DB는 배포 전 ignored `.data/backups/`에 일관된 SQLite snapshot으로 백업했다.
+- 최신 서버 변경에는 Python compile과 `git diff --check`를 다시 수행했다. 웹/테스트 JavaScript 10개 파일의 `node --check`, 비공개 경로 ignore·공개 트리/기존 Git 이력 점검과 운영 DB snapshot은 직전 배포 체크포인트의 기록이며 이번 작업에서 새 배포나 DB 변경은 하지 않았다.
 
 ### 이전까지 확인된 누적 기록
 
@@ -303,9 +305,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - NOVA/Mindlogic proxy 자체의 요청 보관·삭제 세부 정책과 외부 요청의 idempotency key 지원. 확인 전에는 완전한 비보관·비학습이나 exactly-once 과금이라고 주장하지 않는다.
 - 실제 관리자 계정으로 Quick Tunnel을 거쳐 관리자 dialog를 열고 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 누르는 브라우저 end-to-end. 현재는 격리 API와 Node UI 계약까지만 검증했다.
 - 실제 운영 Quick Tunnel의 관리자 **재연결** 버튼. 단위 테스트는 고정 argv·응답 유예·동시 요청·실패 복구를 통과했지만, 임시 주소가 바뀌는 외부 작업은 관리자 계정 설정 뒤 별도로 확인해야 한다.
-- 실제 CLOVA Secret Key 인증과 Basic 스트리밍 도메인 연결, 실제 한국어 음성 응답은 아직 확인하지 않았다. 따라서 Qwen보다 한국어 수업 정확도가 높은지, 실제 지연·15초 과금 단위·Object Storage 결과와 로컬 segment가 일치하는지는 미검증이다.
-- 실제 CLOVA에서 5분 전 connection rotation, 45~90분 수업, 여러 번 pause/resume, 학교 Wi-Fi 단절을 거쳤을 때 문맥·마지막 문장·중복·누락·메모리/스레드/channel 회수는 fake gRPC 계약을 넘어선 검증이 필요하다.
-- CLOVA 무음 ACK, dead-stream 재연결, control 응답, 종료 경합은 fake gRPC를 포함한 최신 Python 전체 회귀에 들어갔다. 실제 Secret Key 인증과 외부 음성 응답은 위와 같이 별도 미검증이다.
+- 실제 Secret Key 인증·Basic 스트리밍 도메인·짧은 한국어 응답과 clock 강제 4분 rotation은 확인했다. 다만 같은 음성에서 Qwen보다 수업 정확도가 높은지, 실제 15초 과금 집계와 고객 Object Storage 결과가 로컬 segment와 일치하는지는 아직 확인하지 않았다.
+- 최신 코드로 실제 시간이 자연스럽게 4분 이상 흐르는 연속 CLOVA 스트림, 45~90분 수업, 여러 번의 pause/resume, 학교 Wi-Fi 단절을 거쳤을 때 문맥·마지막 문장·중복·누락·메모리/스레드/channel 회수는 아직 확인하지 않았다. 현재 실계정 경계 시험은 12.645초 음성과 강제 clock으로 12.281초 안에 수행했다.
+- CLOVA 무음 ACK, dead-stream 재연결, control 응답, 종료 경합은 fake gRPC를 포함한 최신 Python 전체 회귀에 들어갔다. 실계정으로는 짧은 정상 스트림과 강제 rotation 경계까지만 확인했으므로 무음·실제 단절·pause 경로를 외부 서비스에서 별도로 확인해야 한다.
 
 실제 수업 음성 샘플이 제공되면 원본은 `.samples/`에만 두고 다음 순서로 검증한다.
 
@@ -349,6 +351,8 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 2026-09-04 실시간 영속 대기열·입력 재연결·탭 간 잠금·선택형 CLOVA 구현 커밋 `5489afd`를 `main`에 push했고 Pages 실행 `33860357377`이 성공했다. 적용 전 운영 DB는 `.data/backups/pre-durable-queue-clova-deploy-20260904.sqlite3`에 권한 `0600`으로 백업했다. 최종 Python 회귀 152개와 Node 회귀 130개, Python/JavaScript/Bash 구문 및 `git diff --check`를 통과했다. API 서버를 최종 코드로 Qwen warmup 재시작했고 DB schema v6, integrity, FK, 대기 chunk/import/correction 0건을 읽기 전용으로 확인했다. 공개 자산 9개는 로컬 `web/`과 byte-for-byte 일치하고, 공개 `config.json`은 허용된 다섯 필드만 가지며 현재 tunnel origin과 일치하고 만료 전이었다. 외부 edge에서 health 200, 무인증 수업 API 401, 허용하지 않은 Origin 403, Pages Origin의 authorization 포함 preflight 허용을 확인했다. 이 프로젝트를 같은 loopback API에 노출하던 이전 고아 cloudflared 하나는 정확한 PID·cwd·고정 target을 확인한 뒤 SIGTERM으로 종료했고, 현재 관리되는 터널 하나와 외부 health 200을 다시 확인했다. CLOVA 비밀 키는 아직 운영 설정에 없으므로 화면에서 해당 선택은 비활성이고 실계정 gRPC 호출은 검증하지 않았다.
 
+2026-09-05 CLOVA 경계 continuity/reconciliation 보완은 로컬 작업 트리에만 있으며 아직 commit·push·Pages/API 배포하지 않았다. 실제 Basic/KSS 강제 rotation 결과는 ignored `.data/test-results/`에 권한 `0600`으로만 두었고, 비밀 키·계정 ID·음성은 추적 파일에 추가하지 않았다. 이 체크포인트에서 API 서버와 Quick Tunnel은 모두 중지 상태이며 이번 테스트를 위해 다시 열지 않았다. 위 2026-09-04 문단의 CLOVA 미설정·실계정 미검증 내용은 당시 배포 상태를 기록한 것이며 현재 로컬 검증 상태를 뜻하지 않는다.
+
 푸시 전에 반드시 확인할 것:
 
 - 평탄화 잔여 루트 파일이 staging에 없음
@@ -359,12 +363,13 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 ## 다음 단계 우선순위
 
-1. 실제 CLOVA 키를 비공개 설정한 뒤 CONFIG, 연속 음성 두 청크, 완전 무음 ACK, pause/resume, 강제 재연결·4분 회전을 비개인 샘플로 확인한다.
-2. 같은 실제 한국어 수업 샘플로 CLOVA와 Qwen의 누락·고유명사·경계 중복 및 비용을 비교한다.
-3. 실제 관리자 계정으로 외부 dialog를 열어 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 확인한다.
-4. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
-5. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
-6. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
+1. 최신 경계 보완을 검토한 뒤 요청이 있을 때만 commit·push·배포하고 API/Quick Tunnel을 다시 연다.
+2. 실계정 CLOVA에서 자연 경과 4분 이상 스트림, 완전 무음 ACK, pause/resume과 실제 단절·재연결을 비개인 샘플로 확인한다.
+3. 같은 실제 한국어 수업 샘플로 CLOVA와 Qwen의 누락·고유명사·경계 중복 및 비용을 비교한다.
+4. 실제 관리자 계정으로 외부 dialog를 열어 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 확인한다.
+5. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
+6. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
+7. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
 
 ## 재현 명령
 
