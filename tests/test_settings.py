@@ -5,7 +5,8 @@ import tempfile
 from unittest import mock
 from pathlib import Path
 
-from server.manage import update_private_env
+from server.db import Database
+from server.manage import configure_admin, update_private_env
 from server.settings import (
     PROJECT_DIR,
     Settings,
@@ -47,6 +48,8 @@ class UrlValidationTests(unittest.TestCase):
         content = (PROJECT_DIR / "server" / "env.example").read_text(encoding="utf-8")
         account_line = next(line for line in content.splitlines() if line.startswith("ACCOUNT_USERNAMES="))
         self.assertEqual(account_line, "ACCOUNT_USERNAMES=")
+        admin_line = next(line for line in content.splitlines() if line.startswith("ADMIN_USERNAME="))
+        self.assertEqual(admin_line, "ADMIN_USERNAME=")
 
     def test_runtime_configuration_requires_private_account_ids(self):
         with mock.patch("server.settings.load_dotenv"), mock.patch.dict(
@@ -103,6 +106,37 @@ class UrlValidationTests(unittest.TestCase):
             self.assertIn("ACCOUNT_USERNAMES='user-alpha,user-beta'", content)
             self.assertNotIn("API_URL", content)
 
+    def test_admin_configuration_uses_only_activated_account_and_private_env(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = Database(root / "classroom.sqlite3", ("user-alpha", "user-beta"))
+            database.initialize()
+            env_path = root / "server" / ".env"
+            with database.connect() as connection:
+                connection.execute(
+                    "UPDATE users SET password_hash = 'test-hash' WHERE username = 'user-beta'"
+                )
+            configure_admin(database, env_path)
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            self.assertIn("ADMIN_USERNAME='user-beta'", env_path.read_text(encoding="utf-8"))
+
+            with database.connect() as connection:
+                connection.execute(
+                    "UPDATE users SET password_hash = 'test-hash' WHERE username = 'user-alpha'"
+                )
+            with self.assertRaisesRegex(ValueError, "hidden account selection"):
+                configure_admin(database, env_path)
+            configure_admin(database, env_path, selected_username="user-alpha")
+            content = env_path.read_text(encoding="utf-8")
+            self.assertIn("ADMIN_USERNAME='user-alpha'", content)
+            self.assertNotIn("ADMIN_USERNAME='user-beta'", content)
+            with self.assertRaisesRegex(ValueError, "activated configured account"):
+                configure_admin(database, env_path, selected_username="not-an-account")
+            with database.connect() as connection:
+                connection.execute("UPDATE users SET password_hash = NULL")
+            with self.assertRaisesRegex(ValueError, "requires one activated account"):
+                configure_admin(database, env_path)
+
     def test_audio_body_limit_cannot_be_configured_below_the_static_part_contract(self):
         with mock.patch.dict(
             "os.environ",
@@ -134,8 +168,10 @@ class UrlValidationTests(unittest.TestCase):
             data_dir=Path("/tmp/test-data"),
             model_cache_dir=Path("/tmp/test-models"),
             mindlogic_api_key=secret,
+            admin_username="user-alpha",
         )
         self.assertNotIn(secret, repr(settings))
+        self.assertNotIn("admin_username", repr(settings))
         content = (PROJECT_DIR / "server" / "env.example").read_text(encoding="utf-8")
         self.assertIn("MINDLOGIC_API_KEY=\n", content)
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -10,6 +12,10 @@ from dotenv import set_key, unset_key
 from .db import Database
 from .security import digest, new_secret
 from .settings import LOCAL_API_HOSTS, PROJECT_DIR, Settings, api_origin, url_origin
+
+
+class AdminSelectionRequired(ValueError):
+    """More than one activated account requires a private TTY selection."""
 
 
 def update_private_env(env_path: Path, site_origin: str) -> None:
@@ -25,6 +31,41 @@ def update_private_env(env_path: Path, site_origin: str) -> None:
         for line in env_path.read_text(encoding="utf-8").splitlines()
     ):
         unset_key(str(env_path), "API_URL")
+    # python-dotenv rewrites through a temporary file; enforce the final mode.
+    env_path.chmod(0o600)
+
+
+def configure_admin(
+    database: Database,
+    env_path: Path,
+    *,
+    selected_username: str | None = None,
+) -> None:
+    """Select an activated account without echoing its private ID."""
+    with database.connect() as connection:
+        activated = connection.execute(
+            "SELECT username FROM users WHERE password_hash IS NOT NULL ORDER BY username"
+        ).fetchall()
+    activated_usernames = tuple(row["username"] for row in activated)
+    if selected_username is None:
+        if not activated_usernames:
+            raise ValueError("Administrator setup requires one activated account")
+        if len(activated_usernames) > 1:
+            raise AdminSelectionRequired(
+                "Administrator setup requires a hidden account selection when "
+                "more than one account is activated"
+            )
+        username = activated_usernames[0]
+    else:
+        username = selected_username.strip()
+        if username not in activated_usernames:
+            raise ValueError("The selected administrator must be an activated configured account")
+    if username not in database.accounts:
+        raise RuntimeError("The activated administrator is not a configured account")
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.touch(exist_ok=True, mode=0o600)
+    env_path.chmod(0o600)
+    set_key(str(env_path), "ADMIN_USERNAME", username)
     # python-dotenv rewrites through a temporary file; enforce the final mode.
     env_path.chmod(0o600)
 
@@ -51,8 +92,8 @@ def create_invitations(
     lines = [
         "개인 초대 링크 · 7일 동안 한 번만 사용 가능",
         "각 사용자에게 본인 링크만 직접 전달하세요. 비밀번호는 링크를 받은 사람이 설정합니다.",
-        "보안을 위해 초대 링크는 서버 주소를 포함하지 않습니다. 아래 서버 주소를 별도로 전달하고,",
-        "받는 사람이 Pages의 '내 서버'에 먼저 입력한 다음 본인 초대 링크를 열게 하세요.",
+        "보안을 위해 초대 링크는 서버 주소를 포함하지 않습니다. Pages가 현재 주소를 자동으로 찾으므로",
+        "자동 연결 표시를 확인한 뒤 본인 초대 링크를 열게 하세요. 아래 주소는 관리자 확인용입니다.",
         f"현재 서버 주소: {api_url}",
         "이 파일과 server/.env, .data 폴더를 GitHub에 올리지 마세요.",
         "",
@@ -93,11 +134,46 @@ def main():
     initialize.add_argument("--site-url", required=True, help="Full HTTPS GitHub Pages site URL")
     initialize.add_argument("--api-url", required=True, help="Public HTTPS address of this PC's API")
     subcommands.add_parser("status", help="Show account activation state without revealing secrets")
+    configure = subcommands.add_parser(
+        "configure-admin",
+        help="Privately select an activated account as administrator",
+    )
+    configure.add_argument(
+        "--position",
+        choices=("first", "second"),
+        help="Select by private ACCOUNT_USERNAMES order without putting an ID in shell history",
+    )
     arguments = parser.parse_args()
     try:
         settings = Settings.from_env()
         database = Database(settings.database_path, settings.accounts)
         database.initialize()
+        if arguments.command == "configure-admin":
+            if arguments.position:
+                selected = settings.accounts[0 if arguments.position == "first" else 1]
+                configure_admin(
+                    database,
+                    PROJECT_DIR / "server" / ".env",
+                    selected_username=selected,
+                )
+            else:
+                try:
+                    configure_admin(database, PROJECT_DIR / "server" / ".env")
+                except AdminSelectionRequired:
+                    if not sys.stdin.isatty():
+                        raise ValueError(
+                            "Multiple accounts are activated; run this command in an interactive "
+                            "WSL terminal to select the administrator without echo, or pass "
+                            "--position first/second"
+                        ) from None
+                    selected = getpass.getpass("관리자로 지정할 활성 계정 ID (입력 내용은 보이지 않음): ")
+                    configure_admin(
+                        database,
+                        PROJECT_DIR / "server" / ".env",
+                        selected_username=selected,
+                    )
+            print("Configured the administrator in private server/.env. Restart the local server to apply it.")
+            return
         if arguments.command == "status":
             now = time.time()
             with database.connect() as connection:

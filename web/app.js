@@ -18,6 +18,11 @@ let noteActionSequence = 0;
 let correction = null, correctionView = 'raw', correctionLectureId = '';
 let correctionLoading = false, correctionStarting = false, correctionError = '', correctionCreditExhausted = false;
 let correctionSequence = 0, correctionPollTimer = null;
+let adminAuthorized = false, adminOverview = null, adminLoading = false, adminError = '', adminAction = '';
+let adminSequence = 0, adminRefreshTimer = null, adminProbeTimer = null, adminConfirmation = null;
+let tunnelRecoveryTimer = null, tunnelRecoveryDeadline = 0, tunnelRecoveryContext = null;
+let presenceSequence = 0, presenceTimer = null, presenceIdleTimer = null, presenceSending = false;
+let presenceLastSent = '', presenceQueued = '', lastPresenceInteraction = Date.now();
 let connectionState = 'unverified', verifiedApiUrl = '', verifiedApiExpiresAt = 0;
 let connectionGeneration = 0, connectionController = null, connectionLeaseTimer = null, leaseRefreshPromise = null;
 const MAX_PENDING = 8;
@@ -31,6 +36,9 @@ const CONFIG_TIMEOUT_MS = 8000;
 const RUNTIME_CONFIG_TTL_MS = 24 * 60 * 60 * 1000;
 const CONFIG_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const CORRECTION_POLL_MS = 2500;
+const ADMIN_REFRESH_MS = 10000;
+const PRESENCE_INTERVAL_MS = 15000;
+const PRESENCE_IDLE_MS = 5 * 60 * 1000;
 const fmt = seconds => { const n = Math.max(0, Math.floor(seconds || 0)); return `${Math.floor(n / 60).toString().padStart(2, '0')}:${(n % 60).toString().padStart(2, '0')}`; };
 const KST_DATE_FORMATTER = new Intl.DateTimeFormat('ko-KR', {timeZone:'Asia/Seoul',year:'numeric',month:'long',day:'numeric'});
 const KST_DATE_PARTS = new Intl.DateTimeFormat('en', {timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'});
@@ -278,20 +286,31 @@ function validateRuntimeConfig(value, now = Date.now()) {
   if (candidate !== value.apiUrl) throw runtimeConfigError('malformed','자동 연결 설정의 서버 주소 형식이 올바르지 않습니다.');
   return {state:'online',apiUrl:candidate,expiresAt};
 }
-async function fetchRuntimeConfig(signal) {
+async function fetchRuntimeConfig(signal, timeout = CONFIG_TIMEOUT_MS) {
   const controller = new AbortController();
   let timedOut = false;
   const abortFromCaller = () => controller.abort(signal?.reason);
   if (signal?.aborted) abortFromCaller();
   else signal?.addEventListener?.('abort',abortFromCaller,{once:true});
-  const deadline = setTimeout(() => { timedOut = true; controller.abort(); },CONFIG_TIMEOUT_MS);
-  let response;
+  const boundedTimeout = Math.max(1,Math.min(CONFIG_TIMEOUT_MS,Number(timeout) || CONFIG_TIMEOUT_MS));
+  const deadline = setTimeout(() => { timedOut = true; controller.abort(); },boundedTimeout);
   try {
     // Pages/CDN caches can briefly retain the previous tunnel after a publish.
     // The query contains no user data; it only makes each reload a fresh lookup.
-    response = await fetch(`./config.json?v=${Date.now()}`,{cache:'no-store',credentials:'omit',referrerPolicy:'no-referrer',signal:controller.signal});
+    const response = await fetch(`./config.json?v=${Date.now()}`,{cache:'no-store',credentials:'omit',referrerPolicy:'no-referrer',signal:controller.signal});
+    if (!response.ok) {
+      const transient = response.status === 408 || response.status === 429 || response.status >= 500;
+      throw runtimeConfigError(transient ? 'config-unavailable' : 'malformed',
+        `자동 연결 설정을 불러오지 못했습니다 (${response.status}).`,transient);
+    }
+    try { return await response.json(); }
+    catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw runtimeConfigError('malformed','자동 연결 설정을 읽지 못했습니다.');
+    }
   } catch (error) {
     if (signal?.aborted) throw error;
+    if (error?.discoveryCode) throw error;
     throw runtimeConfigError('config-unavailable',timedOut
       ? '자동 연결 설정을 불러오는 데 시간이 오래 걸리고 있습니다.'
       : '자동 연결 설정을 불러오지 못했습니다.',true);
@@ -299,13 +318,6 @@ async function fetchRuntimeConfig(signal) {
     clearTimeout(deadline);
     signal?.removeEventListener?.('abort',abortFromCaller);
   }
-  if (!response.ok) {
-    const transient = response.status === 408 || response.status === 429 || response.status >= 500;
-    throw runtimeConfigError(transient ? 'config-unavailable' : 'malformed',
-      `자동 연결 설정을 불러오지 못했습니다 (${response.status}).`,transient);
-  }
-  try { return await response.json(); }
-  catch { throw runtimeConfigError('malformed','자동 연결 설정을 읽지 못했습니다.'); }
 }
 async function verifyServerCandidate(value, signal, timeout = 10000) {
   const candidate = normalizeUrl(value);
@@ -344,13 +356,15 @@ function discoveryFailureMessage(error) {
   if (error?.discoveryCode === 'malformed') return '자동 연결 설정을 확인하지 못했어요. 현재 서버 주소를 직접 입력해 주세요.';
   return '서버를 자동으로 찾지 못했어요. 서버가 켜져 있는지 확인하고 현재 주소를 직접 입력해 주세요.';
 }
-async function discoverServer() {
+async function discoverServer({deadline = 0} = {}) {
   const retainedVerifiedOrigin = connectionState === 'connected' && hasVerifiedServer() ? apiUrl : '';
   cancelConnectionAttempt();
   const sequence = connectionGeneration;
   const controller = new AbortController();
   connectionController = controller;
   const operationIsCurrent = () => sequence === connectionGeneration && connectionController === controller;
+  const remainingTimeout = fallback => deadline > 0
+    ? Math.max(1,Math.min(fallback,deadline - Date.now())) : fallback;
   setConnectionState('discovering');
   const local = ['localhost','127.0.0.1','[::1]'].includes(location.hostname);
   const saved = storage.get();
@@ -362,19 +376,19 @@ async function discoverServer() {
     if (local) {
       const localCandidate = savedCandidate || 'http://127.0.0.1:8765';
       $('api-url').value = localCandidate;
-      candidate = await verifyServerCandidate(localCandidate,controller.signal);
+      candidate = await verifyServerCandidate(localCandidate,controller.signal,remainingTimeout(10000));
       connectedMessage = '로컬 서버 연결을 확인했어요. 로그인할 수 있습니다.';
     } else {
       // A saved Quick Tunnel cannot safely replace the same-origin runtime
       // lease: it may be expired, stopped, or later reassigned. Keep it only as
       // a manual prefill when Pages config itself is unavailable.
-      const config = await fetchRuntimeConfig(controller.signal);
+      const config = await fetchRuntimeConfig(controller.signal,remainingTimeout(CONFIG_TIMEOUT_MS));
       if (!operationIsCurrent()) return;
       const runtime = validateRuntimeConfig(config);
       if (runtime.state === 'offline') throw runtimeConfigError('offline','서버가 꺼져 있습니다.');
       expiresAt = runtime.expiresAt;
       $('api-url').value = runtime.apiUrl;
-      try { candidate = await verifyServerCandidate(runtime.apiUrl,controller.signal); }
+      try { candidate = await verifyServerCandidate(runtime.apiUrl,controller.signal,remainingTimeout(10000)); }
       catch (error) {
         if (!operationIsCurrent()) return;
         throw runtimeConfigError('unreachable',errorText(error));
@@ -464,6 +478,7 @@ function detachImportWatcher({ clear = true } = {}) {
 function showLogin(clear = true) {
   ++requestGeneration;
   ++noteActionSequence;
+  resetAdminState(); resetPresence();
   recordingDownloadPending = false; recordingFinalizePending = false; deletingLecture = false; deleteTarget = null;
   if ($('delete-dialog').open) $('delete-dialog').close();
   if (recording || starting) void stopRecording('로그인이 만료되어 받아쓰기를 멈췄어요.');
@@ -567,6 +582,8 @@ $('auth-form').onsubmit = async event => {
     document.querySelector('.user-avatar').textContent = user[0].toUpperCase();
     renderCurrent();
     if (current?.id && current.recording_finalized === true && current.segments?.length) void loadCorrection(current.id);
+    startPresence();
+    if (response.user?.is_admin !== false) void loadAdminOverview({probe:true});
     void updateStatus(); clearInterval(statusTimer); statusTimer = setInterval(updateStatus, 20000);
     if (pending.length || draft) { sendError = ''; void retryPending(); }
   } catch (error) { $('auth-error').textContent = errorText(error); $('auth-error').hidden = false; }
@@ -994,6 +1011,505 @@ $('transcript-corrected').onclick = () => {
   correctionView = 'corrected'; renderCurrent();
 };
 $('correct-transcript').onclick = () => { void requestCorrection(); };
+
+function clearAdminRefresh() {
+  if (adminRefreshTimer !== null) clearTimeout(adminRefreshTimer);
+  adminRefreshTimer = null;
+}
+function clearAdminProbe() {
+  if (adminProbeTimer !== null) clearTimeout(adminProbeTimer);
+  adminProbeTimer = null;
+}
+function clearTunnelRecovery() {
+  if (tunnelRecoveryTimer !== null) clearTimeout(tunnelRecoveryTimer);
+  tunnelRecoveryTimer = null; tunnelRecoveryDeadline = 0; tunnelRecoveryContext = null;
+}
+function scrubAdminDom() {
+  // A hidden dialog is still inspectable from the DOM.  Remove every value and
+  // event closure derived from an administrator response when the identity or
+  // server changes, rather than relying on `hidden` or a closed dialog.
+  $('admin-accounts').replaceChildren();
+  $('admin-audit').replaceChildren();
+  $('admin-error').textContent = ''; $('admin-error').hidden = true;
+  $('admin-updated').textContent = '상태를 불러오는 중입니다.';
+  $('admin-access-detail').textContent = '현재 운영 접속 상태를 확인하고 있어요.';
+  $('admin-access-toggle').textContent = '상태 확인 중…'; $('admin-access-toggle').disabled = true;
+  document.querySelector('.admin-access').setAttribute('data-state','unknown');
+  $('admin-server-state').textContent = '확인 중'; $('admin-server-state').setAttribute('data-state','unknown');
+  $('admin-server-detail').textContent = '서버 가동 시간을 확인하고 있어요.';
+  for (const prefix of ['gpu','ram','disk']) {
+    $(`admin-${prefix}-value`).textContent = '확인 중';
+    $(`admin-${prefix}-progress`).removeAttribute('value');
+    $(`admin-${prefix}-progress`).textContent = '사용량 정보 없음';
+    $(`admin-${prefix}-detail`).textContent = '정보를 불러오고 있어요.';
+  }
+  for (const name of ['transcription','import','correction']) $(`admin-${name}-queue`).textContent = '0';
+  $('admin-tunnel-state').textContent = '확인 중'; $('admin-tunnel-state').setAttribute('data-state','unknown');
+  $('admin-tunnel-detail').textContent = '터널 상태를 확인하고 있어요.';
+  $('admin-tunnel-restart').textContent = '터널 재연결'; $('admin-tunnel-restart').disabled = true;
+  $('admin-confirm-title').textContent = '관리 작업을 실행할까요?';
+  $('admin-confirm-description').textContent = '선택한 작업을 확인해 주세요.';
+  $('admin-confirm-accept').textContent = '확인';
+}
+function resetAdminState() {
+  ++adminSequence;
+  clearAdminRefresh(); clearAdminProbe(); clearTunnelRecovery();
+  adminAuthorized = false; adminOverview = null; adminLoading = false; adminError = ''; adminAction = ''; adminConfirmation = null;
+  $('admin-open').hidden = true;
+  if ($('admin-dialog').open) $('admin-dialog').close();
+  if ($('admin-confirm-dialog').open) $('admin-confirm-dialog').close();
+  scrubAdminDom();
+}
+function adminOperationIsCurrent(sequence, owner, sessionToken, server) {
+  return sequence === adminSequence && owner === user && sessionToken === token && server === apiUrl;
+}
+function adminDateTime(value) {
+  const date = new Date(value);
+  if (!value || !Number.isFinite(date.getTime())) return '기록 없음';
+  return new Intl.DateTimeFormat('ko-KR', {
+    timeZone:'Asia/Seoul',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,
+  }).format(date);
+}
+function durationLabel(value) {
+  const total = Math.max(0,Math.floor(Number(value) || 0));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor(total % 86400 / 3600);
+  const minutes = Math.floor(total % 3600 / 60);
+  return [days ? `${days}일` : '',hours ? `${hours}시간` : '',`${minutes}분`].filter(Boolean).join(' ');
+}
+function safeNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+function usagePercent(value) {
+  const explicit = Number(value?.percent ?? value?.usage_percent ?? value?.utilization_percent);
+  if (Number.isFinite(explicit)) return Math.min(100,Math.max(0,explicit));
+  const used = safeNumber(value?.used_bytes,Number.NaN), total = safeNumber(value?.total_bytes,Number.NaN);
+  return Number.isFinite(used) && Number.isFinite(total) && total > 0 ? Math.min(100,used / total * 100) : 0;
+}
+function hasUsageCapacity(value) {
+  return Number.isFinite(Number(value?.used_bytes))
+    && Number.isFinite(Number(value?.total_bytes))
+    && Number(value.total_bytes) > 0;
+}
+function setAdminUsage(prefix, value, {unavailable = false, detailPrefix = ''} = {}) {
+  const progress = $(`admin-${prefix}-progress`);
+  const used = Number(value?.used_bytes), total = Number(value?.total_bytes);
+  const explicit = Number(value?.percent ?? value?.usage_percent ?? value?.utilization_percent);
+  const known = Number.isFinite(explicit) || (Number.isFinite(used) && Number.isFinite(total) && total > 0);
+  if (unavailable || !known) progress.removeAttribute('value');
+  const percent = usagePercent(value);
+  progress.textContent = known && !unavailable ? `${Math.round(percent)}%` : '사용량 정보 없음';
+  if (known && !unavailable) progress.value = percent;
+  $(`admin-${prefix}-value`).textContent = unavailable ? '사용할 수 없음' : known ? `${Math.round(percent)}% 사용` : '확인할 수 없음';
+  const size = Number.isFinite(used) && Number.isFinite(total) && total > 0
+    ? `${bytesLabel(used)} / ${bytesLabel(total)}` : '용량 정보 없음';
+  $(`admin-${prefix}-detail`).textContent = [detailPrefix,size].filter(Boolean).join(' · ');
+}
+function queueLabel(value) {
+  if (typeof value === 'number') return String(Math.max(0,Math.floor(value)));
+  const queued = Math.max(0,Math.floor(Number(value?.queued) || 0));
+  const processing = Math.max(0,Math.floor(Number(value?.processing) || 0));
+  return `${queued} · ${processing}`;
+}
+function adminActivityLabel(account) {
+  if (typeof account?.activity_label === 'string' && account.activity_label.trim()) return account.activity_label.trim();
+  return ({
+    offline:'오프라인',idle:'사용하지 않는 중',viewing:'기록 확인 중',recording:'녹음 중',uploading:'파일 업로드 중',
+    transcribing:'받아쓰기 처리 중',correcting:'AI 후보정 중',away:'자리 비움',
+  })[account?.activity] || (account?.online ? '접속 중' : '오프라인');
+}
+function accountJobLabel(jobs) {
+  const values = [jobs?.transcription,jobs?.imports,jobs?.corrections].map(value => {
+    if (typeof value === 'number') return Math.max(0,Math.floor(value));
+    return Math.max(0,Math.floor(Number(value?.queued) || 0)) + Math.max(0,Math.floor(Number(value?.processing) || 0));
+  });
+  const total = values.reduce((sum,value) => sum + value,0);
+  return total ? `진행 작업 ${total}개` : '';
+}
+function renderAdminAccounts(accounts) {
+  const container = $('admin-accounts');
+  // Do not replace a keyboard-focused account action underneath the user.
+  // The following refresh will render the newest snapshot after focus moves.
+  if (typeof container.contains === 'function' && document.activeElement
+      && container.contains(document.activeElement)) return;
+  container.replaceChildren();
+  const safeAccounts = Array.isArray(accounts) ? accounts.slice(0,50) : [];
+  if (!safeAccounts.length) {
+    const empty = document.createElement('p'); empty.className = 'admin-empty'; empty.textContent = '표시할 계정이 없습니다.'; container.append(empty); return;
+  }
+  for (const account of safeAccounts) {
+    const row = document.createElement('article'); row.className = 'admin-account';
+    const identity = document.createElement('div'); identity.className = 'admin-account-identity';
+    const label = document.createElement('strong'); label.textContent = String(account?.label || '이름 없는 계정');
+    const activation = document.createElement('small'); activation.textContent = account?.activated === false ? '초대·비밀번호 설정 대기' : '계정 활성화됨';
+    identity.append(label,activation);
+    const activity = document.createElement('div'); activity.className = 'admin-account-activity';
+    const activityText = document.createElement('strong'); activityText.textContent = adminActivityLabel(account);
+    const sessions = Math.max(0,Math.floor(Number(account?.session_count) || 0));
+    const jobText = accountJobLabel(account?.jobs);
+    const detail = document.createElement('small');
+    detail.textContent = [`세션 ${sessions}개`,jobText,`최근 활동 ${adminDateTime(account?.last_activity_at)}`].filter(Boolean).join(' · ');
+    activity.append(activityText,detail);
+    const self = account?.is_self === true || account?.label === user;
+    let action;
+    if (self) {
+      action = document.createElement('span'); action.className = 'admin-account-current'; action.textContent = '현재 계정';
+    } else {
+      action = document.createElement('button'); action.type = 'button'; action.className = 'secondary-button';
+      action.textContent = sessions ? '세션 종료' : '세션 없음';
+      action.disabled = !sessions || typeof account?.account_id !== 'string' || !account.account_id || !!adminAction;
+      action.onclick = () => openAdminConfirmation('session-revoke',{...account,is_self:self});
+    }
+    row.append(identity,activity,action); container.append(row);
+  }
+}
+function renderAdminAudit(entries) {
+  const container = $('admin-audit'); container.replaceChildren();
+  const safeEntries = Array.isArray(entries) ? entries.slice(0,20) : [];
+  if (!safeEntries.length) {
+    const empty = document.createElement('p'); empty.className = 'admin-empty'; empty.textContent = '최근 관리 작업이 없습니다.'; container.append(empty); return;
+  }
+  const actionLabels = {
+    access_open:'원격 접속 열기',access_close:'원격 접속 닫기',access_changed:'원격 접속 변경',
+    tunnel_restart:'터널 재연결',tunnel_restarted:'터널 재연결',sessions_revoke:'세션 종료',sessions_revoked:'세션 종료',
+  };
+  const resultLabels = {success:'완료',failed:'실패',accepted:'요청됨'};
+  const targetLabels = {service:'운영 접속',tunnel:'터널'};
+  for (const entry of safeEntries) {
+    const row = document.createElement('article'); row.className = 'admin-audit-entry';
+    const copy = document.createElement('div');
+    const title = document.createElement('strong'); title.textContent = actionLabels[entry?.action] || String(entry?.action || '관리 작업');
+    const targetValue = entry?.target_label ?? entry?.target;
+    const targetText = typeof targetValue === 'string' ? targetValue.trim() : '';
+    const target = targetText ? ` · ${targetLabels[targetText] || targetText}` : '';
+    const detail = document.createElement('small'); detail.textContent = `${adminDateTime(entry?.timestamp ?? entry?.created_at)}${target}`;
+    const result = document.createElement('span');
+    const resultValue = String(entry?.result || ''); result.textContent = resultLabels[resultValue] || resultValue || '확인되지 않음';
+    result.setAttribute('data-state',resultValue === 'success' || resultValue === 'accepted' ? 'ready' : resultValue === 'failed' ? 'error' : 'unknown');
+    result.className = 'admin-badge';
+    copy.append(title,detail); row.append(copy,result); container.append(row);
+  }
+}
+function renderAdminOverview() {
+  $('admin-open').hidden = !adminAuthorized;
+  const overview = adminOverview || {};
+  const busy = adminLoading || !!adminAction;
+  $('admin-refresh').disabled = busy;
+  $('admin-refresh').textContent = adminLoading ? '새로고침 중…' : '새로고침';
+  $('admin-error').hidden = !adminError;
+  $('admin-error').textContent = adminError;
+  $('admin-updated').textContent = adminLoading && !adminOverview ? '상태를 불러오는 중입니다.'
+    : `자동 새로고침 · 기준 ${adminDateTime(overview.generated_at)}`;
+
+  const enabled = overview.access?.enabled === true;
+  $('admin-access-detail').textContent = enabled
+    ? '로그인한 사용자의 새 수업·조회·업로드·다운로드 요청을 처리하고 있습니다.'
+    : '모든 새 수업 데이터 요청을 일시 중지했습니다. 현재 관리자 연결에서는 다시 열 수 있습니다.';
+  const accessSection = document.querySelector('.admin-access');
+  accessSection.setAttribute('data-state',enabled ? 'open' : 'paused');
+  $('admin-access-toggle').textContent = adminAction === 'access' ? '적용 중…' : enabled ? '운영 접속 닫기' : '운영 접속 열기';
+  $('admin-access-toggle').disabled = busy || typeof overview.access?.enabled !== 'boolean';
+  $('admin-access-toggle').classList.toggle('danger-button',enabled);
+  $('admin-access-toggle').classList.toggle('secondary-button',!enabled);
+
+  const server = overview.server || {};
+  const modelStateToServer = {ready:'ready',loading:'starting',unloaded:'running',error:'error'};
+  const reportedServerState = String(modelStateToServer[server.model_state] || server.state || server.status || 'unknown');
+  const serverState = new Set(['running','ready','online','starting','error','offline','unknown']).has(reportedServerState)
+    ? reportedServerState : 'unknown';
+  const serverLabels = {running:'서버 실행 중',ready:'음성 모델 준비됨',online:'API 응답 중',starting:'음성 모델 준비 중',error:'모델 오류',offline:'서버 중지됨',unknown:'확인 중'};
+  $('admin-server-state').textContent = serverLabels[serverState] || serverState;
+  $('admin-server-state').setAttribute('data-state',serverState);
+  const load = overview.resources?.load || {};
+  const loadValues = [load.one ?? load.load_1m,load.five ?? load.load_5m,load.fifteen ?? load.load_15m]
+    .map(value => Number(value)).filter(Number.isFinite);
+  $('admin-server-detail').textContent = [
+    Number.isFinite(Number(server.uptime_seconds)) ? `가동 ${durationLabel(server.uptime_seconds)}` : '',
+    typeof server.model === 'string' && server.model ? `모델 ${server.model}` : '',
+    typeof server.engine === 'string' && server.engine ? `엔진 ${server.engine}` : '',
+    typeof server.device === 'string' && server.device ? `장치 ${server.device}` : '',
+    loadValues.length ? `시스템 부하 ${loadValues.map(value => value.toFixed(2)).join(' / ')}` : '',
+  ].filter(Boolean).join(' · ') || '서버 상태 세부 정보가 없습니다.';
+
+  const resources = overview.resources || {};
+  const gpu = resources.gpu || {};
+  const gpuUnavailable = gpu.available === false || (!gpu.available && !gpu.total_bytes && !gpu.vram_total_bytes);
+  const gpuUsed = gpu.used_bytes ?? gpu.vram_used_bytes;
+  const gpuTotal = gpu.total_bytes ?? gpu.vram_total_bytes;
+  const gpuAllocated = gpu.allocated_bytes ?? gpu.process_allocated_bytes;
+  const gpuReserved = gpu.reserved_bytes ?? gpu.process_reserved_bytes;
+  if (!gpuUnavailable && !Number.isFinite(Number(gpuTotal)) && Number.isFinite(Number(gpuAllocated))) {
+    $('admin-gpu-progress').removeAttribute('value'); $('admin-gpu-progress').textContent = '전체 VRAM 정보 없음';
+    $('admin-gpu-value').textContent = `${bytesLabel(gpuAllocated)} 할당`;
+    $('admin-gpu-detail').textContent = [gpu.name,Number.isFinite(Number(gpuReserved)) ? `예약 ${bytesLabel(gpuReserved)}` : '',
+      Number.isFinite(Number(gpu.utilization_percent)) ? `GPU ${Math.round(Number(gpu.utilization_percent))}%` : ''].filter(Boolean).join(' · ') || 'ROCm 메모리 할당 정보';
+  } else {
+    setAdminUsage('gpu',{used_bytes:gpuUsed,total_bytes:gpuTotal,percent:gpu.vram_percent},
+      {unavailable:gpuUnavailable,detailPrefix:gpuUnavailable ? 'ROCm 정보를 사용할 수 없음' : [gpu.name,
+        Number.isFinite(Number(gpuAllocated)) ? `서버 프로세스 할당 ${bytesLabel(gpuAllocated)}` : '',
+        Number.isFinite(Number(gpuReserved)) ? `예약 ${bytesLabel(gpuReserved)}` : '',
+        Number.isFinite(Number(gpu.utilization_percent)) ? `GPU ${Math.round(Number(gpu.utilization_percent))}%` : ''].filter(Boolean).join(' · ')});
+  }
+  const memory = resources.memory || resources.ram || {};
+  setAdminUsage('ram',memory,{unavailable:!hasUsageCapacity(memory),detailPrefix:Number.isFinite(Number(memory.process_rss_bytes))
+    ? `서버 프로세스 ${bytesLabel(memory.process_rss_bytes)}` : ''});
+  const disk = resources.disk || {};
+  setAdminUsage('disk',disk,{unavailable:!hasUsageCapacity(disk)});
+
+  const queues = overview.queues || {};
+  $('admin-transcription-queue').textContent = queueLabel(queues.transcription);
+  $('admin-import-queue').textContent = queueLabel(queues.imports);
+  $('admin-correction-queue').textContent = queueLabel(queues.corrections);
+
+  const tunnel = overview.tunnel || {};
+  const reportedTunnelState = String(tunnel.state || 'unknown');
+  const tunnelState = new Set(['online','offline','starting','stopping','error','unknown']).has(reportedTunnelState)
+    ? reportedTunnelState : 'unknown';
+  const tunnelRestarting = ['starting','stopping'].includes(tunnelState) || tunnel.operation === 'restarting' || tunnel.operation?.restarting === true;
+  const tunnelDisplayState = tunnelRestarting ? 'starting' : tunnelState;
+  const tunnelRestartSupported = tunnel.restart_available ?? tunnel.restart_supported ?? tunnel.operation?.restart_supported ?? (tunnel.operation !== 'unsupported');
+  const tunnelLabels = {online:'프로세스 실행 중',offline:'프로세스 중지됨',starting:'재연결 중',stopping:'터널 종료 중',unknown:'확인 중',error:'오류'};
+  $('admin-tunnel-state').textContent = tunnelLabels[tunnelDisplayState] || tunnelDisplayState;
+  $('admin-tunnel-state').setAttribute('data-state',tunnelDisplayState);
+  $('admin-tunnel-detail').textContent = typeof tunnel.message === 'string' && tunnel.message
+    ? tunnel.message : tunnelState === 'online'
+      ? 'Cloudflare 터널 프로세스가 실행 중입니다. 외부 HTTPS 접속 가능 여부는 별도로 확인해 주세요.'
+      : 'Cloudflare 터널 프로세스 상태를 확인해 주세요.';
+  $('admin-tunnel-restart').disabled = busy || tunnelRestartSupported === false || tunnelRestarting;
+  $('admin-tunnel-restart').textContent = adminAction === 'tunnel' ? '요청 중…' : tunnelRestarting ? '재연결 중…' : '터널 재연결';
+
+  renderAdminAccounts(overview.accounts);
+  renderAdminAudit(overview.recent_audit);
+}
+function scheduleAdminRefresh() {
+  clearAdminRefresh();
+  if (!adminAuthorized || !$('admin-dialog').open || !token) return;
+  const sequence = adminSequence;
+  adminRefreshTimer = setTimeout(() => {
+    adminRefreshTimer = null;
+    if (sequence !== adminSequence || !$('admin-dialog').open) return;
+    if (document.hidden) scheduleAdminRefresh();
+    else void loadAdminOverview();
+  },ADMIN_REFRESH_MS);
+}
+function scheduleAdminProbeRetry(owner, sessionToken, server) {
+  clearAdminProbe();
+  adminProbeTimer = setTimeout(() => {
+    adminProbeTimer = null;
+    if (!token || owner !== user || sessionToken !== token || server !== apiUrl) return;
+    void loadAdminOverview({probe:true});
+  },ADMIN_REFRESH_MS);
+}
+async function loadAdminOverview({probe = false} = {}) {
+  if (!token) return;
+  clearAdminRefresh();
+  const owner = user, sessionToken = token, server = apiUrl, sequence = ++adminSequence;
+  adminLoading = true;
+  if (adminAuthorized) renderAdminOverview();
+  try {
+    const result = await api('/admin/overview');
+    if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
+    clearAdminProbe();
+    adminAuthorized = true; adminOverview = result && typeof result === 'object' ? result : {};
+    adminError = ''; renderAdminOverview();
+  } catch (error) {
+    if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
+    if (error?.status === 403) {
+      resetAdminState();
+      return;
+    }
+    if (adminAuthorized && !probe) {
+      adminError = errorText(error); renderAdminOverview();
+    } else {
+      adminAuthorized = false; adminOverview = null; $('admin-open').hidden = true;
+      if (probe) scheduleAdminProbeRetry(owner,sessionToken,server);
+    }
+  } finally {
+    if (adminOperationIsCurrent(sequence,owner,sessionToken,server)) {
+      adminLoading = false; renderAdminOverview(); scheduleAdminRefresh();
+    }
+  }
+}
+function closeAdminDialog() {
+  clearAdminRefresh();
+  if ($('admin-dialog').open) $('admin-dialog').close();
+}
+$('admin-open').onclick = () => {
+  if (!adminAuthorized || !token) return;
+  renderAdminOverview(); $('admin-dialog').showModal(); $('admin-close').focus(); void loadAdminOverview();
+};
+$('admin-close').onclick = closeAdminDialog;
+$('admin-dialog').oncancel = () => { clearAdminRefresh(); };
+$('admin-refresh').onclick = () => { if (!adminLoading && !adminAction) void loadAdminOverview(); };
+function closeAdminConfirmation() {
+  adminConfirmation = null;
+  if ($('admin-confirm-dialog').open) $('admin-confirm-dialog').close();
+}
+function openAdminConfirmation(type, account = null) {
+  if (!adminAuthorized || adminAction || account?.is_self) return;
+  const copies = {
+    'access-close':['운영 접속을 닫을까요?','새 수업·조회·업로드·다운로드를 포함한 모든 수업 데이터 요청이 일시 중지됩니다. 진행 중인 전송에도 영향을 줄 수 있으며, 현재 관리자 연결에서는 다시 열 수 있습니다.','운영 접속 닫기'],
+    'tunnel-restart':['터널을 재연결할까요?','외부 주소가 바뀌며 이 페이지 연결이 끊길 수 있습니다. 재연결 뒤 자동 주소가 게시될 때까지 기다린 다음 다시 로그인해야 할 수 있습니다.','터널 재연결'],
+    'session-revoke':['계정 세션을 종료할까요?',`${String(account?.label || '선택한 계정')}의 모든 로그인 세션을 종료합니다. 해당 기기에서 다시 로그인해야 합니다.`,'세션 종료'],
+  };
+  const copy = copies[type]; if (!copy) return;
+  adminConfirmation = {type,accountId:account?.account_id || '',label:account?.label || ''};
+  $('admin-confirm-title').textContent = copy[0]; $('admin-confirm-description').textContent = copy[1]; $('admin-confirm-accept').textContent = copy[2];
+  $('admin-confirm-dialog').showModal(); $('admin-confirm-cancel').focus();
+}
+$('admin-confirm-close').onclick = closeAdminConfirmation;
+$('admin-confirm-cancel').onclick = closeAdminConfirmation;
+$('admin-confirm-dialog').oncancel = () => { adminConfirmation = null; };
+async function runAdminAction(type, payload) {
+  if (!adminAuthorized || adminAction || !token) return;
+  const endpoints = {access:'/admin/access',tunnel:'/admin/tunnel/restart',sessions:'/admin/sessions/revoke'};
+  const path = endpoints[type]; if (!path) return;
+  const owner = user, sessionToken = token, server = apiUrl, sequence = ++adminSequence;
+  clearAdminRefresh(); adminAction = type; adminError = ''; renderAdminOverview();
+  try {
+    await api(path,{method:'POST',body:JSON.stringify(payload || {})},30000);
+    if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
+    if (type === 'access') notice(payload.enabled ? '새 수업 데이터 요청을 다시 받습니다.' : '새 수업 데이터 요청을 일시 중지했어요.');
+    else if (type === 'sessions') notice('선택한 계정의 로그인 세션을 종료했어요.');
+    else notice('터널 재연결을 요청했어요. 외부 주소가 바뀌면 다시 로그인해 주세요.');
+    adminAction = '';
+    if (type === 'tunnel') {
+      closeAdminDialog();
+      startTunnelRecovery({owner,sessionToken,server,requestGeneration,connectionGeneration});
+      return;
+    }
+    await loadAdminOverview();
+  } catch (error) {
+    if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
+    adminAction = '';
+    if (error?.status === 403) { resetAdminState(); return; }
+    adminError = errorText(error); renderAdminOverview();
+  } finally {
+    if (adminOperationIsCurrent(sequence,owner,sessionToken,server)) {
+      adminAction = ''; renderAdminOverview(); scheduleAdminRefresh();
+    }
+  }
+}
+function startTunnelRecovery(context) {
+  clearTunnelRecovery();
+  tunnelRecoveryContext = context; tunnelRecoveryDeadline = Date.now() + 3 * 60 * 1000;
+  const exhausted = () => {
+    clearTunnelRecovery();
+    notice('새 터널 주소를 자동으로 찾지 못했어요. 잠시 후 페이지를 새로고침하거나 연결 설정에서 주소를 확인해 주세요.');
+  };
+  const schedule = delay => {
+    const remaining = tunnelRecoveryDeadline - Date.now();
+    if (remaining <= 0) { exhausted(); return; }
+    tunnelRecoveryTimer = setTimeout(async () => {
+      tunnelRecoveryTimer = null;
+      const active = tunnelRecoveryContext;
+      if (!active || active.owner !== user || active.sessionToken !== token || active.server !== apiUrl
+          || active.requestGeneration !== requestGeneration || active.connectionGeneration !== connectionGeneration) {
+        clearTunnelRecovery(); return;
+      }
+      if (Date.now() >= tunnelRecoveryDeadline) { exhausted(); return; }
+      const discovery = discoverServer({deadline:tunnelRecoveryDeadline});
+      active.connectionGeneration = connectionGeneration;
+      await discovery.catch(() => {});
+      if (!tunnelRecoveryContext) return;
+      if (apiUrl !== active.server || token !== active.sessionToken || user !== active.owner
+          || requestGeneration !== active.requestGeneration || connectionGeneration !== active.connectionGeneration) {
+        clearTunnelRecovery(); return;
+      }
+      if (Date.now() >= tunnelRecoveryDeadline) {
+        exhausted();
+        return;
+      }
+      schedule(8000);
+    },Math.min(delay,remaining));
+  };
+  schedule(5000);
+}
+$('admin-access-toggle').onclick = () => {
+  if (!adminAuthorized || adminLoading || adminAction || typeof adminOverview?.access?.enabled !== 'boolean') return;
+  if (adminOverview.access.enabled) openAdminConfirmation('access-close');
+  else void runAdminAction('access',{enabled:true});
+};
+$('admin-tunnel-restart').onclick = () => openAdminConfirmation('tunnel-restart');
+$('admin-confirm-accept').onclick = () => {
+  const pendingAction = adminConfirmation; closeAdminConfirmation();
+  if (!pendingAction) return;
+  if (pendingAction.type === 'access-close') void runAdminAction('access',{enabled:false});
+  else if (pendingAction.type === 'tunnel-restart') void runAdminAction('tunnel',{});
+  else if (pendingAction.type === 'session-revoke' && pendingAction.accountId) {
+    void runAdminAction('sessions',{account_id:pendingAction.accountId});
+  }
+};
+
+function clearPresenceTimers() {
+  if (presenceTimer !== null) clearInterval(presenceTimer);
+  if (presenceIdleTimer !== null) clearTimeout(presenceIdleTimer);
+  presenceTimer = null; presenceIdleTimer = null;
+}
+function resetPresence() {
+  ++presenceSequence; clearPresenceTimers();
+  presenceSending = false; presenceLastSent = ''; presenceQueued = ''; lastPresenceInteraction = Date.now();
+}
+function presenceActivity() {
+  if (document.hidden) return 'away';
+  if (recording || starting) return 'recording';
+  if (importStarting || importJob?.status === 'uploading') return 'uploading';
+  if (sending || pending.length || ['queued','processing'].includes(importJob?.status)) return 'transcribing';
+  if (correctionStarting || ['queued','processing'].includes(correction?.status)) return 'correcting';
+  if (Date.now() - lastPresenceInteraction >= PRESENCE_IDLE_MS) return 'idle';
+  return 'viewing';
+}
+function schedulePresenceIdle() {
+  if (presenceIdleTimer !== null) clearTimeout(presenceIdleTimer);
+  if (presenceTimer === null || !token) { presenceIdleTimer = null; return; }
+  const delay = Math.max(0,lastPresenceInteraction + PRESENCE_IDLE_MS - Date.now());
+  const sequence = presenceSequence;
+  presenceIdleTimer = setTimeout(() => {
+    presenceIdleTimer = null;
+    if (sequence === presenceSequence) void sendPresence();
+  },delay);
+}
+async function sendPresence(force = false) {
+  if (presenceTimer === null || !token) return;
+  const activity = presenceActivity();
+  if (presenceSending) { presenceQueued = activity; return; }
+  if (!force && activity === presenceLastSent) return;
+  const owner = user, sessionToken = token, server = apiUrl, sequence = presenceSequence;
+  presenceSending = true; presenceQueued = '';
+  try {
+    await api('/presence',{method:'POST',body:JSON.stringify({activity})},10000);
+    if (sequence === presenceSequence && owner === user && sessionToken === token && server === apiUrl) presenceLastSent = activity;
+  } catch (error) {
+    if (sequence === presenceSequence && owner === user && sessionToken === token && server === apiUrl
+        && (error?.status === 403 || error?.status === 404)) presenceLastSent = activity;
+  } finally {
+    if (sequence !== presenceSequence || owner !== user || sessionToken !== token || server !== apiUrl) return;
+    presenceSending = false;
+    const queued = presenceQueued; presenceQueued = '';
+    if (queued && queued !== presenceLastSent) void sendPresence();
+  }
+}
+function notePresenceStateChange() {
+  if (presenceTimer === null || !token) return;
+  const activity = presenceActivity();
+  if (activity !== presenceLastSent) void sendPresence();
+}
+function notePresenceInteraction() {
+  const wasIdle = presenceActivity() === 'idle';
+  lastPresenceInteraction = Date.now(); schedulePresenceIdle();
+  if (wasIdle) notePresenceStateChange();
+}
+function startPresence() {
+  resetPresence();
+  const sequence = presenceSequence;
+  presenceTimer = setInterval(() => { if (sequence === presenceSequence) void sendPresence(true); },PRESENCE_INTERVAL_MS);
+  schedulePresenceIdle();
+  setTimeout(() => { if (sequence === presenceSequence) void sendPresence(true); },0);
+}
+document.addEventListener('pointerdown',notePresenceInteraction,{passive:true});
+document.addEventListener('keydown',notePresenceInteraction);
+
 function renderCurrent() {
   const lectureId = current?.id || '';
   if (lectureId !== correctionLectureId) {
@@ -1128,6 +1644,7 @@ function updateControls() {
   for (const button of $('lecture-list').querySelectorAll('button')) button.disabled = busy;
   updateCorrectionControls(noteToolsBusy);
   renderImportStatus();
+  notePresenceStateChange();
 }
 $('recording-file').onchange = () => {
   const file = $('recording-file').files?.[0];
@@ -1615,7 +2132,11 @@ $('logout').onclick = async () => {
   }
 };
 window.addEventListener('beforeunload', event => { if (isBusy()) { event.preventDefault(); event.returnValue = ''; } });
-document.addEventListener('visibilitychange', () => { if (document.hidden && recording) notice(selectedCaptureSource() === 'system' ? '공유 중인 탭이나 화면을 유지해 주세요. 브라우저가 오디오 공유를 중단할 수 있어요.' : '이 탭과 화면을 유지해 주세요. 기기가 녹음을 중단할 수 있어요.'); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && recording) notice(selectedCaptureSource() === 'system' ? '공유 중인 탭이나 화면을 유지해 주세요. 브라우저가 오디오 공유를 중단할 수 있어요.' : '이 탭과 화면을 유지해 주세요. 기기가 녹음을 중단할 수 있어요.');
+  notePresenceStateChange();
+  if (!document.hidden && adminAuthorized && $('admin-dialog').open && !adminLoading && !adminAction) void loadAdminOverview();
+});
 
 async function init() {
   // Keep invitation codes out of the URL as soon as the document runs.

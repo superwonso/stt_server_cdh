@@ -8,20 +8,21 @@ import math
 import os
 import secrets
 import shutil
+import sys
 import threading
 import time
 import uuid
 import wave
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Mapping
 
 import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, StrictInt, StringConstraints
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, StringConstraints
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -70,6 +71,32 @@ class ImportBody(BaseModel):
     filename: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
     file_fingerprint: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     size: StrictInt
+
+
+PresenceActivity = Literal[
+    "idle",
+    "viewing",
+    "recording",
+    "uploading",
+    "transcribing",
+    "correcting",
+    "away",
+]
+
+
+class PresenceBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    activity: PresenceActivity
+
+
+class AdminAccessBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: StrictBool
+
+
+class AdminRevokeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_id: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{24,64}$")]
 
 
 class DescriptorFileResponse(FileResponse):
@@ -211,8 +238,25 @@ def decode_wav(payload: bytes) -> tuple[np.ndarray, float, bytes]:
     return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0, frames / 16000, pcm
 
 
-def create_app(settings: Settings | None = None, transcriber=None, postprocessor=None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    transcriber=None,
+    postprocessor=None,
+    *,
+    tunnel_status=None,
+    tunnel_restart=None,
+) -> FastAPI:
+    production_factory = settings is None
     settings = settings or Settings.from_env()
+    if production_factory and (tunnel_status is None or tunnel_restart is None):
+        # The uvicorn factory calls create_app() without arguments.  Importing
+        # these lazy wrappers wires production control without inspecting any
+        # process until an authenticated administrator asks for status.
+        from .tunnel_control import tunnel_restart as default_tunnel_restart
+        from .tunnel_control import tunnel_status as default_tunnel_status
+
+        tunnel_status = tunnel_status or default_tunnel_status
+        tunnel_restart = tunnel_restart or default_tunnel_restart
     accounts = frozenset(settings.accounts)
     database = Database(settings.database_path, settings.accounts)
     database.initialize()
@@ -255,6 +299,13 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
     correction_worker_wake = threading.Event()
     correction_worker_shutdown = threading.Event()
     correction_worker_thread: threading.Thread | None = None
+    process_started_at = time.monotonic()
+    presence_lock = threading.Lock()
+    # Presence is deliberately ephemeral.  It contains no address, user-agent,
+    # lesson metadata, or transcript and disappears whenever this process exits.
+    presence: dict[str, tuple[str, float]] = {}
+    presence_ttl_seconds = 45.0
+    account_ids = {username: secrets.token_urlsafe(24) for username in settings.accounts}
 
     @asynccontextmanager
     async def lifespan(application):
@@ -288,6 +339,8 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
     app.state.transcriber = engine
     app.state.postprocessor = correction_engine
     app.state.recording_store = recording_store
+    app.state.tunnel_status = tunnel_status
+    app.state.tunnel_restart = tunnel_restart
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, error: RequestValidationError):
@@ -360,6 +413,457 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
             raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인하세요.", headers={"WWW-Authenticate": "Bearer"})
         return {"username": session["username"], "token_hash": token_hash}
 
+    def admin_identity(user: dict = Depends(identity)) -> dict:
+        administrator = settings.admin_username
+        if administrator is None or not secrets.compare_digest(user["username"], administrator):
+            # The same response covers a missing setting and a non-admin user,
+            # so the private account configuration cannot be enumerated.
+            raise HTTPException(403, "관리자 권한이 필요합니다.")
+        return user
+
+    def access_state(connection=None) -> dict:
+        if connection is None:
+            with database.connect() as own_connection:
+                row = own_connection.execute(
+                    "SELECT access_enabled, updated_at FROM operational_state WHERE singleton = 1"
+                ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT access_enabled, updated_at FROM operational_state WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            # initialize() owns creation of the singleton.  Failing closed here
+            # protects private records if a damaged database is encountered.
+            return {"enabled": False, "updated_at": None}
+        return {"enabled": bool(row["access_enabled"]), "updated_at": row["updated_at"]}
+
+    def require_data_access() -> None:
+        if not access_state()["enabled"]:
+            raise HTTPException(
+                503,
+                "서비스 이용이 잠시 중지되었습니다.",
+                headers={"Retry-After": "60"},
+            )
+
+    def data_identity(user: dict = Depends(identity)) -> dict:
+        # Authentication deliberately happens first.  Anonymous callers still
+        # receive 401 rather than learning the operator's access setting.
+        require_data_access()
+        return user
+
+    def audit(connection, action: str, result: str, target: str) -> None:
+        allowed_actions = {"access_changed", "sessions_revoked", "tunnel_restarted"}
+        allowed_results = {"success", "failed", "accepted"}
+        allowed_targets = {"service", "tunnel", *settings.accounts}
+        if action not in allowed_actions or result not in allowed_results or target not in allowed_targets:
+            raise RuntimeError("Unsafe administrator audit metadata")
+        connection.execute(
+            "INSERT INTO admin_audit(timestamp, action, result, target) VALUES (?, ?, ?, ?)",
+            (now_text(), action, result, target),
+        )
+        # A small bounded operational history is enough for two-account use.
+        connection.execute(
+            "DELETE FROM admin_audit WHERE id NOT IN "
+            "(SELECT id FROM admin_audit ORDER BY timestamp DESC, id DESC LIMIT 500)"
+        )
+
+    def epoch_text(value: float) -> str:
+        return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def safe_engine_status() -> dict:
+        fallback = {
+            "model_state": "unknown",
+            "engine": "local",
+            "model": str(settings.model).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1][:128]
+            or "unknown",
+            "device": str(settings.device)[:32],
+        }
+        try:
+            raw = engine.status()
+        except Exception:
+            return fallback
+        if not isinstance(raw, Mapping):
+            return fallback
+        try:
+            state = raw.get("model_state")
+            if not isinstance(state, str) or state not in {"unloaded", "loading", "ready", "error"}:
+                state = "unknown"
+            model = str(raw.get("model") or settings.model)
+            # A custom deployment can configure an absolute local model path.
+            # Only its final component is operationally useful to the browser.
+            model = model.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1][:128] or "unknown"
+            engine_name = str(raw.get("engine") or "local")[:64]
+            device = str(raw.get("device") or settings.device)[:32]
+            return {
+                "model_state": state,
+                "engine": engine_name,
+                "model": model,
+                "device": device,
+            }
+        except Exception:
+            return fallback
+
+    def memory_resources() -> dict | None:
+        try:
+            values = {}
+            with open("/proc/meminfo", "r", encoding="ascii") as source:
+                for line in source:
+                    key, separator, raw = line.partition(":")
+                    if separator and key in {"MemTotal", "MemAvailable"}:
+                        values[key] = int(raw.strip().split()[0]) * 1024
+            total = values["MemTotal"]
+            available = values["MemAvailable"]
+            with open("/proc/self/statm", "r", encoding="ascii") as source:
+                resident_pages = int(source.read().split()[1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            return {
+                "total_bytes": total,
+                "used_bytes": max(0, total - available),
+                "available_bytes": available,
+                "process_rss_bytes": max(0, resident_pages * page_size),
+            }
+        except (OSError, KeyError, IndexError, TypeError, ValueError):
+            return None
+
+    def load_resources() -> dict | None:
+        try:
+            one, five, fifteen = os.getloadavg()
+            if not all(math.isfinite(value) and value >= 0 for value in (one, five, fifteen)):
+                return None
+            return {
+                "one": round(one, 3),
+                "five": round(five, 3),
+                "fifteen": round(fifteen, 3),
+                "cpu_count": os.cpu_count(),
+            }
+        except (AttributeError, OSError):
+            return None
+
+    def disk_resources() -> dict | None:
+        try:
+            usage = shutil.disk_usage(settings.data_dir)
+            return {
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+            }
+        except OSError:
+            return None
+
+    def gpu_resources() -> dict:
+        result = {
+            "available": False,
+            "name": None,
+            "total_bytes": None,
+            "free_bytes": None,
+            "used_bytes": None,
+            "process_allocated_bytes": None,
+            "process_reserved_bytes": None,
+        }
+        # Merely opening the admin screen must not import PyTorch or initialize
+        # ROCm.  Report allocator counters only after the model did so itself.
+        torch = sys.modules.get("torch")
+        if torch is None or not str(settings.device).startswith("cuda"):
+            return result
+        try:
+            if not torch.cuda.is_available():
+                return result
+            free_bytes, total_bytes = (int(value) for value in torch.cuda.mem_get_info(settings.device))
+            if free_bytes < 0 or total_bytes <= 0:
+                raise ValueError("invalid GPU memory counters")
+            free_bytes = min(free_bytes, total_bytes)
+            raw_name = str(torch.cuda.get_device_name(settings.device)).replace("\\", "/").split("/")[-1]
+            safe_name = "".join(
+                character for character in raw_name if character.isprintable() and character not in "\r\n\t"
+            ).strip()[:80]
+            result.update(
+                {
+                    "available": True,
+                    "name": safe_name or "GPU",
+                    "total_bytes": total_bytes,
+                    "free_bytes": free_bytes,
+                    "used_bytes": total_bytes - free_bytes,
+                    "process_allocated_bytes": max(
+                        0, int(torch.cuda.memory_allocated(settings.device))
+                    ),
+                    "process_reserved_bytes": max(
+                        0, int(torch.cuda.memory_reserved(settings.device))
+                    ),
+                }
+            )
+        except Exception:
+            # GPU metrics are optional and must never make overview unavailable.
+            return {
+                "available": False,
+                "name": None,
+                "total_bytes": None,
+                "free_bytes": None,
+                "used_bytes": None,
+                "process_allocated_bytes": None,
+                "process_reserved_bytes": None,
+            }
+        return result
+
+    def sanitized_tunnel_status(raw=None) -> dict:
+        if raw is None and callable(tunnel_status):
+            try:
+                raw = tunnel_status()
+            except Exception:
+                raw = None
+        raw = raw if isinstance(raw, Mapping) else {}
+        try:
+            state = raw.get("state")
+            if not isinstance(state, str) or state not in {
+                "online",
+                "offline",
+                "starting",
+                "stopping",
+                "error",
+                "unknown",
+            }:
+                state = "unknown"
+            operation = raw.get("operation")
+            if not isinstance(operation, str) or operation not in {
+                "idle",
+                "restarting",
+                "stopping",
+                "restart_succeeded",
+                "restart_failed",
+                "stop_succeeded",
+                "stop_failed",
+            }:
+                operation = "idle"
+            remote_recovery = raw.get("remote_recovery_possible") is True
+            local_start = raw.get("local_start_required") is True
+            same_url = raw.get("same_public_url_guaranteed") is True
+            reported_restart_available = raw.get("restart_available")
+        except Exception:
+            state, operation = "unknown", "idle"
+            remote_recovery = local_start = same_url = False
+            reported_restart_available = False
+        # Never reflect an arbitrary hook-provided message.  The browser gets a
+        # short message derived only from allowlisted state and booleans.
+        if state == "starting":
+            message = "임시 HTTPS 터널을 다시 연결하고 있습니다. 같은 공개 주소는 보장되지 않습니다."
+        elif state == "stopping":
+            message = "임시 HTTPS 터널을 종료하고 있습니다."
+        elif state == "online":
+            message = "임시 HTTPS 터널이 실행 중입니다."
+        elif state == "offline" and local_start:
+            message = "터널이 꺼져 있어 이 컴퓨터에서 다시 시작해야 합니다."
+        elif state == "offline":
+            message = "임시 HTTPS 터널이 꺼져 있습니다."
+        elif state == "error":
+            message = "터널 상태를 안전하게 확인하지 못했습니다. 이 컴퓨터에서 확인해 주세요."
+        else:
+            message = "터널 상태를 확인하지 못했습니다."
+        if reported_restart_available is None:
+            # Injected test/local hooks predating this optional field remain
+            # usable, but an error/stopping status does not advertise control.
+            restart_available = callable(tunnel_restart) and state not in {"error", "stopping"}
+        else:
+            # The production controller derives this strict boolean from PID,
+            # executable, server ownership, and operation state.  Preserve a
+            # safe retry after a completed failure when those checks still pass.
+            restart_available = callable(tunnel_restart) and reported_restart_available is True
+        return {
+            "state": state,
+            "operation": operation,
+            "message": message[:160],
+            "remote_recovery_possible": remote_recovery,
+            "local_start_required": local_start,
+            "same_public_url_guaranteed": same_url,
+            "restart_available": restart_available,
+        }
+
+    @app.post("/presence")
+    def heartbeat(body: PresenceBody, user: dict = Depends(identity)):
+        if not limiter.allow(("presence", user["username"]), 60, 300):
+            raise HTTPException(429, "상태 요청이 너무 많습니다.", headers={"Retry-After": "15"})
+        with presence_lock:
+            # identity() may have completed just before an administrator
+            # revoked this account.  Revalidate while holding the same lock
+            # used to clear presence so that a late heartbeat cannot recreate
+            # a short-lived ghost-online state.
+            with database.connect() as connection:
+                live = connection.execute(
+                    "SELECT 1 FROM sessions WHERE token_hash = ? AND username = ? AND expires_at > ?",
+                    (user["token_hash"], user["username"], time.time()),
+                ).fetchone()
+            if live is None:
+                raise HTTPException(
+                    401,
+                    "로그인이 만료되었습니다. 다시 로그인하세요.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            presence[user["username"]] = (body.activity, time.time())
+        return {"status": "ok"}
+
+    @app.get("/admin/overview")
+    def admin_overview(user: dict = Depends(admin_identity)):
+        current_time = time.time()
+        with database.connect() as connection:
+            access = access_state(connection)
+            account_rows = {
+                row["username"]: row
+                for row in connection.execute(
+                    "SELECT u.username, u.password_hash IS NOT NULL AS activated, "
+                    "(SELECT COUNT(*) FROM sessions s "
+                    " WHERE s.username = u.username AND s.expires_at > ?) AS session_count, "
+                    "(SELECT COUNT(*) FROM chunks c JOIN lectures l ON l.id = c.lecture_id "
+                    " WHERE l.username = u.username AND c.status = 'pending') AS transcription_jobs, "
+                    "(SELECT COUNT(*) FROM imports i WHERE i.username = u.username "
+                    " AND i.status IN ('uploading', 'queued', 'processing')) AS import_jobs, "
+                    "(SELECT COUNT(*) FROM transcript_corrections tc "
+                    " JOIN lectures l2 ON l2.id = tc.lecture_id "
+                    " WHERE l2.username = u.username AND tc.status IN ('queued', 'processing')) "
+                    " AS correction_jobs "
+                    "FROM users u",
+                    (current_time,),
+                ).fetchall()
+            }
+            queues = {
+                "transcription": connection.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE status = 'pending'"
+                ).fetchone()[0],
+                "imports": connection.execute(
+                    "SELECT COUNT(*) FROM imports "
+                    "WHERE status IN ('uploading', 'queued', 'processing')"
+                ).fetchone()[0],
+                "corrections": connection.execute(
+                    "SELECT COUNT(*) FROM transcript_corrections "
+                    "WHERE status IN ('queued', 'processing')"
+                ).fetchone()[0],
+            }
+            recent_audit = [
+                {
+                    "timestamp": row["timestamp"],
+                    "action": row["action"],
+                    "result": row["result"],
+                    "target": row["target"],
+                }
+                for row in connection.execute(
+                    "SELECT timestamp, action, result, target FROM admin_audit "
+                    "ORDER BY timestamp DESC, id DESC LIMIT 20"
+                ).fetchall()
+            ]
+        with presence_lock:
+            expired_accounts = [
+                username
+                for username, (_, observed_at) in presence.items()
+                if current_time - observed_at > presence_ttl_seconds
+            ]
+            for username in expired_accounts:
+                presence.pop(username, None)
+            presence_snapshot = dict(presence)
+        account_results = []
+        for username in settings.accounts:
+            row = account_rows[username]
+            activity, last_activity = presence_snapshot.get(username, ("offline", None))
+            online = last_activity is not None and current_time - last_activity <= presence_ttl_seconds
+            if not online:
+                activity = "offline"
+            account_results.append(
+                {
+                    "account_id": account_ids[username],
+                    "label": username,
+                    "is_self": secrets.compare_digest(username, user["username"]),
+                    "activated": bool(row["activated"]),
+                    "online": online,
+                    "activity": activity,
+                    "last_activity_at": epoch_text(last_activity) if last_activity is not None else None,
+                    "session_count": row["session_count"],
+                    "jobs": {
+                        "transcription": row["transcription_jobs"],
+                        "imports": row["import_jobs"],
+                        "corrections": row["correction_jobs"],
+                    },
+                }
+            )
+        return {
+            "generated_at": now_text(),
+            "access": access,
+            "server": {
+                "state": "online",
+                "uptime_seconds": max(0, round(time.monotonic() - process_started_at)),
+                **safe_engine_status(),
+            },
+            "resources": {
+                "memory": memory_resources(),
+                "load": load_resources(),
+                "disk": disk_resources(),
+                "gpu": gpu_resources(),
+            },
+            "queues": queues,
+            "tunnel": sanitized_tunnel_status(),
+            "accounts": account_results,
+            "recent_audit": recent_audit,
+        }
+
+    @app.post("/admin/access")
+    def set_admin_access(body: AdminAccessBody, user: dict = Depends(admin_identity)):
+        del user
+        changed_at = now_text()
+        with database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = access_state(connection)
+            if current["enabled"] != body.enabled:
+                connection.execute(
+                    "UPDATE operational_state SET access_enabled = ?, updated_at = ? WHERE singleton = 1",
+                    (int(body.enabled), changed_at),
+                )
+                audit(connection, "access_changed", "success", "service")
+                return {"enabled": body.enabled, "updated_at": changed_at}
+            return current
+
+    @app.post("/admin/sessions/revoke")
+    def revoke_account_sessions(body: AdminRevokeBody, user: dict = Depends(admin_identity)):
+        target = None
+        for username, opaque_id in account_ids.items():
+            if secrets.compare_digest(body.account_id, opaque_id):
+                target = username
+        if target is None:
+            raise HTTPException(404, "계정을 찾을 수 없습니다.")
+        if secrets.compare_digest(target, user["username"]):
+            raise HTTPException(409, "현재 관리자 세션은 이 화면에서 해제할 수 없습니다.")
+        with database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            revoked = connection.execute("DELETE FROM sessions WHERE username = ?", (target,)).rowcount
+            audit(connection, "sessions_revoked", "success", target)
+        with presence_lock:
+            presence.pop(target, None)
+        return {"status": "ok", "revoked_sessions": revoked}
+
+    @app.post("/admin/tunnel/restart", status_code=202)
+    def restart_admin_tunnel(user: dict = Depends(admin_identity)):
+        if not limiter.allow(("admin-tunnel-restart", user["username"]), 3, 300):
+            raise HTTPException(429, "터널 재연결 요청이 너무 많습니다.", headers={"Retry-After": "300"})
+        if not callable(tunnel_restart):
+            with database.connect() as connection:
+                audit(connection, "tunnel_restarted", "failed", "tunnel")
+            raise HTTPException(503, "터널 제어 기능을 사용할 수 없습니다.")
+        try:
+            raw_result = tunnel_restart()
+        except Exception:
+            with database.connect() as connection:
+                audit(connection, "tunnel_restarted", "failed", "tunnel")
+            # Do not retain or reflect the controller's exception message.
+            raise HTTPException(503, "터널을 다시 연결하지 못했습니다.") from None
+        try:
+            accepted = isinstance(raw_result, Mapping) and raw_result.get("accepted") is True
+        except Exception:
+            accepted = False
+        if not accepted:
+            with database.connect() as connection:
+                audit(connection, "tunnel_restarted", "failed", "tunnel")
+            safe_status = sanitized_tunnel_status(raw_result)
+            if safe_status["operation"] in {"restarting", "stopping"}:
+                raise HTTPException(409, "다른 터널 작업이 진행 중입니다. 잠시 후 다시 시도하세요.")
+            raise HTTPException(503, "터널을 다시 연결하지 못했습니다.")
+        with database.connect() as connection:
+            audit(connection, "tunnel_restarted", "accepted", "tunnel")
+        return {"accepted": True, **sanitized_tunnel_status(raw_result)}
+
     def owned_lecture(lecture_id: str, username: str, *, include_deleting: bool = False) -> dict:
         deleting_clause = "" if include_deleting else " AND deleting = 0"
         with database.connect() as connection:
@@ -423,6 +927,8 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
     def logout(user: dict = Depends(identity)):
         with database.connect() as connection:
             connection.execute("DELETE FROM sessions WHERE token_hash = ?", (user["token_hash"],))
+        with presence_lock:
+            presence.pop(user["username"], None)
         return {"status": "ok"}
 
     @app.get("/status")
@@ -435,7 +941,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         return result
 
     @app.get("/lectures")
-    def list_lectures(user: dict = Depends(identity)):
+    def list_lectures(user: dict = Depends(data_identity)):
         with database.connect() as connection:
             rows = connection.execute(
                 "SELECT id, username, title, language, created_at, deleting, recording_finalized FROM lectures "
@@ -448,7 +954,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
     def create_lecture(
         body: LectureBody,
         x_lecture_id: Annotated[str | None, Header(max_length=64)] = None,
-        user: dict = Depends(identity),
+        user: dict = Depends(data_identity),
     ):
         try:
             lecture_id = str(uuid.UUID(x_lecture_id)) if x_lecture_id else str(uuid.uuid4())
@@ -500,7 +1006,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         )
 
     @app.get("/lectures/{lecture_id}")
-    def get_lecture(lecture_id: str, user: dict = Depends(identity)):
+    def get_lecture(lecture_id: str, user: dict = Depends(data_identity)):
         lecture = owned_lecture(lecture_id, user["username"])
         with database.connect() as connection:
             segments = [dict(row) for row in connection.execute(
@@ -575,7 +1081,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         return dict(row) if row is not None else None
 
     @app.get("/lectures/{lecture_id}/correction")
-    def get_correction(lecture_id: str, user: dict = Depends(identity)):
+    def get_correction(lecture_id: str, user: dict = Depends(data_identity)):
         lecture = owned_lecture(lecture_id, user["username"])
         row = get_correction_row(lecture["id"])
         if row is None:
@@ -583,7 +1089,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         return correction_result(row)
 
     @app.post("/lectures/{lecture_id}/correction")
-    def start_correction(lecture_id: str, user: dict = Depends(identity)):
+    def start_correction(lecture_id: str, user: dict = Depends(data_identity)):
         # Validate ownership before configuration so another account cannot use
         # this endpoint to learn whether an arbitrary lecture ID exists.
         lecture = owned_lecture(lecture_id, user["username"])
@@ -685,7 +1191,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
                 download_tickets.pop(token_hash, None)
 
     @app.post("/lectures/{lecture_id}/recording-download-ticket")
-    def create_recording_download_ticket(lecture_id: str, user: dict = Depends(identity)):
+    def create_recording_download_ticket(lecture_id: str, user: dict = Depends(data_identity)):
         lecture = owned_lecture(lecture_id, user["username"])
         try:
             recording = recording_store.info(user["username"], lecture["id"])
@@ -709,7 +1215,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         return {"path": f"/recording-downloads/{ticket}", "expires_in": 60}
 
     @app.post("/lectures/{lecture_id}/recording-finalize")
-    def finalize_received_recording(lecture_id: str, user: dict = Depends(identity)):
+    def finalize_received_recording(lecture_id: str, user: dict = Depends(data_identity)):
         """Close a stopped lesson after its failed final browser chunk was skipped."""
 
         with recording_store.lock:
@@ -747,9 +1253,18 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         if not 32 <= len(ticket) <= 128:
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
         now = time.monotonic()
+        token_hash = digest(ticket)
         with download_ticket_lock:
             clear_expired_download_tickets(now)
-            token_hash = digest(ticket)
+            granted = download_tickets.get(token_hash)
+        if granted is None or granted[0] <= now:
+            raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
+        # Validate the unguessable grant before revealing the paused state, but
+        # do not consume a retry while the operator has disabled data access.
+        require_data_access()
+        now = time.monotonic()
+        with download_ticket_lock:
+            clear_expired_download_tickets(now)
             granted = download_tickets.get(token_hash)
             if granted is not None and granted[0] > now:
                 if granted[3] <= 1:
@@ -981,7 +1496,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         x_start_seconds: Annotated[str, Header(max_length=40)],
         x_overlap_seconds: Annotated[str, Header(max_length=40)] = "0",
         x_final_chunk: Annotated[str, Header(max_length=8)] = "true",
-        user: dict = Depends(identity),
+        user: dict = Depends(data_identity),
     ):
         lecture = await run_in_threadpool(owned_lecture, lecture_id, user["username"])
         try:
@@ -1158,7 +1673,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
                 log.exception("Could not remove an orphaned private recording")
 
     @app.delete("/lectures/{lecture_id}")
-    def delete_lecture(lecture_id: str, user: dict = Depends(identity)):
+    def delete_lecture(lecture_id: str, user: dict = Depends(data_identity)):
         with import_fs_lock, recording_store.lock:
             try:
                 lecture = owned_lecture(lecture_id, user["username"], include_deleting=True)
@@ -1818,7 +2333,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
     def create_import(
         body: ImportBody,
         x_import_id: Annotated[str | None, Header(max_length=64)] = None,
-        user: dict = Depends(identity),
+        user: dict = Depends(data_identity),
     ):
         ensure_import_worker()
         maintain_import_jobs()
@@ -1901,7 +2416,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         return import_result(owned_import(import_id, user["username"]))
 
     @app.get("/imports")
-    def list_imports(user: dict = Depends(identity)):
+    def list_imports(user: dict = Depends(data_identity)):
         ensure_import_worker()
         maintain_import_jobs()
         with database.connect() as connection:
@@ -1914,7 +2429,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         return [import_result(dict(row)) for row in rows]
 
     @app.get("/imports/{import_id}")
-    def get_import(import_id: str, user: dict = Depends(identity)):
+    def get_import(import_id: str, user: dict = Depends(data_identity)):
         ensure_import_worker()
         job = owned_import(import_id, user["username"])
         return import_result(reconcile_terminal_upload(job))
@@ -1925,7 +2440,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         request: Request,
         x_upload_offset: Annotated[str, Header(max_length=32)],
         x_part_sha256: Annotated[str, Header(max_length=64)],
-        user: dict = Depends(identity),
+        user: dict = Depends(data_identity),
     ):
         job = await run_in_threadpool(owned_import, import_id, user["username"])
         try:
@@ -1998,7 +2513,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         return import_result(owned_import(job["id"], user["username"]))
 
     @app.post("/imports/{import_id}/complete")
-    def complete_import(import_id: str, user: dict = Depends(identity)):
+    def complete_import(import_id: str, user: dict = Depends(data_identity)):
         with import_fs_lock:
             job = owned_import(import_id, user["username"])
             if job["status"] in {"queued", "processing", "completed"}:
@@ -2036,7 +2551,7 @@ def create_app(settings: Settings | None = None, transcriber=None, postprocessor
         return result
 
     @app.post("/imports/{import_id}/cancel")
-    def cancel_import(import_id: str, user: dict = Depends(identity)):
+    def cancel_import(import_id: str, user: dict = Depends(data_identity)):
         with import_fs_lock:
             job = owned_import(import_id, user["username"])
             if job["status"] in {"completed", "failed", "cancelled"}:

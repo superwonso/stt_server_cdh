@@ -699,8 +699,31 @@ button {
   font-size: 10px;
 }
 
+.sidebar-footer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.admin-open-button {
+  min-height: 40px;
+  padding: 7px 9px;
+  border: 1px solid rgba(49, 92, 76, 0.2);
+  border-radius: 9px;
+  color: var(--forest-700);
+  background: rgba(255, 253, 249, 0.75);
+  font-size: 11px;
+}
+
+.admin-open-button:hover:not(:disabled) {
+  border-color: var(--forest-600);
+  background: var(--forest-100);
+}
+
 .logout-button {
   min-height: 40px;
+  margin-left: auto;
   padding: 7px 0;
   border: 0;
   color: #6d7672;
@@ -1355,10 +1378,334 @@ button {
   box-shadow: var(--shadow);
 }
 
+.admin-dialog {
+  width: min(94vw, 920px);
+  max-width: 920px;
+  max-height: min(90vh, 900px);
+  max-height: min(90dvh, 900px);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid rgba(31, 52, 44, 0.17);
+  border-radius: 20px;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
 .connection-dialog::backdrop,
-.delete-dialog::backdrop {
+.delete-dialog::backdrop,
+.admin-dialog::backdrop {
   background: rgba(15, 28, 23, 0.55);
   backdrop-filter: blur(3px);
+}
+
+.admin-dialog-content {
+  max-height: min(90vh, 900px);
+  max-height: min(90dvh, 900px);
+  padding: 29px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.admin-heading {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.admin-heading h2,
+.admin-section h3 {
+  margin: 0;
+}
+
+.admin-heading h2 {
+  font-family: Georgia, "Times New Roman", "Noto Serif KR", serif;
+  font-size: 29px;
+  font-weight: 600;
+}
+
+.admin-heading #admin-description {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.admin-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 15px 0;
+  gap: 12px;
+}
+
+.admin-toolbar p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.admin-toolbar .secondary-button {
+  min-height: 38px;
+}
+
+.admin-error {
+  margin: 0 0 15px;
+  padding: 11px 13px;
+  border: 1px solid rgba(163, 62, 62, 0.25);
+  border-radius: 10px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  font-size: 12px;
+}
+
+.admin-section {
+  margin-top: 14px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.admin-section .eyebrow {
+  margin-bottom: 3px;
+}
+
+.admin-section h3 {
+  font-size: 15px;
+}
+
+.admin-access,
+.admin-operation-row,
+.admin-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.admin-access {
+  border-color: rgba(49, 92, 76, 0.2);
+  background: #f6faf7;
+}
+
+.admin-access[data-state="paused"] {
+  border-color: rgba(163, 62, 62, 0.28);
+  background: var(--danger-soft);
+}
+
+.admin-access p,
+.admin-operation-row p,
+.admin-section-detail {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.admin-resource-grid,
+.admin-queue-grid {
+  display: grid;
+  margin-top: 14px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.admin-metric,
+.admin-queue-grid article {
+  min-width: 0;
+  padding: 13px;
+  border-radius: 11px;
+  background: var(--surface-muted);
+}
+
+.admin-metric > span,
+.admin-queue-grid article > span {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.admin-metric strong,
+.admin-queue-grid strong {
+  display: block;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+  color: var(--forest-800);
+  font-size: 17px;
+}
+
+.admin-metric progress {
+  width: 100%;
+  height: 6px;
+  margin: 10px 0 5px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 99px;
+  background: #e5e3dc;
+}
+
+.admin-metric progress::-webkit-progress-bar {
+  border-radius: 99px;
+  background: #e5e3dc;
+}
+
+.admin-metric progress::-webkit-progress-value {
+  border-radius: 99px;
+  background: var(--forest-600);
+}
+
+.admin-metric progress::-moz-progress-bar {
+  border-radius: 99px;
+  background: var(--forest-600);
+}
+
+.admin-metric small,
+.admin-queue-grid small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.admin-queue-grid strong {
+  font-size: 22px;
+}
+
+.admin-operation-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.admin-badge {
+  display: inline-flex;
+  min-height: 27px;
+  align-items: center;
+  padding: 4px 9px;
+  border-radius: 99px;
+  color: var(--muted);
+  background: #ecebe6;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.admin-badge[data-state="online"],
+.admin-badge[data-state="ready"],
+.admin-badge[data-state="running"] {
+  color: var(--forest-700);
+  background: var(--forest-100);
+}
+
+.admin-badge[data-state="starting"],
+.admin-badge[data-state="stopping"] {
+  color: #6d5723;
+  background: #fff3cf;
+}
+
+.admin-badge[data-state="offline"],
+.admin-badge[data-state="error"],
+.admin-badge[data-state="paused"] {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.admin-accounts {
+  display: grid;
+  margin-top: 12px;
+  gap: 8px;
+}
+
+.admin-account {
+  display: grid;
+  align-items: center;
+  padding: 12px 13px;
+  grid-template-columns: minmax(90px, 0.7fr) minmax(140px, 1fr) auto;
+  gap: 12px;
+  border-radius: 11px;
+  background: var(--surface-muted);
+}
+
+.admin-account-identity strong,
+.admin-account-activity strong {
+  display: block;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-account-identity small,
+.admin-account-activity small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.admin-account-activity strong {
+  color: var(--forest-700);
+}
+
+.admin-account button {
+  min-height: 38px;
+}
+
+.admin-account-current {
+  color: var(--forest-700);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.admin-empty {
+  margin: 0;
+  padding: 16px;
+  border-radius: 10px;
+  color: var(--muted);
+  background: var(--surface-muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.admin-audit {
+  display: grid;
+  margin-top: 12px;
+  gap: 7px;
+}
+
+.admin-audit-entry {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  gap: 12px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+}
+
+.admin-audit-entry > div {
+  min-width: 0;
+}
+
+.admin-audit-entry strong,
+.admin-audit-entry small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-audit-entry strong {
+  font-size: 11px;
+}
+
+.admin-audit-entry small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .connection-form {
@@ -1729,6 +2076,57 @@ button {
     padding: 25px 20px;
   }
 
+  .admin-dialog {
+    width: calc(100vw - 20px);
+    border-radius: 16px;
+  }
+
+  .admin-dialog-content {
+    padding: 22px 16px;
+  }
+
+  .admin-toolbar,
+  .admin-access,
+  .admin-operation-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .admin-toolbar {
+    margin-bottom: 12px;
+  }
+
+  .admin-toolbar .secondary-button,
+  .admin-access > button,
+  .admin-operation-actions,
+  .admin-operation-actions > button {
+    width: 100%;
+  }
+
+  .admin-operation-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .admin-badge {
+    align-self: flex-start;
+  }
+
+  .admin-resource-grid,
+  .admin-queue-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .admin-account {
+    align-items: stretch;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 9px;
+  }
+
+  .admin-account button {
+    width: 100%;
+  }
+
   .delete-dialog-actions {
     align-items: stretch;
     flex-direction: column-reverse;
@@ -1753,6 +2151,7 @@ button {
   .note-actions,
   .transcript-versions,
   .correction-panel,
+  .admin-dialog,
   .view-meta {
     display: none !important;
   }

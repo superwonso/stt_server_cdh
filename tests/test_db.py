@@ -126,7 +126,7 @@ class DatabaseTests(unittest.TestCase):
                 ).fetchone()
                 schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(tuple(state), (0, 0))
-            self.assertEqual(schema_version, 4)
+            self.assertEqual(schema_version, 5)
 
     def test_accounts_are_data_not_hardcoded_in_the_users_schema(self):
         with tempfile.TemporaryDirectory() as temporary:

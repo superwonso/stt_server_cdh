@@ -78,3 +78,17 @@ test('AI correction controls keep raw and corrected transcripts explicit without
   assert.match(html, /모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호는 이 PC에서 먼저 가리지만/);
   assert.doesNotMatch(html, /MINDLOGIC_API_KEY|OPENAI_API_KEY|Bearer\s+[A-Za-z0-9_-]/i);
 });
+
+test('admin controls are hidden by default, accessible, and contain no embedded account data', () => {
+  assert.match(html, /<button\b[^>]*\bid="admin-open"[^>]*\baria-haspopup="dialog"[^>]*\baria-controls="admin-dialog"[^>]*\bhidden/i);
+  assert.match(html, /<dialog\b[^>]*\bid="admin-dialog"[^>]*\baria-labelledby="admin-title"[^>]*\baria-describedby="admin-description"/i);
+  assert.match(html, /<p\b[^>]*\bid="admin-updated"[^>]*>/i);
+  assert.doesNotMatch(html, /<p\b[^>]*\bid="admin-updated"[^>]*\baria-live="polite"/i);
+  assert.match(html, /<p\b[^>]*\bid="admin-error"[^>]*\brole="alert"[^>]*\bhidden/i);
+  assert.match(html, /<button\b[^>]*\bid="admin-access-toggle"[^>]*\bdisabled/i);
+  assert.match(html, /<button\b[^>]*\bid="admin-tunnel-restart"[^>]*\bdisabled/i);
+  assert.match(html, /<dialog\b[^>]*\bid="admin-confirm-dialog"[^>]*\baria-labelledby="admin-confirm-title"[^>]*\baria-describedby="admin-confirm-description"/i);
+  assert.match(html, /<div\b[^>]*\bid="admin-accounts"[^>]*><\/div>/i);
+  assert.match(html, /관리자 현황용 상태에는 IP, 기기 정보, 수업 제목과 내용을 저장하거나 표시하지 않습니다/);
+  assert.doesNotMatch(html, /data-account-id|MINDLOGIC_API_KEY|OPENAI_API_KEY/i);
+});

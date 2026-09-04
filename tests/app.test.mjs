@@ -28,7 +28,8 @@ function runtimeConfig({state = 'online', apiUrl = 'https://fresh-tunnel.tryclou
 }
 function deferred() { let resolve, reject; const promise = new Promise((yes,no) => { resolve = yes; reject = no; }); return {promise,resolve,reject}; }
 function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' } = {}) {
-  const elements = new Map(), createdElements = new Map(), intervals = new Set(), timeouts = new Map(), objectUrls = new Map();
+  const elements = new Map(), createdElements = new Map(), intervals = new Map(), timeouts = new Map(), objectUrls = new Map();
+  const documentListeners = new Map();
   const location = {hash:'',hostname:'student.github.io',pathname:'/classroom/',search:''};
   const historyCalls = [];
   let storedServerValue = storedServer;
@@ -73,9 +74,16 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
     values.push(node); createdElements.set(tag,values);
     return node;
   };
+  const document = {
+    hidden:false,getElementById:element,querySelector:element,createElement,
+    addEventListener(name,callback) {
+      const callbacks = documentListeners.get(name) || [];
+      callbacks.push(callback); documentListeners.set(name,callbacks);
+    },
+  };
   const context = vm.createContext({
     Blob, Headers, URL:TestURL, URLSearchParams, AbortController, console, crypto:webcrypto,
-    document:{getElementById:element,querySelector:element,createElement,addEventListener(){}},
+    document,
     window:{addEventListener(){}}, performance:{now:() => 0},
     location,history:{replaceState(...args){historyCalls.push(args);}},
     localStorage:{
@@ -84,7 +92,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
     },
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },
     clearTimeout:value => timeouts.delete(value),
-    setInterval:() => { const value = ++id; intervals.add(value); return value; },clearInterval:value => intervals.delete(value),
+    setInterval:(callback,delay = 0) => { const value = ++id; intervals.set(value,{callback,delay}); return value; },clearInterval:value => intervals.delete(value),
     fetch,
     TestCapture:class {
       constructor(callbacks) { mic = this; this.callbacks = callbacks; }
@@ -106,10 +114,19 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '' 
     assert.ok(entry, `missing ${delay} ms timer`);
     timeouts.delete(entry[0]); entry[1].callback(); await tick(); await tick();
   };
+  const runInterval = async delay => {
+    const entry = [...intervals].find(([, timer]) => timer.delay === delay);
+    assert.ok(entry, `missing ${delay} ms interval`);
+    entry[1].callback(); await tick(); await tick();
+  };
+  const dispatchDocument = async name => {
+    for (const callback of documentListeners.get(name) || []) callback();
+    await tick(); await tick();
+  };
   const created = tag => createdElements.get(tag)?.at(-1);
   const createdAll = tag => createdElements.get(tag) || [];
   const objectUrlBlob = value => objectUrls.get(value);
-  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,location,historyCalls,storedServer:() => storedServerValue,microphone:() => mic};
+  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,runInterval,dispatchDocument,document,location,historyCalls,storedServer:() => storedServerValue,microphone:() => mic};
 }
 
 test('activation presents and enforces the four-character minimum in the browser', () => {
@@ -520,6 +537,221 @@ test('late AI correction responses and polling timers cannot cross lecture bound
   app.run('resetNewNote()');
   assert.equal(app.run('correctionPollTimer'), null);
   assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 2500));
+});
+
+function adminOverviewFixture(overrides = {}) {
+  return {
+    generated_at:'2026-09-04T03:00:00Z',
+    access:{enabled:true,updated_at:'2026-09-04T02:59:00Z'},
+    server:{uptime_seconds:3720,model_state:'ready',engine:'qwen3-asr',model:'Qwen3-ASR-1.7B',device:'cuda'},
+    resources:{
+      memory:{total_bytes:32 * 1024 ** 3,used_bytes:12 * 1024 ** 3,available_bytes:20 * 1024 ** 3,process_rss_bytes:2 * 1024 ** 3},
+      load:{one:0.5,five:0.4,fifteen:0.3,cpu_count:8},
+      disk:{total_bytes:500 * 1024 ** 3,used_bytes:125 * 1024 ** 3,free_bytes:375 * 1024 ** 3},
+      gpu:{available:true,total_bytes:16 * 1024 ** 3,used_bytes:5 * 1024 ** 3,free_bytes:11 * 1024 ** 3,
+        process_allocated_bytes:3 * 1024 ** 3,process_reserved_bytes:4 * 1024 ** 3},
+    },
+    queues:{transcription:1,imports:2,corrections:3},
+    tunnel:{state:'online',restart_available:true},
+    accounts:[
+      {account_id:'opaque-self',label:'user-alpha',is_self:true,activated:true,online:true,activity:'recording',last_activity_at:'2026-09-04T02:59:58Z',session_count:1,jobs:{transcription:1,imports:0,corrections:0}},
+      {account_id:'opaque-peer',label:'member-beta',is_self:false,activated:false,online:false,activity:'offline',last_activity_at:null,session_count:2,jobs:{transcription:0,imports:0,corrections:0}},
+    ],
+    recent_audit:[
+      {timestamp:'2026-09-04T02:58:00Z',action:'access_changed',result:'success',target:'service'},
+      {timestamp:'2026-09-04T02:57:00Z',action:'sessions_revoked',result:'success',target:'member-beta'},
+    ],
+    ...overrides,
+  };
+}
+
+test('admin discovery stays hidden after 403 and ignores an overview from an old session', async () => {
+  const denied = setup(async () => response({detail:'관리자 권한이 필요합니다.'},403));
+  await denied.run('loadAdminOverview({probe:true})');
+  assert.equal(denied.run('adminAuthorized'), false);
+  assert.equal(denied.element('admin-open').hidden, true);
+  assert.equal(denied.element('admin-dialog').open, false);
+
+  const late = deferred();
+  const stale = setup(() => late.promise);
+  const loading = stale.run('loadAdminOverview({probe:true})');
+  await tick();
+  stale.run('showLogin()');
+  late.resolve(response(adminOverviewFixture()));
+  await loading;
+  assert.equal(stale.run('adminOverview'), null);
+  assert.equal(stale.run('adminAuthorized'), false);
+  assert.equal(stale.element('admin-open').hidden, true);
+});
+
+test('a transient initial admin probe retries without exposing the control early', async () => {
+  let attempts = 0;
+  const app = setup(async url => {
+    if (url.endsWith('/admin/overview') && ++attempts === 1) return response({detail:'잠시 실패'},503);
+    return response(adminOverviewFixture());
+  });
+  await app.run('loadAdminOverview({probe:true})');
+  assert.equal(app.element('admin-open').hidden,true);
+  assert.ok([...app.timeouts.values()].some(timer => timer.delay === 10000));
+
+  await app.runTimeout(10000);
+  assert.equal(attempts,2);
+  assert.equal(app.element('admin-open').hidden,false);
+});
+
+test('admin response data and account action closures are scrubbed when the identity resets', async () => {
+  const app = setup(async () => response(adminOverviewFixture()));
+  await app.run('loadAdminOverview({probe:true})');
+  app.element('admin-accounts').children[1].children[2].onclick();
+  assert.match(app.element('admin-confirm-description').textContent,/member-beta/);
+  assert.match(app.element('admin-server-detail').textContent,/Qwen3-ASR-1\.7B/);
+
+  app.run('resetAdminState()');
+
+  assert.equal(app.element('admin-open').hidden,true);
+  assert.equal(app.element('admin-accounts').children.length,0);
+  assert.equal(app.element('admin-audit').children.length,0);
+  assert.doesNotMatch(app.element('admin-confirm-description').textContent,/member-beta/);
+  assert.doesNotMatch(app.element('admin-server-detail').textContent,/Qwen3-ASR-1\.7B/);
+  assert.equal(app.element('admin-tunnel-restart').disabled,true);
+  assert.equal(app.run('adminOverview'),null);
+  assert.equal(app.run('adminConfirmation'),null);
+});
+
+test('admin overview renders safe operational metadata, refreshes while open, and never offers self-revocation', async () => {
+  const overview = adminOverviewFixture();
+  const app = setup(async () => response(overview));
+  await app.run('loadAdminOverview({probe:true})');
+
+  assert.equal(app.element('admin-open').hidden, false);
+  assert.equal(app.element('admin-server-state').textContent, '음성 모델 준비됨');
+  assert.match(app.element('admin-server-detail').textContent, /Qwen3-ASR-1\.7B/);
+  assert.match(app.element('admin-server-detail').textContent, /시스템 부하 0\.50/);
+  assert.match(app.element('admin-gpu-detail').textContent, /서버 프로세스 할당 3\.00 GiB/);
+  assert.match(app.element('admin-ram-detail').textContent, /서버 프로세스 2\.00 GiB/);
+  assert.equal(app.element('admin-transcription-queue').textContent, '1');
+  assert.equal(app.element('admin-import-queue').textContent, '2');
+  assert.equal(app.element('admin-correction-queue').textContent, '3');
+  assert.equal(app.element('admin-tunnel-state').textContent, '프로세스 실행 중');
+  assert.match(app.element('admin-tunnel-detail').textContent, /외부 HTTPS 접속 가능 여부는 별도로 확인/);
+
+  const accountRows = app.element('admin-accounts').children;
+  assert.equal(accountRows.length, 2);
+  assert.equal(accountRows[0].children[0].children[0].textContent, 'user-alpha');
+  assert.equal(accountRows[0].children[1].children[0].textContent, '녹음 중');
+  assert.equal(accountRows[0].children[2].tagName, 'SPAN');
+  assert.equal(accountRows[0].children[2].textContent, '현재 계정');
+  assert.equal(accountRows[1].children[0].children[1].textContent, '초대·비밀번호 설정 대기');
+  assert.equal(accountRows[1].children[2].tagName, 'BUTTON');
+  assert.doesNotMatch(accountRows[1].children[2].textContent, /opaque-peer/);
+  assert.match(app.element('admin-audit').children[0].children[0].children[1].textContent, /운영 접속/);
+
+  app.element('admin-open').onclick();
+  await tick(); await tick();
+  assert.equal(app.element('admin-dialog').open, true);
+  assert.ok([...app.timeouts.values()].some(timer => timer.delay === 10000));
+  app.element('admin-close').onclick();
+  assert.equal(app.element('admin-dialog').open, false);
+  assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 10000));
+
+  app.run("adminOverview={...adminOverview,tunnel:{state:'starting',restart_available:true}}; renderAdminOverview() ");
+  assert.equal(app.element('admin-tunnel-state').textContent, '재연결 중');
+  assert.equal(app.element('admin-tunnel-restart').disabled, true);
+
+  app.run("adminOverview={...adminOverview,resources:{...adminOverview.resources,memory:null,disk:null}}; renderAdminOverview() ");
+  assert.equal(app.element('admin-ram-value').textContent, '사용할 수 없음');
+  assert.equal(app.element('admin-disk-value').textContent, '사용할 수 없음');
+});
+
+test('admin mutations require confirmation and send only the opaque account reference', async () => {
+  const calls = [];
+  const overview = adminOverviewFixture();
+  const app = setup(async (url, options = {}) => {
+    calls.push({url,method:options.method || 'GET',body:options.body});
+    return response(url.endsWith('/admin/overview') ? overview : {status:'ok'});
+  });
+  await app.run('loadAdminOverview({probe:true})');
+  const peerRevoke = app.element('admin-accounts').children[1].children[2];
+  peerRevoke.onclick();
+  assert.equal(app.element('admin-confirm-dialog').open, true);
+  assert.match(app.element('admin-confirm-description').textContent, /member-beta/);
+  assert.doesNotMatch(app.element('admin-confirm-description').textContent, /opaque-peer/);
+  assert.equal(calls.filter(call => call.method === 'POST').length, 0);
+  app.element('admin-confirm-accept').onclick();
+  await tick(); await tick(); await tick();
+  const revoke = calls.find(call => call.url.endsWith('/admin/sessions/revoke'));
+  assert.ok(revoke);
+  assert.deepEqual(JSON.parse(revoke.body),{account_id:'opaque-peer'});
+
+  app.element('admin-access-toggle').onclick();
+  assert.equal(app.element('admin-confirm-dialog').open, true);
+  assert.match(app.element('admin-confirm-description').textContent, /모든 수업 데이터 요청이 일시 중지/);
+  assert.equal(calls.filter(call => call.url.endsWith('/admin/access')).length, 0);
+  app.element('admin-confirm-cancel').onclick();
+
+  app.element('admin-tunnel-restart').onclick();
+  assert.equal(app.element('admin-confirm-dialog').open, true);
+  assert.match(app.element('admin-confirm-description').textContent, /외부 주소가 바뀌며/);
+  assert.equal(calls.filter(call => call.url.endsWith('/admin/tunnel/restart')).length, 0);
+});
+
+test('presence heartbeat reports only activity and follows recording, away, and logout state', async () => {
+  const bodies = [];
+  const app = setup(async (url, options = {}) => {
+    if (url.endsWith('/presence')) bodies.push(JSON.parse(options.body));
+    return response({status:'ok'});
+  });
+  app.run('startPresence()');
+  await app.runTimeout(0);
+  assert.deepEqual(bodies.at(-1),{activity:'viewing'});
+
+  app.run('recording=true; notePresenceStateChange()');
+  await tick(); await tick();
+  assert.deepEqual(bodies.at(-1),{activity:'recording'});
+  app.document.hidden = true;
+  await app.dispatchDocument('visibilitychange');
+  assert.deepEqual(bodies.at(-1),{activity:'away'});
+  await app.runInterval(15000);
+  assert.deepEqual(bodies.at(-1),{activity:'away'});
+  assert.ok(bodies.every(body => Object.keys(body).length === 1 && typeof body.activity === 'string'));
+
+  app.run('recording=false; showLogin()');
+  assert.equal(app.intervals.size, 0);
+  assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 5 * 60 * 1000));
+});
+
+test('tunnel recovery retries published config after five seconds and is cancelled by logout', async () => {
+  const oldServer = 'https://old-tunnel.trycloudflare.com';
+  const config = runtimeConfig({apiUrl:oldServer});
+  const requests = [];
+  const app = setup(async url => {
+    requests.push(String(url));
+    if (String(url).startsWith('./config.json?')) return response(config);
+    if (String(url).endsWith('/health')) return response({status:'ok'});
+    return response({});
+  });
+  app.run(`apiUrl='${oldServer}'; verifiedApiUrl=apiUrl; connectionState='connected';
+    startTunnelRecovery({owner:user,sessionToken:token,server:apiUrl,requestGeneration,connectionGeneration});`);
+  assert.ok([...app.timeouts.values()].some(timer => timer.delay === 5000));
+  await app.runTimeout(5000);
+  assert.ok(requests.some(url => url.startsWith('./config.json?')));
+  assert.ok(requests.some(url => url.endsWith('/health')));
+  assert.ok([...app.timeouts.values()].some(timer => timer.delay === 8000));
+  app.run('showLogin()');
+  assert.equal(app.run('tunnelRecoveryTimer'), null);
+  assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 8000));
+
+  const exhausted = setup(async url => {
+    if (String(url).startsWith('./config.json?')) return response(config);
+    if (String(url).endsWith('/health')) return response({status:'ok'});
+    return response({});
+  });
+  exhausted.run(`apiUrl='${oldServer}'; verifiedApiUrl=apiUrl; connectionState='connected';
+    startTunnelRecovery({owner:user,sessionToken:token,server:apiUrl,requestGeneration,connectionGeneration});
+    tunnelRecoveryDeadline=Date.now()-1;`);
+  await exhausted.runTimeout(5000);
+  assert.equal(exhausted.run('tunnelRecoveryTimer'), null);
+  assert.match(exhausted.element('notice').textContent, /페이지를 새로고침하거나 연결 설정/);
 });
 
 test('recording download exchanges bearer auth for a same-origin native ticket link', async () => {

@@ -213,6 +213,24 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS transcript_corrections_queue
                     ON transcript_corrections(status, created_at);
+                CREATE TABLE IF NOT EXISTS operational_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    access_enabled INTEGER NOT NULL CHECK (access_enabled IN (0, 1)),
+                    updated_at TEXT NOT NULL
+                );
+                INSERT OR IGNORE INTO operational_state(singleton, access_enabled, updated_at)
+                    VALUES (1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+                CREATE TABLE IF NOT EXISTS admin_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK (
+                        action IN ('access_changed', 'sessions_revoked', 'tunnel_restarted')
+                    ),
+                    result TEXT NOT NULL CHECK (result IN ('success', 'failed', 'accepted')),
+                    target TEXT NOT NULL CHECK (length(target) BETWEEN 1 AND 64)
+                );
+                CREATE INDEX IF NOT EXISTS admin_audit_recent
+                    ON admin_audit(timestamp DESC, id DESC);
             """)
             chunk_columns = {row[1] for row in connection.execute("PRAGMA table_info(chunks)")}
             lecture_columns = {row[1] for row in connection.execute("PRAGMA table_info(lectures)")}
@@ -280,5 +298,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 4:
-                connection.execute("PRAGMA user_version = 4")
+            if schema_version < 5:
+                connection.execute("PRAGMA user_version = 5")

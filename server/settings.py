@@ -102,7 +102,11 @@ def _path(value: str) -> Path:
 class Settings:
     data_dir: Path
     model_cache_dir: Path
-    accounts: tuple[str, ...] = ("user-alpha", "user-beta")
+    accounts: tuple[str, ...] = field(default=("user-alpha", "user-beta"), repr=False)
+    # The administrator is a private deployment detail.  Excluding it from
+    # repr prevents an otherwise convenient Settings log/debug statement from
+    # publishing a real account ID.
+    admin_username: str | None = field(default=None, repr=False)
     site_origins: tuple[str, ...] = ()
     model: str = "Qwen3-ASR-1.7B"
     aligner: str = "Qwen3-ForcedAligner-0.6B"
@@ -133,6 +137,12 @@ class Settings:
     def __post_init__(self) -> None:
         if account_usernames(",".join(self.accounts)) != self.accounts:
             raise ValueError("Settings.accounts must contain two normalized account IDs")
+        if self.admin_username is not None and (
+            ACCOUNT_USERNAME.fullmatch(self.admin_username) is None
+            or self.admin_username not in self.accounts
+        ):
+            # Do not reflect a possibly secret/mistyped account ID.
+            raise ValueError("ADMIN_USERNAME must identify one configured account")
         normalized_gateway = mindlogic_gateway_base_url(self.mindlogic_base_url)
         object.__setattr__(self, "mindlogic_base_url", normalized_gateway)
 
@@ -149,6 +159,7 @@ class Settings:
             data_dir=_path(os.getenv("DATA_DIR", ".data")),
             model_cache_dir=_path(os.getenv("MODEL_CACHE_DIR", ".models")),
             accounts=accounts,
+            admin_username=(os.getenv("ADMIN_USERNAME") or "").strip() or None,
             site_origins=origins,
             model=os.getenv("ASR_MODEL", os.getenv("WHISPER_MODEL", "Qwen3-ASR-1.7B")),
             aligner=os.getenv("ASR_ALIGNER", "Qwen3-ForcedAligner-0.6B"),
