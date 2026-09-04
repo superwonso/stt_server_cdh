@@ -6,9 +6,9 @@
 
 ## 현재 결론
 
-현재 기본 엔진은 `Qwen/Qwen3-ASR-1.7B`의 Transformers 경로(`qwen-asr==0.0.6`, BF16, SDPA)와 `Qwen3-ForcedAligner-0.6B`다. 브라우저 마이크와 `getDisplayMedia`의 오디오 트랙은 16 kHz 모노 PCM을 모아 새 음성이 8초 이상이고 최근 0.24초가 조용하면 자르며, 조용한 지점이 없으면 전체 WAV 15초에서 자른다. 첫 조각 뒤에는 이전 3초를 겹쳐 보낸다. 업로드 파일도 PyAV로 스트리밍 디코딩한 뒤 같은 분할 규칙을 쓴다. 서버는 0.6초 stability guard와 단어 정렬 시각으로 각 조각에서 확정할 범위를 정한다. Qwen의 vLLM 네이티브 스트리밍은 현재 코드에서 사용하지 않는다.
+현재 로컬 엔진은 `Qwen/Qwen3-ASR-1.7B`의 Transformers 경로(`qwen-asr==0.0.6`, BF16, SDPA)와 `Qwen3-ForcedAligner-0.6B`다. 브라우저 마이크와 `getDisplayMedia`의 오디오 트랙은 16 kHz 모노 PCM을 모아 새 음성이 8초 이상이고 최근 0.24초가 조용하면 자르며, 조용한 지점이 없으면 전체 WAV 15초에서 자른다. 첫 조각 뒤에는 이전 3초를 겹쳐 보낸다. 업로드 파일도 PyAV로 스트리밍 디코딩한 뒤 같은 분할 규칙을 쓴다. 서버는 0.6초 stability guard와 단어 정렬 시각으로 각 조각에서 확정할 범위를 정한다. Qwen의 vLLM 네이티브 스트리밍은 현재 코드에서 사용하지 않는다.
 
-마이크 실시간 수업에는 `qwen`(기본·로컬)과 NAVER Cloud `clova`(명시적 opt-in) 선택을 추가했다. provider는 lecture에 불변 저장하고 청크 요청에서 바꿀 수 없다. 공유 화면/탭 소리와 파일 import는 계속 Qwen으로 강제한다. CLOVA는 공식 bidirectional gRPC 한 스트림을 수업별로 유지하며 healthy 연결에서는 브라우저 overlap을 잘라 새 PCM만 전송한다. 5분 연결 제한 전 회전·idle/단절 후 새 스트림에서는 현재 청크의 최대 3초 overlap을 문맥으로 다시 넣고 align timestamp가 그 구간인 결과는 버린다. 화면 갱신은 기존 8~15초 브라우저 청크 주기를 그대로 사용하므로 단어 단위 초저지연 UI로 바뀐 것은 아니다.
+마이크 실시간 수업에는 `qwen`(로컬)과 NAVER Cloud `clova` 선택을 추가했다. 인증된 `/status`에서 CLOVA 설정을 확인하면 새 마이크 수업은 CLOVA를 우선 선택하고, 미설정·상태 확인 실패 때는 Qwen을 선택한다. 사용자가 이번 계정 세션에서 Qwen 또는 CLOVA를 직접 고르면 새 수업·기록 화면 왕복과 상태 polling에서도 그 선호를 유지하되, CLOVA를 일시 사용할 수 없을 때의 새 수업만 Qwen으로 표시하고 회복 시 선호를 복원한다. 진행 중 수업은 절대 자동 전환하지 않는다. provider는 lecture에 불변 저장하고 청크 요청에서 바꿀 수 없다. 공유 화면/탭 소리와 파일 import는 계속 Qwen으로 강제한다. CLOVA는 공식 bidirectional gRPC 한 스트림을 수업별로 유지하며 healthy 연결에서는 브라우저 overlap을 잘라 새 PCM만 전송한다. 5분 연결 제한 전 회전·idle/단절 후 새 스트림에서는 현재 청크의 최대 3초 overlap을 문맥으로 다시 넣고 align timestamp가 그 구간인 결과는 버린다. 화면 갱신은 기존 8~15초 브라우저 청크 주기를 그대로 사용하므로 단어 단위 초저지연 UI로 바뀐 것은 아니다.
 
 CLOVA 선택 시 경로는 `브라우저 → Cloudflare → 이 PC → clovaspeech-gw.ncloud.com:50051`이며 음성과 결과가 NAVER Cloud로 간다. 공식 문서상 스트리밍 결과는 고객 Object Storage에 자동 저장된다. 로컬 수업 삭제는 그 클라우드 사본을 삭제하지 않는다. Basic Stream은 15초당 5원(VAT 별도)이고 Free 도메인은 실시간 gRPC를 지원하지 않는다. 따라서 CLOVA를 품질 우위로 단정하거나 자동 fallback으로 쓰지 않고 같은 실제 한국어 수업 음성으로 Qwen과 비교해야 한다.
 
@@ -16,7 +16,7 @@ CLOVA 선택 시 경로는 `브라우저 → Cloudflare → 이 PC → clovaspee
 
 실시간 마이크와 공유 소리는 사용자 일시정지를 지원한다. pause acknowledgement 경계까지 새 PCM을 비최종 청크로 flush하고, 정지 중 render frame은 버린다. 수업 ID·누적 음성 시간축·직전 3초 overlap은 유지하며 재개하고, 실제 종료에서만 overlap-only guard를 포함한 `final` 청크로 수업을 확정한다. 진행 수업의 후보정 버튼은 녹음을 멈추지 않고 의도만 예약하며, 사용자가 종료한 뒤 final 저장이 성공해야 후보정 요청을 시작한다.
 
-이 선택은 “Qwen이 언제나 가장 정확하다”는 결론이 아니다. 대상 Radeon/ROCm에서 실제 한국어 음성을 실시간보다 빠르게 처리했고, 현재 3초 겹침 경로가 짧은 낭독 시험에서 CER 4.03%, 마지막 기준 25자 완전 일치, 탐지된 텍스트 중복 0건을 낸 점과 요청 단위 복구가 단순하다는 운영상 이유로 정한 보수적 기본값이다. 서로 독립적으로 인식한 청크의 정렬 시각은 흔들릴 수 있으므로 실제 수업에서 exactly-once를 수학적으로 보장하지 않는다.
+CLOVA를 마이크 화면의 기본 선택으로 둔 것은 실제 같은 수업 음성에서 Qwen보다 항상 정확하다고 검증한 결론이 아니라 사용자의 운영 선택이다. Qwen은 대상 Radeon/ROCm에서 실제 한국어 음성을 실시간보다 빠르게 처리했고, 현재 3초 겹침 경로가 짧은 낭독 시험에서 CER 4.03%, 마지막 기준 25자 완전 일치, 탐지된 텍스트 중복 0건을 냈으므로 CLOVA 미설정·상태 확인 실패의 로컬 대안과 화면 소리·파일 변환 엔진으로 유지한다. 서로 독립적으로 인식한 Qwen 청크의 정렬 시각은 흔들릴 수 있으므로 실제 수업에서 exactly-once를 수학적으로 보장하지 않는다.
 
 VibeVoice-ASR-Streaming-7B는 이 PC에서도 BF16/SDPA로 실제 로드되고 공식 live-state API로 7분 52초를 완주했다. 2.9초 청크와 0.5초 lookahead, 이전 음성·텍스트 문맥, 화자 라벨을 한 세션에서 유지하는 점은 회의·수업에 매력적이다. 그러나 공개 체크포인트의 목표 세션이 최대 8분이고, 실측에서도 KV가 1,702→6,574토큰, GPU reserved가 16.59→22.19 GiB로 증가했다. 최근 10청크 평균 연산도 2분 2.15초에서 종료 시 3.25초로 늘어 2.933초 입력 간격을 넘었다. 따라서 45~90분 수업 기본값으로 두지 않았다. 8분마다 상태를 끊으면 실행은 가능할 수 있지만 화자 일관성과 장기 문맥이라는 장점도 함께 끊긴다.
 
@@ -45,7 +45,7 @@ VibeVoice-ASR-Streaming-7B는 이 PC에서도 BF16/SDPA로 실제 로드되고 �
 | --- | --- | --- | --- |
 | `microsoft/VibeVoice-ASR-Streaming-7B` | 이름은 7B지만 [모델 카드](https://huggingface.co/microsoft/VibeVoice-ASR-Streaming-7B)는 9B BF16로 표시한다. [기술 보고서](https://arxiv.org/html/2609.02812v1)는 2.9초 청크 + 0.5초 lookahead, 예상 화자 귀속 지연 2.00초, 한국어 MLC CER 9.09/cpCER 23.22를 보고한다. 이전 음성·텍스트를 유지하지만 비용이 선형 증가하고 공개 체크포인트는 최대 480초 녹음을 대상으로 한다. [공식 실행 문서](https://github.com/microsoft/VibeVoice/blob/main/docs/vibevoice-asr-streaming.md)는 NVIDIA PyTorch 컨테이너를 검증 환경으로 제시한다. | 이 PC의 공식 `init_streaming_state`→`streaming_generate_step` 경로에서 472.08초를 완주했으나 최근 평균 청크 연산이 2.15→3.25초로 증가해 종료 시 입력 간격을 초과했다. allocated는 16.32→16.58 GiB, reserved는 16.59→22.19 GiB, KV는 1,702→6,574토큰이었다. | **ROCm 실측 완료, 기본값 아님.** 짧은 FLEURS 3개 간이 aggregate CER 25.2%; 별도의 14회 반복 7:52 실험은 custom content CER 15.75%. 두 값은 음성 구성과 정규화가 달라 서로 직접 비교할 수 없다. |
 | `mistralai/Voxtral-Mini-4B-Realtime-2602` | [공식 모델 카드](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602)는 4B BF16, 16GB 이상 GPU, sliding-window attention, 기본 131072 context(3시간 이상)를 설명한다. Korean FLEURS 공식값은 WER로 480ms 지연 15.74, 2400ms 지연 14.30이다. [기술 보고서](https://arxiv.org/html/2602.11298v3)도 긴 연속 스트림을 주목적으로 설명한다. | 공식 2400ms stream을 호환성 shim이 있는 격리 환경에서 실행했다. 111.12초 음성 추론이 176.02초(RTF 1.584)여서 현재 경로는 입력을 따라가지 못한다. 종료 시 3.28초 right padding이 필수였다. | **ROCm 실측 완료, 기본값 아님.** CER 4.70%, WER 21.53%; GPU allocated 약 8.94GB, peak 약 9.18GB. |
-| `Qwen/Qwen3-ASR-1.7B` | [공식 모델 카드](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)와 [저장소](https://github.com/QwenLM/Qwen3-ASR)는 한국어를 포함한 30개 언어, 오프라인·스트리밍 모드를 명시한다. 패키지의 스트리밍은 현재 vLLM backend에서만 제공되고, Transformers 경로는 확정 결과와 forced alignment를 제공한다. | 모델이 작고 현재 ROCm PyTorch/SDPA에서 실제 작동했다. HTTP 청크는 네이티브 스트리밍보다 느리게 확정되지만, 연결 재시도와 DB idempotency가 단순하다. 3초 겹침이 경계 손실을 완화하나 독립 ASR/정렬의 jitter는 남는다. | **현재 기본값.** 전체 파일 CER 2.24%/RTF 0.592, 실제 짧은 청크 경로 CER 4.03%/RTF 0.466. 60분 35초 연속 청크 경로도 CER 3.51%/RTF 0.442로 완주했다. |
+| `Qwen/Qwen3-ASR-1.7B` | [공식 모델 카드](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)와 [저장소](https://github.com/QwenLM/Qwen3-ASR)는 한국어를 포함한 30개 언어, 오프라인·스트리밍 모드를 명시한다. 패키지의 스트리밍은 현재 vLLM backend에서만 제공되고, Transformers 경로는 확정 결과와 forced alignment를 제공한다. | 모델이 작고 현재 ROCm PyTorch/SDPA에서 실제 작동했다. HTTP 청크는 네이티브 스트리밍보다 느리게 확정되지만, 연결 재시도와 DB idempotency가 단순하다. 3초 겹침이 경계 손실을 완화하나 독립 ASR/정렬의 jitter는 남는다. | **현재 로컬 엔진·fallback.** 전체 파일 CER 2.24%/RTF 0.592, 실제 짧은 청크 경로 CER 4.03%/RTF 0.466. 60분 35초 연속 청크 경로도 CER 3.51%/RTF 0.442로 완주했다. |
 | Whisper `turbo` | [OpenAI 모델 카드](https://github.com/openai/whisper/blob/main/model-card.md)는 798M multilingual 모델이며 large-v3의 디코더를 줄여 추론 속도를 높였다고 설명한다. Whisper 자체는 실시간 state를 유지하는 네이티브 스트리밍 모델이 아니다. 기존 코드는 faster-whisper/CTranslate2였다. | [CTranslate2 GPU 지원](https://opennmt.net/CTranslate2/hardware_support.html)은 NVIDIA CUDA 중심이라 기존 faster-whisper GPU 설정을 AMD ROCm에서 그대로 쓸 수 없다. 대신 OpenAI PyTorch 구현은 이 PC ROCm에서 빠르게 실행됐다. 파일 전체 품질은 좋았지만 분할 경로에서 한 발화가 통째로 빠졌다. | **ROCm 기준선 실측 완료, 기본값 아님.** 전체 파일 CER 4.03%/RTF 0.193; 동일 3초 겹침+단어 시각 분할 CER 23.71%/RTF 0.259. |
 
 ### 왜 현재는 네이티브 스트리밍이 아닌가
@@ -146,7 +146,7 @@ FLEURS 원음과 결과는 `.samples/` 아래에 두어 Git에서 제외한다. 
 | 기존 고정 8초 비겹침 | RTF 0.239, CER 14.77%, 텍스트 중복 0, 마지막 1.37초 보존, 한 발화 전체 누락 |
 | pause-aware 3초 겹침 + word timestamps | 추론 29.399초, RTF 0.259, CER 23.71%, 마지막 25자 완전 일치, 중복 검출 0, 한 발화 전체 누락 |
 
-Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업처럼 짧은 독립 WAV를 시간으로 나눠 확정할 때의 누락이 Qwen보다 컸다. 따라서 현재 기본값으로 되돌리지 않았다.
+Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업처럼 짧은 독립 WAV를 시간으로 나눠 확정할 때의 누락이 Qwen보다 컸다. 따라서 현재 로컬 엔진으로 되돌리지 않았다.
 
 ## 구현 현황
 
@@ -201,7 +201,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - 네트워크·서버 혼잡·터널 지연처럼 재전송해도 안전한 오류는 동일 chunk UUID를 유지한 채 상한이 있는 지수 backoff 간격으로 횟수 제한 없이 큐 순서대로 재시도한다. 캡처는 계속되고 대기 음성이 IndexedDB에 쌓이므로 지연이 길면 브라우저 저장공간을 확인한다. 결과 수신 여부가 모호한 CLOVA 오류는 중복 기록·과금 가능성 때문에 이 자동 재시도 대상이 아니며 해당 조각을 명시적으로 보류한다.
 - 페이지가 정상적으로 실행 중인 동안의 일시적인 `AudioContext` `suspended`/`interrupted`와 live track `mute`는 수업을 끝내지 않고 입력 복구를 기다린다. mute가 오래 지속돼도 앱이 임의로 그래프를 닫지 않으며, 사용자가 **입력 복구 시도**를 누른 경우에만 같은 수업에서 입력 재연결로 전환한다. 영구적인 track `ended`/context `closed`도 수업·큐·누적 시간축을 끝내지 않고 사용자 동작으로 입력만 다시 연결하며, 실제 **종료**에서만 final 조각을 만든다.
 - 브라우저나 OS가 백그라운드 탭·화면 잠금 상태에서 프로세스나 마이크 캡처 자체를 멈춘 동안의 소리는 앱이 나중에 복구할 수 없다. 특히 모바일·태블릿에서는 수업 중 화면을 켜고 앱 탭을 전면에 유지하는 것을 권장하며, 재연결 뒤에는 중단 구간이 기록되지 않았음을 전제로 끝부분을 확인해야 한다.
-- 마이크 provider selector는 Qwen을 기본으로 하고 인증된 `/status`가 CLOVA configured를 true로 알린 경우에만 CLOVA를 연다. 선택은 localStorage에 저장하지 않고 로그아웃/계정 scrub과 새 노트에서 Qwen으로 돌아간다. system audio를 고르면 selector도 Qwen으로 고정된다. CLOVA 선택 화면에는 음성·결과의 NAVER 전송, 사용량 과금, 고객 Object Storage 자동 저장, 앱 삭제와 클라우드 삭제가 다르다는 내용을 표시한다.
+- 마이크 provider selector는 로그인 첫 인증된 `/status`가 CLOVA configured를 true로 알리면 CLOVA를 우선 선택하고, 미설정·상태 확인 실패 때는 Qwen을 사용한다. 사용자가 고른 마이크 provider는 localStorage에 저장하지 않고 해당 계정 세션에만 보존하며, system audio를 고른 동안 selector는 Qwen으로 고정했다가 마이크로 돌아오면 선호를 복원한다. 로그아웃·계정 scrub에서는 자동 선택으로 초기화한다. CLOVA 선택 화면에는 음성·결과의 NAVER 전송, 사용량 과금, 고객 Object Storage 자동 저장, 앱 삭제와 클라우드 삭제가 다르다는 내용을 표시한다.
 - lecture 생성 전에 provider를 session에 snapshot하고 생성 body와 모든 queued chunk에 유지한다. CLOVA는 한국어/영어 직접 선택만 허용한다. CLOVA 조각은 HTTP 요청 전에 IndexedDB에서 `queued → inflight`를 영속화하고, 응답 전 탭 종료나 네트워크/HTTP `424`처럼 결과가 모호한 경우 자동 retry 없이 해당 조각을 보류한다. 실패 WAV 보관과 위험을 명시한 수동 재전송만 제공하며 캡처와 후속 조각의 로컬 보관은 계속된다.
 - 새 음성 8초 이후 조용한 0.24초 지점을 찾고 전체 WAV 최대 15초, 이전 3초 overlap으로 자른다. 사용자 pause는 acknowledgement 전에 받은 새 PCM만 비최종 청크로 flush하고 worklet 입력을 버리는 상태로 바꾼다. resume은 같은 수업·누적 음성 시간축·3초 overlap으로 이어지며, stop 직후에는 overlap만 남아도 final guard 조각을 보내 마지막 확정을 요청한다.
 - pause 뒤 브라우저가 사라져 final guard를 잃은 미완료 수업은 기존 owner-only `recording-finalize`가 서버 WAV의 마지막 최대 3초를 overlap-only final로 한 번 재추론한다. 비공개 내부 sentinel chunk를 inference 전에 claim하고, GPU 대기 중 DB·recording lock을 놓으며, commit 직전 owner/deleting/pending/import와 WAV frame revision을 다시 확인한다. 완료/응답 유실 재요청은 같은 segment ID를 replay해 끝 문장을 중복하지 않는다.
@@ -243,7 +243,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 ### 현재 변경분에서 확인
 
 - 제한 없는 호스트 환경에서 `./.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v`: 서버/API/DB/설정/전사기/importer/녹음·후보정·관리자·터널·CLOVA fake 계약 152개가 27.349초에 모두 통과했다. CLOVA 계약에는 공식 영어 응답 형태의 띄어쓰기 보존과 한국어 overlap 부분 문자열 검사가 포함된다. 테스트가 의도적으로 만든 원본 삭제 실패 로그 외 실패·오류는 없었다.
-- VS Code Server의 Node.js 24.18.0으로 `node --test --test-isolation=none tests/*.test.mjs`: 앱 상태 93개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 130개가 모두 통과했다. 문서의 격리 실행 `node --test tests/*.test.mjs`도 4개 test file 모두 통과했다.
+- VS Code Server의 Node.js 24.18.0으로 `node --test --test-isolation=none tests/*.test.mjs`: 앱 상태 98개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 135개가 모두 통과했다. 로그인 첫 status 완료 전 작업공간 잠금과 status 401의 재인증 유지, 늦은 이전 status 응답 폐기, 설정된 CLOVA 자동 선택, 상태 실패 시 새 수업 Qwen fallback·회복, 명시적 Qwen 선호 보존, 시스템 소리 Qwen 고정, 진행 중 CLOVA 불변 계약을 포함한다. 문서의 격리 실행 `node --test tests/*.test.mjs`도 4개 test file 모두 통과했다.
 - 앱 테스트 대역도 실제 UUID·owner·provider·capture 시간축·CLOVA `inflight` 전이·final-last·영속 삭제 계약을 검사하도록 강화했고, PCM 없는 종료에 합성 final WAV를 넣지 않는다. 따라서 새 내구성 경로의 실패를 기대값만 완화해 숨기지 않았다.
 - Python 전체 compile, 웹/테스트 JavaScript 10개 파일 `node --check`, `git diff --check`, 비공개 경로 ignore 및 실제 구성 계정·키 값의 현재 공개 트리/기존 Git 이력 불포함을 확인했다. 운영 DB는 배포 전 ignored `.data/backups/`에 일관된 SQLite snapshot으로 백업했다.
 
@@ -279,7 +279,7 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 ### 아직 확인하지 못함
 
-- Windows Chrome의 네이티브 임시 프로필과 localhost 합성 WAV 하네스로 IndexedDB/Web Locks 실동작 확인을 시도했다. WSL UNC 프로필의 Chrome DB 잠금 오류는 Windows 네이티브 프로필로 분리했지만, `--dump-dom` 실행기가 비동기 완료 상태를 폴링하지 못해 제품 성공·실패를 판정할 결과 마커를 얻지 못했다. 운영 origin·계정·API에는 접근하지 않았고 제품 실패로 판정된 항목도 없다. 따라서 영속 IndexedDB 대기열의 페이지 재실행 복구, Web Locks의 두 탭 상호 배제, 새 Quick Tunnel 재로그인, AudioContext 재개와 영구 track 종료 뒤 입력 재연결을 함께 반복하는 실제 브라우저 장시간 시험은 아직 하지 않았다. 자동 상태/오디오 계약은 위 130개 Node 회귀에 포함된다.
+- Windows Chrome의 네이티브 임시 프로필과 localhost 합성 WAV 하네스로 IndexedDB/Web Locks 실동작 확인을 시도했다. WSL UNC 프로필의 Chrome DB 잠금 오류는 Windows 네이티브 프로필로 분리했지만, `--dump-dom` 실행기가 비동기 완료 상태를 폴링하지 못해 제품 성공·실패를 판정할 결과 마커를 얻지 못했다. 운영 origin·계정·API에는 접근하지 않았고 제품 실패로 판정된 항목도 없다. 따라서 영속 IndexedDB 대기열의 페이지 재실행 복구, Web Locks의 두 탭 상호 배제, 새 Quick Tunnel 재로그인, AudioContext 재개와 영구 track 종료 뒤 입력 재연결을 함께 반복하는 실제 브라우저 장시간 시험은 아직 하지 않았다. 자동 상태/오디오 계약은 위 135개 Node 회귀에 포함된다.
 - 사용자가 실제로 들을 45~90분 한국어 수업 샘플의 인식 품질
 - 교실 거리·잔향·잡음·여러 화자·전문용어 조건
 - 90분 연속 실행 중 thermal throttling과 WSL 공유 메모리 회수

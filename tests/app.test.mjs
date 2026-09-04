@@ -411,6 +411,12 @@ test('the selected computer-audio source is passed to capture without a precedin
   assert.equal(app.element('asr-provider').value, 'qwen');
   assert.equal(app.element('asr-provider').disabled, true);
   assert.match(app.element('provider-guidance').textContent, /항상 이 PC의 Qwen/);
+  app.element('audio-source').value = 'microphone';
+  app.element('audio-source').onchange();
+  assert.equal(app.element('asr-provider').value, 'clova',
+    'the explicit microphone preference survives a temporary system-audio selection');
+  app.element('audio-source').value = 'system';
+  app.element('audio-source').onchange();
   const starting = app.run('startRecording()');
   assert.equal(app.microphone().callbacks.source, 'system');
   assert.equal(requests.length, 0, 'capture is opened synchronously before lecture creation');
@@ -433,8 +439,12 @@ test('authenticated status enables only the advertised CLOVA choice and ignores 
     },
   }) : response({}));
   assert.equal(app.element('asr-provider').value,'qwen');
+  app.element('language').value = 'auto';
   await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'clova');
+  assert.equal(app.element('language').value,'ko');
   assert.equal(app.element('asr-provider-clova').disabled,false);
+  assert.match(app.element('asr-provider-clova').textContent,/기본/);
   assert.match(app.element('asr-provider-clova').textContent,/NAVER CLOVA Speech/);
   assert.doesNotMatch(app.element('asr-provider-clova').textContent,/untrusted|must-not-render/);
   assert.doesNotMatch(app.run('JSON.stringify(transcriptionProviders)'),/secret|label|must-not-render/);
@@ -451,18 +461,83 @@ test('authenticated status enables only the advertised CLOVA choice and ignores 
   assert.match(app.element('provider-privacy').textContent,/삭제해도 그 클라우드 사본은 삭제되지/);
 });
 
-test('an unavailable CLOVA provider cannot start capture and falls back only by an explicit UI selection', async () => {
+test('an unavailable CLOVA provider keeps an automatic new microphone lesson on Qwen', async () => {
   const app = setup(async url => url.endsWith('/status') ? response({
     model_state:'ready',transcription_providers:{qwen:{configured:true},clova:{configured:false}},
   }) : response({}));
   await app.run('updateStatus()');
   assert.equal(app.element('asr-provider-clova').disabled,true);
+  assert.equal(app.element('asr-provider').value,'qwen');
   app.element('asr-provider').value = 'clova';
   await app.run('startRecording()');
   assert.equal(app.microphone(),undefined);
   assert.equal(app.run('draft'),null);
   assert.match(app.element('notice').textContent,/설정되지 않았/);
   assert.equal(app.element('asr-provider').value,'clova','start does not silently switch engines');
+});
+
+test('the automatic microphone provider falls back on status failure and returns to CLOVA after recovery', async () => {
+  let state = 'ready';
+  const app = setup(async url => {
+    if (!url.endsWith('/status')) return response({});
+    if (state === 'failed') throw new TypeError('status unavailable');
+    return response({model_state:'ready',transcription_providers:{
+      qwen:{configured:true},clova:{configured:true},
+    }});
+  });
+
+  await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'clova');
+  state = 'failed';
+  await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'qwen');
+  assert.equal(app.run('micProviderPreference'),null);
+  state = 'ready';
+  await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'clova');
+});
+
+test('an older status response cannot overwrite a newer provider decision', async () => {
+  const first = deferred();
+  const second = deferred();
+  let calls = 0;
+  const app = setup(async url => {
+    if (!url.endsWith('/status')) return response({});
+    calls += 1;
+    return calls === 1 ? first.promise : second.promise;
+  });
+  const older = app.run('updateStatus()');
+  const newer = app.run('updateStatus()');
+  second.resolve(response({model_state:'ready',transcription_providers:{
+    qwen:{configured:true},clova:{configured:false},
+  }}));
+  await newer;
+  assert.equal(app.element('asr-provider').value,'qwen');
+  first.resolve(response({model_state:'ready',transcription_providers:{
+    qwen:{configured:true},clova:{configured:true},
+  }}));
+  await older;
+  assert.equal(app.element('asr-provider').value,'qwen');
+  assert.equal(app.run('transcriptionProviders.clova.configured'),false);
+});
+
+test('an explicit Qwen microphone preference survives polling, source changes, and a new note', async () => {
+  const app = setup(async url => url.endsWith('/status') ? response({
+    model_state:'ready',transcription_providers:{qwen:{configured:true},clova:{configured:true}},
+  }) : response({}));
+  await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'clova');
+  app.element('asr-provider').value = 'qwen';
+  app.element('asr-provider').onchange();
+  await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'qwen');
+  app.element('audio-source').value = 'system';
+  app.element('audio-source').onchange();
+  app.element('audio-source').value = 'microphone';
+  app.element('audio-source').onchange();
+  assert.equal(app.element('asr-provider').value,'qwen');
+  app.run('resetNewNote()');
+  assert.equal(app.element('asr-provider').value,'qwen');
 });
 
 test('a CLOVA microphone lecture snapshots its provider in creation and every queued chunk', async () => {
@@ -495,6 +570,29 @@ test('a CLOVA microphone lecture snapshots its provider in creation and every qu
   await app.run('stopRecording()');
   await tick(); await tick();
   assert.ok(requests.filter(request => request.url.includes('/chunks')).length >= 1);
+});
+
+test('a status failure never changes an in-progress CLOVA microphone session', async () => {
+  let statusFails = false;
+  const app = setup(async url => {
+    if (url.endsWith('/status')) {
+      if (statusFails) throw new TypeError('status unavailable');
+      return response({model_state:'ready',transcription_providers:{
+        qwen:{configured:true},clova:{configured:true},
+      }});
+    }
+    return response({segments:[]});
+  });
+  await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'clova');
+  await app.run('startRecording()');
+  assert.equal(app.run('captureSession.asrProvider'),'clova');
+  statusFails = true;
+  await app.run('updateStatus()');
+  assert.equal(app.run('captureSession.asrProvider'),'clova');
+  assert.equal(app.element('asr-provider').value,'clova');
+  app.microphone().tail = null;
+  await app.run('stopRecording()');
 });
 
 test('a mismatched server lecture provider blocks upload without ending capture', async () => {
@@ -2056,10 +2154,12 @@ test('a late unauthorized response cannot log out a newer login', async () => {
 
 test('the workspace stays hidden until login history and import recovery finish', async () => {
   const imports = deferred();
+  const status = deferred();
   const app = setup((url) => {
     if (url.endsWith('/auth/login')) return response({token:'fresh-token',user:{username:'user-alpha'}});
     if (url.endsWith('/lectures')) return response([]);
     if (url.endsWith('/imports')) return imports.promise;
+    if (url.endsWith('/status')) return status.promise;
     return response({});
   });
   app.element('auth-screen').hidden = false;
@@ -2072,11 +2172,36 @@ test('the workspace stays hidden until login history and import recovery finish'
   assert.equal(app.element('auth-screen').hidden, false);
   assert.equal(app.element('workspace').hidden, true);
   imports.resolve(response([]));
+  await tick(); await tick();
+  assert.equal(app.run('authenticating'), true);
+  assert.equal(app.element('workspace').hidden, true,
+    'the first provider status must settle before recording can be enabled');
+  status.resolve(response({model_state:'ready',transcription_providers:{
+    qwen:{configured:true},clova:{configured:true},
+  }}));
   await submitting;
   assert.equal(app.element('auth-screen').hidden, true);
   assert.equal(app.element('workspace').hidden, false);
+  assert.equal(app.element('asr-provider').value,'clova');
   assert.equal(app.element('record-button').disabled, false);
   assert.equal(app.element('recording-file').disabled, false);
+});
+
+test('a rejected first provider status cannot expose an authenticated workspace', async () => {
+  const app = setup((url) => {
+    if (url.endsWith('/auth/login')) return response({token:'fresh-token',user:{username:'user-alpha'}});
+    if (url.endsWith('/lectures') || url.endsWith('/imports')) return response([]);
+    if (url.endsWith('/status')) return response({detail:'expired'},401);
+    return response({});
+  });
+  app.element('auth-screen').hidden = false;
+  app.element('workspace').hidden = true;
+  app.element('username').value = 'user-alpha';
+  app.element('password').value = 'valid-password';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  assert.equal(app.run('token'),'');
+  assert.equal(app.element('auth-screen').hidden,false);
+  assert.equal(app.element('workspace').hidden,true);
 });
 
 test('a different account may log in after expiry when no unsent audio is owner-locked', async () => {

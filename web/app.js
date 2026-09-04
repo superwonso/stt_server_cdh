@@ -14,7 +14,7 @@ let capture = null, recording = false, paused = false, starting = false, pausing
 let pending = [], sendError = '', sampleSeconds = 0, timer = null, requestGeneration = 0;
 let draft = null, captureSession = null, pausePromise = null, resumePromise = null, stopPromise = null;
 let elapsedActiveMs = 0, elapsedStartedAt = 0;
-let noticeTimer, statusTimer, retryTimer = null, retryAttempt = 0, retryMessage = '';
+let noticeTimer, statusTimer, statusSequence = 0, retryTimer = null, retryAttempt = 0, retryMessage = '';
 let captureWarning = '';
 let inputUnavailable = false, inputReconnectNeeded = false, inputUnavailableMessage = '';
 let liveQueue = null, liveQueueReady = null, liveQueueAvailable = false;
@@ -46,6 +46,11 @@ let presenceLastSent = '', presenceQueued = '', lastPresenceInteraction = Date.n
 let connectionState = 'unverified', verifiedApiUrl = '', verifiedApiExpiresAt = 0;
 let connectionGeneration = 0, connectionController = null, connectionLeaseTimer = null, leaseRefreshPromise = null;
 let transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
+// null means "automatic": prefer CLOVA for a new microphone lesson when the
+// authenticated server advertises it, otherwise stay on the local Qwen path.
+// Keep an explicit user choice only in this account session; never persist it
+// in shared browser storage or let status polling rewrite an active lecture.
+let micProviderPreference = null;
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30000;
 const MAX_RECORDING_FINALIZE_CONTENTION_RETRIES = 8;
@@ -1065,6 +1070,7 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
   if (!pending.length) { sendError = ''; clearUploadRetry(); }
   $('recording-file').value = '';
   transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
+  micProviderPreference = null;
   $('lecture-title').value = ''; $('language').value = 'ko'; $('audio-source').value = 'microphone';
   $('asr-provider').value = 'qwen'; $('asr-provider-clova').disabled = true;
   $('asr-provider-clova').textContent = 'NAVER CLOVA Speech · 서버 설정 필요';
@@ -1228,6 +1234,12 @@ $('auth-form').onsubmit = async event => {
       await recoverFileImport();
     } catch (error) { notice(errorText(error)); }
     if (!token) return;
+    // Resolve the authenticated provider list before enabling the workspace.
+    // Otherwise a fast first click could start Qwen while the CLOVA-default
+    // status request is still in flight.
+    const statusToken = token, statusUser = user;
+    await updateStatus();
+    if (!token || token !== statusToken || user !== statusUser || apiUrl !== authServer) return;
     $('auth-capture-stop').hidden = true;
     $('auth-screen').hidden = true; $('workspace').hidden = false; $('current-user').textContent = user;
     document.querySelector('.user-avatar').textContent = user[0].toUpperCase();
@@ -1235,7 +1247,7 @@ $('auth-form').onsubmit = async event => {
     if (current?.id && current.recording_finalized === true && current.segments?.length) void loadCorrection(current.id);
     startPresence();
     if (response.user?.is_admin !== false) void loadAdminOverview({probe:true});
-    void updateStatus(); clearInterval(statusTimer); statusTimer = setInterval(updateStatus, 20000);
+    clearInterval(statusTimer); statusTimer = setInterval(updateStatus, 20000);
     if (pending.length || draft) {
       if (clovaManualRetryRequired()) {
         notice('CLOVA 대기 음성은 중복 기록과 추가 과금을 막기 위해 자동 재전송하지 않았어요. 안내를 확인한 뒤 직접 선택해 주세요.');
@@ -1252,8 +1264,12 @@ $('auth-form').onsubmit = async event => {
 };
 async function updateStatus() {
   if (!token) return;
+  const sequence = ++statusSequence, statusToken = token, statusUser = user, statusServer = apiUrl;
+  const requestIsCurrent = () => sequence === statusSequence && token === statusToken
+    && user === statusUser && apiUrl === statusServer;
   try {
     const status = await api('/status');
+    if (!requestIsCurrent()) return;
     const advertised = status?.transcription_providers;
     const qwenConfigured = advertised?.qwen?.configured !== false;
     const clovaConfigured = advertised?.clova?.configured === true;
@@ -1261,13 +1277,16 @@ async function updateStatus() {
     $('asr-provider-qwen').disabled = !qwenConfigured;
     $('asr-provider-clova').disabled = !clovaConfigured;
     $('asr-provider-clova').textContent = clovaConfigured
-      ? 'NAVER CLOVA Speech · 클라우드' : 'NAVER CLOVA Speech · 서버 설정 필요';
+      ? 'NAVER CLOVA Speech · 클라우드 · 기본' : 'NAVER CLOVA Speech · 서버 설정 필요';
+    applyNewLectureProvider();
     $('model-status').textContent = ({unloaded:'첫 받아쓰기 준비됨',loading:'음성 인식 모델 준비 중',ready:'음성 인식 모델 연결됨',error:'음성 인식 모델 확인 필요'})[status.model_state] || '서버 연결됨';
     updateProviderGuidance(); updateControls();
   } catch {
+    if (!requestIsCurrent()) return;
     transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
     $('asr-provider-qwen').disabled = false; $('asr-provider-clova').disabled = true;
     $('asr-provider-clova').textContent = 'NAVER CLOVA Speech · 서버 설정 필요';
+    applyNewLectureProvider();
     updateProviderGuidance(); updateControls();
     $('model-status').textContent = '서버 연결 확인 필요';
   }
@@ -2415,6 +2434,19 @@ function renderCurrent() {
 }
 function selectedCaptureSource() { return $('audio-source').value === 'system' ? 'system' : 'microphone'; }
 function selectedAsrProvider() { return $('asr-provider').value === 'clova' ? 'clova' : 'qwen'; }
+function preferredMicrophoneProvider() {
+  if (micProviderPreference === 'qwen') return 'qwen';
+  if (transcriptionProviders.clova.configured) return 'clova';
+  return 'qwen';
+}
+function applyNewLectureProvider() {
+  // Historical and in-progress lectures display their immutable persisted
+  // provider. Only reconcile the controls for a genuinely new lecture.
+  if (current || captureSession || draft) return;
+  $('asr-provider').value = selectedCaptureSource() === 'system'
+    ? 'qwen' : preferredMicrophoneProvider();
+  enforceClovaLanguage(false);
+}
 function displayedAsrProvider() {
   if (current) return current.asr_provider === 'clova' ? 'clova' : 'qwen';
   if (captureSession?.asrProvider) return captureSession.asrProvider === 'clova' ? 'clova' : 'qwen';
@@ -2445,7 +2477,7 @@ function enforceClovaLanguage(announce = false) {
 }
 function updateSourceGuidance() {
   const system = selectedCaptureSource() === 'system';
-  if (system && !current) $('asr-provider').value = 'qwen';
+  if (!current) applyNewLectureProvider();
   $('source-guidance').textContent = system
     ? '데스크톱 Chrome·Edge에서 탭·화면과 오디오 공유를 켜세요. 선택 범위의 알림이나 다른 앱 소리도 함께 들어갈 수 있으며, 화면 영상은 서버로 보내지 않습니다.'
     : '마이크로 주변의 수업 소리를 받아씁니다.';
@@ -2453,7 +2485,10 @@ function updateSourceGuidance() {
   updateProviderGuidance();
 }
 $('audio-source').onchange = () => { updateSourceGuidance(); updateControls(); };
-$('asr-provider').onchange = () => { enforceClovaLanguage(true); updateProviderGuidance(); updateControls(); };
+$('asr-provider').onchange = () => {
+  micProviderPreference = selectedAsrProvider();
+  enforceClovaLanguage(true); updateProviderGuidance(); updateControls();
+};
 $('language').onchange = () => { enforceClovaLanguage(true); updateControls(); };
 function resetNewNote({ focus = false } = {}) {
   ++requestGeneration;
@@ -2461,7 +2496,6 @@ function resetNewNote({ focus = false } = {}) {
   current = null; lectureDateFilter = ''; sampleSeconds = 0; elapsedActiveMs = 0; elapsedStartedAt = 0;
   $('lecture-title').value = '';
   $('language').value = 'ko';
-  $('asr-provider').value = 'qwen';
   $('elapsed').textContent = '00:00';
   updateSourceGuidance();
   renderCurrent(); renderHistory();
