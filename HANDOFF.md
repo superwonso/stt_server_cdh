@@ -297,6 +297,8 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 후보정 구현 커밋 `ea1a934`의 Pages 실행 `33780005582`가 성공했다. 공개 `index.html`, JavaScript, CSS, favicon 7개를 로컬 파일과 SHA-256으로 비교해 모두 일치했고, 런타임 설정도 현재 터널을 `online`으로 가리켰다. 같은 외부 edge에서 health 200, 무인증 후보정 401, 외부 Origin 403, Pages Origin CORS 허용을 다시 확인했다.
 
+관리자 콘솔 구현 커밋 `df7203d`도 `main`에 push했다. Pages push 실행 `33829281812`와 현재 터널 런타임 설정 재게시 실행 `33829478729`가 모두 성공했다. 새 관리자 설정으로 로컬 Qwen 서버를 warmup 재시작한 뒤 외부 edge health 200, 무인증 관리자 API 401, 허용하지 않은 Origin 403, Pages Origin의 presence preflight 허용을 확인했다. 공개 자산 7개는 로컬 `web/`과 byte-for-byte 일치했고, 공개 `config.json`은 현재 tunnel origin과 일치하며 만료 전이고 `version/state/apiUrl/publishedAt/expiresAt` 외 필드가 없었다. 관리자 비밀번호를 보거나 운영 DB에 시험 세션을 주입하지 않았으므로 실제 관리자 로그인 뒤 dialog 조작은 사용자 브라우저 확인 범위로 남긴다.
+
 푸시 전에 반드시 확인할 것:
 
 - 평탄화 잔여 루트 파일이 staging에 없음
