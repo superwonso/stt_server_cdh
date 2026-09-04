@@ -347,6 +347,8 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 같은 날 사용자의 요청으로 세 번째 구성 계정의 초대를 다시 발급했다. 변경 전 DB는 `.data/backups/pre-account3-invite-reset-20260904.sqlite3`에 보존했고, 해당 계정의 자격정보·세션·설정 상태만 초기화했으며 기존 수업은 보존했다. 새 일회용 링크는 권한 `0600`의 `.data/invitations.txt`에만 있고 이전 링크와 비밀번호는 무효다. 이 작업에서는 실행 중 서버와 터널을 중단하거나 재시작하지 않았다.
 
+2026-09-04 실시간 영속 대기열·입력 재연결·탭 간 잠금·선택형 CLOVA 구현 커밋 `5489afd`를 `main`에 push했고 Pages 실행 `33860357377`이 성공했다. 적용 전 운영 DB는 `.data/backups/pre-durable-queue-clova-deploy-20260904.sqlite3`에 권한 `0600`으로 백업했다. 최종 Python 회귀 152개와 Node 회귀 130개, Python/JavaScript/Bash 구문 및 `git diff --check`를 통과했다. API 서버를 최종 코드로 Qwen warmup 재시작했고 DB schema v6, integrity, FK, 대기 chunk/import/correction 0건을 읽기 전용으로 확인했다. 공개 자산 9개는 로컬 `web/`과 byte-for-byte 일치하고, 공개 `config.json`은 허용된 다섯 필드만 가지며 현재 tunnel origin과 일치하고 만료 전이었다. 외부 edge에서 health 200, 무인증 수업 API 401, 허용하지 않은 Origin 403, Pages Origin의 authorization 포함 preflight 허용을 확인했다. 이 프로젝트를 같은 loopback API에 노출하던 이전 고아 cloudflared 하나는 정확한 PID·cwd·고정 target을 확인한 뒤 SIGTERM으로 종료했고, 현재 관리되는 터널 하나와 외부 health 200을 다시 확인했다. CLOVA 비밀 키는 아직 운영 설정에 없으므로 화면에서 해당 선택은 비활성이고 실계정 gRPC 호출은 검증하지 않았다.
+
 푸시 전에 반드시 확인할 것:
 
 - 평탄화 잔여 루트 파일이 staging에 없음
