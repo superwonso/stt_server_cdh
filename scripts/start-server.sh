@@ -215,6 +215,9 @@ import socket
 import sys
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    # Match uvicorn: closed connections in TIME_WAIT must not block restart.
+    # SO_REUSEADDR still refuses a port held by an active listening socket.
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", int(sys.argv[1])))
 PY
 }

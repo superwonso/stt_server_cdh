@@ -18,7 +18,9 @@ CLOVA 선택 시 경로는 `브라우저 → Cloudflare → 이 PC → clovaspee
 
 CLOVA를 마이크 화면의 기본 선택으로 둔 것은 실제 같은 수업 음성에서 Qwen보다 항상 정확하다고 검증한 결론이 아니라 사용자의 운영 선택이다. Qwen은 대상 Radeon/ROCm에서 실제 한국어 음성을 실시간보다 빠르게 처리했고, 현재 3초 겹침 경로가 짧은 낭독 시험에서 CER 4.03%, 마지막 기준 25자 완전 일치, 탐지된 텍스트 중복 0건을 냈으므로 CLOVA 미설정·상태 확인 실패의 로컬 대안과 화면 소리·파일 변환 엔진으로 유지한다. 서로 독립적으로 인식한 Qwen 청크의 정렬 시각은 흔들릴 수 있으므로 실제 수업에서 exactly-once를 수학적으로 보장하지 않는다.
 
-보존 WAV를 이 PC에 영구 보관하지 않고 운영자의 개인 Gmail My Drive로 옮기는 선택형 archive를 추가했다. 완료된 WAV를 로컬 staging에 두고 재개 가능 업로드한 뒤 크기·MD5·SHA-256을 검증해야만 로컬 사본을 삭제한다. 녹음은 `STT 수업 녹음/<runtime account ID>/<lecture UUID>.wav`로 분리한다. 실제 계정 ID 목록은 GitHub/Pages에 게시하지 않고 Drive appProperties·archive 메타데이터/다운로드 URL·집계 CLI에도 넣지 않으며, 비공개 Drive 폴더명과 인증된 본인/관리자 화면·해당 기기의 로컬 대기열에서만 운영상 사용한다. 인증·업로드·검증·폴더 이동 오류에서는 로컬 WAV를 보존하고 상태를 재시도 또는 수동 확인으로 남긴다. 이 기능은 녹음만 옮기며 DB·계정·텍스트는 이 PC에 남는다. 실제 개인 Gmail OAuth, 첫 1건 keep-local 업로드와 사용자 수동 재생, 사용자 폴더 3개로의 전체 10건 이전·전수 재검증·로컬 정리까지 완료했다. 최신 API 서버도 Qwen warmup으로 재기동했고 로컬/외부 health 200이며, GitHub 푸시·Pages 배포는 하지 않았다.
+보존 WAV를 운영자의 개인 Gmail My Drive로 옮기는 선택형 archive를 추가했다. 완료된 WAV를 로컬 staging에 두고 재개 가능 업로드한 뒤 크기·MD5·SHA-256을 검증해야만 로컬 사본을 삭제한다. 녹음은 `STT 수업 녹음/<runtime account ID>/<lecture UUID>.wav`로 분리한다. 실제 계정 ID 목록은 GitHub/Pages에 게시하지 않고 Drive appProperties·archive 메타데이터/다운로드 URL·집계 CLI에도 넣지 않으며, 비공개 Drive 폴더명과 인증된 본인/관리자 화면·개인 초대 링크·해당 기기의 로컬 대기열에서만 운영상 사용한다. 인증·업로드·검증·폴더 이동 오류에서는 로컬 WAV를 보존하고 상태를 재시도 또는 수동 확인으로 남긴다. 이 기능은 녹음만 옮기며 DB·계정·텍스트는 이 PC에 남는다.
+
+실제 개인 Gmail OAuth, 첫 1건 keep-local 업로드와 사용자 수동 재생, 사용자 폴더 3개로의 전체 10건 이전·전수 재검증·로컬 정리를 완료했다. Drive 구현 `aaffb4e`를 main에 푸시했고 Pages 실행 `33950879705`가 성공했다. API도 Qwen warmup으로 재시작해 로컬/외부 health 200과 공개 자산 9개의 byte-for-byte 일치를 확인했다. 이후 종료 직후 TIME_WAIT를 잘못 점유로 판단하던 시작 스크립트도 보완했다. 최신 검증 결과와 남은 범위는 아래에서 구분한다.
 
 VibeVoice-ASR-Streaming-7B는 이 PC에서도 BF16/SDPA로 실제 로드되고 공식 live-state API로 7분 52초를 완주했다. 2.9초 청크와 0.5초 lookahead, 이전 음성·텍스트 문맥, 화자 라벨을 한 세션에서 유지하는 점은 회의·수업에 매력적이다. 그러나 공개 체크포인트의 목표 세션이 최대 8분이고, 실측에서도 KV가 1,702→6,574토큰, GPU reserved가 16.59→22.19 GiB로 증가했다. 최근 10청크 평균 연산도 2분 2.15초에서 종료 시 3.25초로 늘어 2.933초 입력 간격을 넘었다. 따라서 45~90분 수업 기본값으로 두지 않았다. 8분마다 상태를 끊으면 실행은 가능할 수 있지만 화자 일관성과 장기 문맥이라는 장점도 함께 끊긴다.
 
@@ -258,7 +260,15 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 ## 검증 범위
 
-### 현재 변경분에서 확인
+### 최신 릴리스에서 확인
+
+- Python 전체 274개(37.491초), Node 전체 136개(1.796초), Python/JavaScript/Bash 구문과 diff 검사가 통과했다. 최초 Drive 업로드 전 삭제 경계 3개와 실제 운영 포트와 분리한 ephemeral socket 재시작 회귀 3개를 추가했다.
+- 실제 Drive 메타데이터 10건, 표본 1건 전체·Range 재조립 checksum과 연결 조기 종료 후 재다운로드를 확인했다. 실계정 업로드·폴더 이전·전수 메타데이터 검증은 앞선 이전 단계에서 완료했다. 이번 릴리스에서는 기존 녹음을 수정하거나 삭제하지 않았다.
+- API 재시작 후 local/external health 200, 무인증 `/status` 401, 잘못된 Origin 403, Pages CORS preflight 200, runtime config의 현재 tunnel·online·만료 전 일치와 공개 자산 9개 byte-for-byte 일치를 확인했다. `.nojekyll`은 Pages 제어 파일이므로 공개 브라우저 자산 비교 대상에서 제외한다.
+- 비공개 계정·env/DB/OAuth 값 41개를 릴리스 후보 파일과 reachable Git history 전체에 대조해 일치 0이었다. 개인정보·키·녹음·개인 수업은 staging에 포함하지 않았다. 아래 이전 단계의 미푸시 문구는 당시 체크포인트를 뜻하며 최신 배포 상태가 아니다.
+- ASR 코드 검토는 [ASR_REVIEW.md](ASR_REVIEW.md)에 기록했다. 모델·ASR 처리 방식은 바꾸지 않았으며, 개선안에 대한 새 실음성 정확도·브라우저 종단 지연·장시간 평가는 하지 않았다.
+
+### Drive 구현 직후 확인 (릴리스 전 기록)
 
 - 제한 없는 호스트 환경에서 `./.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -q`: 서버/API/DB/설정/전사기/importer/녹음·후보정·관리자·터널·CLOVA·Google Drive 계약 268개가 36.307초에 모두 통과했다. 이 체크포인트의 Drive/CLI 집중 계약은 OAuth 최소 scope·비밀 파일 권한, checksum, resumable 재개/응답 유실, Gmail/client binding, 404 fail-closed, 8일 session inactivity, 사용자별 폴더·기존 루트 파일 이동·이동 응답 유실, 동시 유지보수 경합, PID 파일이 유실된 서버 탐지, Range·disconnect close, startup 비차단, owner 격리, 휴지통-before-DB 삭제를 포함한다.
 - 실제 Secret Key와 Basic 스트리밍 도메인으로 공개 KSS 한국어 낭독 12.645초를 보냈고, 대기하지 않고 clock을 강제로 241초 전진시켜 4분 rotation 경로를 실행했다. 최종 코드의 wall time은 12.281초, native transport는 2개였으며 두 번째 스트림이 overlap 안의 `이다.`를 회수해 목표 문장이 전체 결과에 정확히 한 번 남았다. final 뒤 adapter의 활성 session과 reader thread는 모두 0이었다. 이는 짧은 단일 화자·강제 시각 시험이지 자연 경과 4분 또는 장시간 수업 시험은 아니다.
@@ -391,6 +401,10 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 - 기존 원격 파일 10개의 크기·MD5·SHA-256 appProperty·object·사용자 parent를 다시 확인했다. 표본 1개(255,446바이트)는 실제 전체 다운로드 SHA-256, 두 HTTP Range의 재조립 SHA-256, 조기 연결 종료 후 재다운로드가 모두 통과했다. 녹음을 출력·수정·삭제하지 않았다. 이는 서버의 Drive storage 계층 실통신 검증이며, 실제 로그인 브라우저에서 API 티켓을 받아 다운로드·삭제하는 end-to-end 시험과는 다르다.
 - 운영 DB schema v9, integrity ok/FK 오류 0, ready 10개/사용자 폴더 3개, pending chunk/import/correction/deleting/미완료 수업 0, 로컬 WAV 0개를 읽기 전용으로 확인했다. 배포 직전 `.data/backups/pre-drive-release-20260905.sqlite3`에 일관된 private DB 백업을 추가했다.
 - 정확도·실시간성 검토 결과는 [ASR_REVIEW.md](ASR_REVIEW.md)에 있다. CLOVA 전송 전 실패의 안전한 자동 복구, 전문용어 사전, IndexedDB 정리 전 결과 표시, Qwen 경계 보강과 CLOVA 전송·확정 분리를 제안했다. ASR 동작은 이번 배포에서 바꾸지 않았고 새 유료 ASR 호출·실음성 정확도 평가를 하지 않았다.
+
+### Google Drive 배포와 재시작 결과 (2026-09-05)
+
+구현 커밋 `aaffb4e`와 Pages 실행 `33950879705`가 성공했고, 배포된 자산 9개와 현재 API 연결·접근 차단을 위와 같이 확인했다. API는 대기·처리 중 작업과 미완료 수업이 모두 0인 상태에서 정상 SIGTERM 종료 후 Qwen warmup으로 재시작했다. 직후 TCP TIME_WAIT 때문에 기존 포트 사전검사가 잘못 실패하는 현상을 확인했다. 실제 listener가 없음을 확인하고 서버를 다시 켠 뒤, uvicorn과 동일하게 probe에 `SO_REUSEADDR`를 설정했다. 임시 포트 회귀에서 기존 probe 실패·수정 probe 성공과 활성 listener 거절을 모두 확인했다. 운영 서버를 반복 재시작해 시험하지는 않았다. SQLite schema v9/integrity ok/FK 0, Drive ready 10/사용자 폴더 3/로컬 WAV 0 상태는 유지됐다.
 
 ## 다음 단계 우선순위
 
