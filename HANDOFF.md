@@ -353,6 +353,8 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 
 2026-09-05 새 마이크 수업에서 CLOVA를 우선하는 `d2505ec`와 경계 continuity/reconciliation 보완 `93ebcfa`를 `main`에 push했다. Pages push 실행 `33891354210`과 현재 Quick Tunnel 주소를 게시한 workflow dispatch 실행 `33891506118`이 모두 같은 `93ebcfa`에서 성공했다. 최신 코드로 API 서버를 Qwen fallback warmup과 함께 재시작했고 Quick Tunnel을 연결했다. 로컬/외부 health 200, 무인증 `/status` 401, 허용하지 않은 Origin 403, Pages runtime config의 현재 tunnel origin·online lease 일치와 공개 정적 파일 9개의 byte-for-byte 일치를 확인했다. 실제 Basic/KSS 강제 rotation 결과는 ignored `.data/test-results/`에 권한 `0600`으로만 두었고, 비밀 키·계정 ID·음성은 추적 파일에 추가하지 않았다. 위 2026-09-04 문단의 CLOVA 미설정·실계정 미검증 내용은 당시 배포 상태를 기록한 것이며 현재 상태를 뜻하지 않는다.
 
+같은 날 최종 사용자에게 비용이 청구되는 것처럼 보이던 CLOVA 문구를 `cfa8e79`에서 제거하고, 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인과 운영자가 연결한 Object Storage라는 설명으로 바꿨다. 운영자용 README의 요금 정보에는 앱 사용자가 아니라 운영자 계정에 청구된다고 명시했다. Pages 실행 `33935173634`가 성공했고 배포본 `index.html`·`app.js`에서 최종 사용자 과금 문구 없음과 운영자 계정 고지를 직접 확인했다. 공개 파일 9개 일치, runtime config 일치, local/external health 200, 무인증 `/status` 401, 잘못된 Origin 403을 재확인했으며 API도 같은 커밋으로 재시작했다.
+
 푸시 전에 반드시 확인할 것:
 
 - 평탄화 잔여 루트 파일이 staging에 없음
