@@ -227,7 +227,8 @@ class AdminApiTests(unittest.TestCase):
         self.assertTrue(result["access"]["enabled"])
         self.assertEqual(result["server"]["state"], "online")
         self.assertEqual(result["server"]["model"], "fake-model")
-        self.assertEqual(result["queues"], {"transcription": 1, "imports": 1, "corrections": 1})
+        self.assertEqual(result["queues"], {"transcription": 1, "imports": 1, "corrections": 1,
+                                          "summaries": 0, "translations": 0})
         self.assertEqual(result["tunnel"]["state"], "online")
         self.assertEqual(
             set(result["tunnel"]),
@@ -250,7 +251,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(accounts["user-beta"]["activity"], "transcribing")
         self.assertEqual(
             accounts["user-beta"]["jobs"],
-            {"transcription": 1, "imports": 1, "corrections": 1},
+            {"transcription": 1, "imports": 1, "corrections": 1, "summaries": 0, "translations": 0},
         )
         self.assertNotEqual(accounts["user-beta"]["account_id"], "user-beta")
         self.assertEqual(result["recent_audit"], [])
@@ -265,6 +266,38 @@ class AdminApiTests(unittest.TestCase):
             "must-not-be-returned",
         ):
             self.assertNotIn(private_value, serialized)
+
+    def test_summary_and_translation_counts_are_owned_and_exclude_terminal_jobs(self):
+        rows = (
+            ("lecture_summaries", "summary_json", "user-beta", "queued"),
+            ("lecture_translations", "translation_json", "user-gamma", "processing"),
+            ("lecture_summaries", "summary_json", "user-alpha", "completed"),
+            ("lecture_translations", "translation_json", "user-alpha", "failed"),
+        )
+        private_ids = []
+        with self.app.state.database.connect() as connection:
+            for table, payload_column, username, state in rows:
+                lecture_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+                private_ids.extend((lecture_id, job_id))
+                connection.execute("INSERT INTO lectures(id,username,title,created_at) VALUES(?,?,'PRIVATE-JOB-TITLE','now')",
+                                   (lecture_id, username))
+                connection.execute(
+                    f"INSERT INTO {table}(lecture_id,job_id,raw_revision,status,model,{payload_column},created_at,updated_at,completed_at) "
+                    "VALUES(?,?,?,?,?,?, 'now','now',?)",
+                    (lecture_id, job_id, "a" * 64, state, "PRIVATE-JOB-MODEL",
+                     '{"private":"PRIVATE-JOB-CONTENT"}' if state == "completed" else None,
+                     "now" if state == "completed" else None),
+                )
+        response = self.client.get("/admin/overview", headers=self.headers())
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["queues"], {"transcription": 0, "imports": 0, "corrections": 0,
+                                          "summaries": 1, "translations": 1})
+        accounts = {account["label"]: account for account in result["accounts"]}
+        for username, expected in (("user-alpha", (0, 0)), ("user-beta", (1, 0)), ("user-gamma", (0, 1))):
+            self.assertEqual((accounts[username]["jobs"]["summaries"], accounts[username]["jobs"]["translations"]), expected)
+        for secret in (*private_ids, "PRIVATE-JOB-TITLE", "PRIVATE-JOB-MODEL", "PRIVATE-JOB-CONTENT"):
+            self.assertNotIn(secret, response.text)
 
     def test_third_account_is_listed_but_remains_data_isolated_and_non_admin(self):
         created = self.client.post(

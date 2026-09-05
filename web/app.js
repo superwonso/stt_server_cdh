@@ -1,6 +1,7 @@
 import { MicrophoneCapture } from './audio.js';
 import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';
 import { liveCoordination } from './live-coordination.js';
+import { TabAuthSessionStore } from './auth-session.js';
 import {
   DurableLiveQueue,
   estimateStorage,
@@ -10,6 +11,9 @@ import {
 
 const $ = id => document.getElementById(id);
 let apiUrl = '', token = '', user = '', activation = false, lectures = [], current = null;
+const authSessionStore = new TabAuthSessionStore();
+let authSessionExpiresAt = 0, authSessionExpiryTimer = null;
+let authRestoreSequence = 0, authRestoreController = null, authRestorePromise = null;
 let capture = null, recording = false, paused = false, starting = false, pausing = false, resuming = false, stopping = false, sending = false, authenticating = false, loggingOut = false;
 let pending = [], sendError = '', sampleSeconds = 0, timer = null, requestGeneration = 0;
 let draft = null, captureSession = null, pausePromise = null, resumePromise = null, stopPromise = null;
@@ -46,6 +50,7 @@ let presenceLastSent = '', presenceQueued = '', lastPresenceInteraction = Date.n
 let connectionState = 'unverified', verifiedApiUrl = '', verifiedApiExpiresAt = 0;
 let connectionGeneration = 0, connectionController = null, connectionLeaseTimer = null, leaseRefreshPromise = null;
 let transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
+let transcriptRenderState = {scope:'',rows:new Map()};
 // null means "automatic": prefer CLOVA for a new microphone lesson when the
 // authenticated server advertises it, otherwise stay on the local Qwen path.
 // Keep an explicit user choice only in this account session; never persist it
@@ -57,6 +62,8 @@ const MAX_RECORDING_FINALIZE_CONTENTION_RETRIES = 8;
 const RETRYABLE_UPLOAD_STATUSES = new Set([408, 425, 429]);
 const PERMANENT_UPLOAD_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 424, 507]);
 const UPLOAD_TIMEOUT_MS = 60000;
+const MAX_CLOVA_RESULT_POLLS = 6;
+const CLOVA_RESULT_POLL_DEADLINE_MS = 120000;
 const CONFIG_TIMEOUT_MS = 8000;
 const RUNTIME_CONFIG_TTL_MS = 24 * 60 * 60 * 1000;
 const CONFIG_CLOCK_SKEW_MS = 5 * 60 * 1000;
@@ -401,7 +408,7 @@ async function acknowledgePendingChunk(chunk, { strict = false } = {}) {
   let lastError = null;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
-      const result = await liveQueue.ackChunk(chunk.owner,chunk.id);
+      const result = await liveQueue.ackChunk(chunk.owner,chunk.id,{serverConfirmed:chunk.serverConfirmed === true});
       liveQueueBytes = Math.max(0,liveQueueBytes - (result?.chunk?.byteLength || chunk.byteLength || 0));
       return;
     } catch (error) {
@@ -538,6 +545,8 @@ async function performDurableLiveAudioRecovery(owner) {
       existing.byteLength = stored.byteLength;
       existing.blocked = stored.state === 'blocked' || stored.state === 'inflight';
       existing.inflight = stored.state === 'inflight';
+      existing.recoveryOnly = stored.asrProvider === 'clova' && existing.blocked;
+      if (existing.recoveryOnly) { existing.resultPolls = 0; existing.resultPollDeadline = 0; }
       existing.downloadRequested = existing.downloadRequested || stored.downloadRequested;
       existing.lectureReady = !!session?.lecture;
       continue;
@@ -566,6 +575,7 @@ async function performDurableLiveAudioRecovery(owner) {
       persistPromise:Promise.resolve(),
       blocked:stored.state === 'blocked' || stored.state === 'inflight',
       inflight:stored.state === 'inflight',
+      recoveryOnly:stored.asrProvider === 'clova' && ['blocked','inflight'].includes(stored.state),
     });
   }
   const recoveredSessionCreatedAt = new Map(recovered.sessions.map(item => [item.id,item.createdAt]));
@@ -622,7 +632,10 @@ async function performDurableLiveAudioRecovery(owner) {
     }
   }
   const blocked = pending[0]?.owner === owner && pending[0].blocked ? pending[0] : null;
-  if (blocked && !sendError) {
+  if (blocked?.recoveryOnly) {
+    sendError = '';
+    retryMessage = '기기에 남아 있는 음성의 서버 저장 결과를 확인합니다.';
+  } else if (blocked && !sendError) {
     sendError = blocked.inflight
       ? '브라우저가 닫히기 직전에 보낸 CLOVA 음성은 처리 여부를 확인할 수 없어 자동 재전송하지 않았어요.'
       : blocked.asrProvider === 'clova'
@@ -667,8 +680,46 @@ function nativeDownloadUrl(value, server = apiUrl) {
   return url.href;
 }
 function setServer(value) { apiUrl = normalizeUrl(value); storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl; }
+function clearActiveAuthExpiry() {
+  if (authSessionExpiryTimer !== null) clearTimeout(authSessionExpiryTimer);
+  authSessionExpiryTimer = null;
+  authSessionExpiresAt = 0;
+}
+function cancelSavedSessionRestore() {
+  ++authRestoreSequence;
+  if (authRestoreController) authenticating = false;
+  authRestoreController?.abort();
+  authRestoreController = null;
+}
+function expireActiveAuthSession() {
+  if (!token || !authSessionExpiresAt || Date.now() < authSessionExpiresAt) return false;
+  authSessionStore.clearMatching(token,apiUrl);
+  clearActiveAuthExpiry();
+  token = '';
+  showLogin(false);
+  return true;
+}
+function rememberAuthenticatedSession(response, origin, notAfter = Infinity) {
+  clearActiveAuthExpiry();
+  const saved = authSessionStore.save({token:response.token,username:response.user.username,apiOrigin:origin,
+    sessionExpiresAt:response.session_expires_at,notAfter});
+  if (!saved) return;
+  authSessionExpiresAt = saved.expiresAt;
+  const expectedToken = response.token, expectedOrigin = origin, expectedExpiry = saved.expiresAt;
+  authSessionExpiryTimer = setTimeout(() => {
+    authSessionExpiryTimer = null;
+    if (token === expectedToken && apiUrl === expectedOrigin && authSessionExpiresAt === expectedExpiry) {
+      expireActiveAuthSession();
+    }
+  },Math.max(0,saved.expiresAt - Date.now() + 1));
+}
 async function api(path, options = {}, timeout = 15000, baseUrl = '') {
   const anonymous = options.anonymous === true;
+  if (!anonymous && expireActiveAuthSession()) {
+    const expired = new Error('로그인이 만료됐어요. 같은 계정으로 다시 로그인해 주세요.');
+    expired.status = 401;
+    throw expired;
+  }
   const uploaderAlreadyLocked = options.uploaderAlreadyLocked === true;
   const {
     anonymous:_anonymous,
@@ -705,9 +756,14 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
     const data = response.status === 204 ? null : await response.json().catch(() => null);
     if (!response.ok) {
       let message = typeof data?.detail === 'string' ? data.detail : `요청을 처리하지 못했습니다 (${response.status}).`;
-      if (response.status === 401 && requestToken && token === requestToken && apiUrl === requestServer) { message = '로그인이 만료됐어요. 같은 계정으로 다시 로그인해 주세요.'; token = ''; showLogin(false); }
+      if (response.status === 401 && requestToken && token === requestToken && apiUrl === requestServer) {
+        message = '로그인이 만료됐어요. 같은 계정으로 다시 로그인해 주세요.';
+        authSessionStore.clearMatching(requestToken,requestServer);
+        clearActiveAuthExpiry(); token = ''; showLogin(false);
+      }
       const error = new Error(message); error.status = response.status;
       error.code = typeof data?.error_code === 'string' ? data.error_code : typeof data?.code === 'string' ? data.code : '';
+      error.safeToRetry = response.status === 429 && data?.code === 'chunk_not_started' && data?.safe_to_retry === true;
       const retryAfterHeader = response.headers?.get?.('Retry-After');
       const retryAfter = retryAfterHeader === null || retryAfterHeader === undefined || retryAfterHeader.trim() === ''
         ? Number.NaN : Number(retryAfterHeader);
@@ -905,8 +961,11 @@ async function verifyServerCandidate(value, signal, timeout = 10000) {
 }
 function installVerifiedServer(candidate, message, {expiresAt = 0} = {}) {
   const before = apiUrl;
+  authSessionStore.discardOtherOrigin(candidate);
   let changed = false;
   if (candidate !== before) {
+    cancelSavedSessionRestore();
+    clearActiveAuthExpiry();
     const preserveOwner = !!user && hasOwnerLockedWork();
     const hasExistingSession = !!before || !!token || !!user || hasOwnerLockedWork();
     if (hasExistingSession) {
@@ -1205,6 +1264,7 @@ $('connection-form').onsubmit = async event => {
       return;
     }
     $('connection-dialog').close(); notice('서버에 연결했어요.');
+    if (!token && !activation) await restoreStoredSession();
   } catch (error) {
     if (sequence !== null && (sequence !== connectionGeneration || connectionController !== controller)) return;
     setConnectionState(hasTrustedApiOrigin() ? 'connected' : 'manual-needed',hasTrustedApiOrigin()
@@ -1221,27 +1281,16 @@ $('connection-form').onsubmit = async event => {
     }
   }
 };
-$('auth-form').onsubmit = async event => {
-  event.preventDefault(); $('auth-error').hidden = true;
-  const refreshingExpiredLease = automaticLeaseExpired();
-  if (!hasVerifiedServer() && !refreshingExpiredLease) {
-    $('auth-error').textContent = '서버 연결을 먼저 확인해 주세요.'; $('auth-error').hidden = false;
-    $('auth-server-open').focus(); return;
-  }
-  if (!refreshingExpiredLease) cancelConnectionAttempt();
-  authenticating = true; updateAuthControls();
-  const authServer = apiUrl, generation = requestGeneration;
-  try {
-    const username = $('username').value, password = $('password').value;
-    const ownerLocked = hasOwnerLockedWork();
-    if (ownerLocked && user && username !== user) throw new Error('전송 대기 중인 음성이 있어요. 이전 계정으로 다시 로그인해 주세요.');
-    if (stopPromise) await stopPromise;
-    if (activation && password !== $('password-confirm').value) throw new Error('입력한 두 비밀번호가 일치하지 않아요.');
-    const body = {username,password}; if (activation) body.setup_code = $('setup-code').value.trim();
-    const response = await api(activation ? '/auth/activate' : '/auth/login', {method:'POST',body:JSON.stringify(body)});
-    if (apiUrl !== authServer || requestGeneration !== generation) throw new Error('서버 연결 상태가 바뀌어 로그인 응답을 적용하지 않았어요. 다시 로그인해 주세요.');
+async function enterAuthenticatedWorkspace(response, authServer, {notAfter = Infinity} = {}) {
+    if (typeof response?.token !== 'string' || !response.token || typeof response?.user?.username !== 'string'
+        || !response.user.username.trim()) throw new Error('서버의 로그인 결과를 확인하지 못했어요.');
+    if (response.session_expires_at !== undefined && (typeof response.session_expires_at !== 'number'
+        || !Number.isFinite(response.session_expires_at) || response.session_expires_at * 1000 <= Date.now())) {
+      throw new Error('서버의 로그인 만료 시각을 확인하지 못했어요. 다시 로그인해 주세요.');
+    }
     const previousUser = user;
     token = response.token; user = response.user.username; ++requestGeneration;
+    rememberAuthenticatedSession(response,authServer,notAfter);
     if (previousUser !== user) {
       scheduledCorrections.clear();
       scrubAccountWorkspace();
@@ -1273,10 +1322,86 @@ $('auth-form').onsubmit = async event => {
       if (clovaManualRetryRequired()) {
         notice('CLOVA 대기 음성은 중복 기록을 막기 위해 자동 재전송하지 않았어요. 안내를 확인한 뒤 직접 선택해 주세요.');
       } else {
-        sendError = ''; void retryPending();
+        sendError = ''; void retryPending({manual:false});
       }
     }
     resumeFinalizedScheduledCorrections();
+}
+function restoreStoredSession() {
+  if (authRestorePromise) return authRestorePromise;
+  if (token || activation || authenticating || !hasVerifiedServer()) return Promise.resolve(false);
+  const saved = authSessionStore.read();
+  if (!saved) return Promise.resolve(false);
+  if (saved.apiOrigin !== apiUrl || (user && hasOwnerLockedWork() && saved.username !== user)) {
+    authSessionStore.clear();
+    return Promise.resolve(false);
+  }
+  const sequence = ++authRestoreSequence, generation = requestGeneration;
+  const controller = new AbortController();
+  authRestoreController = controller;
+  const currentRestore = () => sequence === authRestoreSequence && generation === requestGeneration
+    && !token && apiUrl === saved.apiOrigin && hasVerifiedServer();
+  authenticating = true; updateAuthControls();
+  $('auth-error').hidden = true;
+  let operation;
+  operation = (async () => {
+    try {
+      // Only /auth/me receives the saved token. It stays out of the active
+      // workspace until the current verified origin confirms this session.
+      const identity = await api('/auth/me',{signal:controller.signal,
+        headers:{Authorization:`Bearer ${saved.token}`}},15000,saved.apiOrigin);
+      if (!currentRestore()) return false;
+      if (identity?.username !== saved.username || typeof identity?.session_expires_at !== 'number'
+          || !Number.isFinite(identity.session_expires_at) || identity.session_expires_at * 1000 <= Date.now()
+          || saved.expiresAt <= Date.now()) {
+        authSessionStore.clearMatching(saved.token,saved.apiOrigin);
+        throw new Error('저장된 로그인이 만료되었거나 계정이 달라 다시 로그인해야 해요.');
+      }
+      await enterAuthenticatedWorkspace({token:saved.token,user:{username:identity.username,is_admin:identity.is_admin},
+        session_expires_at:identity.session_expires_at},saved.apiOrigin,{notAfter:saved.expiresAt});
+      return token === saved.token && user === saved.username && apiUrl === saved.apiOrigin;
+    } catch (error) {
+      if (sequence !== authRestoreSequence || generation !== requestGeneration || apiUrl !== saved.apiOrigin) return false;
+      if (error?.status === 401 || error?.status === 403) authSessionStore.clearMatching(saved.token,saved.apiOrigin);
+      if (error?.name !== 'AbortError') {
+        $('auth-error').textContent = error?.status === 401 || error?.status === 403
+          ? '로그인이 만료되었거나 해제됐어요. 다시 로그인해 주세요.'
+          : '저장된 로그인을 확인하지 못했어요. 연결을 확인한 뒤 새로고침하거나 직접 로그인해 주세요.';
+        $('auth-error').hidden = false;
+      }
+      return false;
+    } finally {
+      if (authRestoreController === controller) authRestoreController = null;
+      if (sequence === authRestoreSequence) { authenticating = false; updateAuthControls(); updateControls(); }
+      if (authRestorePromise === operation) authRestorePromise = null;
+    }
+  })();
+  authRestorePromise = operation;
+  return operation;
+}
+$('auth-form').onsubmit = async event => {
+  event.preventDefault(); $('auth-error').hidden = true;
+  if (authenticating && !authRestoreController) return;
+  cancelSavedSessionRestore();
+  expireActiveAuthSession();
+  const refreshingExpiredLease = automaticLeaseExpired();
+  if (!hasVerifiedServer() && !refreshingExpiredLease) {
+    $('auth-error').textContent = '서버 연결을 먼저 확인해 주세요.'; $('auth-error').hidden = false;
+    $('auth-server-open').focus(); return;
+  }
+  if (!refreshingExpiredLease) cancelConnectionAttempt();
+  authenticating = true; updateAuthControls();
+  const authServer = apiUrl, generation = requestGeneration;
+  try {
+    const username = $('username').value, password = $('password').value;
+    const ownerLocked = hasOwnerLockedWork();
+    if (ownerLocked && user && username !== user) throw new Error('전송 대기 중인 음성이 있어요. 이전 계정으로 다시 로그인해 주세요.');
+    if (stopPromise) await stopPromise;
+    if (activation && password !== $('password-confirm').value) throw new Error('입력한 두 비밀번호가 일치하지 않아요.');
+    const body = {username,password}; if (activation) body.setup_code = $('setup-code').value.trim();
+    const response = await api(activation ? '/auth/activate' : '/auth/login', {method:'POST',body:JSON.stringify(body)});
+    if (apiUrl !== authServer || requestGeneration !== generation) throw new Error('서버 연결 상태가 바뀌어 로그인 응답을 적용하지 않았어요. 다시 로그인해 주세요.');
+    await enterAuthenticatedWorkspace(response,authServer);
   } catch (error) {
     $('password').value = ''; $('password-confirm').value = '';
     $('auth-error').textContent = errorText(error); $('auth-error').hidden = false;
@@ -1654,6 +1779,8 @@ function clearCorrectionPoll() {
   correctionPollTimer = null;
 }
 function resetCorrectionState(lectureId = '') {
+  resetTranslationView();
+  resetSummaryView();
   ++correctionSequence;
   clearCorrectionPoll();
   correction = null; correctionView = 'raw'; correctionLectureId = lectureId;
@@ -2036,7 +2163,7 @@ function adminActivityLabel(account) {
   })[account?.activity] || (account?.online ? '접속 중' : '오프라인');
 }
 function accountJobLabel(jobs) {
-  const values = [jobs?.transcription,jobs?.imports,jobs?.corrections].map(value => {
+  const values = [jobs?.transcription,jobs?.imports,jobs?.corrections,jobs?.summaries,jobs?.translations].map(value => {
     if (typeof value === 'number') return Math.max(0,Math.floor(value));
     return Math.max(0,Math.floor(Number(value?.queued) || 0)) + Math.max(0,Math.floor(Number(value?.processing) || 0));
   });
@@ -2177,6 +2304,8 @@ function renderAdminOverview() {
   $('admin-transcription-queue').textContent = queueLabel(queues.transcription);
   $('admin-import-queue').textContent = queueLabel(queues.imports);
   $('admin-correction-queue').textContent = queueLabel(queues.corrections);
+  $('admin-summary-queue').textContent = queueLabel(queues.summaries);
+  $('admin-translation-queue').textContent = queueLabel(queues.translations);
 
   const tunnel = overview.tunnel || {};
   const reportedTunnelState = String(tunnel.state || 'unknown');
@@ -2426,6 +2555,356 @@ function startPresence() {
 document.addEventListener('pointerdown',notePresenceInteraction,{passive:true});
 document.addEventListener('keydown',notePresenceInteraction);
 
+function renderTranscriptSegments(transcript, segments, scope) {
+  if (transcriptRenderState.scope !== scope || !segments.length) {
+    transcript.replaceChildren();
+    transcriptRenderState = {scope,rows:new Map()};
+  }
+  if (!segments.length) return;
+  const previous = transcriptRenderState.rows;
+  if (!previous.size) transcript.replaceChildren();
+  const next = new Map(), occurrences = new Map();
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const base = typeof segment.id === 'string' && segment.id
+      ? `id:${segment.id}` : `index:${index}`;
+    const occurrence = occurrences.get(base) || 0;
+    occurrences.set(base,occurrence + 1);
+    const key = JSON.stringify([base,occurrence]);
+    let entry = previous.get(key);
+    if (!entry) {
+      entry = {row:document.createElement('div'),text:document.createElement('p'),time:null,
+        textValue:null,timeValue:null,timed:null};
+    }
+    const timed = hasSegmentStart(segment);
+    if (entry.timed !== timed) {
+      entry.row.className = `segment${timed ? '' : ' without-time'}`;
+      entry.time = timed ? document.createElement('time') : null;
+      entry.row.replaceChildren(...(timed ? [entry.time,entry.text] : [entry.text]));
+      entry.timed = timed;
+      entry.timeValue = null;
+    }
+    const text = String(segment.text ?? '');
+    if (entry.textValue !== text) {
+      entry.text.textContent = text;
+      entry.textValue = text;
+    }
+    const time = timed ? fmt(segment.start) : null;
+    if (entry.timeValue !== time) {
+      entry.time.textContent = time;
+      entry.timeValue = time;
+    }
+    next.set(key,entry);
+  }
+  for (const [key,entry] of previous) {
+    if (!next.has(key)) transcript.removeChild(entry.row);
+  }
+  let index = 0;
+  for (const entry of next.values()) {
+    const at = transcript.children[index] || null;
+    // Appended live text must not detach existing rows or replace their text
+    // nodes: both would disturb a student's selection and reading position.
+    if (at !== entry.row) transcript.insertBefore(entry.row,at);
+    index += 1;
+  }
+  transcriptRenderState = {scope,rows:next};
+}
+
+// Summary state is tied to the exact login, server and selected lecture. The
+// worker is independent of live capture, so opening an older lesson is safe.
+let summaryView = {scope:'',row:null,loaded:false,busy:false,configured:false,error:'',polls:0};
+let summaryPollTimer = null;
+let summaryAbort = null;
+function summaryScope() { return JSON.stringify([user,token,apiUrl,current?.id || '']); }
+function resetSummaryView() {
+  clearTimeout(summaryPollTimer); summaryPollTimer = null;
+  summaryAbort?.abort(); summaryAbort = null;
+  summaryView = {scope:'',row:null,loaded:false,busy:false,configured:false,error:'',polls:0};
+  $('summary-content').replaceChildren();
+  $('summary-panel').hidden = true;
+}
+function summaryEligible() { return !!(user && token && current?.recording_finalized && current?.segments?.length); }
+function summaryIsCurrent(view) { return summaryView === view && view.scope === summaryScope(); }
+function summaryPending(row = summaryView.row) { return ['queued','processing'].includes(row?.status); }
+function summaryDocument(value) {
+  const ids = new Set((current?.segments || []).map(s => s.id));
+  const text = (s,limit) => typeof s === 'string' && !!s.trim() && s.length <= limit;
+  const sources = (s,limit = 12) => Array.isArray(s) && s.length > 0 && s.length <= limit
+    && s.every(id => typeof id === 'string' && ids.has(id));
+  if (!value || !text(value.overview,1500) || !sources(value.overview_source_ids,24)
+      || !Array.isArray(value.sections) || !value.sections.length || value.sections.length > 8
+      || !Array.isArray(value.review_questions) || value.review_questions.length > 8) return null;
+  if (!value.sections.every(s => text(s?.heading,120) && Array.isArray(s.bullets)
+      && s.bullets.length > 0 && s.bullets.length <= 6
+      && s.bullets.every(b => text(b?.text,500) && sources(b.source_ids)))) return null;
+  if (!value.review_questions.every(q => text(q?.question,300) && sources(q.source_ids))) return null;
+  return value;
+}
+function summarySources(ids) {
+  const segments = new Map((current?.segments || []).map(s => [s.id,s]));
+  return [...new Set(ids.map(id => segments.get(id)?.start).filter(Number.isFinite))]
+    .sort((a,b) => a-b).map(fmt).join(', ');
+}
+function renderSummaryDocument(documentValue) {
+  const target = $('summary-content'); target.replaceChildren();
+  if (!documentValue) return;
+  const appendPoint = (parent, tag, text, ids) => {
+    const node = document.createElement(tag); node.textContent = text;
+    const sources = document.createElement('small'); sources.className = 'summary-sources';
+    sources.textContent = `원문 ${summarySources(ids)}`;
+    node.append(sources); parent.append(node);
+  };
+  appendPoint(target,'p',documentValue.overview,documentValue.overview_source_ids);
+  for (const section of documentValue.sections) {
+    const heading = document.createElement('h4'); heading.textContent = section.heading;
+    const list = document.createElement('ul');
+    for (const bullet of section.bullets) appendPoint(list,'li',bullet.text,bullet.source_ids);
+    target.append(heading,list);
+  }
+  if (documentValue.review_questions.length) {
+    const heading = document.createElement('h4'); heading.textContent = '복습 질문';
+    const list = document.createElement('ul');
+    for (const item of documentValue.review_questions) appendPoint(list,'li',item.question,item.source_ids);
+    target.append(heading,list);
+  }
+}
+function renderSummary() {
+  const scope = summaryScope();
+  if (summaryView.scope !== scope) { resetSummaryView(); summaryView.scope = scope; }
+  const view = summaryView;
+  $('summary-panel').hidden = !current || !token;
+  const eligible = summaryEligible(), pendingSummary = summaryPending();
+  const documentValue = view.row?.status === 'completed' ? summaryDocument(view.row.document) : null;
+  $('summary-state').textContent = view.error || (!eligible
+    ? '수업을 종료하고 받아쓰기 저장이 끝나면 원문을 바탕으로 요약할 수 있어요.'
+    : view.busy ? '요약 상태를 확인하고 있어요…'
+      : pendingSummary ? (view.polls >= 200 ? '요약은 서버에서 계속 진행 중입니다. 상태 확인 버튼으로 다시 확인하세요.' : '서버에서 수업을 요약하고 있어요. 다른 수업을 녹음하거나 살펴봐도 됩니다.')
+        : documentValue ? '핵심 내용과 복습 질문을 정리했어요. 원문과 비교해 확인해 주세요.'
+          : !view.loaded ? '저장된 요약을 확인하고 있어요…'
+            : !view.configured ? '운영자의 수업 요약 API 설정이 필요해요.'
+              : view.row?.status === 'failed' ? (view.row.error || '요약하지 못했어요. 다시 요청할 수 있습니다.')
+                : '원문을 유지한 채 별도의 요약을 만들어요. 긴 수업은 시간이 걸릴 수 있어요.');
+  $('summarize-lecture').disabled = !eligible || view.busy || !!documentValue || (view.loaded && !view.configured);
+  $('summarize-lecture').textContent = pendingSummary || view.error || !view.loaded ? '요약 상태 확인'
+    : documentValue ? '요약 완료' : view.row?.status === 'failed' ? '요약 다시 요청' : '수업 요약 만들기';
+  $('summary-download').disabled = !documentValue;
+  renderSummaryDocument(documentValue);
+  if (eligible && !view.loaded && !view.busy && !view.error) void fetchSummary(false);
+}
+async function fetchSummary(create = false) {
+  const view = summaryView;
+  if (view.busy || !summaryEligible() || !summaryIsCurrent(view)) return;
+  if (create && (!view.loaded || !view.configured || summaryPending() || view.row?.status === 'completed')) return;
+  clearTimeout(summaryPollTimer); summaryPollTimer = null;
+  summaryAbort?.abort();
+  const controller = new AbortController(); summaryAbort = controller;
+  view.busy = true; view.error = ''; renderSummary();
+  try {
+    const result = await api(`/lectures/${current.id}/summary`,{method:create ? 'POST' : 'GET',signal:controller.signal});
+    if (!summaryIsCurrent(view)) return;
+    if (!result || (result.summary !== null && (typeof result.summary !== 'object'
+        || result.summary.lecture_id !== current.id
+        || !['queued','processing','completed','failed'].includes(result.summary.status)))) {
+      throw new Error('요약 응답 형식을 확인하지 못했습니다.');
+    }
+    if (!create) view.configured = result.configured === true;
+    view.loaded = true; view.row = result.summary;
+    if (view.row?.status === 'completed' && !summaryDocument(view.row.document)) {
+      view.row = null;
+      throw new Error('요약의 원문 참조를 확인하지 못했습니다. 상태를 다시 확인해 주세요.');
+    }
+    if (summaryPending() && view.polls < 200) {
+      view.polls += 1;
+      summaryPollTimer = setTimeout(() => {
+        summaryPollTimer = null;
+        if (summaryIsCurrent(view)) void fetchSummary(false);
+      },3000);
+    }
+  } catch (error) {
+    if (summaryIsCurrent(view) && error.name !== 'AbortError') {
+      view.error = create ? '요약 요청의 처리 여부를 확인하지 못했어요. 상태 확인을 눌러 확인하세요.' : errorText(error);
+    }
+  } finally {
+    if (summaryIsCurrent(view)) { view.busy = false; renderSummary(); }
+    if (summaryAbort === controller) summaryAbort = null;
+  }
+}
+$('summarize-lecture').onclick = () => {
+  const create = summaryView.loaded && !summaryView.error && !summaryPending();
+  summaryView.polls = 0;
+  void fetchSummary(create);
+};
+$('summary-download').onclick = () => {
+  if (!summaryIsCurrent(summaryView) || !summaryEligible()) return;
+  const documentValue = summaryDocument(summaryView.row?.document);
+  if (!documentValue) return;
+  // Escape Markdown syntax and HTML from both untrusted model and lesson text.
+  const plain = value => String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/([\\`*_{}\[\]()#+.!|~\-])/g,'\\$1').replace(/[\r\n]+/g,' ');
+  const point = (text,ids) => `${plain(text)} (원문 ${summarySources(ids)})`;
+  const lines = [`# ${plain(current.title)} · AI 수업 요약`,'',
+    'AI가 만든 요약입니다. 원문과 비교해 확인하세요.','',
+    point(documentValue.overview,documentValue.overview_source_ids),''];
+  for (const section of documentValue.sections) {
+    lines.push(`## ${plain(section.heading)}`,'');
+    for (const bullet of section.bullets) lines.push(`- ${point(bullet.text,bullet.source_ids)}`);
+    lines.push('');
+  }
+  if (documentValue.review_questions.length) {
+    lines.push('## 복습 질문','');
+    for (const item of documentValue.review_questions) lines.push(`- ${point(item.question,item.source_ids)}`);
+  }
+  const url = URL.createObjectURL(new Blob(['\uFEFF',lines.join('\n')],{type:'text/markdown;charset=utf-8'}));
+  const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(current.title)}_수업요약.md`;
+  link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+};
+
+let translationView = {scope:'',row:null,loaded:false,busy:false,configured:false,error:'',polls:0,mode:'paired'};
+let translationPollTimer = null;
+let translationAbort = null;
+function translationScope() { return JSON.stringify([user,token,apiUrl,current?.id || '']); }
+function resetTranslationView() {
+  clearTimeout(translationPollTimer); translationPollTimer = null;
+  translationAbort?.abort(); translationAbort = null;
+  translationView = {scope:'',row:null,loaded:false,busy:false,configured:false,error:'',polls:0,mode:'paired'};
+  $('translation-content').replaceChildren();
+  $('translation-panel').hidden = true;
+}
+function translationEligible() { return !!(user && token && current?.recording_finalized && current?.segments?.length); }
+function translationIsCurrent(view) { return translationView === view && view.scope === translationScope(); }
+function translationPending() { return ['queued','processing'].includes(translationView.row?.status); }
+function translatedSegments(row = translationView.row) {
+  if (row?.status !== 'completed' || !Array.isArray(row.segments)) return null;
+  const raw = current?.segments || [], segments = row.segments;
+  if (!raw.length || raw.length > 50000 || segments.length !== raw.length) return null;
+  let total = 0;
+  const ids = new Set();
+  for (let i = 0; i < raw.length; i += 1) {
+    const original = raw[i], translated = segments[i];
+    if (!translated || typeof translated.id !== 'string' || translated.id !== original.id || ids.has(translated.id)
+        || !Number.isFinite(translated.start) || !Number.isFinite(translated.end)
+        || translated.start !== original.start || translated.end !== original.end
+        || typeof translated.text !== 'string' || !translated.text.trim() || translated.text.length > 48000) return null;
+    ids.add(translated.id); total += translated.text.length;
+    if (total > 1000000) return null;
+  }
+  return segments;
+}
+function renderTranslationContent(segments) {
+  const view = translationView, target = $('translation-content');
+  if (view.renderedSegments === segments && view.renderedMode === view.mode
+      && view.renderedRaw === current?.segments) return;
+  view.renderedSegments = segments; view.renderedMode = view.mode; view.renderedRaw = current?.segments;
+  target.replaceChildren();
+  if (!segments) return;
+  for (let index = 0; index < segments.length; index += 1) {
+    const translated = segments[index];
+    const row = document.createElement('div'); row.className = 'translation-row';
+    const time = document.createElement('small'); time.className = 'summary-sources'; time.textContent = fmt(translated.start);
+    row.append(time);
+    if (view.mode === 'paired') {
+      const source = document.createElement('p'); source.className = 'translation-source'; source.lang = 'en';
+      source.textContent = current.segments[index].text;
+      row.append(source);
+    }
+    const text = document.createElement('p'); text.className = 'translation-target'; text.lang = 'ko';
+    text.textContent = translated.text; row.append(text); target.append(row);
+  }
+}
+function renderTranslation() {
+  const scope = translationScope();
+  if (translationView.scope !== scope) { resetTranslationView(); translationView.scope = scope; }
+  const view = translationView, eligible = translationEligible(), pendingTranslation = translationPending();
+  const segments = translatedSegments();
+  $('translation-panel').hidden = !current || !token;
+  $('translation-state').textContent = view.error || (!eligible
+    ? '수업을 종료하고 마지막 받아쓰기 저장이 끝나면 영어 원문을 한국어로 번역할 수 있어요.'
+    : view.busy ? '번역 상태를 확인하고 있어요…'
+      : pendingTranslation ? (view.polls >= 200 ? '번역은 서버에서 계속 진행 중입니다. 상태 확인 버튼으로 다시 확인하세요.' : '수업 전체 문맥을 참고해 문장별로 번역하고 있어요. 다른 수업 녹음은 계속할 수 있습니다.')
+        : segments ? '문장별 원문 대조 또는 한국어 전체 보기로 읽을 수 있어요. 두 보기는 같은 문맥 기반 번역입니다.'
+          : !view.loaded ? '저장된 번역을 확인하고 있어요…'
+            : !view.configured ? '운영자의 번역 API 설정이 필요해요.'
+              : view.row?.status === 'failed' ? (view.row.error || '번역하지 못했어요. 다시 요청할 수 있습니다.')
+                : '영어 수업을 문맥에 맞게 한국어로 번역합니다. 원문은 유지하며 긴 수업은 시간이 걸릴 수 있어요.');
+  $('translate-lecture').disabled = !eligible || view.busy || !!segments || (view.loaded && !view.configured);
+  $('translate-lecture').textContent = pendingTranslation || view.error || !view.loaded ? '번역 상태 확인'
+    : segments ? '번역 완료' : view.row?.status === 'failed' ? '번역 다시 요청' : '한국어 번역 만들기';
+  $('translation-download').disabled = !segments;
+  $('translation-views').hidden = !segments;
+  for (const mode of ['paired','full']) {
+    $(`translation-${mode}`).classList.toggle('active',view.mode === mode);
+    $(`translation-${mode}`).setAttribute('aria-pressed',String(view.mode === mode));
+  }
+  renderTranslationContent(segments);
+  if (eligible && !view.loaded && !view.busy && !view.error) void fetchTranslation(false);
+}
+async function fetchTranslation(create = false) {
+  const view = translationView;
+  if (view.busy || !translationEligible() || !translationIsCurrent(view)) return;
+  if (create && (!view.loaded || !view.configured || translationPending() || view.row?.status === 'completed')) return;
+  clearTimeout(translationPollTimer); translationPollTimer = null;
+  translationAbort?.abort();
+  const controller = new AbortController(); translationAbort = controller;
+  view.busy = true; view.error = ''; renderTranslation();
+  try {
+    const result = await api(`/lectures/${current.id}/translation`,{method:create ? 'POST' : 'GET',signal:controller.signal});
+    if (!translationIsCurrent(view)) return;
+    if (!result || (result.translation !== null && (typeof result.translation !== 'object'
+        || result.translation.lecture_id !== current.id
+        || !['queued','processing','completed','failed'].includes(result.translation.status)))) {
+      throw new Error('번역 응답 형식을 확인하지 못했습니다.');
+    }
+    view.configured = result.configured === true;
+    view.loaded = true; view.row = result.translation;
+    if (view.row?.status === 'completed' && !translatedSegments()) {
+      view.row = null;
+      throw new Error('번역과 원문의 문장 연결을 확인하지 못했습니다. 상태를 다시 확인해 주세요.');
+    }
+    if (translationPending() && view.polls < 200) {
+      view.polls += 1;
+      translationPollTimer = setTimeout(() => {
+        translationPollTimer = null;
+        if (translationIsCurrent(view)) void fetchTranslation(false);
+      },3000);
+    }
+  } catch (error) {
+    if (translationIsCurrent(view) && error.name !== 'AbortError') {
+      view.error = create ? '번역 요청의 처리 여부를 확인하지 못했어요. 상태 확인을 눌러 확인하세요.' : errorText(error);
+    }
+  } finally {
+    if (translationIsCurrent(view)) { view.busy = false; renderTranslation(); }
+    if (translationAbort === controller) translationAbort = null;
+  }
+}
+$('translate-lecture').onclick = () => {
+  const create = translationView.loaded && !translationView.error && !translationPending();
+  translationView.polls = 0; void fetchTranslation(create);
+};
+for (const mode of ['paired','full']) {
+  $(`translation-${mode}`).onclick = () => {
+    if (!translationIsCurrent(translationView) || !translatedSegments()) return;
+    translationView.mode = mode; renderTranslation();
+  };
+}
+$('translation-download').onclick = () => {
+  if (!translationIsCurrent(translationView) || !translationEligible()) return;
+  const segments = translatedSegments(); if (!segments) return;
+  const plain = value => String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/([\\`*_{}\[\]()#+.!|~\-])/g,'\\$1').replace(/[\r\n]+/g,' ');
+  const paired = translationView.mode === 'paired';
+  const lines = [`# ${plain(current.title)} · 한국어 번역`,'',
+    '전체 수업에서 추린 문맥을 참고한 AI 번역입니다. 원문·녹음과 비교해 확인하세요.',''];
+  for (let i = 0; i < segments.length; i += 1) {
+    lines.push(`## ${fmt(segments[i].start)}`,'');
+    if (paired) lines.push(`원문: ${plain(current.segments[i].text)}`,'');
+    lines.push(`${paired ? '번역: ' : ''}${plain(segments[i].text)}`,'');
+  }
+  const url = URL.createObjectURL(new Blob(['\uFEFF',lines.join('\n')],{type:'text/markdown;charset=utf-8'}));
+  const link = document.createElement('a'); link.href = url;
+  link.download = `${safeFilename(current.title)}_한국어번역${paired ? '_문장대조' : ''}.md`;
+  link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+};
+
 function renderCurrent() {
   const lectureId = current?.id || '';
   if (lectureId !== correctionLectureId) {
@@ -2440,8 +2919,13 @@ function renderCurrent() {
     $('asr-provider').value = current.asr_provider === 'clova' ? 'clova' : 'qwen';
   }
   renderCorrection();
+  renderSummary();
+  renderTranslation();
   const segments = displayedTranscriptSegments();
-  const transcript = $('transcript'); transcript.replaceChildren();
+  const transcript = $('transcript');
+  const transcriptVersion = correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw';
+  const transcriptScope = JSON.stringify([user,apiUrl,lectureId,current?.asr_provider || 'qwen',transcriptVersion]);
+  renderTranscriptSegments(transcript,segments,transcriptScope);
   if (!segments.length) {
     const activeCaptureView = hasLiveCaptureSession() && current?.id === activeCaptureLectureId();
     const empty = document.createElement('div'); empty.className = 'empty-note';
@@ -2452,16 +2936,6 @@ function renderCurrent() {
       : activeCaptureView ? '목소리가 들어오면 이곳에 글이 나타나요.'
         : current ? '이 수업에는 표시할 받아쓰기 문장이 없어요.' : '수업 이름을 적고 받아쓰기를 시작해 보세요.';
     empty.append(mark,heading,text); transcript.append(empty);
-  } else {
-    for (const segment of segments) {
-      const row = document.createElement('div');
-      const timed = hasSegmentStart(segment);
-      row.className = `segment${timed ? '' : ' without-time'}`;
-      const text = document.createElement('p'); text.textContent = segment.text;
-      if (timed) { const time = document.createElement('time'); time.textContent = fmt(segment.start); row.append(time,text); }
-      else row.append(text);
-      transcript.append(row);
-    }
   }
   $('segment-count').textContent = segments.length;
   $('transcript-title').textContent = correctionView === 'corrected' && correctionIsReady() ? 'AI 후보정본' : '받아쓴 원문';
@@ -2785,11 +3259,23 @@ async function cancelFileImport() {
 $('import-cancel').onclick = () => { void cancelFileImport(); };
 $('new-note').onclick = () => { if (!isBusy()) resetNewNote({focus:true}); };
 function startElapsedClock() {
+  if (!capture || !recording || paused || capture.paused
+      || inputUnavailable || inputReconnectNeeded || starting || pausing || resuming || stopping) {
+    stopElapsedClock();
+    return;
+  }
+  if (timer !== null) return;
   elapsedStartedAt = performance.now();
-  clearInterval(timer);
   timer = setInterval(() => {
     $('elapsed').textContent = fmt((elapsedActiveMs + performance.now() - elapsedStartedAt) / 1000);
   }, 500);
+}
+function alignElapsedToCapture() {
+  const captured = capture?.capturedSeconds;
+  const seconds = Number.isFinite(captured) && captured >= 0 ? captured : sampleSeconds;
+  elapsedActiveMs = seconds * 1000;
+  elapsedStartedAt = performance.now();
+  $('elapsed').textContent = fmt(seconds);
 }
 function stopElapsedClock() {
   if (timer !== null) {
@@ -2881,7 +3367,7 @@ async function startRecording() {
     enqueueChunk(session,chunk);
     updateControls();
   };
-  capture = new MicrophoneCapture({
+  const microphone = new MicrophoneCapture({
     source:session.source,
     onChunk:queue,
     onLevel:level => { $('mic-level').style.width = `${Math.min(100,Math.max(0,level) * 180)}%`; },
@@ -2889,6 +3375,7 @@ async function startRecording() {
     onInputRecovered:handleInputRecovered,
     onReconnectNeeded:handleReconnectNeeded,
   });
+  capture = microphone;
   try {
     // Invoke microphone/display capture directly in the click gesture, before network awaits.
     const startOperation = capture.start();
@@ -2923,9 +3410,10 @@ async function startRecording() {
   if (!session.cancelled) {
     recording = capture.recording;
     paused = capture.paused;
-    if (recording && !inputUnavailable) startElapsedClock();
   }
-  starting = false; updateControls();
+  starting = false;
+  if (recording && !inputUnavailable) startElapsedClock();
+  updateControls();
   // Creating the server-side note is retried independently. Audio capture must
   // not end merely because the model PC or tunnel is temporarily unavailable.
   void ensureLectureAssigned(session);
@@ -2942,8 +3430,7 @@ function pauseRecording() {
       await operation;
       if (capture !== microphone || stopping) return;
       recording = false; paused = true;
-      elapsedActiveMs = sampleSeconds * 1000;
-      $('elapsed').textContent = fmt(sampleSeconds);
+      alignElapsedToCapture();
       void persistLiveSessionState(captureSession,'paused');
       renderHistory();
       notice('받아쓰기를 일시정지했어요. 재개하면 같은 수업에 이어서 기록합니다.');
@@ -3015,6 +3502,7 @@ function resumeRecording() {
       }
     } finally {
       resuming = false;
+      if (capture === microphone && !stopping) startElapsedClock();
       updateControls();
     }
   })().finally(() => { resumePromise = null; });
@@ -3280,14 +3768,81 @@ function manualUploadError(error) {
 function clovaManualUploadError(error) {
   return `${errorText(error)} CLOVA 처리 결과를 확인할 수 없어 자동 재전송하지 않았어요. 같은 음성 조각을 다시 보내면 중복 기록이 생길 수 있습니다. 실패 WAV를 내려받아 보관하고 새 수업으로 다시 시작하거나, 위험을 이해한 경우에만 수동 재전송하세요.`;
 }
+function validateChunkResponse(response) {
+  if (!response || !Array.isArray(response.segments)
+      || ['recording_available','recording_finalized'].some(name => response[name] !== undefined
+        && typeof response[name] !== 'boolean')
+      || response.segments.some(segment => !segment || typeof segment.id !== 'string' || !segment.id
+        || typeof segment.text !== 'string' || !Number.isFinite(segment.start)
+        || !Number.isFinite(segment.end) || segment.start < 0 || segment.end < segment.start)) {
+    const error = new Error('서버의 받아쓰기 결과를 확인하지 못해 음성 조각을 보관했어요.');
+    error.code = 'invalid_chunk_response';
+    throw error;
+  }
+  return response;
+}
+function chunkResponseScopeIsCurrent(chunk, session, scope) {
+  return scope?.owner === user && scope.sessionToken === token && scope.server === apiUrl
+    && liveSessions.get(chunk.captureId) === session && session.owner === scope.owner
+    && session.asrProvider === chunk.asrProvider && !!lectureForStoredProvider(session,session.lecture)
+    && (current?.id !== chunk.lectureId || !!lectureForStoredProvider(session,current));
+}
+async function queryClovaChunkResult(chunk, blob, session, scope) {
+  chunk.resultPollDeadline ||= Date.now() + CLOVA_RESULT_POLL_DEADLINE_MS;
+  chunk.resultPolls = (chunk.resultPolls || 0) + 1;
+  if (chunk.resultPolls > MAX_CLOVA_RESULT_POLLS) throw new Error('서버의 음성 처리 결과 확인 횟수를 넘었어요.');
+  if (!chunk.resultPayloadHash) {
+    const digest = await crypto.subtle.digest('SHA-256',await blob.arrayBuffer());
+    chunk.resultPayloadHash = Array.from(new Uint8Array(digest),byte => byte.toString(16).padStart(2,'0')).join('');
+  }
+  if (!chunkResponseScopeIsCurrent(chunk,session,scope)) throw connectionChangedBeforeRequestError();
+  const timeout = Math.min(15000,chunk.resultPollDeadline - Date.now());
+  if (timeout <= 0) throw new Error('서버의 음성 처리 결과 확인 시간이 지났어요.');
+  const result = await api(`/lectures/${encodeURIComponent(chunk.lectureId)}/chunks/${encodeURIComponent(chunk.id)}/result`,{
+    uploaderAlreadyLocked:true,
+    headers:{'X-Chunk-Payload-SHA256':chunk.resultPayloadHash,
+      'X-Start-Seconds':String(chunk.startSeconds),'X-Overlap-Seconds':String(chunk.overlapSeconds ?? 0),
+      'X-Final-Chunk':chunk.final ? 'true' : 'false'},
+  },timeout);
+  if (!['done','pending','unknown'].includes(result?.state)) {
+    throw new Error('서버에 저장된 음성 처리 상태를 확인하지 못했어요.');
+  }
+  if (result.state === 'done') validateChunkResponse(result.result);
+  return result;
+}
+function scheduleClovaResultPoll(chunk, session, scope) {
+  chunk.resultPollDeadline ||= Date.now() + CLOVA_RESULT_POLL_DEADLINE_MS;
+  if (chunk.resultPolls >= MAX_CLOVA_RESULT_POLLS || Date.now() >= chunk.resultPollDeadline) return false;
+  const delay = Math.min(15000,2000 * (2 ** (chunk.resultPolls - 1)),chunk.resultPollDeadline - Date.now());
+  retryMessage = '서버가 보낸 음성을 처리하고 있어요. 저장 결과를 확인하면서 새 녹음은 이 기기에 보관합니다.';
+  const scheduled = setTimeout(() => {
+    if (retryTimer !== scheduled) return;
+    retryTimer = null; retryMessage = '';
+    if (!chunkResponseScopeIsCurrent(chunk,session,scope) || pending[0] !== chunk) return;
+    updateControls(); void drain();
+  },delay);
+  retryTimer = scheduled;
+  return true;
+}
 function mergeChunkSegments(lecture, response) {
   if (!lecture) return;
   if (!Array.isArray(lecture.segments)) lecture.segments = [];
-  const ids = new Set(lecture.segments.map(segment => segment.id));
-  for (const segment of response?.segments || []) {
-    if (!ids.has(segment.id)) { lecture.segments.push(segment); ids.add(segment.id); }
+  const ids = new Set();
+  let ordered = true, previousStart = -Infinity;
+  for (const segment of lecture.segments) {
+    ids.add(segment.id);
+    if (segment.start < previousStart) ordered = false;
+    previousStart = segment.start;
   }
-  lecture.segments.sort((a,b) => a.start - b.start);
+  for (const segment of response?.segments || []) {
+    if (ids.has(segment.id)) continue;
+    if (segment.start < previousStart) ordered = false;
+    previousStart = segment.start;
+    lecture.segments.push(segment); ids.add(segment.id);
+  }
+  // Normal live results are already chronological. A delayed boundary result
+  // can still precede the tail, so retain the stable full-sort fallback.
+  if (!ordered) lecture.segments.sort((a,b) => a.start - b.start);
 }
 async function drain() {
   if (sending || liveQueueRecoveryPromise || sendError || retryTimer !== null || !token || !pending.length) return;
@@ -3322,9 +3877,11 @@ async function drain() {
           chunk.blocked = false;
           chunk.inflight = false;
         }
+        chunk.recoveryOnly = false;
+        chunk.resultPolls = 0; chunk.resultPollDeadline = 0;
         manualRetryApprovedIds.delete(chunk.id);
       }
-      if (chunk.blocked) {
+      if (chunk.blocked && !chunk.recoveryOnly) {
         sendError = chunk.asrProvider === 'clova'
           ? '이 CLOVA 음성 조각은 이전 처리 결과를 확인하지 못해 자동 재전송하지 않았어요.'
           : '이 음성 조각은 이전 오류를 확인한 뒤 직접 재전송해야 해요.';
@@ -3355,6 +3912,7 @@ async function drain() {
       session.providerMismatch = false;
       session.lecture = known;
       chunk.lectureReady = true;
+      const responseScope = {owner:drainOwner,sessionToken:token,server:apiUrl};
       let blob;
       try {
         blob = await uploadBlob(chunk);
@@ -3368,12 +3926,44 @@ async function drain() {
         }
         throw error;
       }
+      if (!chunkResponseScopeIsCurrent(chunk,session,responseScope)) {
+        if (user === drainOwner) sendError = '로그인 또는 수업 연결이 바뀌어 보관된 음성을 보내지 않았어요.';
+        break;
+      }
       let response;
+      if (chunk.asrProvider === 'clova' && chunk.recoveryOnly) {
+        try {
+          const recovered = await queryClovaChunkResult(chunk,blob,session,responseScope);
+          if (!chunkResponseScopeIsCurrent(chunk,session,responseScope)) {
+            throw connectionChangedBeforeRequestError();
+          }
+          if (recovered.state === 'done') {
+            response = recovered.result;
+            chunk.recoveryOnly = false;
+          } else if (recovered.state === 'pending' && scheduleClovaResultPoll(chunk,session,responseScope)) {
+            break;
+          } else {
+            throw new Error(recovered.state === 'pending'
+              ? '서버의 음성 처리가 아직 끝나지 않아 자동 확인을 멈췄어요.'
+              : '서버에서 이 음성의 확정된 처리 결과를 찾지 못했어요.');
+          }
+        } catch (error) {
+          chunk.recoveryOnly = false;
+          await markPendingBlocked(chunk,error);
+          if (user === drainOwner) sendError = clovaManualUploadError(error);
+          break;
+        }
+      } else {
       try {
         // Persist the ambiguity boundary before a CLOVA request leaves the
         // browser. If this tab dies after the provider may have accepted the
         // audio, recovery presents a manual decision instead of replaying it.
         if (chunk.asrProvider === 'clova') await markPendingInflight(chunk);
+        if (!chunkResponseScopeIsCurrent(chunk,session,responseScope)) {
+          if (chunk.asrProvider === 'clova') await markPendingQueued(chunk);
+          if (user === drainOwner) sendError = '로그인 또는 수업 연결이 바뀌어 보관된 음성을 보내지 않았어요.';
+          break;
+        }
         response = await api(`/lectures/${chunk.lectureId}/chunks`,{method:'POST',body:blob,uploaderAlreadyLocked:true,headers:{'Content-Type':'audio/wav','X-Chunk-Id':chunk.id,'X-Start-Seconds':String(chunk.startSeconds),'X-Overlap-Seconds':String(chunk.overlapSeconds ?? 0),'X-Final-Chunk':chunk.final ? 'true' : 'false'}},UPLOAD_TIMEOUT_MS);
       } catch (error) {
         if (chunk.asrProvider === 'clova'
@@ -3384,9 +3974,10 @@ async function drain() {
           try {
             await markPendingQueued(chunk);
           } catch (storeError) {
-            sendError = `${errorText(storeError)} CLOVA 요청은 보내지 않았지만 안전한 전송 상태를 복구하지 못했어요.`;
+            if (user === drainOwner) sendError = `${errorText(storeError)} CLOVA 요청은 보내지 않았지만 안전한 전송 상태를 복구하지 못했어요.`;
             break;
           }
+          if (user !== drainOwner) break;
           if (!token && user) {
             retryMessage = '같은 계정으로 다시 로그인하면 보관된 음성을 이어서 전송합니다.';
           } else {
@@ -3404,10 +3995,15 @@ async function drain() {
           break;
         }
         if (chunk.asrProvider === 'clova') {
+          if (error.safeToRetry === true && error.status === 429 && error.code === 'chunk_not_started') {
+            await markPendingQueued(chunk);
+            scheduleUploadRetry(error);
+            break;
+          }
           if (shouldRecoverPublishedServer(error)) void recoverPublishedServerAfterTransportFailure();
-          sendError = clovaManualUploadError(error);
-          await markPendingBlocked(chunk,error);
-          break;
+          chunk.recoveryOnly = true;
+          chunk.resultPolls = 0; chunk.resultPollDeadline = 0;
+          continue;
         }
         if (retryableUpload(error)) {
           scheduleUploadRetry(error);
@@ -3417,17 +4013,25 @@ async function drain() {
         await markPendingBlocked(chunk,error);
         break;
       }
-      const activeLecture = captureSession?.lecture?.id === chunk.lectureId ? captureSession.lecture : null;
-      mergeChunkSegments(activeLecture,response);
-      if (current?.id === chunk.lectureId && current !== activeLecture) mergeChunkSegments(current,response);
+      }
+      if (!chunkResponseScopeIsCurrent(chunk,session,responseScope)) {
+        await markPendingBlocked(chunk,{code:'stale_chunk_response'});
+        if (user === drainOwner) sendError = '로그인 또는 수업 연결이 바뀌어 이전 음성 응답을 적용하지 않았어요. 보관된 음성 상태를 확인해 주세요.';
+        break;
+      }
+      validateChunkResponse(response);
+      chunk.serverConfirmed = true;
       applyRecordingFlags(chunk.lectureId,response);
+      // The server has already committed this text. Slow local storage cleanup
+      // must not delay display or replace the selected transcript with a draft.
+      if (current?.id === chunk.lectureId) renderCurrent();
+      else updateControls();
       await acknowledgePendingChunk(chunk);
       const acknowledgedIndex = pending.findIndex(item => item.id === chunk.id);
       if (acknowledgedIndex >= 0) pending.splice(acknowledgedIndex,1);
       await finishRemovedPendingChunk(chunk);
       retryAttempt = 0; retryMessage = '';
-      if (current?.id === chunk.lectureId) renderCurrent();
-      else updateControls();
+      updateControls();
     }
     });
     noteCoordinationSupport(coordinated.supported);
@@ -3441,13 +4045,13 @@ async function drain() {
   } finally {
     sending = false; updateControls();
     // Pick up a final microphone tail that may have arrived while an upload awaited.
-    if (pending.length && token && !sendError && retryTimer === null) void drain();
+    if (pending[0]?.owner === user && token && !sendError && retryTimer === null) void drain();
   }
 }
-async function retryPending() {
+async function retryPending({manual = true} = {}) {
   if (sending || starting || pausing || resuming || stopping) return;
   clearUploadRetry(); sendError = '';
-  if (pending[0]) manualRetryApprovedIds.add(pending[0].id);
+  if (manual && pending[0]) manualRetryApprovedIds.add(pending[0].id);
   if (draft) {
     await ensureLectureAssigned(draft);
   }
@@ -3759,6 +4363,9 @@ $('delete-confirm').onclick = async () => {
 };
 $('logout').onclick = async () => {
   if (isBusy()) return;
+  cancelSavedSessionRestore();
+  authSessionStore.clear();
+  clearActiveAuthExpiry();
   loggingOut = true; updateControls();
   try { await api('/auth/logout',{method:'POST'}); } catch {}
   finally {
@@ -3770,6 +4377,7 @@ $('logout').onclick = async () => {
 };
 window.addEventListener('beforeunload', event => { if (isBusy()) { event.preventDefault(); event.returnValue = ''; } });
 document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) expireActiveAuthSession();
   if (document.hidden && recording) notice(selectedCaptureSource() === 'system' ? '공유 중인 탭이나 화면을 유지해 주세요. 브라우저가 오디오 공유를 중단할 수 있어요.' : '이 탭과 화면을 유지해 주세요. 기기가 녹음을 중단할 수 있어요.');
   notePresenceStateChange();
   if (!document.hidden) nudgeQueuedUpload();
@@ -3779,6 +4387,7 @@ window.addEventListener('online',nudgeQueuedUpload);
 
 async function init() {
   void openLiveQueue();
+  authSessionStore.read();
   // Keep invitation codes out of the URL as soon as the document runs.
   const invite = new URLSearchParams(location.hash.slice(1));
   if (location.hash) history.replaceState(null,'',location.pathname + location.search);
@@ -3794,5 +4403,6 @@ async function init() {
   updateSourceGuidance();
   renderCurrent();
   await discoverServer();
+  if (!activation) await restoreStoredSession();
 }
 void init();

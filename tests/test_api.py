@@ -9,6 +9,7 @@ import unittest
 import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -183,9 +184,166 @@ class ApiTests(unittest.TestCase):
         } | (extra_headers or {})
         return self.client.post(f"/lectures/{lecture_id}/chunks", content=payload if payload is not None else wav_audio(), headers=headers)
 
+    def chunk_result_headers(self, token, payload, **changes):
+        return self.headers(token) | {
+            "X-Chunk-Payload-SHA256": hashlib.sha256(payload).hexdigest(),
+            "X-Start-Seconds": "0", "X-Overlap-Seconds": "0", "X-Final-Chunk": "false",
+        } | changes
+
+    def test_chunk_result_recovers_exact_done_response_without_provider_replay(self):
+        token = self.activate()
+        self.clova.configured = True
+        lecture_id = self.lecture(token, asr_provider="clova")
+        chunk_id = str(uuid.uuid4())
+        payload = wav_audio()
+        uploaded = self.upload(token, lecture_id, payload, chunk_id,
+                               extra_headers={"X-Final-Chunk": "false"})
+        self.assertEqual(uploaded.status_code, 200)
+        recovered = self.client.get(
+            f"/lectures/{lecture_id}/chunks/{chunk_id}/result",
+            headers=self.chunk_result_headers(token, payload),
+        )
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(recovered.json(), {"state": "done", "result": uploaded.json()})
+        self.assertEqual(self.clova.calls, 1)
+        self.assertNotIn("payload_hash", recovered.text)
+        self.assertNotIn("qwen_boundary", recovered.text)
+        self.assertNotIn("user-alpha", recovered.text)
+        self.assertEqual(recovered.headers.get("cache-control"), "no-store")
+
+    def test_chunk_result_owner_and_exact_audio_timeline_are_required(self):
+        token = self.activate()
+        other = self.activate("user-beta")
+        lecture_id = self.lecture(token)
+        chunk_id = str(uuid.uuid4())
+        payload = wav_audio()
+        self.upload(token, lecture_id, payload, chunk_id,
+                    extra_headers={"X-Final-Chunk": "false"})
+        path = f"/lectures/{lecture_id}/chunks/{chunk_id}/result"
+        self.assertEqual(self.client.get(path).status_code, 401)
+        self.assertEqual(self.client.get(path, headers=self.chunk_result_headers(other, payload)).status_code, 404)
+        for changed in (
+            {"X-Chunk-Payload-SHA256": "0" * 64}, {"X-Start-Seconds": "0.2"},
+            {"X-Overlap-Seconds": "0.2"}, {"X-Final-Chunk": "true"},
+        ):
+            result = self.client.get(path, headers=self.chunk_result_headers(token, payload, **changed))
+            self.assertEqual(result.status_code, 409, result.text)
+            self.assertNotIn("segments", result.text)
+        invalid = self.client.get(path, headers=self.chunk_result_headers(
+            token, payload, **{"X-Chunk-Payload-SHA256": "z" * 64}))
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(self.engine.calls, 1)
+
+    def test_missing_or_failed_clova_result_is_unknown_not_permission_to_resend(self):
+        token = self.activate()
+        self.clova.configured = True
+        lecture_id = self.lecture(token, asr_provider="clova")
+        chunk_id = str(uuid.uuid4())
+        payload = wav_audio()
+        path = f"/lectures/{lecture_id}/chunks/{chunk_id}/result"
+        headers = self.chunk_result_headers(token, payload)
+        self.assertEqual(self.client.get(path, headers=headers).json(), {"state": "unknown"})
+        self.clova.error = ClovaTranscriptionError("provider_timeout", retryable=True)
+        with self.assertLogs("classroom", level="WARNING"):
+            failed = self.upload(token, lecture_id, payload, chunk_id,
+                                 extra_headers={"X-Final-Chunk": "false"})
+        self.assertEqual(failed.status_code, 424)
+        self.assertNotIn("safe_to_retry", failed.json())
+        self.assertEqual(self.client.get(path, headers=headers).json(), {"state": "unknown"})
+        self.assertEqual(self.clova.calls, 1)
+
+    def test_pending_result_is_read_only_and_clova_admission_rejection_is_retryable(self):
+        token = self.activate()
+        self.clova.configured = True
+        local_id = self.lecture(token)
+        cloud_id = self.lecture(token, asr_provider="clova")
+        chunk_id = str(uuid.uuid4())
+        payload = wav_audio()
+        self.engine.block = True
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.upload, token, local_id, payload, chunk_id,
+                                 extra_headers={"X-Final-Chunk": "false"})
+            try:
+                self.assertTrue(self.engine.entered.wait(5))
+                pending = self.client.get(
+                    f"/lectures/{local_id}/chunks/{chunk_id}/result",
+                    headers=self.chunk_result_headers(token, payload),
+                )
+                self.assertEqual(pending.json(), {"state": "pending"})
+                self.assertEqual(pending.headers.get("Retry-After"), "2")
+                rejected = self.upload(token, cloud_id, payload,
+                                       extra_headers={"X-Final-Chunk": "false"})
+                self.assertEqual(rejected.status_code, 429)
+                self.assertEqual(rejected.json()["code"], "chunk_not_started")
+                self.assertIs(rejected.json()["safe_to_retry"], True)
+                self.assertEqual(self.clova.calls, 0)
+                self.assertEqual(self.engine.calls, 1)
+            finally:
+                self.engine.release.set()
+            self.assertEqual(future.result(timeout=5).status_code, 200)
+        retried = self.upload(token, cloud_id, payload,
+                              extra_headers={"X-Final-Chunk": "false"})
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(self.clova.calls, 1)
+
+    def test_same_lecture_admission_is_serial_even_when_global_capacity_has_room(self):
+        token = self.activate()
+        lecture_id = self.lecture(token)
+        payload = wav_audio(seconds=8)
+        parallel_app = create_app(replace(self.settings, max_pending_chunks=2),
+                                  self.engine, clova_transcriber=self.clova)
+        self.engine.block = True
+        with TestClient(parallel_app) as client, ThreadPoolExecutor(max_workers=1) as pool:
+            first_headers = self.headers(token) | {
+                "Content-Type": "audio/wav", "X-Chunk-Id": str(uuid.uuid4()),
+                "X-Start-Seconds": "0", "X-Final-Chunk": "false",
+            }
+            next_headers = first_headers | {
+                "X-Chunk-Id": str(uuid.uuid4()), "X-Start-Seconds": "5", "X-Overlap-Seconds": "3",
+            }
+            future = pool.submit(client.post, f"/lectures/{lecture_id}/chunks",
+                                 content=payload, headers=first_headers)
+            try:
+                self.assertTrue(self.engine.entered.wait(5))
+                rejected = client.post(f"/lectures/{lecture_id}/chunks",
+                                       content=payload, headers=next_headers)
+                self.assertEqual(rejected.status_code, 429)
+                self.assertIs(rejected.json()["safe_to_retry"], True)
+                self.assertEqual(self.engine.calls, 1)
+                with self.database.connect() as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT count(*) FROM chunks WHERE lecture_id=? AND status='pending'",
+                        (lecture_id,),
+                    ).fetchone()[0], 1)
+            finally:
+                self.engine.release.set()
+            self.assertEqual(future.result(timeout=5).status_code, 200)
+            retried = client.post(f"/lectures/{lecture_id}/chunks", content=payload, headers=next_headers)
+            self.assertEqual(retried.status_code, 200)
+            self.assertEqual(self.engine.calls, 2)
+
+    def test_chunk_result_recovers_empty_silent_done_result(self):
+        token = self.activate()
+        lecture_id = self.lecture(token)
+        chunk_id = str(uuid.uuid4())
+        payload = wav_audio(sample=0)
+        self.engine.result = []
+        uploaded = self.upload(token, lecture_id, payload, chunk_id)
+        recovered = self.client.get(
+            f"/lectures/{lecture_id}/chunks/{chunk_id}/result",
+            headers=self.chunk_result_headers(token, payload, **{"X-Final-Chunk": "true"}),
+        )
+        self.assertEqual(recovered.json(), {"state": "done", "result": uploaded.json()})
+        self.assertEqual(recovered.json()["result"]["segments"], [])
+        self.assertTrue(recovered.json()["result"]["recording_finalized"])
+        self.assertEqual(self.engine.calls, 1)
+
     def test_activation_is_single_use_and_session_is_revocable(self):
         token = self.activate()
-        self.assertEqual(self.client.get("/auth/me", headers=self.headers(token)).json(), {"username": "user-alpha"})
+        restored = self.client.get("/auth/me", headers=self.headers(token)).json()
+        self.assertEqual(restored["username"], "user-alpha")
+        self.assertGreater(restored["session_expires_at"], time.time())
+        self.assertLessEqual(restored["session_expires_at"], time.time() + self.settings.session_hours * 3600)
         again = self.client.post("/auth/activate", json={"username": "user-alpha", "setup_code": self.codes["user-alpha"], "password": self.password})
         self.assertEqual(again.status_code, 400)
         unknown = self.client.post("/auth/activate", json={"username": "third-person", "setup_code": "x" * 43, "password": self.password})

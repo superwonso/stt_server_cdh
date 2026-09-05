@@ -358,7 +358,11 @@ class ClovaStreamingTranscriber:
         self._state_lock = threading.Lock()
         self._sessions: OrderedDict[tuple[str, str], _Session] = OrderedDict()
         self._opening: dict[tuple[str, str], _Session] = {}
+        self._opening_reservations: set[tuple[str, str]] = set()
         self._operation_tokens: dict[tuple[str, str], set[object]] = {}
+        self._owner_queues: dict[
+            tuple[str, str], OrderedDict[object, threading.Event]
+        ] = {}
         self._cache: OrderedDict[tuple[str, str, str], _CacheEntry] = OrderedDict()
         # Keep a small, owner-scoped description of the audio/text frontier.
         # It recovers words finalized just behind an HTTP chunk boundary and
@@ -391,7 +395,10 @@ class ClovaStreamingTranscriber:
                 "configured": self.configured,
                 "model_state": self._state,
                 "engine": "clova-speech-streaming",
-                "active_sessions": len(self._sessions) + len(self._opening),
+                "active_sessions": (
+                    len(self._sessions) + len(self._opening)
+                    + len(self._opening_reservations)
+                ),
                 "cached_chunks": len(self._cache),
             }
 
@@ -410,7 +417,7 @@ class ClovaStreamingTranscriber:
         if not isinstance(username, str) or not isinstance(lecture_id, str):
             raise ClovaTranscriptionError("invalid_input")
         owner_key = (username, lecture_id)
-        # Register before waiting for the global operation lock. A concurrent
+        # Register before waiting for this lecture's operation turn. A concurrent
         # lecture deletion can therefore invalidate both the active call and
         # already-queued calls before either sends CONFIG or private audio.
         with self._track_operation(owner_key) as operation_token:
@@ -459,7 +466,7 @@ class ClovaStreamingTranscriber:
         )
         owner_key = (username, lecture_id)
 
-        with self._operation_lock:
+        with self._wait_for_owner_turn(owner_key, operation_token):
             with self._state_lock:
                 if self._closed:
                     raise ClovaTranscriptionError("closed")
@@ -488,7 +495,10 @@ class ClovaStreamingTranscriber:
                 if session.language != language:
                     raise ClovaTranscriptionError("chunk_conflict")
                 with session.condition:
-                    unusable = session.closing or session.error is not None
+                    unusable = (
+                        session.closing or session.error is not None
+                        or now - session.last_used >= self._idle_seconds
+                    )
                 if unusable:
                     self._remove_and_shutdown(owner_key, session)
                     session = None
@@ -683,9 +693,17 @@ class ClovaStreamingTranscriber:
     def _track_operation(self, owner_key: tuple[str, str]):
         token = object()
         with self._state_lock:
-            pending = sum(len(tokens) for tokens in self._operation_tokens.values())
+            # Cancellation removes authorization tokens immediately, but its
+            # queued calls still own their turns until they unwind. Count the
+            # turns so repeated close/reopen cannot bypass the resource bound.
+            pending = sum(len(turns) for turns in self._owner_queues.values())
             if pending >= MAX_PENDING_OPERATIONS:
                 raise ClovaTranscriptionError("session_capacity", retryable=True)
+            turns = self._owner_queues.setdefault(owner_key, OrderedDict())
+            turn = threading.Event()
+            turns[token] = turn
+            if len(turns) == 1:
+                turn.set()
             self._operation_tokens.setdefault(owner_key, set()).add(token)
         try:
             yield token
@@ -696,6 +714,25 @@ class ClovaStreamingTranscriber:
                     tokens.discard(token)
                     if not tokens:
                         self._operation_tokens.pop(owner_key, None)
+                turns = self._owner_queues.get(owner_key)
+                if turns is not None:
+                    turns.pop(token, None)
+                    if turns:
+                        next(iter(turns.values())).set()
+                    else:
+                        self._owner_queues.pop(owner_key, None)
+
+    @contextmanager
+    def _wait_for_owner_turn(self, owner_key: tuple[str, str], token: object):
+        with self._state_lock:
+            turn = self._owner_queues.get(owner_key, {}).get(token)
+        if turn is None:
+            raise ClovaTranscriptionError("provider_unavailable", retryable=True)
+        # A FIFO turn survives close_session until all older calls unwind.
+        # Waiting here holds no global lock; other lectures can receive ACKs
+        # and commit results independently of this lecture's provider latency.
+        turn.wait()
+        yield
 
     def _validate_request(
         self,
@@ -820,10 +857,12 @@ class ClovaStreamingTranscriber:
 
     def _cleanup_idle(self) -> None:
         now = self._now()
-        with self._state_lock:
+        with self._operation_lock, self._state_lock:
             self._prune_continuity_locked(now)
             stale = []
             for key, session in self._sessions.items():
+                if key in self._owner_queues:
+                    continue
                 with session.condition:
                     failed = session.closing or session.error is not None
                 if failed or now - session.last_used >= self._idle_seconds:
@@ -841,24 +880,40 @@ class ClovaStreamingTranscriber:
         now: float,
         operation_token: object,
     ) -> _Session:
-        while True:
+        with self._operation_lock:
             with self._state_lock:
                 if self._closed:
                     raise ClovaTranscriptionError("closed")
-                if len(self._sessions) + len(self._opening) < MAX_ACTIVE_SESSIONS:
+                if operation_token not in self._operation_tokens.get(owner_key, ()):
+                    raise ClovaTranscriptionError("provider_unavailable", retryable=True)
+                occupied = (
+                    len(self._sessions) + len(self._opening)
+                    + len(self._opening_reservations)
+                )
+                if occupied < MAX_ACTIVE_SESSIONS:
                     old_session = None
-                elif self._sessions:
-                    _old_key, old_session = self._sessions.popitem(last=False)
                 else:
-                    raise ClovaTranscriptionError("session_capacity", retryable=True)
-            if old_session is None:
-                break
+                    idle_key = next(
+                        (key for key in self._sessions if key not in self._owner_queues),
+                        None,
+                    )
+                    if idle_key is None:
+                        raise ClovaTranscriptionError("session_capacity", retryable=True)
+                    old_session = self._sessions.pop(idle_key)
+                # Reserve capacity before creating a channel or awaiting
+                # CONFIG. Parallel owners must not both claim the last slot.
+                self._opening_reservations.add(owner_key)
+        if old_session is not None:
             self._shutdown(old_session)
         try:
             stub, channel = self._make_transport()
         except ClovaTranscriptionError:
+            with self._state_lock:
+                self._opening_reservations.discard(owner_key)
             raise
         except Exception:
+            with self._state_lock:
+                self._opening_reservations.discard(owner_key)
             raise ClovaTranscriptionError("provider_unavailable", retryable=True) from None
         session = _Session(
             owner_key=owner_key,
@@ -869,6 +924,7 @@ class ClovaStreamingTranscriber:
             last_used=now,
         )
         with self._state_lock:
+            self._opening_reservations.discard(owner_key)
             if self._closed:
                 close_code = "closed"
             elif operation_token not in self._operation_tokens.get(owner_key, ()):
@@ -1350,12 +1406,13 @@ class ClovaStreamingTranscriber:
         return responses, provider_end
 
     def _allocate_seq_id(self) -> int:
-        if self._next_seq_id > 2_147_483_647:
-            # Reusing an acknowledgement ID would make completion ambiguous.
-            raise ClovaTranscriptionError("session_capacity", retryable=True)
-        value = self._next_seq_id
-        self._next_seq_id += 1
-        return value
+        with self._state_lock:
+            if self._next_seq_id > 2_147_483_647:
+                # Reusing an acknowledgement ID would make completion ambiguous.
+                raise ClovaTranscriptionError("session_capacity", retryable=True)
+            value = self._next_seq_id
+            self._next_seq_id += 1
+            return value
 
     @staticmethod
     def _local_segments(

@@ -6,6 +6,7 @@ import json
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -170,6 +171,341 @@ def settings(**updates):
     }
     values.update(updates)
     return SimpleNamespace(**values)
+
+
+class ClovaConcurrencyTests(unittest.TestCase):
+    @staticmethod
+    def call(engine, lecture="lecture-a", *, start=0, final=False):
+        return engine.transcribe(
+            np.zeros(16_000, dtype=np.float32),
+            "ko",
+            final_chunk=final,
+            lecture_id=lecture,
+            username="owner",
+            start_seconds=start,
+            payload_hash=digest(f"{lecture}:{start}"),
+        )
+
+    def wait_for_turns(self, engine, count):
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with engine._state_lock:
+                actual = sum(len(turns) for turns in engine._owner_queues.values())
+            if actual == count:
+                return
+            time.sleep(0.005)
+        self.fail(f"expected {count} registered operation turns, got {actual}")
+
+    def test_another_lecture_completes_while_the_first_waits_for_ack(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow(seq, _start, _end):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return [transcript("가", 0, [("가", 0.1, 0.2)], seq_id=seq)]
+
+        def fast(seq, _start, _end):
+            return [transcript("나", 0, [("나", 0.1, 0.2)], seq_id=seq)]
+
+        factory = FakeFactory([[slow], [fast]])
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3), stub_factory=factory
+        )
+        self.addCleanup(engine.close)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.call, engine)
+            try:
+                self.assertTrue(entered.wait(1))
+                second = pool.submit(self.call, engine, "lecture-b")
+                self.assertEqual(second.result(timeout=1)[0]["text"], "나")
+                self.assertFalse(first.done())
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=1)[0]["text"], "가")
+        self.assertEqual(engine._owner_queues, {})
+
+    def test_same_lecture_waits_and_submits_chunks_in_registration_order(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def plan(word, position, wait=False):
+            def respond(seq, start, _end):
+                if wait:
+                    entered.set()
+                    self.assertTrue(release.wait(3))
+                return [transcript(
+                    word, position, [(word, start + 0.1, start + 0.2)], seq_id=seq
+                )]
+            return respond
+
+        factory = FakeFactory([[plan("가", 0, True), plan("나", 1), plan("다", 2)]])
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3), stub_factory=factory
+        )
+        self.addCleanup(engine.close)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            first = pool.submit(self.call, engine)
+            try:
+                self.assertTrue(entered.wait(1))
+                second = pool.submit(self.call, engine, start=1)
+                self.wait_for_turns(engine, 2)
+                third = pool.submit(self.call, engine, start=2, final=True)
+                self.wait_for_turns(engine, 3)
+                self.assertEqual(len(factory.stubs[0].data_groups), 1)
+                self.assertFalse(second.done())
+                self.assertFalse(third.done())
+            finally:
+                release.set()
+            self.assertEqual(
+                [future.result(timeout=1)[0]["text"] for future in (first, second, third)],
+                ["가", "나", "다"],
+            )
+        self.assertEqual(len(factory.stubs), 1)
+        self.assertEqual(engine._owner_queues, {})
+
+    def test_another_lecture_can_open_while_a_transport_is_still_being_created(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def response(seq, _start, _end):
+            return [transcript("가", 0, [("가", 0.1, 0.2)], seq_id=seq)]
+
+        factory = FakeFactory([[response], [response]])
+        factory_lock = threading.Lock()
+
+        def first_transport_waits():
+            with factory_lock:
+                is_first = not factory.stubs
+                product = factory()
+            if is_first:
+                entered.set()
+                self.assertTrue(release.wait(3))
+            return product
+
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3),
+            stub_factory=first_transport_waits,
+        )
+        self.addCleanup(engine.close)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.call, engine)
+            try:
+                self.assertTrue(entered.wait(1))
+                second = pool.submit(self.call, engine, "lecture-b")
+                self.assertEqual(second.result(timeout=1)[0]["text"], "가")
+                self.assertFalse(first.done())
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=1)[0]["text"], "가")
+        self.assertEqual(engine._opening_reservations, set())
+
+    def test_busy_session_survives_status_and_other_lecture_idle_cleanup(self):
+        entered, release = threading.Event(), threading.Event()
+        clock = FakeClock()
+
+        def slow(seq, _start, _end):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return [transcript("가", 0, [("가", 0.1, 0.2)], seq_id=seq)]
+
+        def fast(seq, _start, _end):
+            return [transcript("나", 0, [("나", 0.1, 0.2)], seq_id=seq)]
+
+        factory = FakeFactory([[slow], [fast]])
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3, clova_stream_idle_seconds=1),
+            stub_factory=factory, clock=clock,
+        )
+        self.addCleanup(engine.close)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.call, engine)
+            try:
+                self.assertTrue(entered.wait(1))
+                clock.value = 2
+                self.assertEqual(engine.status()["active_sessions"], 1)
+                self.assertFalse(factory.channels[0].closed.is_set())
+                second = pool.submit(self.call, engine, "lecture-b")
+                self.assertEqual(second.result(timeout=1)[0]["text"], "나")
+                self.assertFalse(factory.channels[0].closed.is_set())
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=1)[0]["text"], "가")
+
+    def test_session_capacity_never_evicts_another_active_lecture(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow(seq, _start, _end):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return [transcript("가", 0, [("가", 0.1, 0.2)], seq_id=seq)]
+
+        factory = FakeFactory([[slow]])
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3), stub_factory=factory
+        )
+        self.addCleanup(engine.close)
+        with patch("server.clova_transcriber.MAX_ACTIVE_SESSIONS", 1):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(self.call, engine)
+                try:
+                    self.assertTrue(entered.wait(1))
+                    with self.assertRaises(ClovaTranscriptionError) as raised:
+                        self.call(engine, "lecture-b")
+                    self.assertEqual(raised.exception.code, "session_capacity")
+                    self.assertTrue(raised.exception.retryable)
+                    self.assertFalse(factory.channels[0].closed.is_set())
+                    self.assertEqual(engine.status()["active_sessions"], 1)
+                finally:
+                    release.set()
+                self.assertEqual(first.result(timeout=1)[0]["text"], "가")
+
+    def test_transport_creation_reserves_the_last_session_slot(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def response(seq, _start, _end):
+            return [transcript("가", 0, [("가", 0.1, 0.2)], seq_id=seq)]
+
+        factory = FakeFactory([[response]])
+
+        def blocked_factory():
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return factory()
+
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3), stub_factory=blocked_factory
+        )
+        self.addCleanup(engine.close)
+        with patch("server.clova_transcriber.MAX_ACTIVE_SESSIONS", 1):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(self.call, engine)
+                try:
+                    self.assertTrue(entered.wait(1))
+                    self.assertEqual(engine.status()["active_sessions"], 1)
+                    with self.assertRaises(ClovaTranscriptionError) as raised:
+                        self.call(engine, "lecture-b")
+                    self.assertEqual(raised.exception.code, "session_capacity")
+                finally:
+                    release.set()
+                self.assertEqual(first.result(timeout=1)[0]["text"], "가")
+        self.assertEqual(len(factory.stubs), 1)
+        self.assertEqual(engine._opening_reservations, set())
+
+    def test_cancelled_turns_remain_bounded_until_their_owner_queue_unwinds(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def response(seq, _start, _end):
+            return [transcript("가", 0, [("가", 0.1, 0.2)], seq_id=seq)]
+
+        factory = FakeFactory([[response], [response]])
+
+        def blocked_factory():
+            if not factory.stubs:
+                entered.set()
+                self.assertTrue(release.wait(3))
+            return factory()
+
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3), stub_factory=blocked_factory
+        )
+        self.addCleanup(engine.close)
+        with patch("server.clova_transcriber.MAX_PENDING_OPERATIONS", 2):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(self.call, engine)
+                try:
+                    self.assertTrue(entered.wait(1))
+                    second = pool.submit(self.call, engine, start=1)
+                    self.wait_for_turns(engine, 2)
+                    engine.close_session("owner", "lecture-a")
+                    with self.assertRaises(ClovaTranscriptionError) as raised:
+                        self.call(engine, start=2)
+                    self.assertEqual(raised.exception.code, "session_capacity")
+                finally:
+                    release.set()
+                for future in (first, second):
+                    with self.assertRaises(ClovaTranscriptionError):
+                        future.result(timeout=1)
+        self.assertEqual(factory.stubs[0].requests, [])
+        self.assertEqual(engine._owner_queues, {})
+        self.assertEqual(engine._opening_reservations, set())
+        self.assertEqual(self.call(engine, final=True)[0]["text"], "가")
+        self.assertEqual(engine._owner_queues, {})
+
+    def test_parallel_lectures_keep_unique_ack_ids_and_release_all_turns(self):
+        count = 8
+        all_sent = threading.Barrier(count)
+
+        def response(seq, _start, _end):
+            all_sent.wait(timeout=2)
+            return [transcript("가", 0, [("가", 0.1, 0.2)], seq_id=seq)]
+
+        factory = FakeFactory([[response] for _ in range(count)])
+        factory_lock = threading.Lock()
+
+        def locked_factory():
+            with factory_lock:
+                return factory()
+
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3), stub_factory=locked_factory
+        )
+        self.addCleanup(engine.close)
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            futures = [
+                pool.submit(self.call, engine, f"lecture-{index}", final=True)
+                for index in range(count)
+            ]
+            for future in futures:
+                self.assertEqual(future.result(timeout=3)[0]["text"], "가")
+        sequences = [
+            json.loads(stub.data_groups[0][-1].data.extra_contents)["seqId"]
+            for stub in factory.stubs
+        ]
+        self.assertEqual(len(set(sequences)), count)
+        self.assertEqual(engine._owner_queues, {})
+        self.assertEqual(engine._operation_tokens, {})
+        self.assertEqual(engine._opening_reservations, set())
+        self.assertEqual(engine.status()["active_sessions"], 0)
+
+    def test_reopening_a_cancelled_lecture_waits_for_older_turns_to_unwind(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def response(seq, _start, _end):
+            return [transcript("가", 0, [("가", 0.1, 0.2)], seq_id=seq)]
+
+        factory = FakeFactory([[response], [response]])
+
+        def blocked_factory():
+            product = factory()
+            if len(factory.stubs) == 1:
+                entered.set()
+                self.assertTrue(release.wait(3))
+            return product
+
+        engine = ClovaStreamingTranscriber(
+            settings(clova_stream_response_timeout_seconds=3), stub_factory=blocked_factory
+        )
+        self.addCleanup(engine.close)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            first = pool.submit(self.call, engine)
+            try:
+                self.assertTrue(entered.wait(1))
+                second = pool.submit(self.call, engine, start=1)
+                self.wait_for_turns(engine, 2)
+                engine.close_session("owner", "lecture-a")
+                reopened = pool.submit(self.call, engine, final=True)
+                self.wait_for_turns(engine, 3)
+                self.assertFalse(reopened.done())
+                self.assertEqual(len(factory.stubs), 1)
+            finally:
+                release.set()
+            for future in (first, second):
+                with self.assertRaises(ClovaTranscriptionError):
+                    future.result(timeout=1)
+            self.assertEqual(reopened.result(timeout=1)[0]["text"], "가")
+        self.assertEqual(factory.stubs[0].requests, [])
+        self.assertEqual(len(factory.stubs[1].data_groups), 1)
+        self.assertEqual(engine._owner_queues, {})
+        self.assertEqual(engine._operation_tokens, {})
+        self.assertEqual(engine._opening_reservations, set())
 
 
 class ClovaStreamingTranscriberTests(unittest.TestCase):

@@ -145,6 +145,9 @@ class Database:
                     final_chunk INTEGER NOT NULL DEFAULT 1 CHECK (final_chunk IN (0, 1)),
                     status TEXT NOT NULL CHECK (status IN ('pending', 'done')),
                     processing_seconds REAL,
+                    qwen_boundary_json TEXT CHECK (
+                        qwen_boundary_json IS NULL OR length(qwen_boundary_json) <= 65536
+                    ),
                     PRIMARY KEY (lecture_id, chunk_id)
                 );
                 CREATE TABLE IF NOT EXISTS segments (
@@ -279,6 +282,44 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS transcript_corrections_queue
                     ON transcript_corrections(status, created_at);
+                CREATE TABLE IF NOT EXISTS lecture_summaries (
+                    lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL UNIQUE,
+                    raw_revision TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
+                    model TEXT NOT NULL,
+                    summary_json TEXT,
+                    error_code TEXT,
+                    error TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    CHECK ((status = 'completed' AND summary_json IS NOT NULL
+                            AND completed_at IS NOT NULL AND error IS NULL AND error_code IS NULL)
+                        OR (status != 'completed' AND summary_json IS NULL AND completed_at IS NULL))
+                );
+                CREATE INDEX IF NOT EXISTS lecture_summaries_queue
+                    ON lecture_summaries(status, created_at);
+                CREATE TABLE IF NOT EXISTS lecture_translations (
+                    lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL UNIQUE,
+                    raw_revision TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
+                    model TEXT NOT NULL,
+                    translation_json TEXT,
+                    error_code TEXT,
+                    error TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    CHECK ((status = 'completed' AND translation_json IS NOT NULL
+                            AND completed_at IS NOT NULL AND error IS NULL AND error_code IS NULL)
+                        OR (status != 'completed' AND translation_json IS NULL AND completed_at IS NULL))
+                );
+                CREATE INDEX IF NOT EXISTS lecture_translations_queue
+                    ON lecture_translations(status, created_at);
                 CREATE TABLE IF NOT EXISTS operational_state (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     access_enabled INTEGER NOT NULL CHECK (access_enabled IN (0, 1)),
@@ -327,6 +368,13 @@ class Database:
                 connection.execute(
                     "ALTER TABLE chunks ADD COLUMN final_chunk INTEGER NOT NULL DEFAULT 1 "
                     "CHECK (final_chunk IN (0, 1))"
+                )
+            if "qwen_boundary_json" not in chunk_columns:
+                # Private, bounded alignment context committed with the same
+                # chunk's text. Legacy chunks have no recoverable word context.
+                connection.execute(
+                    "ALTER TABLE chunks ADD COLUMN qwen_boundary_json TEXT "
+                    "CHECK (qwen_boundary_json IS NULL OR length(qwen_boundary_json) <= 65536)"
                 )
             import_columns = {row[1] for row in connection.execute("PRAGMA table_info(imports)")}
             if "file_fingerprint" not in import_columns:
@@ -383,5 +431,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 9:
-                connection.execute("PRAGMA user_version = 9")
+            if schema_version < 12:
+                connection.execute("PRAGMA user_version = 12")

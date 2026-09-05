@@ -2264,6 +2264,21 @@ button {
   }
 }
 
+.lesson-summary { margin: 20px 0; padding: 20px; border: 1px solid #d6dfd5; border-radius: 14px; background: #f7faf6; overflow-wrap: anywhere; }
+.lesson-summary h3 { margin: 0 0 12px; }
+.lesson-summary h4 { margin: 20px 0 8px; }
+.lesson-summary ul { padding-left: 22px; }
+.lesson-summary li { margin: 8px 0; }
+.summary-privacy, .summary-sources { color: #51604f; font-size: .82rem; line-height: 1.65; }
+.summary-sources { display: block; }
+.summary-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.lesson-translation { background: #f7f8fc; border-color: #d8ddea; }
+.translation-row { padding: 14px 0; border-bottom: 1px solid #dfe3ec; line-height: 1.75; }
+.translation-row:last-child { border-bottom: 0; }
+.translation-source { color: #606977; margin: 6px 0; white-space: pre-wrap; }
+.translation-target { margin: 6px 0; white-space: pre-wrap; }
+@media print { .summary-actions, .summary-privacy, #summary-state, #translation-state, #translation-views { display: none !important; } }
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

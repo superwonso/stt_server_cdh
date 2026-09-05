@@ -28,6 +28,27 @@ from server.settings import (
 
 
 class UrlValidationTests(unittest.TestCase):
+    def test_translation_uses_existing_gateway_key_with_independent_bounded_defaults(self):
+        with mock.patch("server.settings.load_dotenv"), mock.patch.dict(
+            "os.environ", {"ACCOUNT_USERNAMES": "user-alpha,user-beta", "MINDLOGIC_API_KEY": "test-only-gateway-key"},
+            clear=True,
+        ):
+            settings = Settings.from_env()
+        self.assertEqual((settings.translation_model, settings.translation_chunk_chars,
+                          settings.translation_max_source_chars), ("solar-pro4", 6000, 250000))
+        self.assertEqual(settings.mindlogic_api_key, "test-only-gateway-key")
+        self.assertNotIn("test-only-gateway-key", repr(settings))
+
+    def test_translation_environment_clamps_work_bounds_without_loading_private_configuration(self):
+        for value, expected in (("-1", (1000, 1000)), ("999999999", (24000, 250000))):
+            with mock.patch("server.settings.load_dotenv"), mock.patch.dict(
+                "os.environ", {"ACCOUNT_USERNAMES": "user-alpha,user-beta", "TRANSLATION_MODEL": "test-model",
+                               "TRANSLATION_CHUNK_CHARS": value, "TRANSLATION_MAX_SOURCE_CHARS": value}, clear=True,
+            ):
+                settings = Settings.from_env()
+            self.assertEqual((settings.translation_chunk_chars, settings.translation_max_source_chars), expected)
+            self.assertEqual(settings.translation_model, "test-model")
+
     def test_private_account_allowlist_is_parsed_and_normalized(self):
         self.assertEqual(
             account_usernames(" user-alpha , user-beta "),

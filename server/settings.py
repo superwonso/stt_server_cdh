@@ -150,6 +150,12 @@ class Settings:
     mindlogic_api_key: str | None = field(default=None, repr=False)
     mindlogic_base_url: str = f"https://{MINDLOGIC_GATEWAY_HOST}{MINDLOGIC_GATEWAY_PATH}"
     mindlogic_model: str = "solar-pro4"
+    summary_model: str = "solar-pro4"
+    summary_chunk_chars: int = 6000
+    summary_max_source_chars: int = 250000
+    translation_model: str = "solar-pro4"
+    translation_chunk_chars: int = 6000
+    translation_max_source_chars: int = 250000
     correction_chunk_chars: int = 6000
     correction_overlap_segments: int = 2
     correction_connect_timeout_seconds: float = 10.0
@@ -274,6 +280,16 @@ class Settings:
                 )
             ),
             mindlogic_model=(os.getenv("MINDLOGIC_MODEL", "solar-pro4").strip() or "solar-pro4"),
+            summary_model=(os.getenv("SUMMARY_MODEL", "solar-pro4").strip() or "solar-pro4"),
+            summary_chunk_chars=max(1000, min(int(os.getenv("SUMMARY_CHUNK_CHARS", "6000")), 24000)),
+            summary_max_source_chars=max(
+                1000, min(int(os.getenv("SUMMARY_MAX_SOURCE_CHARS", "250000")), 250000)
+            ),
+            translation_model=(os.getenv("TRANSLATION_MODEL", "solar-pro4").strip() or "solar-pro4"),
+            translation_chunk_chars=max(1000, min(int(os.getenv("TRANSLATION_CHUNK_CHARS", "6000")), 24000)),
+            translation_max_source_chars=max(
+                1000, min(int(os.getenv("TRANSLATION_MAX_SOURCE_CHARS", "250000")), 250000)
+            ),
             correction_chunk_chars=max(1000, min(int(os.getenv("CORRECTION_CHUNK_CHARS", "6000")), 24000)),
             correction_overlap_segments=max(
                 0, min(int(os.getenv("CORRECTION_OVERLAP_SEGMENTS", "2")), 5)

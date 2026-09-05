@@ -69,8 +69,8 @@ test('WAV output is mono signed PCM16 with a 16 kHz header and clipping', async 
     [-32768, -32768, 0, 32767, 32767, 0]);
 });
 
-function prepareCapture(inputRate, chunks) {
-  const capture = new MicrophoneCapture({ onChunk: chunk => chunks.push(chunk) });
+function prepareCapture(inputRate, chunks, options = {}) {
+  const capture = new MicrophoneCapture({ onChunk: chunk => chunks.push(chunk), ...options });
   capture._resampler = new StreamingResampler(inputRate);
   capture._chunk = new Float32Array(16000 * 15);
   capture._chunkUsed = 0;
@@ -238,7 +238,7 @@ class FakeEventTarget {
   stop() { this.stopped = true; this.readyState = 'ended'; }
 }
 
-function installCaptureBrowser({ withAudio = true, autoAcknowledge = true } = {}) {
+function installCaptureBrowser({ withAudio = true, autoAcknowledge = true, allowMicrophone = false } = {}) {
   const originals = new Map();
   const replace = (name, value) => {
     originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
@@ -321,7 +321,11 @@ function installCaptureBrowser({ withAudio = true, autoAcknowledge = true } = {}
   replace('removeEventListener', pageTarget.removeEventListener.bind(pageTarget));
   replace('navigator', {
     mediaDevices: {
-      getUserMedia: async () => { throw new Error('getUserMedia must not be used'); },
+      getUserMedia: async (constraints) => {
+        if (!allowMicrophone) throw new Error('getUserMedia must not be used');
+        requests.push({ constraints });
+        return new FakeMediaStream(withAudio ? [audioTrack] : []);
+      },
       getDisplayMedia: async function getDisplayMedia(constraints) {
         requests.push({ constraints, receiver: this });
         return displayStream;
@@ -675,4 +679,182 @@ test('a transient system-track mute that recovers does not end a long capture', 
 test('capture source is explicit and rejects unknown input modes', () => {
   assert.throws(() => new MicrophoneCapture({ source: 'speaker', onChunk() {} }), /microphone 또는 system/);
   assert.equal(new MicrophoneCapture({ source: 'system', onChunk() {} }).captureSource, 'system');
+});
+
+function acceptedSamples(chunks) {
+  return chunks.reduce((sum, chunk) => sum + pcmSamples(chunk) - Math.round(chunk.overlapSeconds * 16000), 0);
+}
+
+async function freshPCM(chunks) {
+  const values = [];
+  for (const chunk of chunks) {
+    const view = new DataView(await chunk.blob.arrayBuffer());
+    for (let index = Math.round(chunk.overlapSeconds * 16000); index < pcmSamples(chunk); index += 1) {
+      values.push(view.getInt16(44 + index * 2, true));
+    }
+  }
+  return values;
+}
+
+test('microphone and system captures preserve two minutes of silence without pausing or finalizing', async () => {
+  for (const source of ['microphone', 'system']) {
+    const chunks = [];
+    const capture = prepareCapture(16000, chunks, {source});
+    const buffer = capture._chunk;
+    const quietBlock = new Float32Array(16000 / 10);
+    for (let index = 0; index < 1200; index += 1) {
+      capture._acceptSamples(quietBlock);
+      assert.equal(capture.recording, true);
+      assert.equal(capture.paused, false);
+      assert.equal(capture._chunk, buffer, 'capture uses the same bounded PCM buffer');
+    }
+    assert.equal(capture.capturedSeconds, 120);
+    assert.ok(chunks.length > 1, 'quiet PCM keeps being emitted for storage');
+    assert.ok(chunks.every(chunk => chunk.final === false));
+    await capture.stop();
+    assert.equal(capture.capturedSeconds, 120);
+    assert.equal(acceptedSamples(chunks), 16000 * 120);
+    assert.equal(chunks.filter(chunk => chunk.final).length, 1);
+    for (const chunk of chunks) {
+      const bytes = new Uint8Array(await chunk.blob.arrayBuffer(), 44);
+      assert.ok(bytes.every(value => value === 0), 'all quiet PCM survives as exact silence');
+    }
+    for (let index = 1; index < chunks.length; index += 1) {
+      assert.equal(Math.round((chunks[index].startSeconds + chunks[index].overlapSeconds) * 16000),
+        Math.round((chunks[index - 1].startSeconds + chunks[index - 1].durationSeconds) * 16000));
+    }
+  }
+});
+
+test('faint speech and very short sounds after long silence are preserved sample for sample', async () => {
+  const chunks = [];
+  const capture = prepareCapture(16000, chunks);
+  capture._acceptSamples(new Float32Array(16000 * 12));
+  capture._acceptSamples(new Float32Array(640).fill(0.0015));
+  capture._acceptSamples(new Float32Array(111).fill(0.25));
+  capture._acceptSamples(new Float32Array(320).fill(0.8));
+  capture._acceptSamples(new Float32Array(97));
+  await capture.stop();
+  const pcm = await freshPCM(chunks);
+  assert.equal(pcm.length, 16000 * 12 + 1168);
+  assert.ok(pcm.slice(0, 16000 * 12).every(value => value === 0));
+  assert.deepEqual(pcm.slice(16000 * 12, 16000 * 12 + 640), Array(640).fill(49));
+  assert.deepEqual(pcm.slice(16000 * 12 + 640, 16000 * 12 + 751), Array(111).fill(8192));
+  assert.deepEqual(pcm.slice(16000 * 12 + 751, -97), Array(320).fill(26214));
+  assert.ok(pcm.slice(-97).every(value => value === 0));
+  assert.equal(chunks.filter(chunk => chunk.final).length, 1);
+});
+
+test('long quiet microphone input leaves its graph and track running until explicit stop', async () => {
+  const browser = installCaptureBrowser({allowMicrophone:true});
+  const chunks = [];
+  try {
+    const capture = new MicrophoneCapture({onChunk: chunk => chunks.push(chunk)});
+    await capture.start();
+    const graph = browser.sourceNode;
+    for (let index = 0; index < 6; index += 1) {
+      browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(48000 * 4)}});
+    }
+    assert.equal(capture.recording, true);
+    assert.equal(capture.paused, false);
+    assert.equal(graph.disconnectCalls, 0);
+    assert.equal(browser.audioTrack.stopped, false);
+    assert.equal(browser.audioContext.state, 'running');
+    assert.deepEqual(browser.controlMessages, []);
+    assert.ok(chunks.every(chunk => chunk.final === false));
+    await capture.stop();
+    assert.equal(acceptedSamples(chunks), 16000 * 24);
+    assert.equal(chunks.filter(chunk => chunk.final).length, 1);
+    assert.equal(browser.audioTrack.stopped, true);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('manual pause discards both quiet and voiced input until explicit resume on the same timeline', async () => {
+  const browser = installCaptureBrowser({allowMicrophone:true});
+  const chunks = [];
+  try {
+    const capture = new MicrophoneCapture({onChunk: chunk => chunks.push(chunk)});
+    await capture.start();
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(48000 * 12)}});
+    await capture.pause();
+    assert.equal(capture.paused, true);
+    assert.equal(capture.capturedSeconds, 12);
+    const boundaryCount = chunks.length;
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(48000)}});
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(48000).fill(0.8)}});
+    assert.equal(capture.paused, true);
+    assert.equal(capture.recording, false);
+    assert.equal(capture.capturedSeconds, 12);
+    assert.equal(chunks.length, boundaryCount);
+    await capture.resume();
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(4800).fill(0.25)}});
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(48000 * 12)}});
+    assert.equal(capture.recording, true);
+    assert.equal(capture.paused, false);
+    assert.ok(chunks.every(chunk => chunk.final === false));
+    await capture.stop();
+    assert.equal(acceptedSamples(chunks), 16000 * 24.1);
+    assert.equal(capture.capturedSeconds, 24.1);
+    assert.ok((await freshPCM(chunks)).every(value => value < 16000), 'paused loud input never enters a WAV');
+    assert.deepEqual(browser.controlMessages.map(item => item.type), ['pause', 'resume', 'stop']);
+    assert.equal(chunks.filter(chunk => chunk.final).length, 1);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('a pending manual pause preserves its received tail but cannot resume itself when speech arrives', async () => {
+  const browser = installCaptureBrowser({allowMicrophone:true, autoAcknowledge:false});
+  const chunks = [];
+  try {
+    const capture = new MicrophoneCapture({onChunk: chunk => chunks.push(chunk)});
+    await capture.start();
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(48000 * 12)}});
+    const pausing = capture.pause();
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(9600).fill(0.25)}});
+    assert.equal(capture.recording, false);
+    assert.deepEqual(browser.controlMessages.map(item => item.type), ['pause']);
+    browser.acknowledge(browser.controlMessages[0]);
+    await pausing;
+    assert.equal(capture.paused, true);
+    assert.equal(capture.capturedSeconds, 12.2);
+    const stopping = capture.stop();
+    await new Promise(resolve => setImmediate(resolve));
+    browser.acknowledge(browser.controlMessages.at(-1));
+    await stopping;
+    assert.equal(acceptedSamples(chunks), 16000 * 12.2);
+    assert.equal(chunks.filter(chunk => chunk.final).length, 1);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('ended microphone input after silence can reconnect without losing or finalizing the existing recording', async () => {
+  const browser = installCaptureBrowser({allowMicrophone:true});
+  const chunks = [], reconnects = [];
+  try {
+    const capture = new MicrophoneCapture({onChunk: chunk => chunks.push(chunk), onReconnectNeeded: error => reconnects.push(error)});
+    await capture.start();
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(48000 * 12)}});
+    browser.audioTrack.readyState = 'ended';
+    browser.audioTrack.dispatch('ended');
+    await capture._reconnectPreparation;
+    assert.equal(capture.reconnectNeeded, true);
+    assert.equal(reconnects.length, 1);
+    assert.equal(capture.capturedSeconds, 12);
+    assert.ok(chunks.every(chunk => chunk.final === false));
+    browser.audioTrack.readyState = 'live';
+    await capture.reconnect();
+    assert.equal(capture.recording, true);
+    assert.equal(browser.requests.length, 2);
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(48000 * 2)}});
+    await capture.stop();
+    assert.equal(acceptedSamples(chunks), 16000 * 14);
+    assert.equal(capture.capturedSeconds, 14);
+    assert.equal(chunks.filter(chunk => chunk.final).length, 1);
+  } finally {
+    browser.restore();
+  }
 });

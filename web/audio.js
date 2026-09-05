@@ -248,6 +248,7 @@ export class MicrophoneCapture {
 
   get recording() { return this._state === 'recording'; }
   get paused() { return this._state === 'paused'; }
+  get capturedSeconds() { return ((this._chunkStartSamples || 0) + (this._chunkUsed || 0)) / PCM_SAMPLE_RATE; }
   get reconnectNeeded() { return this._state === 'reconnect-needed'; }
 
   start() {
@@ -726,7 +727,7 @@ export class MicrophoneCapture {
         ).catch(() => {});
       }
       if (this._resampler) {
-        try { this._appendPCM(this._resampler.flush()); } catch { /* Keep already accepted PCM. */ }
+        try { this._consumePCM(this._resampler.flush()); } catch { /* Keep already accepted PCM. */ }
         this._resampler = null;
       }
       this._pauseBoundaryPending = false;
@@ -746,7 +747,7 @@ export class MicrophoneCapture {
   }
 
   _acceptSamples(samples) {
-    this._appendPCM(this._resampler.push(samples));
+    this._consumePCM(this._resampler.push(samples));
     if (this.recording) {
       let power = 0;
       for (const sample of samples) power += sample * sample;
@@ -754,7 +755,9 @@ export class MicrophoneCapture {
     }
   }
 
-  _appendPCM(samples) {
+  _consumePCM(samples) {
+    // Quiet input is still recording data. Only an explicit manual pause or
+    // unavailable input may interrupt capture; amplitude never removes PCM.
     let offset = 0;
     while (offset < samples.length) {
       const count = Math.min(samples.length - offset, this._chunk.length - this._chunkUsed);
@@ -798,6 +801,7 @@ export class MicrophoneCapture {
     };
     this._hasEmitted = true;
     if (final) {
+      this._chunkStartSamples += count;
       this._chunkUsed = 0;
       this._chunkOverlap = 0;
     } else {
@@ -915,7 +919,7 @@ export class MicrophoneCapture {
     if (this._state === 'reconnect-needed') throw this._reconnectError;
     this._disconnectSource();
     if (boundaryConfirmed) {
-      if (this._resampler) this._appendPCM(this._resampler.flush());
+      if (this._resampler) this._consumePCM(this._resampler.flush());
       this._resampler = null;
       this._pauseBoundaryPending = false;
     } else {
@@ -989,7 +993,7 @@ export class MicrophoneCapture {
         'paused',
         '일시정지 직전 오디오를 아직 정리하지 못했습니다. 잠시 후 재개를 다시 눌러 주세요.',
       );
-      if (this._resampler) this._appendPCM(this._resampler.flush());
+      if (this._resampler) this._consumePCM(this._resampler.flush());
       this._resampler = null;
       this._pauseBoundaryPending = false;
       this.checkpoint();
@@ -1068,7 +1072,7 @@ export class MicrophoneCapture {
       } else if (this._node) {
         flushError = new Error('기기가 오디오 처리를 종료하여 마지막 오디오 조각을 확인하지 못했습니다. 받은 내용은 저장됩니다.');
       }
-      if (this._resampler) this._appendPCM(this._resampler.flush());
+      if (this._resampler) this._consumePCM(this._resampler.flush());
       this._emitChunk(true);
     } finally {
       await this._releaseResources();

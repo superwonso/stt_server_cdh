@@ -943,7 +943,10 @@ export class DurableLiveQueue {
     return chunk;
   }
 
-  async ackChunk(ownerValue, chunkIdValue) {
+  async ackChunk(ownerValue, chunkIdValue, { serverConfirmed = false } = {}) {
+    if (typeof serverConfirmed !== 'boolean') {
+      throw new LiveQueueValidationError('서버의 음성 저장 확인 상태가 올바르지 않습니다.');
+    }
     const owner = cleanOwner(ownerValue);
     const chunkId = cleanUuid(chunkIdValue, '음성 조각 ID');
     const now = this._clock();
@@ -954,11 +957,14 @@ export class DurableLiveQueue {
       if (chunk.owner !== owner) throw new LiveQueueOwnershipError();
       const explicitlyDownloadedChunk = chunk.downloadRequested === true;
       if (chunk.asrProvider === 'clova' && chunk.state !== 'inflight'
-          && !explicitlyDownloadedChunk) {
+          && !explicitlyDownloadedChunk && !serverConfirmed) {
         throw new LiveQueueConflictError(
           'CLOVA 음성은 전송 중 상태를 저장하거나 파일을 내려받은 뒤에만 완료할 수 있습니다.',
         );
       }
+      // A matching, owner-checked server result can acknowledge a blocked row
+      // directly. Never pass through `queued`: a crash between two writes
+      // could otherwise replay already committed CLOVA audio after reload.
       const sessionValue = await requestPromise(stores[SESSION_STORE].get(chunk.captureId));
       if (!sessionValue) throw new LiveQueueCorruptError('음성 조각의 녹음 세션을 찾을 수 없습니다.');
       const session = storedValue(sessionValue, validateSessionRecord, '저장된 녹음 세션');

@@ -43,6 +43,10 @@ from .recordings import (
     WAV_HEADER_BYTES,
 )
 from .postprocessor import MindlogicPostprocessor, PostprocessingError
+from .summarizer import MindlogicSummarizer
+from .summary_service import SummaryService
+from .translator import MindlogicTranslator
+from .translation_service import TranslationService
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
 from .settings import Settings
 from .transcriber import LocalTranscriber
@@ -50,6 +54,17 @@ from .transcriber import LocalTranscriber
 log = logging.getLogger("classroom")
 Username = Annotated[str, StringConstraints(min_length=1, max_length=32)]
 Password = Annotated[str, StringConstraints(min_length=4, max_length=128)]
+
+
+class ChunkNotStartedError(HTTPException):
+    """An admission rejection, never a provider or post-inference failure."""
+
+    def __init__(self):
+        super().__init__(
+            429,
+            "음성 처리 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.",
+            headers={"Retry-After": "2"},
+        )
 
 
 def _single_byte_range(value: str | None, total: int) -> tuple[int | None, int | None]:
@@ -307,6 +322,8 @@ def create_app(
     postprocessor=None,
     *,
     clova_transcriber=None,
+    summarizer=None,
+    translator=None,
     drive_storage=None,
     tunnel_status=None,
     tunnel_restart=None,
@@ -329,8 +346,12 @@ def create_app(
     clova_engine = clova_transcriber or ClovaStreamingTranscriber(settings)
     correction_engine = postprocessor or MindlogicPostprocessor(settings)
     limiter = RateLimiter()
+    summary_service = SummaryService(settings, database, summarizer or MindlogicSummarizer(settings), limiter)
+    translation_service = TranslationService(settings, database, translator or MindlogicTranslator(settings), limiter)
     inference_lock = threading.Lock()
     capacity = threading.BoundedSemaphore(settings.max_pending_chunks)
+    chunk_admission_lock = threading.Lock()
+    active_chunk_lectures: set[tuple[str, str]] = set()
     dummy_password = PASSWORD_HASHER.hash(new_secret())
     import_directory = settings.data_dir / "imports"
     import_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -388,10 +409,14 @@ def create_app(
         archive_manager.recover()
         recover_import_jobs()
         recover_correction_jobs()
+        summary_service.recover()
+        translation_service.recover()
         if settings.model_warmup and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
         ensure_import_worker()
         ensure_correction_worker()
+        summary_service.start()
+        translation_service.start()
         archive_manager.start()
         try:
             yield
@@ -400,9 +425,13 @@ def create_app(
             # waits share one deadline inside stop.sh's process grace time.
             request_correction_worker_shutdown()
             request_import_worker_shutdown()
+            summary_service.request_shutdown()
+            translation_service.request_shutdown()
             archive_manager.request_shutdown()
             shutdown_deadline = time.monotonic() + 18
             correction_stopped = stop_correction_worker(timeout=8)
+            summary_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
+            translation_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
             archive_stopped = archive_manager.stop(
                 timeout=max(0.0, shutdown_deadline - time.monotonic())
@@ -420,6 +449,8 @@ def create_app(
     app.state.transcriber = engine
     app.state.clova_transcriber = clova_engine
     app.state.postprocessor = correction_engine
+    app.state.summary_service = summary_service
+    app.state.translation_service = translation_service
     app.state.recording_store = recording_store
     app.state.archive_manager = archive_manager
     app.state.tunnel_status = tunnel_status
@@ -429,6 +460,14 @@ def create_app(
     async def invalid_request(request: Request, error: RequestValidationError):
         # Framework validation otherwise echoes passwords and invitation codes.
         return JSONResponse({"detail": "입력값의 형식과 길이를 확인하세요. 새 비밀번호는 4~128자입니다."}, status_code=422)
+
+    @app.exception_handler(ChunkNotStartedError)
+    async def chunk_not_started(request: Request, error: ChunkNotStartedError):
+        return JSONResponse(
+            {"detail": error.detail, "code": "chunk_not_started", "safe_to_retry": True},
+            status_code=error.status_code,
+            headers=error.headers,
+        )
 
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_bytes)
     app.add_middleware(
@@ -440,6 +479,7 @@ def create_app(
             "Authorization",
             "Content-Type",
             "X-Chunk-Id",
+            "X-Chunk-Payload-SHA256",
             "X-Start-Seconds",
             "X-Overlap-Seconds",
             "X-Final-Chunk",
@@ -470,18 +510,19 @@ def create_app(
             raise RuntimeError("Cannot issue a session for an unknown account")
         token = new_secret()
         now = time.time()
+        expires_at = now + settings.session_hours * 3600
         with database.connect() as connection:
             connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
             connection.execute(
                 "INSERT INTO sessions(token_hash, username, expires_at, created_at) VALUES (?, ?, ?, ?)",
-                (digest(token), username, now + settings.session_hours * 3600, now),
+                (digest(token), username, expires_at, now),
             )
             connection.execute(
                 "DELETE FROM sessions WHERE username = ? AND token_hash NOT IN "
                 "(SELECT token_hash FROM sessions WHERE username = ? ORDER BY created_at DESC LIMIT 5)",
                 (username, username),
             )
-        return {"token": token, "user": {"username": username}}
+        return {"token": token, "user": {"username": username}, "session_expires_at": expires_at}
 
     def identity(authorization: str | None = Header(default=None)) -> dict:
         scheme, _, token = (authorization or "").partition(" ")
@@ -490,11 +531,12 @@ def create_app(
         token_hash = digest(token)
         with database.connect() as connection:
             session = connection.execute(
-                "SELECT username FROM sessions WHERE token_hash = ? AND expires_at > ?", (token_hash, time.time())
+                "SELECT username, expires_at FROM sessions WHERE token_hash = ? AND expires_at > ?", (token_hash, time.time())
             ).fetchone()
         if session is None or session["username"] not in accounts:
             raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인하세요.", headers={"WWW-Authenticate": "Bearer"})
-        return {"username": session["username"], "token_hash": token_hash}
+        return {"username": session["username"], "token_hash": token_hash,
+                "session_expires_at": session["expires_at"]}
 
     def admin_identity(user: dict = Depends(identity)) -> dict:
         administrator = settings.admin_username
@@ -800,7 +842,13 @@ def create_app(
                     "(SELECT COUNT(*) FROM transcript_corrections tc "
                     " JOIN lectures l2 ON l2.id = tc.lecture_id "
                     " WHERE l2.username = u.username AND tc.status IN ('queued', 'processing')) "
-                    " AS correction_jobs "
+                    " AS correction_jobs, "
+                    "(SELECT COUNT(*) FROM lecture_summaries ls "
+                    " JOIN lectures l3 ON l3.id = ls.lecture_id "
+                    " WHERE l3.username = u.username AND ls.status IN ('queued', 'processing')) AS summary_jobs, "
+                    "(SELECT COUNT(*) FROM lecture_translations lt "
+                    " JOIN lectures l4 ON l4.id = lt.lecture_id "
+                    " WHERE l4.username = u.username AND lt.status IN ('queued', 'processing')) AS translation_jobs "
                     "FROM users u",
                     (current_time,),
                 ).fetchall()
@@ -816,6 +864,12 @@ def create_app(
                 "corrections": connection.execute(
                     "SELECT COUNT(*) FROM transcript_corrections "
                     "WHERE status IN ('queued', 'processing')"
+                ).fetchone()[0],
+                "summaries": connection.execute(
+                    "SELECT COUNT(*) FROM lecture_summaries WHERE status IN ('queued', 'processing')"
+                ).fetchone()[0],
+                "translations": connection.execute(
+                    "SELECT COUNT(*) FROM lecture_translations WHERE status IN ('queued', 'processing')"
                 ).fetchone()[0],
             }
             recent_audit = [
@@ -860,6 +914,8 @@ def create_app(
                         "transcription": row["transcription_jobs"],
                         "imports": row["import_jobs"],
                         "corrections": row["correction_jobs"],
+                        "summaries": row["summary_jobs"],
+                        "translations": row["translation_jobs"],
                     },
                 }
             )
@@ -1016,7 +1072,7 @@ def create_app(
 
     @app.get("/auth/me")
     def me(user: dict = Depends(identity)):
-        return {"username": user["username"]}
+        return {"username": user["username"], "session_expires_at": user["session_expires_at"]}
 
     @app.post("/auth/logout")
     def logout(user: dict = Depends(identity)):
@@ -1051,6 +1107,14 @@ def create_app(
         result["postprocessing"] = {
             "configured": correction_configured(),
             "model": getattr(correction_engine, "model", settings.mindlogic_model),
+        }
+        result["summarization"] = {
+            "configured": summary_service.configured,
+            "model": settings.summary_model,
+        }
+        result["translation"] = {
+            "configured": translation_service.configured,
+            "model": settings.translation_model,
         }
         return result
 
@@ -1495,6 +1559,37 @@ def create_app(
                 headers={"Retry-After": "2"},
             )
 
+    def transcribe_local_chunk(lecture, samples, overlap, final, start_seconds):
+        # Context is private, owner-scoped and taken only from a committed
+        # chunk. Retry/rollback/restart cannot advance an in-memory ASR tail.
+        if not getattr(engine, "supports_boundary_context", False):
+            return engine.transcribe(samples, lecture["language"], overlap, final), None
+        with database.connect() as connection:
+            previous = connection.execute(
+                "SELECT c.qwen_boundary_json FROM chunks c "
+                "JOIN lectures l ON l.id = c.lecture_id "
+                "WHERE c.lecture_id = ? AND l.username = ? AND l.deleting = 0 "
+                "AND c.status = 'done' ORDER BY c.start_seconds DESC, c.rowid DESC LIMIT 1",
+                (lecture["id"], lecture["username"]),
+            ).fetchone()
+        context = None
+        if previous is not None and previous["qwen_boundary_json"] is not None:
+            try:
+                context = json.loads(previous["qwen_boundary_json"])
+            except (ValueError, TypeError):
+                # The adapter validates the version/shape/timeline too. A
+                # damaged optional context must not synthesize prior speech.
+                context = None
+        output = {}
+        segments = engine.transcribe(
+            samples, lecture["language"], overlap, final,
+            start_seconds=start_seconds, boundary_context=context, boundary_output=output,
+        )
+        serialized = json.dumps(output, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if len(serialized.encode("utf-8")) > 65536:
+            raise RuntimeError("ASR boundary context exceeds its private storage limit")
+        return segments, serialized
+
     @app.post("/lectures/{lecture_id}/recording-finalize")
     def finalize_received_recording(lecture_id: str, user: dict = Depends(data_identity)):
         """Close an interrupted lesson and recover its withheld final ASR guard."""
@@ -1556,6 +1651,7 @@ def create_app(
         payload_hash = None if snapshot is None else hashlib.sha256(snapshot["payload"]).hexdigest()
         processing_seconds = 0.0
         segments = []
+        boundary_json = None
         claimed_guard = False
         if snapshot is not None:
             # Claim the deterministic synthetic chunk before inference. A
@@ -1615,11 +1711,9 @@ def create_app(
                 started = time.perf_counter()
                 inference_lock.acquire()
                 try:
-                    raw_segments = engine.transcribe(
-                        samples,
-                        lecture["language"],
-                        snapshot["duration_seconds"],
-                        True,
+                    raw_segments, boundary_json = transcribe_local_chunk(
+                        lecture, samples, snapshot["duration_seconds"], True,
+                        snapshot["start_seconds"],
                     )
                 finally:
                     inference_lock.release()
@@ -1689,10 +1783,10 @@ def create_app(
                                 ],
                             )
                             completed = connection.execute(
-                                "UPDATE chunks SET status = 'done', processing_seconds = ? "
+                                "UPDATE chunks SET status = 'done', processing_seconds = ?, qwen_boundary_json = ? "
                                 "WHERE lecture_id = ? AND chunk_id = ? AND payload_hash = ? "
                                 "AND status = 'pending'",
-                                (processing_seconds, lecture_id, guard_chunk_id, payload_hash),
+                                (processing_seconds, boundary_json, lecture_id, guard_chunk_id, payload_hash),
                             )
                             if completed.rowcount != 1:
                                 raise HTTPException(
@@ -1911,6 +2005,62 @@ def create_app(
             ),
         }
 
+    @app.get("/lectures/{lecture_id}/chunks/{chunk_id}/result")
+    def recover_chunk_result(
+        lecture_id: str,
+        chunk_id: str,
+        x_chunk_payload_sha256: Annotated[str, Header(min_length=64, max_length=64)],
+        x_start_seconds: Annotated[str, Header(max_length=40)],
+        x_overlap_seconds: Annotated[str, Header(max_length=40)] = "0",
+        x_final_chunk: Annotated[str, Header(max_length=8)] = "true",
+        user: dict = Depends(data_identity),
+    ):
+        """Recover an ACK without resending audio or invoking either provider.
+
+        Absence is deliberately unknown: an old process may have dispatched
+        audio before it failed. Only admission errors authorize a fresh POST.
+        Bind results to the exact WAV and timeline, including empty results.
+        """
+        lecture = owned_lecture(lecture_id, user["username"])
+        try:
+            normalized_chunk = str(uuid.UUID(chunk_id))
+            start = float(x_start_seconds)
+            overlap = float(x_overlap_seconds)
+            final = x_final_chunk.strip().lower()
+            if (
+                any(char not in "0123456789abcdef" for char in x_chunk_payload_sha256)
+                or not math.isfinite(start) or not 0 <= start <= 86400
+                or not math.isfinite(overlap) or not 0 <= overlap <= 3
+                or final not in {"true", "false"}
+            ):
+                raise ValueError("invalid chunk contract")
+        except (ValueError, OverflowError, AttributeError):
+            raise HTTPException(422, "음성 ID 또는 시간 정보가 올바르지 않습니다.") from None
+        with database.connect() as connection:
+            try:
+                replay = replay_result(
+                    connection, lecture["id"], normalized_chunk,
+                    x_chunk_payload_sha256, start, overlap, final == "true",
+                    user["username"],
+                )
+            except HTTPException as error:
+                if error.status_code == 409 and error.headers == {"Retry-After": "2"}:
+                    return JSONResponse({"state": "pending"}, headers={"Retry-After": "2"})
+                raise
+        if replay is None:
+            return {"state": "unknown"}
+        # Unlike POST replay this read-only route must not queue archive work.
+        return {
+            "state": "done",
+            "result": {
+                "segments": replay["segments"],
+                "processing_seconds": replay["processing_seconds"],
+                **recording_flags(
+                    user["username"], lecture["id"], replay["recording_finalized"]
+                ),
+            },
+        }
+
     def process_chunk(
         lecture: dict,
         chunk_id: str,
@@ -1939,7 +2089,13 @@ def create_app(
         if replay is not None:
             return replay_response(lecture_id, replay)
         if not capacity.acquire(blocking=False):
-            raise HTTPException(429, "음성 처리 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.", headers={"Retry-After": "2"})
+            raise ChunkNotStartedError()
+        admission_key = (lecture["username"], lecture_id)
+        with chunk_admission_lock:
+            if admission_key in active_chunk_lectures:
+                capacity.release()
+                raise ChunkNotStartedError()
+            active_chunk_lectures.add(admission_key)
         claimed = False
         try:
             with database.connect() as connection:
@@ -1973,6 +2129,7 @@ def create_app(
             if replay is not None:
                 return replay_response(lecture_id, replay)
             started = time.perf_counter()
+            boundary_json = None
             provider = lecture.get("asr_provider", "qwen")
             if provider == "qwen":
                 if interrupted is None:
@@ -1985,11 +2142,8 @@ def create_app(
                         inference_lock.release()
                         raise ImportInterrupted("import stopped before inference")
                 try:
-                    raw_segments = engine.transcribe(
-                        samples,
-                        lecture["language"],
-                        overlap_seconds,
-                        final_chunk,
+                    raw_segments, boundary_json = transcribe_local_chunk(
+                        lecture, samples, overlap_seconds, final_chunk, start_seconds,
                     )
                 finally:
                     inference_lock.release()
@@ -2047,9 +2201,9 @@ def create_app(
                         ],
                     )
                     connection.execute(
-                        "UPDATE chunks SET status = 'done', processing_seconds = ? "
+                        "UPDATE chunks SET status = 'done', processing_seconds = ?, qwen_boundary_json = ? "
                         "WHERE lecture_id = ? AND chunk_id = ?",
-                        (processing_seconds, lecture_id, chunk_id),
+                        (processing_seconds, boundary_json, lecture_id, chunk_id),
                     )
                     if final_chunk:
                         connection.execute(
@@ -2084,10 +2238,14 @@ def create_app(
             log.exception("Local transcription failed")
             raise HTTPException(503, "이 PC에서 음성 인식을 실행하지 못했습니다. 서버 상태를 확인하고 다시 시도하세요.", headers={"Retry-After": "5"}) from error
         finally:
-            if claimed:
-                with database.connect() as connection:
-                    connection.execute("DELETE FROM chunks WHERE lecture_id = ? AND chunk_id = ? AND status = 'pending'", (lecture_id, chunk_id))
-            capacity.release()
+            try:
+                if claimed:
+                    with database.connect() as connection:
+                        connection.execute("DELETE FROM chunks WHERE lecture_id = ? AND chunk_id = ? AND status = 'pending'", (lecture_id, chunk_id))
+            finally:
+                with chunk_admission_lock:
+                    active_chunk_lectures.discard(admission_key)
+                capacity.release()
 
     @app.post("/lectures/{lecture_id}/chunks")
     async def upload_chunk(
@@ -2333,8 +2491,17 @@ def create_app(
                                 (lecture["id"],),
                             ).fetchall()
                         ]
-                    if active is not None or pending is not None or correcting is not None:
-                        raise HTTPException(409, "진행 중인 음성 처리나 후보정이 끝난 뒤 수업을 삭제하세요.")
+                    with database.connect() as connection:
+                        summarizing = connection.execute(
+                            "SELECT 1 FROM lecture_summaries WHERE lecture_id=? AND status='processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        translating = connection.execute(
+                            "SELECT 1 FROM lecture_translations WHERE lecture_id=? AND status='processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                    if any(job is not None for job in (active, pending, correcting, summarizing, translating)):
+                        raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역이 끝난 뒤 수업을 삭제하세요.")
                 for job in terminal_jobs:
                     if not remove_private_upload(job):
                         raise HTTPException(503, "업로드 원본 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
@@ -2362,8 +2529,16 @@ def create_app(
                             "WHERE lecture_id = ? AND status = 'processing'",
                             (lecture["id"],),
                         ).fetchone()
-                        if active is not None or pending is not None or correcting is not None:
-                            raise HTTPException(409, "진행 중인 음성 처리나 후보정이 끝난 뒤 수업을 삭제하세요.")
+                        summarizing = connection.execute(
+                            "SELECT 1 FROM lecture_summaries WHERE lecture_id=? AND status='processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        translating = connection.execute(
+                            "SELECT 1 FROM lecture_translations WHERE lecture_id=? AND status='processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        if any(job is not None for job in (active, pending, correcting, summarizing, translating)):
+                            raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역이 끝난 뒤 수업을 삭제하세요.")
                         # A queued correction has not sent anything yet. Removing
                         # it in this same transaction wins atomically against the
                         # worker's queued->processing claim.
@@ -2373,6 +2548,10 @@ def create_app(
                             (lecture["id"],),
                         )
                         connection.execute("DELETE FROM imports WHERE lecture_id = ?", (lecture["id"],))
+                        connection.execute("DELETE FROM lecture_summaries WHERE lecture_id=? AND status='queued'",
+                                           (lecture["id"],))
+                        connection.execute("DELETE FROM lecture_translations WHERE lecture_id=? AND status='queued'",
+                                           (lecture["id"],))
                         connection.execute("UPDATE lectures SET deleting = 1 WHERE id = ?", (lecture["id"],))
         purge_download_tickets(lecture["id"])
         if not finalize_lecture_deletion(lecture["id"], user["username"]):
@@ -3237,4 +3416,8 @@ def create_app(
         import_worker_wake.set()
         return result
 
+    summary_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
+                            raw_segments=raw_segments, transcript_revision=transcript_revision)
+    translation_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
+                                raw_segments=raw_segments, transcript_revision=transcript_revision)
     return app

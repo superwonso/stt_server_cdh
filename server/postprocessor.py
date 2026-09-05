@@ -13,7 +13,9 @@ from .settings import Settings
 
 _EMAIL = re.compile(
     r"(?<![A-Za-z0-9_.+-])[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-    r"(?![A-Za-z0-9_.-])"
+    # A final sentence period is outside the address; a dotted domain
+    # continuation is not. Korean postpositions retain the existing boundary.
+    r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9])"
 )
 _RESIDENT_NUMBER = re.compile(r"(?<!\d)\d{6}[- ]?[1-4]\d{6}(?!\d)")
 _CARD_NUMBER = re.compile(r"(?<!\d)(?:\d{4}[- ]?){3}\d{4}(?!\d)")

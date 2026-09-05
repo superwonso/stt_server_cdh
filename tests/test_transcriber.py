@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -83,7 +84,17 @@ class TranscriberTests(unittest.TestCase):
         ]
         text = "앞부분. 프랑스 남부를 침략했다."
         self.assertEqual(aligned_text_slice(text, items, [1, 2]), "프랑스 남부를")
-        self.assertEqual(aligned_text_slice(text, items, [1, 2, 3]), "프랑스 남부를 침략했다")
+        self.assertEqual(aligned_text_slice(text, items, [1, 2, 3]), "프랑스 남부를 침략했다.")
+
+    def test_aligned_slice_keeps_final_question_mark_and_complete_quotes(self):
+        items = [SimpleNamespace(text="맞나요")]
+        self.assertEqual(aligned_text_slice("맞나요?", items, [0]), "맞나요?")
+        self.assertEqual(aligned_text_slice('“맞나요?”', items, [0]), '“맞나요?”')
+
+    def test_aligned_slice_keeps_punctuation_at_the_last_kept_token(self):
+        items = [SimpleNamespace(text="첫문장"), SimpleNamespace(text="둘째문장")]
+        self.assertEqual(aligned_text_slice("첫문장! 둘째문장?", items, [0]), "첫문장!")
+        self.assertEqual(aligned_text_slice("첫문장! 둘째문장?", items, [1]), "둘째문장?")
 
     def test_overlap_guard_assigns_boundary_words_exactly_once(self):
         time = np.arange(8 * 16000, dtype=np.float32) / 16000
@@ -109,6 +120,49 @@ class TranscriberTests(unittest.TestCase):
         )
         self.assertEqual(second[0]["text"], "경계 뒤")
         self.assertEqual(f"{first[0]['text']} {second[0]['text']}", "앞 안정 경계 뒤")
+
+    def test_call_scoped_boundary_metadata_recovers_tail_without_leaking_to_another_lecture(self):
+        model = FakeQwen("경계어?", [SimpleNamespace(text="경계어", start_time=7.4, end_time=7.6)])
+        engine = self.engine(model)
+        first_metadata = {}
+        with patch("server.transcriber.contains_speech", return_value=True):
+            self.assertEqual(engine.transcribe(
+                np.zeros(8 * 16000, dtype=np.float32), "ko", final_chunk=False,
+                start_seconds=0.0, boundary_output=first_metadata,
+            ), [])
+            model.items = [SimpleNamespace(text="경계어", start_time=2.2, end_time=2.4)]
+            recovered = engine.transcribe(
+                np.zeros(4 * 16000, dtype=np.float32), "ko", overlap_seconds=3.0,
+                start_seconds=5.0, boundary_context=first_metadata, boundary_output={},
+            )
+            unrelated = engine.transcribe(
+                np.zeros(4 * 16000, dtype=np.float32), "ko", overlap_seconds=3.0,
+                start_seconds=5.0, boundary_output={},
+            )
+        self.assertEqual(recovered, [{"start": 2.2, "end": 2.4, "text": "경계어?"}])
+        self.assertEqual(unrelated, [])
+        self.assertFalse(first_metadata["tokens"][0]["emitted"])
+        self.assertEqual(set(engine.__dict__), {"settings", "_model", "_state", "_state_lock", "_load_lock"})
+
+    def test_silence_returns_an_empty_bounded_frontier_without_loading_a_model(self):
+        model = FakeQwen()
+        output = {"stale": "value"}
+        result = self.engine(model).transcribe(
+            np.zeros(8 * 16000, dtype=np.float32), "ko", start_seconds=5.0, boundary_output=output,
+        )
+        self.assertEqual(result, [])
+        self.assertEqual(model.calls, [])
+        self.assertEqual(output, {"version": 1, "audio_end": 13.0, "tokens": []})
+
+    def test_failed_inference_does_not_return_stale_boundary_metadata(self):
+        model = FakeQwen(error=RuntimeError("inference failed"))
+        output = {"stale": "value"}
+        with patch("server.transcriber.contains_speech", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "inference failed"):
+                self.engine(model).transcribe(
+                    np.zeros(8 * 16000, dtype=np.float32), "ko", boundary_output=output,
+                )
+        self.assertEqual(output, {})
 
     def test_warmup_failure_sets_error_state(self):
         engine = self.engine(FakeQwen(error=RuntimeError("warmup failed")))

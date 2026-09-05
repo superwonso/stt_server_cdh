@@ -355,6 +355,19 @@ def preview_chunks(chunks: list[ChunkSpec]) -> list[dict]:
     ]
 
 
+def transcribe_validation_chunk(engine, samples, chunk, context=None, *, use_context=True):
+    """Match the API's per-call context and committed-JSON handoff contract."""
+    metadata = {} if use_context else None
+    options = ({"start_seconds": chunk.start / SAMPLE_RATE,
+                "boundary_context": context, "boundary_output": metadata} if use_context else {})
+    segments = engine.transcribe(samples, "ko", overlap_seconds=chunk.overlap / SAMPLE_RATE,
+                                 final_chunk=chunk.final, **options)
+    # No shared model state and no advancing to the next context before this
+    # call succeeds. A JSON round trip mirrors the private DB metadata format.
+    committed = json.loads(json.dumps(metadata, allow_nan=False)) if metadata else None
+    return segments, committed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exercise the same pause/overlap/final contract used by web/audio.js."
@@ -403,6 +416,8 @@ def main() -> None:
         help="with --quiet-chunks, emit a compact progress event every N chunks (default: 50)",
     )
     parser.add_argument("--plan-only", action="store_true", help="validate capture contracts without loading a model")
+    parser.add_argument("--boundary-context", action=argparse.BooleanOptionalAction, default=True,
+                        help="exercise the current per-lecture boundary context (default true; disable for baseline)")
     args = parser.parse_args()
 
     if args.limit < 1:
@@ -561,15 +576,13 @@ def main() -> None:
     reserved_samples = []
     rss_samples = []
     cumulative_fresh = 0
+    boundary_context = None
 
     for chunk_index, chunk in enumerate(chunks):
         samples = audio[chunk.start : chunk.end]
         chunk_started = time.perf_counter()
-        segments = engine.transcribe(
-            samples,
-            "ko",
-            overlap_seconds=chunk.overlap / SAMPLE_RATE,
-            final_chunk=chunk.final,
+        segments, boundary_context = transcribe_validation_chunk(
+            engine, samples, chunk, boundary_context, use_context=args.boundary_context,
         )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - chunk_started
@@ -661,6 +674,7 @@ def main() -> None:
         json.dumps(
             {
                 "event": "summary",
+                "boundary_context": args.boundary_context,
                 "chunks": len(durations),
                 "audio_seconds": round(audio_seconds, 3),
                 "processed_audio_seconds": round(processed_audio_seconds, 3),

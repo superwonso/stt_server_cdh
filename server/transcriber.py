@@ -8,6 +8,7 @@ import numpy as np
 import webrtcvad
 
 from .settings import Settings
+from .qwen_boundary import reconcile_tokens
 
 SAMPLE_RATE = 16000
 VAD_FRAME_SAMPLES = 320  # 20 ms
@@ -72,13 +73,19 @@ def aligned_text_slice(text: str, items: list, keep: list[int]) -> str:
     end_normalized = spans[last + 1][0] if last + 1 < len(spans) else len(normalized)
     if not positions or start_normalized >= len(positions):
         return " ".join(str(items[index].text) for index in keep).strip()
-    start_original = positions[start_normalized]
+    # A complete first token owns any opening quotation mark/parenthesis too.
+    # At an overlap boundary we begin at the kept token, not at punctuation
+    # belonging to an earlier token. Sentence-final punctuation belongs to the
+    # kept text and must survive, including for a complete final chunk.
+    start_original = 0 if first == 0 else positions[start_normalized]
     end_original = positions[end_normalized] if end_normalized < len(positions) else len(text)
-    return text[start_original:end_original].strip(" \t\r\n,.;:!?·-–—")
+    return text[start_original:end_original].strip()
 
 
 class LocalTranscriber:
     """One model, loaded on demand; callers serialize inference off the event loop."""
+
+    supports_boundary_context = True
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -151,12 +158,41 @@ class LocalTranscriber:
         language: str | None,
         overlap_seconds: float = 0.0,
         final_chunk: bool = True,
+        *,
+        start_seconds: float = 0.0,
+        boundary_context: dict | None = None,
+        boundary_output: dict | None = None,
     ) -> list[dict]:
+        # Metadata is returned to this call's transaction only. Never attach a
+        # lecture's context to the shared model instance.
+        if boundary_output is not None:
+            boundary_output.clear()
         duration = len(samples) / SAMPLE_RATE
+        lower = max(0.0, overlap_seconds - self.settings.stability_guard_seconds)
+        upper = duration if final_chunk else max(lower, duration - self.settings.stability_guard_seconds)
+
+        def partition(items: list, keep: list[int]) -> list[int]:
+            if boundary_context is None and boundary_output is None:
+                return keep
+            selected, metadata = reconcile_tokens(
+                items,
+                keep,
+                start_seconds=start_seconds,
+                duration=duration,
+                overlap_seconds=overlap_seconds,
+                lower=lower,
+                upper=upper,
+                context=boundary_context,
+            )
+            if boundary_output is not None and metadata is not None:
+                boundary_output.update(metadata)
+            return selected
+
         if not contains_speech(
             samples,
             FINAL_MIN_VOICED_FRAMES if final_chunk else MIN_VOICED_FRAMES,
         ):
+            partition([], [])
             return []
         model = self._load()
         # qwen-asr 0.0.6 documents a 0.5 s minimum but does not pad short
@@ -177,22 +213,37 @@ class LocalTranscriber:
             items = list(alignment.items) if alignment is not None else []
             if text and not items:
                 raise RuntimeError("Forced alignment returned no timestamps")
-            lower = max(0.0, overlap_seconds - self.settings.stability_guard_seconds)
-            upper = duration if final_chunk else max(lower, duration - self.settings.stability_guard_seconds)
+            if not text:
+                partition([], [])
+                self._set_state("ready")
+                return []
             keep = [
                 index
                 for index, item in enumerate(items)
                 if lower <= (float(item.start_time) + float(item.end_time)) / 2 < upper
             ]
-            text = aligned_text_slice(text, items, keep)
+            keep = partition(items, keep)
             self._set_state("ready")
             if not text or not keep:
                 return []
-            return [{
-                "start": max(0.0, float(items[keep[0]].start_time)),
-                "end": min(duration, float(items[keep[-1]].end_time)),
-                "text": text,
-            }]
+            # Reconciliation can remove a replay token between two retained
+            # ranges. Slice each contiguous range so the removed word cannot
+            # leak back through a broad first-to-last substring.
+            groups: list[list[int]] = []
+            for index in keep:
+                if not groups or index != groups[-1][-1] + 1:
+                    groups.append([])
+                groups[-1].append(index)
+            result = []
+            for group in groups:
+                selected_text = aligned_text_slice(text, items, group)
+                if selected_text:
+                    result.append({
+                        "start": max(0.0, float(items[group[0]].start_time)),
+                        "end": min(duration, float(items[group[-1]].end_time)),
+                        "text": selected_text,
+                    })
+            return result
         except Exception:
             self._set_state("error")
             raise
