@@ -118,7 +118,7 @@
       <nav id="lecture-list" class="lecture-list" aria-label="지난 수업 목록"></nav>
 
       <div class="sidebar-footer">
-        <p><span aria-hidden="true">⌂</span> 기록은 서버 컴퓨터에 보관됩니다.</p>
+        <p><span aria-hidden="true">⌂</span> 기록은 내 서버가 관리하고, 녹음은 설정된 경우 서버를 통해 Google Drive에 보관됩니다.</p>
         <div class="sidebar-footer-actions">
           <button id="admin-open" class="admin-open-button" type="button" aria-haspopup="dialog" aria-controls="admin-dialog" hidden>운영 관리</button>
           <button id="logout" class="logout-button" type="button">로그아웃</button>
@@ -229,9 +229,9 @@
             <p id="import-detail"></p>
           </div>
 
-          <div class="save-row">
+          <div class="save-row" role="status" aria-live="polite" aria-atomic="true">
             <span class="save-check" aria-hidden="true">✓</span>
-            <span id="save-state">서버 컴퓨터에 저장</span>
+            <span id="save-state">녹음 저장 준비</span>
           </div>
           <div id="processing" class="processing" role="status" aria-live="polite" hidden>
             <span class="processing-spinner" aria-hidden="true"></span>
@@ -307,10 +307,10 @@
         </div>
         <button id="delete-close" class="dialog-close" type="button" aria-label="삭제 확인 닫기">×</button>
       </div>
-      <p id="delete-description"><strong id="delete-lecture-title">선택한 수업</strong>의 받아쓴 원문, AI 후보정본과 저장된 녹음을 서버에서 삭제합니다. 이 작업은 되돌릴 수 없습니다.</p>
+      <p id="delete-description"><strong id="delete-lecture-title">선택한 수업</strong>의 받아쓴 원문, AI 후보정본과 저장된 녹음을 앱에서 삭제합니다. Google Drive에 저장된 녹음은 Drive 휴지통으로 이동하며, 받아쓴 기록은 앱에서 되돌릴 수 없습니다. CLOVA Object Storage 사본은 이 삭제의 대상이 아닙니다.</p>
       <div class="delete-dialog-actions">
         <button id="delete-cancel" class="secondary-button" type="button">취소</button>
-        <button id="delete-confirm" class="danger-button solid" type="button">수업 영구 삭제</button>
+        <button id="delete-confirm" class="danger-button solid" type="button">수업 삭제</button>
       </div>
     </div>
   </dialog>

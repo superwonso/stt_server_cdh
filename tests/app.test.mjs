@@ -1734,6 +1734,35 @@ test('recording download exchanges bearer auth for a same-origin native ticket l
   }
 });
 
+test('recording archive states explain Drive progress without exposing a Drive locator', () => {
+  const app = setup(async () => response({}));
+  const lectureId = webcrypto.randomUUID();
+  app.run(`current={id:${JSON.stringify(lectureId)},title:'수업',created_at:'2026-01-01T00:00:00Z',
+    segments:[],recording_available:true,recording_finalized:true,recording_storage_state:'local_recording'};
+    lectures=[{...current}]; updateControls()`);
+  const labels = {
+    local_recording:'이 서버에 녹음 저장됨',
+    upload_queued:'Google Drive 저장 대기 · 이 서버에 임시 보관',
+    uploading:'Google Drive로 녹음을 옮기는 중',
+    retrying:'Google Drive 연결 대기 · 이 서버에 임시 보관',
+    drive_cleanup_pending:'Google Drive 저장 확인 완료 · 서버 임시본 정리 중',
+    drive_ready:'Google Drive에 녹음 저장됨',
+    attention_required:'Google Drive 저장 확인 필요 · 서버에서 확인해 주세요',
+  };
+  for (const [state,label] of Object.entries(labels)) {
+    app.run(`current.recording_storage_state=${JSON.stringify(state)}; updateControls()`);
+    assert.equal(app.element('save-state').textContent,label,state);
+  }
+  app.run(`applyRecordingFlags(${JSON.stringify(lectureId)}, {
+    recording_available:true,recording_finalized:true,recording_storage_state:'drive_ready',
+    drive_file_id:'must-not-be-copied'
+  }); updateControls()`);
+  assert.equal(app.run('current.recording_storage_state'),'drive_ready');
+  assert.equal(app.run('lectures[0].recording_storage_state'),'drive_ready');
+  assert.equal(app.run("Object.hasOwn(current,'drive_file_id')"),false);
+  assert.equal(app.element('save-state').textContent,'Google Drive에 녹음 저장됨');
+});
+
 test('recording download repairs an unfinished saved WAV before requesting its ticket', async () => {
   const lectureId = webcrypto.randomUUID();
   const ticketPath = `/recording-downloads/${'b'.repeat(43)}`;

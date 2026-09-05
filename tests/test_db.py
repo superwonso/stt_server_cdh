@@ -131,7 +131,149 @@ class DatabaseTests(unittest.TestCase):
                 ).fetchone()
                 schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(tuple(state), (0, 0))
-            self.assertEqual(schema_version, 6)
+            self.assertEqual(schema_version, 9)
+
+    def test_recording_archive_schema_keeps_remote_state_private_and_owned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(
+                Path(temporary) / "data" / "classroom.sqlite3",
+                TEST_ACCOUNTS,
+            )
+            database.initialize()
+            lecture_id = str(uuid.uuid4())
+            with database.connect() as connection:
+                connection.execute(
+                    "INSERT INTO lectures(id, username, title, language, created_at, recording_finalized) "
+                    "VALUES (?, 'user-alpha', 'archive', 'ko', '2026-01-01T00:00:00Z', 1)",
+                    (lecture_id,),
+                )
+                connection.execute(
+                    "INSERT INTO recording_archives(lecture_id, state, object_key, updated_at) "
+                    "VALUES (?, 'pending', ?, '2026-01-01T00:00:00Z')",
+                    (lecture_id, "a" * 64),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE recording_archives SET state = 'ready' WHERE lecture_id = ?",
+                        (lecture_id,),
+                    )
+            with database.connect() as connection:
+                connection.execute("DELETE FROM lectures WHERE id = ?", (lecture_id,))
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM recording_archives WHERE lecture_id = ?",
+                        (lecture_id,),
+                    ).fetchone()
+                )
+
+    def test_drive_binding_is_singleton_and_opaque(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(
+                Path(temporary) / "data" / "classroom.sqlite3",
+                TEST_ACCOUNTS,
+            )
+            database.initialize()
+            with database.connect() as connection:
+                connection.execute(
+                    "INSERT INTO drive_archive_binding"
+                    "(singleton, binding_key, folder_id, updated_at) "
+                    "VALUES (1, ?, 'opaqueFolder_1', '2026-01-01T00:00:00Z')",
+                    ("a" * 64,),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO drive_archive_binding"
+                        "(singleton, binding_key, folder_id, updated_at) "
+                        "VALUES (2, ?, 'opaqueFolder_2', '2026-01-01T00:00:00Z')",
+                        ("b" * 64,),
+                    )
+                row = connection.execute(
+                    "SELECT binding_key, folder_id FROM drive_archive_binding"
+                ).fetchone()
+            self.assertEqual(tuple(row), ("a" * 64, "opaqueFolder_1"))
+
+    def test_drive_user_folder_binding_is_owned_unique_and_opaque(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(
+                Path(temporary) / "data" / "classroom.sqlite3",
+                TEST_ACCOUNTS,
+            )
+            database.initialize()
+            with database.connect() as connection:
+                connection.execute(
+                    "INSERT INTO drive_archive_user_folders"
+                    "(username, folder_key, folder_id, updated_at) VALUES (?, ?, ?, ?)",
+                    ("user-alpha", "a" * 64, "opaqueUserFolder_1", "2026-01-01T00:00:00Z"),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO drive_archive_user_folders"
+                        "(username, folder_key, folder_id, updated_at) VALUES (?, ?, ?, ?)",
+                        ("user-beta", "b" * 64, "opaqueUserFolder_1", "2026-01-01T00:00:00Z"),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO drive_archive_user_folders"
+                        "(username, folder_key, folder_id, updated_at) VALUES (?, ?, ?, ?)",
+                        ("not-configured", "c" * 64, "opaqueUserFolder_3", "2026-01-01T00:00:00Z"),
+                    )
+
+    def test_v8_ready_archive_upgrades_with_unconfirmed_folder_layout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "data" / "classroom.sqlite3"
+            database = Database(path, TEST_ACCOUNTS)
+            database.initialize()
+            lecture_id = str(uuid.uuid4())
+            with database.connect() as connection:
+                connection.execute(
+                    "INSERT INTO lectures(id, username, title, language, created_at, "
+                    "recording_finalized) VALUES (?, 'user-alpha', 'archive', 'ko', "
+                    "'2026-01-01T00:00:00Z', 1)",
+                    (lecture_id,),
+                )
+                connection.execute("ALTER TABLE recording_archives RENAME TO archives_v9")
+                connection.execute(
+                    "CREATE TABLE recording_archives ("
+                    "lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE, "
+                    "state TEXT NOT NULL, object_key TEXT NOT NULL UNIQUE, "
+                    "drive_file_id TEXT UNIQUE, upload_session_uri TEXT, source_bytes INTEGER, "
+                    "source_sha256 TEXT, source_md5 TEXT, uploaded_bytes INTEGER NOT NULL DEFAULT 0, "
+                    "local_deleted INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, "
+                    "next_attempt_at REAL NOT NULL DEFAULT 0, last_error_code TEXT, updated_at TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO recording_archives"
+                    "(lecture_id, state, object_key, drive_file_id, source_bytes, source_sha256, "
+                    "source_md5, uploaded_bytes, local_deleted, updated_at) "
+                    "VALUES (?, 'ready', ?, 'opaqueDriveFile_1', 44, ?, ?, 44, 0, ?)",
+                    (
+                        lecture_id,
+                        "d" * 64,
+                        "e" * 64,
+                        "f" * 32,
+                        "2026-01-01T00:01:00Z",
+                    ),
+                )
+                connection.execute("DROP TABLE archives_v9")
+                connection.execute("DROP TABLE drive_archive_user_folders")
+                connection.execute("PRAGMA user_version = 8")
+
+            database.initialize()
+
+            with database.connect() as connection:
+                row = connection.execute(
+                    "SELECT state, drive_file_id, local_deleted, folder_layout_version "
+                    "FROM recording_archives WHERE lecture_id = ?",
+                    (lecture_id,),
+                ).fetchone()
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                folders_table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'drive_archive_user_folders'"
+                ).fetchone()
+            self.assertEqual(tuple(row), ("ready", "opaqueDriveFile_1", 0, 0))
+            self.assertEqual(version, 9)
+            self.assertIsNotNone(folders_table)
 
     def test_accounts_are_data_not_hardcoded_in_the_users_schema(self):
         with tempfile.TemporaryDirectory() as temporary:

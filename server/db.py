@@ -158,6 +158,70 @@ class Database:
                         REFERENCES chunks(lecture_id, chunk_id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS segments_lecture ON segments(lecture_id, start);
+                CREATE TABLE IF NOT EXISTS recording_archives (
+                    lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
+                    state TEXT NOT NULL CHECK (
+                        state IN ('pending', 'uploading', 'ready', 'attention')
+                    ),
+                    object_key TEXT NOT NULL UNIQUE CHECK (
+                        length(object_key) = 64 AND object_key = lower(object_key)
+                    ),
+                    drive_file_id TEXT UNIQUE CHECK (
+                        drive_file_id IS NULL OR length(drive_file_id) BETWEEN 1 AND 256
+                    ),
+                    upload_session_uri TEXT CHECK (
+                        upload_session_uri IS NULL OR length(upload_session_uri) BETWEEN 1 AND 4096
+                    ),
+                    source_bytes INTEGER CHECK (source_bytes IS NULL OR source_bytes >= 44),
+                    source_sha256 TEXT CHECK (
+                        source_sha256 IS NULL OR (
+                            length(source_sha256) = 64 AND source_sha256 = lower(source_sha256)
+                        )
+                    ),
+                    source_md5 TEXT CHECK (
+                        source_md5 IS NULL OR (
+                            length(source_md5) = 32 AND source_md5 = lower(source_md5)
+                        )
+                    ),
+                    uploaded_bytes INTEGER NOT NULL DEFAULT 0 CHECK (uploaded_bytes >= 0),
+                    local_deleted INTEGER NOT NULL DEFAULT 0 CHECK (local_deleted IN (0, 1)),
+                    folder_layout_version INTEGER NOT NULL DEFAULT 0 CHECK (
+                        folder_layout_version BETWEEN 0 AND 1
+                    ),
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    next_attempt_at REAL NOT NULL DEFAULT 0,
+                    last_error_code TEXT CHECK (
+                        last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 64
+                    ),
+                    updated_at TEXT NOT NULL,
+                    CHECK (
+                        state != 'ready' OR (
+                            drive_file_id IS NOT NULL AND source_bytes IS NOT NULL
+                            AND source_sha256 IS NOT NULL AND source_md5 IS NOT NULL
+                        )
+                    ),
+                    CHECK (source_bytes IS NULL OR uploaded_bytes <= source_bytes)
+                );
+                CREATE INDEX IF NOT EXISTS recording_archives_queue
+                    ON recording_archives(state, next_attempt_at, updated_at);
+                CREATE TABLE IF NOT EXISTS drive_archive_binding (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    binding_key TEXT NOT NULL CHECK (
+                        length(binding_key) = 64 AND binding_key = lower(binding_key)
+                    ),
+                    folder_id TEXT NOT NULL CHECK (length(folder_id) BETWEEN 1 AND 256),
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS drive_archive_user_folders (
+                    username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+                    folder_key TEXT NOT NULL UNIQUE CHECK (
+                        length(folder_key) = 64 AND folder_key = lower(folder_key)
+                    ),
+                    folder_id TEXT NOT NULL UNIQUE CHECK (
+                        length(folder_id) BETWEEN 1 AND 256
+                    ),
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS imports (
                     id TEXT PRIMARY KEY,
                     username TEXT NOT NULL REFERENCES users(username),
@@ -281,6 +345,17 @@ class Database:
                     "ALTER TABLE imports ADD COLUMN raw_deleted INTEGER NOT NULL DEFAULT 0 "
                     "CHECK (raw_deleted IN (0, 1))"
                 )
+            archive_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(recording_archives)")
+            }
+            if "folder_layout_version" not in archive_columns:
+                # Existing v8 Drive files may be directly under the archive
+                # root.  Keep that uncertainty explicit until the worker has
+                # verified and moved each file into its owner's folder.
+                connection.execute(
+                    "ALTER TABLE recording_archives ADD COLUMN folder_layout_version "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (folder_layout_version BETWEEN 0 AND 1)"
+                )
             if schema_version < 4:
                 # Before retained WAV recordings existed, completed text-only
                 # lectures had no lecture-level final flag and all old chunks
@@ -308,5 +383,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 6:
-                connection.execute("PRAGMA user_version = 6")
+            if schema_version < 9:
+                connection.execute("PRAGMA user_version = 9")

@@ -1,6 +1,6 @@
 # 여백 · 수업 받아쓰기
 
-노트북·태블릿의 마이크, 데스크톱 브라우저가 공유한 탭/화면 소리, 기존 녹음 파일을 받아 수업 기록을 만드는 개인용 웹 앱입니다. 마이크 수업은 로컬 `Qwen3-ASR-1.7B` 또는 NAVER Cloud `CLOVA Speech`를 수업마다 고를 수 있고, 공유 소리와 파일 변환은 계속 로컬 Qwen을 사용합니다. 완료된 받아쓰기는 선택할 때만 충북대 NOVA Gateway의 `solar-pro4`로 별도 후보정본을 만들 수 있습니다. 화면만 GitHub Pages에 공개되고 로그인·원문 기록·보존 WAV는 WSL이 실행되는 이 컴퓨터가 관리합니다.
+노트북·태블릿의 마이크, 데스크톱 브라우저가 공유한 탭/화면 소리, 기존 녹음 파일을 받아 수업 기록을 만드는 개인용 웹 앱입니다. 마이크 수업은 로컬 `Qwen3-ASR-1.7B` 또는 NAVER Cloud `CLOVA Speech`를 수업마다 고를 수 있고, 공유 소리와 파일 변환은 계속 로컬 Qwen을 사용합니다. 완료된 받아쓰기는 선택할 때만 충북대 NOVA Gateway의 `solar-pro4`로 별도 후보정본을 만들 수 있습니다. 화면만 GitHub Pages에 공개되고 로그인·원문 기록은 WSL이 실행되는 이 컴퓨터가 관리합니다. 녹음 WAV는 이 PC에 안전하게 임시 보관한 뒤, 설정한 경우 서버가 운영자의 개인 Google Drive로 옮기고 검증된 로컬 사본을 정리합니다.
 
 사용할 주소와 현재 준비 상태는 다음과 같습니다.
 
@@ -15,6 +15,8 @@
 
 현재 방식은 단어마다 바로 바뀌는 자막이 아닙니다. 실시간 입력과 파일 변환 모두 새 음성을 최소 약 8초 모으고 말이 잠시 멈춘 지점에서 자르되, 최대 15초 WAV와 이전 3초 겹침을 사용합니다. Qwen은 강제 정렬의 단어 시각과 0.6초 안정 구간으로 각 겹침의 저장 범위를 나눕니다. CLOVA는 마지막으로 반환한 정렬 시각을 수업별로 기억해 다음 응답이 뒤늦게 확정한 경계 음절을 살리고, gRPC 연결 교체 때에는 강한 시간·문구 증거가 있는 재생 부분만 제거합니다. 모호하면 새 발화를 지우지 않는 쪽을 택합니다. CLOVA도 같은 브라우저 청크 주기를 사용하므로 공식 서비스가 스트리밍을 지원하더라도 이 화면의 갱신 주기는 약 8~15초입니다. 실제 수업에서 모든 말을 수학적으로 정확히 한 번씩 저장한다고 보장하지는 않습니다.
 
+정확도·실시간성의 다음 개선 후보와 검증 조건은 [코드 검토](ASR_REVIEW.md)에 정리했습니다. 제안된 ASR 변경이 이미 적용되거나 실음성으로 검증됐다는 뜻은 아닙니다.
+
 ## 구조와 개인정보
 
 ```text
@@ -25,7 +27,9 @@
                                                                     ├─ ROCm Qwen3-ASR
                                                                     ├─ .data/classroom.sqlite3
                                                                     ├─ .data/imports/* (변환 중만)
-                                                                    └─ .data/recordings/* (계정별 WAV)
+                                                                    └─ .data/recordings/* (검증 전 WAV staging)
+완료된 녹음(선택 설정)
+  └─ FastAPI ── 재개 가능 upload·checksum 검증 ── 개인 Google Drive
 완료된 수업에서 사용자가 후보정 선택
   └─ FastAPI ── 받아쓴 텍스트만 HTTPS ── 충북대 NOVA Gateway ── solar-pro4
 
@@ -34,13 +38,15 @@
 ```
 
 - 브라우저에서 받은 음성은 Cloudflare를 경유해 이 PC로 전송됩니다. Cloudflare가 HTTPS를 종단하는 구조이므로 Cloudflare를 통하지 않는 종단간 암호화라고 표현하면 안 됩니다.
-- 새로 처리한 마이크·공유 소리·가져온 파일의 음성은 겹친 구간을 한 번만 남긴 **16 kHz 모노 PCM WAV**로 `.data/recordings/`의 계정별 `0700` 폴더에 `0600` 권한으로 보관합니다. 업로드한 영상·오디오 원본과 원래 파일명은 보존하지 않습니다. 이 기능을 추가하기 전에 만든 수업의 음성은 이미 폐기되어 복구하거나 내려받을 수 없습니다.
+- 새로 처리한 마이크·공유 소리·가져온 파일의 음성은 겹친 구간을 한 번만 남긴 **16 kHz 모노 PCM WAV**로 `.data/recordings/`의 계정별 `0700` 폴더에 `0600` 권한으로 먼저 보관합니다. Google Drive를 켜면 완료된 WAV만 서버가 Drive로 옮기고 크기·MD5·SHA-256을 확인한 뒤 로컬 사본을 삭제합니다. 업로드나 검증이 실패하면 로컬 사본을 지우지 않고 재시도합니다. 업로드한 영상·오디오 원본과 원래 파일명은 보존하지 않습니다. 이 기능을 추가하기 전에 이미 폐기된 음성은 복구할 수 없습니다.
+- Google Drive 연동은 보존 WAV만 대상으로 합니다. 로그인, 비밀번호 해시, 받아쓴 원문·후보정본, 수업 메타데이터는 계속 이 PC의 SQLite에만 있으므로 기록 전체의 백업을 대체하지 않습니다.
 - 녹음 파일 가져오기의 원본은 전송 재개와 서버 디코딩을 위해 `.data/imports/`에 임시 저장합니다. 완료·취소·실패 때 삭제를 확인하고, 실패하면 상태에 그대로 표시한 채 실행 중인 서버가 재시도합니다. 7일간 끝내지 않은 업로드도 자동 폐기합니다.
 - 비밀번호는 Argon2 해시로, 로그인 세션과 초대 코드는 해시로 저장합니다. 로그인 토큰은 브라우저 메모리에만 두므로 탭을 닫으면 사라집니다.
 - 서버가 아직 확인하지 않은 실시간 WAV 조각은 같은 GitHub Pages 출처의 IndexedDB에 임시 저장하고, 서버 ACK 뒤 해당 조각을 삭제합니다. 새로고침이나 브라우저 재실행 뒤에도 같은 계정으로 로그인하면 남은 순서를 복구할 수 있으며, 복구 시에는 전체 WAV를 한꺼번에 메모리에 올리지 않고 전송할 조각 하나씩 읽습니다. 이 큐에는 비밀번호·로그인 토큰·초대 코드·API 주소를 저장하지 않습니다. 다만 마지막으로 익명 확인한 API 주소는 기존 자동 연결 기능을 위해 별도의 `localStorage`에만 저장됩니다.
-- 비공개 로그인 ID 목록과 관리자로 지정한 ID는 Git에서 제외된 `server/.env`와 로컬 DB에만 둡니다. 공개 예시의 `ACCOUNT_USERNAMES`와 `ADMIN_USERNAME`은 의도적으로 비어 있으며, 계정 설정이 없거나 기존 DB와 다르면 서버는 계정을 임의로 추가하지 않고 시작을 중단합니다. 계정 추가는 이 PC의 명시적인 `add-account` 관리 명령으로만 허용됩니다. 관리자 설정이 없거나 구성된 계정 중 하나와 정확히 일치하지 않으면 관리자 API만 닫힌 상태로 유지됩니다.
+- 로그인 ID 목록과 관리자 지정 설정은 Git에서 제외된 `server/.env`와 로컬 DB에서 관리하며 GitHub/Pages에 공개하지 않습니다. 실행 중 ID는 인증된 본인·관리자 화면, 개인 초대 링크, 해당 기기의 대기열 및 비공개 Drive 사용자 폴더에서도 사용됩니다. 공개 예시의 `ACCOUNT_USERNAMES`와 `ADMIN_USERNAME`은 의도적으로 비어 있으며, 계정 설정이 없거나 기존 DB와 다르면 서버는 계정을 임의로 추가하지 않고 시작을 중단합니다. 계정 추가는 이 PC의 명시적인 `add-account` 관리 명령으로만 허용됩니다. 관리자 설정이 없거나 구성된 계정 중 하나와 정확히 일치하지 않으면 관리자 API만 닫힌 상태로 유지됩니다.
 - `MINDLOGIC_API_KEY`도 Git에서 제외된 권한 `0600`의 `server/.env`에서 서버만 읽습니다. 프런트엔드, API 응답, GitHub Pages 설정에는 키를 넣지 않으며 서버는 키를 문서화된 `https://factchat-cloud.mindlogic.ai/v1/gateway`에만 보낼 수 있도록 목적지를 고정합니다.
 - `CLOVA_SPEECH_SECRET_KEY`도 같은 비공개 파일에서 서버만 읽습니다. 프런트엔드에는 설정 가능 여부만 전달하고 키·gRPC 진단·세션 정보는 보내지 않습니다. 목적지는 공식 `clovaspeech-gw.ncloud.com:50051` TLS 주소로 코드에 고정하며 환경변수로 바꿀 수 없습니다.
+- Google OAuth Desktop client JSON, refresh token을 담은 `token.json`, 원격 파일명을 계정·수업에서 분리하는 `identity.key`는 모두 Git에서 제외된 `.data/google-drive/`에만 두며 폴더 `0700`, 파일 `0600`을 유지합니다. 브라우저나 GitHub Pages는 이 파일을 읽지 않습니다.
 - 사용자가 마이크 수업에서 CLOVA를 고르면 음성이 `브라우저 → Cloudflare → 이 PC → 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인`으로 전달됩니다. 스트리밍 인식 결과는 운영자가 그 도메인에 연결한 Object Storage에 자동 저장됩니다. 이 앱에서 수업을 지우면 이 PC의 DB와 WAV는 삭제하지만 그 클라우드 사본까지 삭제하지는 않으므로 운영자가 NAVER Cloud 콘솔에서 별도로 관리해야 합니다. Qwen을 고르면 이 외부 음성 인식 전송은 없습니다. [CLOVA 실시간 API](https://api.ncloud-docs.com/docs/ai-application-service-clovaspeech-grpc), [스트리밍 인식 빌더](https://guide.ncloud-docs.com/docs/clovaspeech-builder-streaming)
 - AI 후보정은 완료된 수업에서 사용자가 버튼을 누를 때만 실행합니다. NOVA에는 음성·수업 제목·계정 ID가 아니라 받아쓴 구간 텍스트, 언어, 내부 구간 ID가 전송됩니다. 이 PC가 모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호·주민번호·카드번호를 먼저 임시 표식으로 바꾸고, 표식이나 기존 숫자가 손상된 응답은 저장하지 않습니다. 정규식 가림은 이름이나 모든 개인정보 형식을 찾는 완전한 익명화가 아니므로 민감한 수업에는 후보정을 누르지 마세요.
 - 원문 `segments`는 후보정으로 수정하지 않습니다. 후보정본은 별도 DB 행에 저장하고 화면도 항상 원문으로 먼저 엽니다. 외부 모델이 정보를 잘못 고칠 수 있으므로 `확인 필요` 용어와 숫자 표기 경고를 원문·녹음과 비교하세요. Gateway 호출은 NOVA 크레딧을 사용하며 소진되어도 로컬 원문과 WAV에는 영향이 없습니다. [NOVA Gateway 개요](https://docs.mindlogic.ai/docs/cbnu-ac/api-gateway/getting-started/overview), [Chat Completions](https://docs.mindlogic.ai/docs/cbnu-ac/api-gateway/reference/chat-completions)
@@ -90,6 +96,75 @@ GPU가 보이는지 확인하려면 다음을 실행합니다.
 ```
 
 마지막 값이 `False`이면 서버를 시작하지 말고 WSL의 `/dev/dxg`, ROCm 설치, 사용 중인 Python 경로부터 확인하세요.
+
+## 개인 Google Drive에 녹음 보관
+
+개인 Gmail의 **My Drive**에 저장하려면 서비스 계정이 아닌 Google OAuth **Desktop app** 자격증을 쓸 것을 권장합니다. 이 앱은 `drive.file` 범위만 요청하며, 자신이 만든 `STT 수업 녹음` 폴더와 파일만 다룹니다. 녹음은 `STT 수업 녹음/<계정 ID>/<수업 UUID>.wav`로 정리됩니다. 실제 계정 ID 목록은 GitHub 소스·Pages 정적 파일·런타임 설정에 하드코딩하거나 게시하지 않고, 이 서버가 런타임에 개인 Drive의 하위 폴더명으로만 사용합니다. Drive `appProperties`·녹음 archive 메타데이터/다운로드 URL·집계 CLI 출력에는 ID를 넣지 않습니다. 다만 로그인한 본인 화면, 관리자 전용 화면, 초대 절차와 해당 기기의 로컬 대기열은 인증·소유자 묶음을 위해 계정 ID를 사용하며 공개 Pages 배포와는 다른 경계입니다. 수업 제목은 Drive에 넣지 않으며 내부 식별 표식도 서버 비밀 키로 만든 opaque 값입니다. 하위 폴더는 정리 단위이고 권한 경계는 아니므로 루트 폴더나 하위 폴더를 다른 사람과 공유하지 마세요. 실제 사용자 격리는 계속 API 서버의 소유권 검사로 수행합니다. [Google Drive API 범위 설명](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
+
+첫 업로드에서 선택한 Google 계정의 opaque `permissionId`와 OAuth client를 이 서버의 비밀 키로 다시 가린 지문을 DB에 고정합니다. 이후 다른 Gmail이나 다른 OAuth client로 잘못 승인하면 다운로드·로컬 정리·Drive 휴지통 이동을 모두 실패로 닫고 로컬 WAV와 수업 DB를 보존합니다. 계정 이메일이나 이 지문은 브라우저와 CLI에 표시하지 않습니다. `about.get`은 이메일 대신 `user(permissionId)`만 요청하며 `drive.file` 범위에서 사용할 수 있습니다. [Google Drive about.get](https://developers.google.com/workspace/drive/api/reference/rest/v3/about/get)
+
+한 번만 Google Cloud Console에서 다음을 준비합니다.
+
+1. 개인용 Google Cloud 프로젝트를 만들고 **Google Drive API**를 사용 설정합니다.
+2. **Google Auth Platform → Branding / Audience / Data Access**에서 동의 화면을 설정합니다. 개인 Gmail이면 Audience는 External로 두고 Testing 중에는 본인 Gmail을 test user로 넣습니다.
+3. **Clients → Create client → Desktop app**으로 OAuth client를 만든 뒤 JSON을 다운로드합니다. Web application 자격증은 이 설정 도구가 거절합니다.
+
+다운로드한 JSON은 내용을 채팅에 붙이지 말고 WSL의 private 경로로 복사합니다. 아래 `/mnt/c/...` 부분만 실제 다운로드 경로로 바꾸세요.
+
+```bash
+cd "$HOME/stt_server"
+install -d -m 700 .data/google-drive
+install -m 600 /mnt/c/.../downloaded-oauth-client.json \
+  .data/google-drive/oauth-client.json
+```
+
+인증 파일을 교체할 때는 실행 중인 API와 refresh token 갱신이 경쟁하지 않도록 API 서버만 잠시 끄고 승인합니다. 명령은 승인 URL이나 token을 터미널에 출력하지 않습니다. WSL에서 브라우저가 자동으로 열리지 않으면, 명령이 대기하는 동안 private `.data/google-drive/authorization-url.txt`의 한 줄을 본인 브라우저에만 열고 채팅·로그에 남기지 마세요.
+
+```bash
+./scripts/stop.sh --server-only
+./.venv/bin/python scripts/google_drive.py auth
+```
+
+승인이 끝나면 `.data/google-drive/token.json`이 `0600`으로 생깁니다. `server/.env`의 아래 값을 켜고 경로는 예시를 유지합니다.
+
+```dotenv
+GOOGLE_DRIVE_RECORDINGS=1
+GOOGLE_DRIVE_OAUTH_CLIENT_FILE=.data/google-drive/oauth-client.json
+GOOGLE_DRIVE_TOKEN_FILE=.data/google-drive/token.json
+```
+
+`GOOGLE_DRIVE_UPLOAD_CHUNK_BYTES`(기본 8 MiB, 256 KiB의 배수), `GOOGLE_DRIVE_CONNECT_TIMEOUT_SECONDS`, `GOOGLE_DRIVE_READ_TIMEOUT_SECONDS`, `GOOGLE_DRIVE_RETRY_MAX_SECONDS`는 업로드·재시도 튜닝값입니다. 처음에는 `server/env.example`의 기본값을 유지하세요. 어떤 Google 설정도 GitHub Pages의 `web/config.json`에 넣지 않습니다.
+
+OAuth 동의 화면이 **Testing**이면 개인 Gmail의 refresh token은 일반적으로 7일 뒤 만료합니다. 수업 중 끊기지 않게 장기 운영 전에 게시 상태를 Production으로 전환할 수 있는지 확인하세요. Testing을 유지하면 7일 안에 위 `auth`를 다시 실행해야 할 수 있습니다. [Google OAuth token 만료 설명](https://developers.google.com/identity/protocols/oauth2#expiration)
+
+### 기존 녹음을 Drive로 옮기기
+
+실제 이전은 API 서버를 끄고 진행합니다. `--dry-run`은 실행 중인 서버가 있어도 건수와 바이트만 계산하며 큐·파일을 바꾸지 않습니다. 현재 파일의 실제 제목·계정·경로·Drive ID는 표시하지 않습니다.
+
+```bash
+# 연결, 큐, 로컬 녹음의 집계만 표시
+./.venv/bin/python scripts/google_drive.py status
+
+# 변경 없이 이전 대상 건수·크기 확인
+./.venv/bin/python scripts/google_drive.py migrate --dry-run
+
+# 선택: 첫 1건은 Drive에 옮기되 로컬 사본을 남겨 수동 확인
+./.venv/bin/python scripts/google_drive.py migrate --limit 1 --keep-local
+
+# 의도한 Gmail의 My Drive에서 STT 수업 녹음/<계정 ID> 폴더와 첫 WAV를 직접 확인
+
+# 나머지를 옮기고, 검증된 로컬 WAV만 삭제
+./.venv/bin/python scripts/google_drive.py migrate
+
+./.venv/bin/python scripts/google_drive.py status
+./scripts/start-server.sh
+```
+
+첫 1건 확인은 생략하지 않는 편이 안전합니다. 이때 선택한 Google 계정과 OAuth client가 archive에 고정됩니다. 이후 OAuth를 갱신할 때도 같은 client JSON과 같은 Gmail을 선택하세요. `migrate`는 중단되어도 업로드 세션과 상태를 보존하므로 같은 명령을 다시 실행할 수 있습니다. `--keep-local`로 남긴 사본도 다음 기본 `migrate`가 Drive 검증을 다시 확인한 뒤 정리합니다. 이전 버전이 루트에 직접 올린 WAV는 재업로드하지 않고 `files.update(addParents/removeParents)`로 해당 계정 폴더에 옮기며, 이동 결과와 체크섬을 확인하기 전에는 로컬 사본을 삭제하지 않습니다. 서버를 `GOOGLE_DRIVE_RECORDINGS=1`로 시작하면 이후 완료된 녹음과 아직 옮기지 않은 기존 녹음을 background worker가 자동으로 처리합니다. `status`의 `folder organization pending`, `needs attention`, `deleting`이 모두 0인지 확인하세요. [Google Drive 파일 이동](https://developers.google.com/workspace/drive/api/guides/folder#move_files_between_folders)
+
+브라우저는 Google에 직접 연결하지 않습니다. 녹음 다운로드는 기존처럼 `GitHub Pages 브라우저 → Cloudflare → 이 API 서버 → Google Drive`로 스트리밍되며, 소유권 검사와 60초 다운로드 ticket을 그대로 적용합니다. Drive 파일 ID·OAuth token·재개 upload URL은 프런트엔드와 API 응답에 노출하지 않습니다. 수업을 삭제하면 연결된 Drive WAV는 영구 삭제 대신 Drive 휴지통으로 옮기고, 텍스트는 이 PC의 DB에서 삭제합니다. CLOVA Object Storage의 별도 사본은 이 삭제에 포함되지 않습니다.
+
+아주 드물게 마지막 upload 응답을 잃은 직후 수업을 삭제하면, 서버는 아직 파일을 만들 수 있는 재개 세션이 사라졌다고 추측하지 않습니다. `308` 상태를 한 번 확인한 뒤 8일 동안 그 세션을 다시 건드리지 않아 Google의 1주 비활성 만료를 기다리되, 완성된 파일은 별도 검색으로 발견하는 즉시 휴지통으로 옮깁니다. 그동안 수업은 목록에서 숨겨진 삭제 대기 상태로 남고 로컬 WAV와 private 추적 행은 보존됩니다. [Google Drive 재개 업로드 상태·만료](https://developers.google.com/workspace/drive/api/guides/manage-uploads)
 
 ## GitHub Pages 배포
 
@@ -260,15 +335,15 @@ cd "$HOME/stt_server"
 
 Quick Tunnel 주소가 바뀌면 앱은 GitHub Pages의 새 런타임 설정을 익명 `/health`로 먼저 확인합니다. 새 후보를 확인하는 동안에는 기존에 검증된 서버로 진행 중인 녹음 전송을 계속하되, 기존 로그인 토큰은 새 origin으로 보내지 않습니다. 새 주소가 설치되면 녹음·대기 WAV를 유지한 채 같은 계정으로 다시 로그인해야 그 주소에서 전송을 재개합니다.
 
-실시간 수업을 끝낼 때 **받아쓰기 종료**를 누르고, 마지막 `final` 청크의 처리 대기 표시가 사라지고 **서버 컴퓨터에 저장됨**이 나온 뒤 내보내기나 녹음 다운로드를 사용합니다. 입력 종료 확인이 실패하면 **마지막 오디오 일부 누락 가능 · 받은 내용만 저장됨** 경고가 다음 녹음 전까지 남습니다. 이 경우 내려받은 텍스트와 WAV의 끝부분을 직접 확인하세요.
+실시간 수업을 끝낼 때 **받아쓰기 종료**를 누르고, 마지막 `final` 청크의 처리 대기 표시가 사라진 뒤 저장 상태를 확인합니다. Drive 연동 시 **Google Drive 저장 대기**나 **옮기는 중**이어도 검증전까지 WAV는 이 서버에 남아 있으므로 수업 기록은 이미 보존됩니다. **Google Drive에 녹음 저장됨**은 원격 검증과 로컬 정리가 끝난 상태입니다. **Google Drive 저장 확인 필요**가 나오면 서버를 끄지 말고 운영자가 `scripts/google_drive.py status`를 확인하세요. 입력 종료 확인이 실패하면 **마지막 오디오 일부 누락 가능 · 받은 내용만 저장됨** 경고가 다음 녹음 전까지 남습니다. 이 경우 내려받은 텍스트와 WAV의 끝부분을 직접 확인하세요.
 
 ### 지난 수업 보기·내보내기·삭제
 
 - 지난 수업은 한국 시간(`Asia/Seoul`) 날짜별로 묶입니다. **전체 날짜** 또는 원하는 날짜를 골라 볼 수 있습니다.
 - 수업을 연 뒤 형식을 고르고 **내보내기**를 누르면 현재 화면에서 선택한 원문 또는 후보정본을 UTF-8 `.txt`로, 혹은 제목·날짜·언어·타임스탬프가 포함된 `.md`로 저장합니다. 후보정본 파일명에는 `_AI후보정`이 붙습니다.
 - 새 기능 적용 뒤 정상적으로 끝난 수업은 **녹음 WAV**로 내려받을 수 있습니다. 서버 재시작이나 마지막 실패 조각 건너뛰기로 WAV만 미확정 상태라면 같은 버튼이 먼저 **녹음 WAV 마무리**를 수행합니다. 녹음·변환 중이거나 기능 적용 전이라 저장된 WAV가 없는 수업은 버튼이 비활성화됩니다.
-- **수업 삭제**는 확인창을 거쳐 받아쓰기 원문, 후보정본, 청크 정보, 연결된 파일 변환 기록과 보존 WAV를 함께 영구 삭제합니다. 진행 중인 전사·파일 변환·AI 후보정이 있으면 서버가 `409`로 거절하므로 먼저 끝내거나 취소하세요. 삭제한 내용은 앱에서 복구할 수 없지만, 삭제 전에 만든 별도 백업에는 남아 있을 수 있습니다.
-- WAV는 시간당 약 110 MiB입니다. 기본 보존 한도는 전체 20 GiB이고, 디스크에 최소 1 GiB를 남깁니다. 필요하면 ignored `server/.env`의 `MAX_RECORDINGS_BYTES`와 `RECORDING_FREE_RESERVE_BYTES`를 조정하세요.
+- **수업 삭제**는 확인창을 거쳐 받아쓰기 원문, 후보정본, 청크 정보, 연결된 파일 변환 기록과 보존 WAV를 함께 앱에서 삭제합니다. Drive WAV는 먼저 휴지통으로 옮겨진 뒤 로컬 DB가 삭제되며, 원격 이동을 확인하지 못하면 수업 DB를 남기고 재시도할 수 있게 실패로 표시합니다. 진행 중인 전사·파일 변환·AI 후보정이 있으면 서버가 `409`로 거절합니다. 삭제한 텍스트는 앱에서 복구할 수 없고, 이미 만든 백업과 CLOVA Object Storage 사본은 별도로 남을 수 있습니다.
+- WAV는 시간당 약 110 MiB입니다. Google Drive로 옮기기 전의 staging과 실패 보존을 위한 기본 로컬 한도는 전체 20 GiB이고, 디스크에 최소 1 GiB를 남깁니다. 필요하면 ignored `server/.env`의 `MAX_RECORDINGS_BYTES`와 `RECORDING_FREE_RESERVE_BYTES`를 조정하세요. Drive 용량이 부족하면 안전하게 로컬 사본을 남기지만 로컬 한도에 닿으면 새 녹음 저장이 중단될 수 있습니다.
 
 ### 받아쓰기 AI 후보정
 
@@ -302,7 +377,7 @@ SQLite WAL에 남아 있는 최신 기록까지 일관되게 포함하려면 DB 
 ./scripts/backup.sh /암호화된/개인저장소/classroom-$(date +%Y%m%d).sqlite3
 ```
 
-이 명령은 **DB만 백업하며 `.data/recordings/`의 WAV는 포함하지 않습니다.** 음성까지 함께 보존하려면 먼저 `./scripts/stop.sh`로 전송과 변환을 정상 종료한 다음, 생성한 SQLite 백업과 `.data/recordings/` 폴더를 같은 암호화된 개인 저장소에 함께 복사하세요. 복원할 때도 둘을 같은 시점의 묶음으로 되돌려야 합니다.
+이 명령은 **DB만 백업하며 로컬 `.data/recordings/`와 Google Drive WAV는 포함하지 않습니다.** Drive는 녹음 보관소이지 로컬 DB의 대체재가 아닙니다. 복원 가능한 전체 백업을 만들려면 서버를 정상 종료하고, SQLite 백업과 아직 업로드되지 않은 `.data/recordings/`, Drive의 private `STT 수업 녹음` 폴더를 같은 시점의 묶음으로 관리하세요. DB와 Drive 파일의 대응을 유지하려면 `.data/google-drive/identity.key`, OAuth client JSON과 `token.json`도 함께 백업하되 반드시 암호화된 개인 저장소에만 두고 공유하지 마세요. 이들은 어떤 경우에도 Git에 올리지 않습니다.
 
 백업에는 모든 계정의 비밀번호 해시, 개인 수업 텍스트와 음성이 들어갈 수 있습니다. GitHub, 공유 Drive, 메신저에 원본 그대로 올리지 마세요. 앱에서 수업을 삭제해도 먼저 만든 백업에서는 자동으로 지워지지 않습니다.
 
@@ -376,7 +451,7 @@ CLOVA 수업은 외부 gRPC 응답을 기다리므로 로컬 GPU 대기와 별�
 
 ## 테스트와 로컬 벤치마크
 
-2026-09-05 현재 변경분에서 Python 서버/API/DB/설정/전사·가져오기·후보정·관리자·터널·CLOVA fake 계약 **173개**가 22.902초에 모두 통과했습니다. 이 중 CLOVA 계약 48개는 정상 연결과 교체 연결의 미확정 접미사, 타임스탬프 흔들림, 실제 반복 발화, 긴 무음 뒤 오래된 문맥, 문장부호, 종료·삭제·계정 격리를 검사합니다. Python compile과 `git diff --check`도 통과했습니다. VS Code Server Node.js 24.18.0으로 앱 상태·오디오·파일 재개·정적 경계 **135개**가 1.808초에 모두 통과했으며, 최종 사용자 화면에 비용·과금 문구가 없고 운영자 관리 NAVER Cloud 계정과 음성 전송은 고지하는 계약을 포함합니다.
+2026-09-05 현재 변경분에서 Python 서버/API/DB/설정/전사·가져오기·후보정·관리자·터널·CLOVA·Google Drive 계약 **268개**가 제한 없는 호스트 환경에서 36.307초에 모두 통과했습니다. Google Drive 계약은 OAuth 범위·비밀 파일 권한, 재개 업로드, checksum, 사용자별 폴더, 기존 루트 파일 이동, 응답 유실 재조정, 동시 유지보수 경합, PID 파일이 유실된 서버 탐지, Range·disconnect, 소유권, 휴지통-before-DB 삭제를 포함합니다. Python compile과 `git diff --check`도 통과했습니다. VS Code Server Node.js 24.18.0으로 앱 상태·오디오·파일 재개·정적 경계 **136개**가 2.522초에 모두 통과했으며, Google Drive 저장 상태·locator 미노출·서버 proxy·trash 안내와 기존 CLOVA 개인정보 문구 계약을 포함합니다.
 
 공개 [KSS 한국어 데이터셋](https://huggingface.co/datasets/Bingsu/KSS_Dataset)의 78~80번 행 12.645초를 9.1초 경계에서 나누고 테스트 시계만 241초로 이동해 실제 CLOVA 연결 교체를 강제했습니다. 최종 코드 실행은 12.281초에 두 TLS/gRPC 연결을 사용했고, 첫 응답의 `비교하는 것` 뒤에서 둘째 응답이 overlap 안의 `이다.`를 회수해 목표 문장이 한 번만 남았습니다. final 뒤 활성 세션과 응답 스레드는 0개였습니다. 이는 공개 단일 화자 낭독의 짧은 경계 시험이며 실제 교실 브라우저, 학교 Wi-Fi, 45~90분 최신 코드 실행을 대신하지 않습니다.
 

@@ -24,6 +24,8 @@ test('page has no remote assets or inline executable content and declares privac
   assert.ok(connectSources.includes('http://127.0.0.1:*'));
   assert.ok(!connectSources.includes('https:'), 'arbitrary HTTPS destinations must not be allowed');
   assert.ok(!connectSources.includes('http:'), 'arbitrary HTTP destinations must not be allowed');
+  assert.ok(!connectSources.some(value => /google(?:apis)?\.com/i.test(value)),
+    'the browser must download recordings through the authenticated API server, not Google');
   assert.match(html, /name="referrer" content="no-referrer"/);
   assert.match(html, /사이트 운영자가 관리하는 NAVER Cloud 계정/);
   assert.doesNotMatch(html, /비용이 청구|추가 과금|중복 과금|과금될/);
@@ -68,7 +70,10 @@ test('history, export, recording, and destructive controls are explicit and acce
   assert.match(html, /<div\b[^>]*\bclass="note-actions"[^>]*\brole="group"[^>]*\baria-label="현재 수업 작업"/i);
   assert.match(html, /<dialog\b[^>]*\bid="delete-dialog"[^>]*\baria-labelledby="delete-title"[^>]*\baria-describedby="delete-description"/i);
   assert.match(html, /받아쓴 원문, AI 후보정본과 저장된 녹음/);
-  assert.match(html, /이 작업은 되돌릴 수 없습니다/);
+  assert.match(html, /Google Drive에 저장된 녹음은 Drive 휴지통으로 이동/);
+  assert.match(html, /받아쓴 기록은 앱에서 되돌릴 수 없습니다/);
+  assert.match(html, /CLOVA Object Storage 사본은 이 삭제의 대상이 아닙니다/);
+  assert.match(html, /<div\b[^>]*\bclass="save-row"[^>]*\brole="status"[^>]*\baria-live="polite"/i);
   assert.match(html, /<div\b[^>]*\bclass="record-actions"[^>]*\brole="group"[^>]*\baria-label="받아쓰기 녹음 제어"/i);
   assert.match(html, /<button\b[^>]*\bid="pause-button"[^>]*\baria-pressed="false"[^>]*\bdisabled[^>]*>Ⅱ 일시정지<\/button>/i);
   assert.match(html, /<div\b[^>]*\bid="live-capture-banner"[^>]*\brole="region"[^>]*\baria-labelledby="live-capture-title"[^>]*\bhidden/i);

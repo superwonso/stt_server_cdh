@@ -83,6 +83,7 @@ class RecordingStore:
         min_free_bytes: int,
         max_seconds: int,
         max_gap_seconds: int = 60,
+        create_directories: bool = True,
     ):
         self.root = Path(root)
         self.accounts = frozenset(accounts)
@@ -91,12 +92,13 @@ class RecordingStore:
         self.max_frames = max_seconds * SAMPLE_RATE
         self.max_gap_frames = max_gap_seconds * SAMPLE_RATE
         self.lock = threading.RLock()
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.root.chmod(0o700)
-        for account in accounts:
-            directory = self.root / account
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            directory.chmod(0o700)
+        if create_directories:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.root.chmod(0o700)
+            for account in accounts:
+                directory = self.root / account
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                directory.chmod(0o700)
 
     def path(self, username: str, lecture_id: str) -> Path:
         if username not in self.accounts:

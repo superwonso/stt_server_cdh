@@ -65,6 +65,18 @@ const ADMIN_REFRESH_MS = 10000;
 const PRESENCE_INTERVAL_MS = 15000;
 const PRESENCE_IDLE_MS = 5 * 60 * 1000;
 const CLOVA_PRIVACY_NOTICE = '선택한 마이크 음성은 브라우저 → 이 서버 → 이 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인으로 전송됩니다. 인식 결과는 운영자가 연결한 Object Storage에 자동 저장되며, 이 앱에서 수업을 삭제해도 그 클라우드 사본은 삭제되지 않습니다.';
+const RECORDING_STORAGE_LABELS = Object.freeze({
+  none: '아직 저장된 녹음 없음',
+  upload_queued: 'Google Drive 저장 대기 · 이 서버에 임시 보관',
+  uploading: 'Google Drive로 녹음을 옮기는 중',
+  retrying: 'Google Drive 연결 대기 · 이 서버에 임시 보관',
+  drive_cleanup_pending: 'Google Drive 저장 확인 완료 · 서버 임시본 정리 중',
+  drive_ready: 'Google Drive에 녹음 저장됨',
+  attention_required: 'Google Drive 저장 확인 필요 · 서버에서 확인해 주세요',
+});
+const TRANSIENT_RECORDING_STORAGE_STATES = new Set([
+  'upload_queued','uploading','retrying','drive_cleanup_pending',
+]);
 const fmt = seconds => { const n = Math.max(0, Math.floor(seconds || 0)); return `${Math.floor(n / 60).toString().padStart(2, '0')}:${(n % 60).toString().padStart(2, '0')}`; };
 const KST_DATE_FORMATTER = new Intl.DateTimeFormat('ko-KR', {timeZone:'Asia/Seoul',year:'numeric',month:'long',day:'numeric'});
 const KST_DATE_PARTS = new Intl.DateTimeFormat('en', {timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'});
@@ -78,6 +90,15 @@ function safeFilename(value) {
   const cleaned = Array.from(String(value || '').replace(/[<>:"/\\|?*\u0000-\u001F]/g,'_').trim())
     .slice(0,100).join('').replace(/[. ]+$/g,'');
   return cleaned || '수업';
+}
+function recordingStorageLabel(lecture) {
+  if (!lecture) return '녹음 저장 준비';
+  const state = lecture.recording_storage_state;
+  if (state === 'local_recording') {
+    return lecture.recording_finalized ? '이 서버에 녹음 저장됨' : '이 서버에 녹음 저장 중';
+  }
+  return RECORDING_STORAGE_LABELS[state]
+    || (lecture.recording_available ? '이 서버에 녹음 저장됨' : '아직 저장된 녹음 없음');
 }
 function escapeMarkdown(value) {
   return String(value ?? '').replace(/\r\n?/g,'\n')
@@ -1281,6 +1302,9 @@ async function updateStatus() {
     applyNewLectureProvider();
     $('model-status').textContent = ({unloaded:'첫 받아쓰기 준비됨',loading:'음성 인식 모델 준비 중',ready:'음성 인식 모델 연결됨',error:'음성 인식 모델 확인 필요'})[status.model_state] || '서버 연결됨';
     updateProviderGuidance(); updateControls();
+    if (lectures.some(lecture => TRANSIENT_RECORDING_STORAGE_STATES.has(lecture?.recording_storage_state))) {
+      void refreshLectures().catch(() => {});
+    }
   } catch {
     if (!requestIsCurrent()) return;
     transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
@@ -1295,7 +1319,18 @@ async function refreshLectures() {
   const owner = user, sessionToken = token, refreshGeneration = ++lectureRefreshGeneration;
   const result = await api('/lectures');
   if (owner !== user || sessionToken !== token || refreshGeneration !== lectureRefreshGeneration) return;
-  lectures = Array.isArray(result) ? result : result.lectures || []; renderHistory();
+  const refreshed = Array.isArray(result) ? result : result.lectures || [];
+  const selectedSummary = refreshed.find(lecture => lecture.id === current?.id);
+  const captureSummary = refreshed.find(lecture => lecture.id === captureSession?.lecture?.id);
+  for (const [target,summary] of [[current,selectedSummary],[captureSession?.lecture,captureSummary]]) {
+    if (!target || !summary) continue;
+    target.recording_available = !!summary.recording_available;
+    target.recording_finalized = !!summary.recording_finalized;
+    if (typeof summary.recording_storage_state === 'string') {
+      target.recording_storage_state = summary.recording_storage_state;
+    }
+  }
+  lectures = refreshed; renderHistory(); updateControls();
 }
 function defaultImportTitle(file) {
   const base = String(file?.name || '').replace(/\.[^.]+$/, '').trim() || `${dateLabel(new Date())} 녹음`;
@@ -2571,7 +2606,7 @@ function updateControls() {
   $('delete-close').disabled = deletingLecture;
   $('delete-cancel').disabled = deletingLecture;
   $('delete-confirm').disabled = deletingLecture;
-  $('delete-confirm').textContent = deletingLecture ? '삭제하는 중…' : '수업 영구 삭제';
+  $('delete-confirm').textContent = deletingLecture ? '삭제하는 중…' : '수업 삭제';
   $('lecture-title').disabled = busy || !!current; $('language').disabled = busy || !!current;
   $('language-auto').disabled = clova;
   $('audio-source').disabled = busy || !!current;
@@ -2604,7 +2639,7 @@ function updateControls() {
     : queued ? `${queued}개 음성${localQueueSize} · 기기에 임시 보관`
       : liveQueuePersisting ? '방금 받은 음성을 기기에 안전하게 보관 중'
         : recoveryFinalizationRequired.size ? `${recoveryFinalizationRequired.size}개 수업 · 마지막 문장 마무리 확인 필요`
-        : captureWarning ? '마지막 오디오 일부 누락 가능 · 받은 내용만 저장됨' : current ? '서버 컴퓨터에 저장됨' : '서버 컴퓨터에 저장';
+        : captureWarning ? '마지막 오디오 일부 누락 가능 · 받은 내용만 저장됨' : recordingStorageLabel(current);
   $('processing').hidden = !recording && !starting && !pausing && !resuming && !inputUnavailable && !queued && !sending;
   $('processing-text').textContent = sendError ? '음성은 계속 보관 중입니다. 안내를 확인해 전송을 이어 주세요.'
     : inputUnavailable ? '서버 전송과 별개로 오디오 입력 복구를 기다리고 있어요…'
@@ -3460,6 +3495,11 @@ function applyRecordingFlags(lectureId, result) {
     recording_available: !!result?.recording_available,
     recording_finalized: !!result?.recording_finalized,
   };
+  if (typeof result?.recording_storage_state === 'string'
+      && (result.recording_storage_state === 'local_recording'
+        || Object.hasOwn(RECORDING_STORAGE_LABELS,result.recording_storage_state))) {
+    state.recording_storage_state = result.recording_storage_state;
+  }
   const summary = lectures.find(lecture => lecture.id === lectureId);
   if (summary) Object.assign(summary,state);
   if (current?.id === lectureId) Object.assign(current,state);
@@ -3678,7 +3718,7 @@ function finishDeletedLecture(target) {
   if ($('delete-dialog').open) $('delete-dialog').close();
   if (current?.id === target.id) resetNewNote();
   else { renderCurrent(); renderHistory(); }
-  notice('수업 기록과 저장된 녹음을 삭제했어요.');
+  notice('수업 기록을 삭제했어요. Google Drive 녹음이 있었다면 Drive 휴지통으로 옮겼어요.');
 }
 $('delete-confirm').onclick = async () => {
   const target = deleteTarget;

@@ -413,6 +413,16 @@ class RecordingApiTests(unittest.TestCase):
         self.assertEqual(metadata, (1, 2, 16_000))
         np.testing.assert_array_equal(frames, expected)
 
+        revoked_ticket = self.client.post(
+            f"/lectures/{lecture_id}/recording-download-ticket",
+            headers=self.headers(),
+        ).json()["path"]
+        self.assertEqual(
+            self.client.post("/auth/logout", headers=self.headers()).status_code,
+            200,
+        )
+        self.assertEqual(self.client.get(revoked_ticket).status_code, 404)
+
     def test_ticket_expires_and_unfinalized_recording_cannot_issue_one(self):
         lecture_id = self.create_lecture()
         response = self.upload(
@@ -687,7 +697,12 @@ class RecordingApiTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(
             first.json(),
-            {"segments": [], "recording_available": False, "recording_finalized": True},
+            {
+                "segments": [],
+                "recording_available": False,
+                "recording_finalized": True,
+                "recording_storage_state": "none",
+            },
         )
         repeated = self.client.post(
             f"/lectures/{lecture_id}/recording-finalize",

@@ -18,6 +18,8 @@ CLOVA 선택 시 경로는 `브라우저 → Cloudflare → 이 PC → clovaspee
 
 CLOVA를 마이크 화면의 기본 선택으로 둔 것은 실제 같은 수업 음성에서 Qwen보다 항상 정확하다고 검증한 결론이 아니라 사용자의 운영 선택이다. Qwen은 대상 Radeon/ROCm에서 실제 한국어 음성을 실시간보다 빠르게 처리했고, 현재 3초 겹침 경로가 짧은 낭독 시험에서 CER 4.03%, 마지막 기준 25자 완전 일치, 탐지된 텍스트 중복 0건을 냈으므로 CLOVA 미설정·상태 확인 실패의 로컬 대안과 화면 소리·파일 변환 엔진으로 유지한다. 서로 독립적으로 인식한 Qwen 청크의 정렬 시각은 흔들릴 수 있으므로 실제 수업에서 exactly-once를 수학적으로 보장하지 않는다.
 
+보존 WAV를 이 PC에 영구 보관하지 않고 운영자의 개인 Gmail My Drive로 옮기는 선택형 archive를 추가했다. 완료된 WAV를 로컬 staging에 두고 재개 가능 업로드한 뒤 크기·MD5·SHA-256을 검증해야만 로컬 사본을 삭제한다. 녹음은 `STT 수업 녹음/<runtime account ID>/<lecture UUID>.wav`로 분리한다. 실제 계정 ID 목록은 GitHub/Pages에 게시하지 않고 Drive appProperties·archive 메타데이터/다운로드 URL·집계 CLI에도 넣지 않으며, 비공개 Drive 폴더명과 인증된 본인/관리자 화면·해당 기기의 로컬 대기열에서만 운영상 사용한다. 인증·업로드·검증·폴더 이동 오류에서는 로컬 WAV를 보존하고 상태를 재시도 또는 수동 확인으로 남긴다. 이 기능은 녹음만 옮기며 DB·계정·텍스트는 이 PC에 남는다. 실제 개인 Gmail OAuth, 첫 1건 keep-local 업로드와 사용자 수동 재생, 사용자 폴더 3개로의 전체 10건 이전·전수 재검증·로컬 정리까지 완료했다. 최신 API 서버도 Qwen warmup으로 재기동했고 로컬/외부 health 200이며, GitHub 푸시·Pages 배포는 하지 않았다.
+
 VibeVoice-ASR-Streaming-7B는 이 PC에서도 BF16/SDPA로 실제 로드되고 공식 live-state API로 7분 52초를 완주했다. 2.9초 청크와 0.5초 lookahead, 이전 음성·텍스트 문맥, 화자 라벨을 한 세션에서 유지하는 점은 회의·수업에 매력적이다. 그러나 공개 체크포인트의 목표 세션이 최대 8분이고, 실측에서도 KV가 1,702→6,574토큰, GPU reserved가 16.59→22.19 GiB로 증가했다. 최근 10청크 평균 연산도 2분 2.15초에서 종료 시 3.25초로 늘어 2.933초 입력 간격을 넘었다. 따라서 45~90분 수업 기본값으로 두지 않았다. 8분마다 상태를 끊으면 실행은 가능할 수 있지만 화자 일관성과 장기 문맥이라는 장점도 함께 끊긴다.
 
 ## 대상 하드웨어
@@ -154,14 +156,14 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 - FastAPI는 `127.0.0.1`에만 bind하며 외부 요청은 Cloudflare 터널로만 받는다.
 - CORS 및 별도 origin middleware가 `SITE_ORIGINS`의 정확한 출처만 허용한다.
-- 실제 계정 ID 목록은 ignored `server/.env`의 `ACCOUNT_USERNAMES`와 로컬 DB에만 존재한다. 2~10개의 서로 다른 정규화된 ID만 허용하며, 빈 설정이나 기존 DB와의 불일치는 값을 반사하지 않는 오류로 fail closed 한다. 일반 서버 시작은 계정을 자동 추가하지 않고 명시적인 로컬 `add-account` 경로만 기존 집합을 한 개 늘릴 수 있다.
+- 실제 계정 ID 허용 목록의 설정 원본은 ignored `server/.env`의 `ACCOUNT_USERNAMES`이고 GitHub/Pages에는 게시하지 않는다. 런타임에는 로컬 DB, 비공개 Drive 폴더명, 로그인한 본인/관리자 화면·초대 절차·해당 기기의 로컬 대기열에서 소유자 묶음으로 사용한다. 2~10개의 서로 다른 정규화된 ID만 허용하며, 빈 설정이나 기존 DB와의 불일치는 값을 반사하지 않는 오류로 fail closed 한다. 일반 서버 시작은 계정을 자동 추가하지 않고 명시적인 로컬 `add-account` 경로만 기존 집합을 한 개 늘릴 수 있다.
 - 관리자 ID도 ignored `server/.env`의 `ADMIN_USERNAME`에만 두고 `Settings` repr에서 계정 목록과 함께 제외한다. 설정이 없거나 구성된 계정 중 하나와 일치하지 않으면 관리자 API는 fail closed 한다.
 - `POST /presence`는 인증 계정별 `idle/viewing/recording/uploading/transcribing/correcting/away` 하나만 프로세스 메모리에 45초 TTL로 보관한다. IP·UA·수업 ID/제목/본문을 받거나 DB에 저장하지 않는다.
 - `GET /admin/overview`는 관리자에게만 uptime/model, `/proc` RAM/RSS/load, 디스크, 이미 로드된 PyTorch의 ROCm VRAM, 작업 수, 계정 활성화/세션/최소 presence와 최근 안전한 조작 이력을 반환한다. 계정 조작 참조는 프로세스마다 새 무작위 token이며 실제 ID는 관리자 응답의 label에만 있다.
 - persisted `operational_state`를 끄면 인증과 health/presence/admin/status는 유지하되 새 lecture/import/녹음 다운로드 요청을 `503`으로 차단한다. 요청 안에서 이미 시작한 추론과 background import/correction은 중간에 죽이지 않는다.
 - 관리자는 자기 세션을 실수로 끊을 수 없고 다른 계정의 모든 세션만 해제할 수 있다. 터널 재연결은 202를 먼저 반환한 뒤 고정 script argv로 비동기 실행하며 임의 hook 메시지·PID·URL·로그를 API에 반사하지 않는다.
 - body-size middleware가 `Content-Length` 유무와 chunked 전송 모두에서 과대한 JSON/WAV/파일 조각 요청을 parsing 전에 차단한다.
-- 계정 ID는 Git에서 제외된 `server/.env`의 `ACCOUNT_USERNAMES`로만 설정하며 앱에서도 그 목록으로 제한한다.
+- 계정 ID는 Git에서 제외된 `server/.env`의 `ACCOUNT_USERNAMES`로만 설정하며 공개 프런트엔드에 허용 목록을 내장하지 않는다. 서버가 로그인·소유권을 검사한다.
 - 초대 코드는 7일/1회용이고 원문은 `.data/invitations.txt`에만 쓴다. 초대 URL에는 API 주소를 넣지 않으며, 활성화 후 DB의 setup hash도 제거된다.
 - 새 비밀번호 정책은 사용자 요청에 따라 4~128자이며 Argon2로 저장한다. 세션·초대 코드는 SHA-256 digest로 저장하고 인증 오류 응답에 비밀번호나 초대 값을 반사하지 않는다.
 - 로그인/초기 설정 시 IP별 30회/5분, IP+계정별 10회/5분과 별도로 모든 주소를 합산한 계정별 50회/30분 제한을 적용한다.
@@ -172,17 +174,22 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - `ClovaStreamingTranscriber`는 공식 TLS host/port와 `authorization: Bearer …` metadata, CONFIG 성공 확인, headerless PCM16 16 kHz mono 32,000-byte DATA, 마지막 DATA의 nonzero `seqId`+`epFlag=true` acknowledgement를 사용한다. response의 `position`과 `alignInfos`를 수업·소유자별 bounded continuity state의 텍스트 tail·확정 시각 frontier와 대조한다. healthy 스트림의 지연 경계와 새 스트림의 최대 3초 replay를 구분해 누락과 중복을 함께 줄이며, idle/4분 회전·종료 시 세션·continuity를 bounded하게 정리한다.
 - CLOVA의 모호한 timeout/단절은 provider 원문을 로그·응답에 싣지 않고 `424`로 바꾼다. 브라우저는 CLOVA 청크를 자동 retry하거나 Qwen으로 fallback하지 않는다. 같은 프로세스에서 응답 이후 DB 쓰기가 실패한 동일 payload는 adapter 성공 cache로 외부 재호출을 피하지만, 프로세스가 정확히 그 사이 죽는 경우까지 외부 exactly-once 과금은 보장하지 않는다.
 - WAV는 최대 512,000 bytes, 0.05~15초, 16 kHz mono PCM16만 받는다. VAD가 침묵 hallucination 저장을 줄인다.
-- 새로 처리한 실시간·파일 import 음성은 overlap을 제거한 16 kHz mono PCM WAV로 `.data/recordings/<private-account>/<lecture UUID>.wav`에 보존한다. 계정 폴더는 `0700`, 파일은 `0600`이며 과거에 이미 버린 음성은 소급 복구하지 않는다.
+- 새로 처리한 실시간·파일 import 음성은 overlap을 제거한 16 kHz mono PCM WAV로 `.data/recordings/<private-account>/<lecture UUID>.wav`에 먼저 staging한다. 계정 폴더는 `0700`, 파일은 `0600`이며 과거에 이미 버린 음성은 소급 복구하지 않는다. Drive가 꺼진 구성에서는 이 경로가 기존처럼 영구 보존 위치다.
 - WAV 저장은 시간축에 이미 있는 PCM과 byte 단위로 대조해 같은 요청/응답 유실 재시도가 파일을 늘리지 않게 한다. 제한된 건너뛴 구간은 무음으로 채우고, 4시간·전체 20 GiB·최소 여유 1 GiB 한도를 적용한다.
+- schema v7의 `recording_archives`는 `pending/uploading/ready/attention`, opaque HMAC object key, Drive file locator, resumable session, 원본 크기·checksum과 로컬 삭제 여부를 lecture FK로 저장한다. 녹음 archive 상태·다운로드 API는 locator·세션 URL을 반환하지 않고, 인증된 사용자 식별 외의 추가 계정 목록을 노출하지 않는다.
+- schema v8의 singleton `drive_archive_binding`은 첫 업로드의 Drive `user.permissionId`와 OAuth client ID를 deployment identity key로 HMAC한 값 및 archive folder locator를 private DB에 고정한다. cleanup/download/trash와 후속 upload는 `about.get(fields=user(permissionId))`로 같은 계정·client인지 재검증하며 mismatch에서는 로컬 WAV와 DB를 보존한다.
+- schema v9의 `drive_archive_user_folders`는 runtime 계정과 opaque HMAC folder key·private Drive folder locator를 로컬 DB에 고정하고, 기존 archive 행의 `folder_layout_version=0`은 사용자 폴더 배치가 확인될 때만 1이 된다. 기존 루트 WAV와 과거 resumable session 결과도 체크섬·부모를 검증해 metadata-only 이동한 뒤에만 로컬 정리를 허용한다.
+- `GoogleDriveStorage`는 private authorized-user token을 갱신하고, 정확히 `drive.file` scope만 허용하며, redirect 없는 bounded `httpx` 요청으로 폴더 탐색·재개 업로드·부모 이동·Range download·trash를 처리한다. provider 본문과 비밀 locator는 예외·CLI에 반사하지 않는다.
+- `DriveArchiveManager`는 단일 background worker와 process/flock 직렬화로 업로드·폴더 배치·trash를 처리한다. 서버 재시작 시 `uploading`을 재시도 상태로 회복하고, 업로드·이동 응답 유실 시 opaque object key와 실제 parent를 재조회해 중복 생성·중복 이동을 피한다.
 - 녹음 파일은 `POST /imports` → 고정 480 KiB `PUT /imports/{id}` → `POST .../complete` 계약으로 계정별 `0700` 폴더의 UUID 파일(`0600`)에 올린다. 최대 1 GiB, 디코딩 음성 4시간, 계정당 활성 작업 1개다.
 - 브라우저와 서버는 모든 480 KiB 조각의 SHA-256을 순서대로 묶은 v2 지문으로 재선택 파일 전체를 검증한다. 브라우저/서버 모두 전체 파일을 메모리에 펼치지 않는다.
 - PyAV 18.1.0이 첫 오디오 스트림만 16 kHz mono s16으로 스트리밍 디코딩한다. nested URL/playlist I/O, 비정상 채널·sample rate·frame duration을 거절하고 디코딩 뒤 최대 15초 PCM만 유지한다.
 - PyAV/FFmpeg 네이티브 디코더는 API 프로세스 안에서 실행된다. 허용된 소수의 인증 사용자가 신뢰할 수 있는 수업 파일만 올린다는 운영 가정이며, 악의적으로 만든 미디어의 네이티브 hang/crash까지 OS sandbox로 격리한 구조는 아니다.
 - 결정적 import chunk UUID와 기존 chunk idempotency로 정상 종료 뒤 재시작 시 완료 청크를 재사용한다. 단일 background worker는 loop 예외를 재시도하고 GET/list가 죽은 worker를 다시 확인한다.
 - 완료·취소·실패 DB 상태와 별도로 `raw_deleted`를 기록한다. unlink 실패를 삭제 성공으로 표시하지 않으며 60초 maintenance/list 조회에서 재시도한다. 7일간 멈춘 업로드는 서버를 재시작하지 않아도 정리한다.
-- 녹음 다운로드는 소유권·완료 상태를 확인한 인증 POST가 60초짜리 무작위 전용 경로를 발급하고, 네이티브 파일 응답은 세션 Bearer를 URL에 넣지 않는다. 짧은 Wi-Fi 중단 뒤 Range 재개를 위해 최대 16회만 재사용하며, 경로는 UUID에서만 계산하고 다운로드 시 열린 `O_NOFOLLOW` descriptor의 WAV 구조와 일반 파일 여부를 다시 검사한다.
+- 녹음 다운로드는 소유권·완료 상태를 확인한 인증 POST가 60초짜리 무작위 전용 경로를 발급하고, 네이티브 파일 응답은 세션 Bearer를 URL에 넣지 않는다. 로컬 WAV는 `O_NOFOLLOW` descriptor와 WAV 구조를 검사하고, Drive WAV는 같은 ticket 경계 뒤에서 API 서버가 Range를 프록시한다. 브라우저는 Google host로 접속하지 않고 Drive ID·OAuth token을 보지 못한다. 짧은 Wi-Fi 중단 뒤 유효 시간 안에서 최대 16회 Range 재개를 허용한다.
 - `MindlogicPostprocessor`는 공식 Gateway로만 나가는 bounded HTTP client, strict schema/문장 매핑 검증, 개인정보 형식 가림과 숫자 보호를 담당한다. 후보정 endpoint는 owner/final 상태와 원문 revision을 확인하고 단일 background worker가 별도 correction 행을 처리한다. worker는 Qwen `inference_lock`과 분리돼 과거 수업 후보정이 다른 수업의 실시간 전사를 막지 않는다. `/status`에는 key가 아니라 configured/model만 보인다.
-- 수업 삭제는 진행 중 import, pending chunk, processing correction이 있으면 `409`로 거절한다. queued correction은 같은 transaction에서 먼저 지운다. 연결된 import metadata를 지우고 durable `deleting` 상태를 먼저 기록한 뒤 WAV와 lecture cascade 데이터를 제거하며, 중간 파일 삭제 실패는 성공으로 표시하지 않고 재시작 때 다시 처리한다.
+- 수업 삭제는 진행 중 import, pending chunk, processing correction이 있으면 `409`로 거절한다. queued correction은 같은 transaction에서 먼저 지운다. durable `deleting`을 먼저 기록하고 Drive WAV가 있으면 trash 성공/이미 없음을 확인한 뒤 로컬 WAV와 lecture cascade 데이터를 제거한다. 원격 오류나 로컬 삭제 실패를 성공으로 표시하지 않고 재시작·재요청으로 완료한다. CLOVA Object Storage 사본은 이 범위에 없다.
 - `MODEL_WARMUP=1`이면 lifespan 중 모델을 로드하고 첫 경로를 실행한다.
 
 ### 웹
@@ -216,10 +223,11 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - import polling delay의 abort listener는 매 회 제거한다. 로그아웃/탭 이탈은 watcher만 detach하고 서버 작업을 취소하지 않으며, 취소/완료 경쟁과 오래된 lecture/list 응답은 terminal 상태·generation/sequence로 판별한다.
 - 지난 수업을 `Asia/Seoul` 날짜로 묶고 단일 날짜를 필터링한다. 상세 기록은 UTF-8 TXT 또는 Markdown으로 내보내며 Markdown 제어문자와 파일명 문자를 정리한다.
 - 녹음 WAV 버튼은 `recording_available`인 수업에만 열린다. 미확정 WAV는 owner-only idempotent finalize POST로 받은 범위까지 먼저 닫고, 로그인 Bearer로 ticket을 받은 뒤 같은 API origin의 상대 경로만 세션 토큰 없이 브라우저 네이티브 다운로드로 연다.
+- API의 `recording_storage_state`를 `local_recording/upload_queued/uploading/retrying/drive_cleanup_pending/drive_ready/attention_required/none`만 허용해 저장 상태로 표시한다. 전송 중 상태는 20초 서버 polling과 수업 목록을 연계해 갱신하며 예상하지 못한 값은 Drive locator나 provider 문구로 렌더링하지 않는다.
 - 완료 수업 후보정은 `queued/processing`을 주기적으로 확인한다. 진행 수업에서 누른 버튼은 캡처를 멈추지 않고 예약만 보관하며, 명시적 종료와 final 저장 성공 뒤 자동 시작한다. 과거 수업 후보정은 다른 수업의 녹음·일시정지와 병행할 수 있다. 원문/AI 후보정본을 명시적으로 전환하고 현재 선택한 버전만 TXT/Markdown으로 내보낸다. 완료 뒤에도 원문이 기본이며 `uncertain_terms`를 최대 5개와 나머지 개수로 표시한다. 수업·계정 전환은 poll timer와 늦은 결과를 generation/sequence로 폐기한다.
 - 후보정 패널은 텍스트만 NOVA로 가고 오디오는 가지 않으며 형식 기반 가림이 이름 등을 보호하지 못한다는 opt-in 안내를 항상 표시한다. 결과는 모두 `textContent`로 렌더링한다.
 - 로그인 세션 만료나 인증 거절은 pause로 취급하지 않는다. 현재 캡처와 영속 큐는 소유자 binding을 유지하고, 같은 계정으로 재로그인해야 남은 전송을 재개한다. 다른 계정은 그 큐를 인수하거나 전송할 수 없다.
-- 수업 삭제 확인창은 제목과 원문·후보정본·녹음 삭제 범위를 보여 준다. 삭제·다운로드·녹음·파일 변환 중 동작을 상호 잠그고 generation/sequence로 늦게 도착한 이전 수업·계정 응답을 버린다.
+- 수업 삭제 확인창은 제목과 원문·후보정본·녹음 삭제 범위, Drive WAV는 휴지통으로 이동한다는 점, CLOVA Object Storage는 별도라는 점을 보여 준다. 삭제·다운로드·녹음·파일 변환 중 동작을 상호 잠그고 generation/sequence로 늦게 도착한 이전 수업·계정 응답을 버린다.
 - 로그인 뒤 관리자 권한은 `/admin/overview`의 200/403으로 서버에서 판별한다. 전용 dialog는 10초마다 상태를 갱신하고 자가 세션 종료를 렌더링하지 않는다. 운영 중지·터널 재연결·다른 계정 세션 종료는 확인 단계를 두고, 안전한 운영 재개는 즉시 적용한다.
 - 모든 로그인 브라우저는 15초 heartbeat와 상태 전환 때 최소 presence만 전송한다. 로그아웃·계정/서버 전환은 timer와 늦은 응답을 폐기한다.
 - 터널 재연결 202 뒤 Pages `config.json`과 anonymous health를 5초 후부터 8초 간격, 최대 3분 재확인한다. 새 origin이면 기존 보안 경계대로 token을 버리고 재로그인을 요구한다.
@@ -232,22 +240,32 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 - `scripts/publish-api-url.sh`와 `scripts/runtime_config.py`: 공개 tunnel origin 또는 `OFFLINE` 입력을 정확한 상태·주소·게시/만료 시각 JSON으로 만들고, 로그인된 GitHub CLI로 그 JSON 전체를 Actions 변수에 저장해 Pages workflow를 실행한다. URL·스키마·만료를 엄격히 검사하며 Git 커밋에는 동적 주소를 쓰지 않음
 - `scripts/status.sh`: PID 소유권, 로컬 health, 실행 중인 tunnel URL과 외부 HTTPS health 표시. 죽은 터널의 마지막 URL은 현재 주소와 구분
 - `scripts/stop.sh`: tunnel 먼저, 서버 다음으로 SIGTERM 종료; PID가 다른 프로세스를 가리키면 건드리지 않음
-- `scripts/backup.sh`: SQLite online backup으로 WAL의 최신 커밋까지 일관된 스냅샷 생성; 기존 대상은 덮어쓰지 않음. 보존 WAV는 포함하지 않으므로 음성 백업은 서버를 끈 상태에서 `.data/recordings/`를 같은 암호화 저장소에 별도로 복사해야 함
+- `scripts/backup.sh`: SQLite online backup으로 WAL의 최신 커밋까지 일관된 스냅샷 생성; 기존 대상은 덮어쓰지 않음. WAV·Drive 파일·OAuth는 포함하지 않음. 전체 복원을 위해 DB, 로컬 staging, private Drive 폴더, `.data/google-drive/identity.key`·OAuth client/token을 같은 시점에 암호화한 개인 저장소로만 백업해야 함
+- `scripts/google_drive.py`: 개인 Gmail Desktop OAuth의 loopback PKCE 승인, 집계만 보이는 `status`, 변경 없는 `migrate --dry-run`, 중단·재개 가능한 기존 WAV 이전을 제공. 관리 server PID가 살아 있으면 auth·실제 migrate를 거절하고 제목·계정·경로·Drive ID·인증 값을 출력하지 않음
 - `server/manage.py`: private `ACCOUNT_USERNAMES`의 미활성 계정 invite 생성과 `SITE_ORIGINS` 갱신. `add-account`는 TTY echo를 끈 입력으로 기존 환경설정·DB 집합에 비활성 계정 하나만 함께 추가하며, 일반 시작의 exact-set 검사는 유지함. 서버 주소와 초대 링크를 같은 로컬 파일에 쓰되 링크 자체나 서버 설정에는 임시 API 주소를 결합하지 않음
 - `server/manage.py configure-admin`: 활성 계정이 하나면 자동 선택하고 여럿이면 TTY echo를 끈 입력 또는 `--position 1` 같은 비공개 목록 위치로 선택해 실제 ID를 출력·shell history에 남기지 않고 `ADMIN_USERNAME`을 기록
 - `server/manage.py configure-clova`: Basic 스트리밍/장문 도메인의 Secret Key를 TTY echo 없이 받아 권한 `0600`의 ignored `server/.env`에 저장한다. gRPC 목적지는 입력받지 않고 공식 host에 고정한다.
 - `server/tunnel_control.py`: fixed project script·argv, process/script ownership, in-process lock와 script flock을 겹쳐 검증하고 12초 응답 유예 뒤 Quick Tunnel stop/start를 수행. 물리적 stop은 원격 재시작 경로도 없앤다는 상태를 명시하며 웹에는 restart만 연결
 
+### Google Drive 운영 설정
+
+- 개인 Gmail에서 Google Drive API를 켜고 External OAuth 동의 화면과 **Desktop app** client를 만든다. Testing이면 본인을 test user로 넣는다. 다운로드한 JSON을 `.data/google-drive/oauth-client.json`에 `0600`으로 두고 비밀값을 문서·채팅에 복사하지 않는다.
+- API 서버만 종료한 뒤 `./.venv/bin/python scripts/google_drive.py auth`로 loopback 승인한다. 브라우저 자동 실행 실패 시 명령이 대기할 때만 생기는 private `authorization-url.txt`를 본인 브라우저에만 연다. 승인 후 `server/.env`의 `GOOGLE_DRIVE_RECORDINGS=1`, `GOOGLE_DRIVE_OAUTH_CLIENT_FILE`, `GOOGLE_DRIVE_TOKEN_FILE`을 확인한다. chunk/connect/read/retry 튜닝은 `GOOGLE_DRIVE_UPLOAD_CHUNK_BYTES`, `GOOGLE_DRIVE_CONNECT_TIMEOUT_SECONDS`, `GOOGLE_DRIVE_READ_TIMEOUT_SECONDS`, `GOOGLE_DRIVE_RETRY_MAX_SECONDS`이며 처음에는 `server/env.example`을 유지한다.
+- 기존 WAV는 `status` → `migrate --dry-run` → `migrate --limit 1 --keep-local` → 의도한 Gmail Drive의 계정 하위 폴더에서 첫 파일 확인 → `migrate` 순서로 옮긴다. 첫 파일에서 계정·OAuth client binding이 확정된다. v8 루트 파일은 `addParents/removeParents`로 사용자 폴더에 옮긴 뒤 검증하며 재업로드하지 않는다. 실제 migrate는 관리 API 서버가 종료된 상태에서만 허용되며 제목·계정·로컬 경로·Drive ID를 출력하지 않는다. 정확한 명령과 권한은 README의 `개인 Google Drive에 녹음 보관`을 따른다.
+- External OAuth 게시 상태가 Testing이면 Drive scope refresh token이 일반적으로 7일 뒤 만료한다. 장기 운영은 Production 전환 여부를 확인하고, Testing을 유지하면 API를 끄고 주기적으로 `auth`를 다시 실행한다.
+- `.data/google-drive/oauth-client.json`, `token.json`, `identity.key`, 재개·lock 상태는 `.gitignore`와 `.data/` 경계 안에 두고 `0700/0600`을 유지한다. DB와 Drive 연결을 복원하려면 이 파일과 SQLite를 암호화된 개인 저장소에만 같이 백업하고 절대 Git에 넣지 않는다.
+- 마지막 resumable PUT 응답 유실 직후 삭제하는 경계에서는 session URI가 `308`이면 DB/local을 지우지 않는다. 빈 PUT이 비활성 만료를 계속 늦추지 않도록 `next_attempt_at`을 8일 뒤로 영속 저장하고, 그 전에는 exact object 검색만 수행한다. 완료 파일은 checksum·opaque object를 확인해 휴지통으로 옮기며, 공식적으로 session 404 만료가 확인된 뒤 exact 검색도 비어 있을 때만 로컬/DB 삭제를 승인한다.
+
 ## 검증 범위
 
 ### 현재 변경분에서 확인
 
-- 제한 없는 호스트 환경에서 `./.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v`: 서버/API/DB/설정/전사기/importer/녹음·후보정·관리자·터널·CLOVA 계약 173개가 22.902초에 모두 통과했다. 이 체크포인트의 CLOVA module 48개는 healthy-stream 지연 경계, 강제 회전 replay, timestamp drift, 실제 새 반복 발화, 구두점·Unicode 정규화, 소유자 격리와 세션/continuity 정리를 포함한다.
+- 제한 없는 호스트 환경에서 `./.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -q`: 서버/API/DB/설정/전사기/importer/녹음·후보정·관리자·터널·CLOVA·Google Drive 계약 268개가 36.307초에 모두 통과했다. 이 체크포인트의 Drive/CLI 집중 계약은 OAuth 최소 scope·비밀 파일 권한, checksum, resumable 재개/응답 유실, Gmail/client binding, 404 fail-closed, 8일 session inactivity, 사용자별 폴더·기존 루트 파일 이동·이동 응답 유실, 동시 유지보수 경합, PID 파일이 유실된 서버 탐지, Range·disconnect close, startup 비차단, owner 격리, 휴지통-before-DB 삭제를 포함한다.
 - 실제 Secret Key와 Basic 스트리밍 도메인으로 공개 KSS 한국어 낭독 12.645초를 보냈고, 대기하지 않고 clock을 강제로 241초 전진시켜 4분 rotation 경로를 실행했다. 최종 코드의 wall time은 12.281초, native transport는 2개였으며 두 번째 스트림이 overlap 안의 `이다.`를 회수해 목표 문장이 전체 결과에 정확히 한 번 남았다. final 뒤 adapter의 활성 session과 reader thread는 모두 0이었다. 이는 짧은 단일 화자·강제 시각 시험이지 자연 경과 4분 또는 장시간 수업 시험은 아니다.
 - 수정 전 구현의 300.818초 진단 실행도 native transport 2개와 프로세스 RSS 약 12.6 MiB 증가로 끝났지만, 바로 그 실행에서 회전 경계의 정확한 누락을 재현했다. 따라서 이 이전 결과를 최신 경계 보완의 5분 통과 기록으로 취급하면 안 된다.
-- VS Code Server Node.js 24.18.0으로 `node --test --test-isolation=none tests/*.test.mjs`의 앱 상태 98개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 135개가 1.808초에 모두 통과했다. 설정된 CLOVA를 새 마이크 수업의 기본값으로 고르는 계약과, 최종 사용자 화면에는 비용·과금 문구를 표시하지 않으면서 사이트 운영자가 관리하는 NAVER Cloud 계정으로의 음성 전송·연결된 Object Storage 저장은 고지하는 계약을 포함한다.
+- VS Code Server Node.js 24.18.0으로 `node --test --test-isolation=none tests/*.test.mjs`의 앱 상태 99개, 오디오 20개, 파일 가져오기 10개, 정적 웹 경계 7개 등 136개가 2.522초에 모두 통과했다. 설정된 CLOVA를 새 마이크 수업의 기본값으로 고르는 계약과, 최종 사용자 화면에는 비용·과금 문구를 표시하지 않으면서 사이트 운영자가 관리하는 NAVER Cloud 계정으로의 음성 전송·연결된 Object Storage 저장은 고지하는 계약을 포함한다. Google Drive 추가분은 저장 상태 8종 매핑, locator 미노출, 브라우저가 Google host로 직접 접속하지 않는 CSP, Drive trash와 CLOVA 사본 삭제 범위 문구를 검사한다.
 - 앱 테스트 대역도 실제 UUID·owner·provider·capture 시간축·CLOVA `inflight` 전이·final-last·영속 삭제 계약을 검사하도록 강화했고, PCM 없는 종료에 합성 final WAV를 넣지 않는다. 따라서 새 내구성 경로의 실패를 기대값만 완화해 숨기지 않았다.
-- 최신 서버 변경에는 Python compile과 `git diff --check`, private env의 실제 계정 ID·CLOVA/NOVA 키가 현재 추적 파일에 없는지 값 비공개 검사를 수행했다. 이번 변경은 DB schema나 운영 데이터를 바꾸지 않는다. 최종 배포 뒤 공개 정적 파일 9개를 로컬 `web/`과 byte-for-byte 비교했고 모두 일치했다.
+- 최신 서버 변경에는 Python compile, `git diff --check`, shell syntax 검사와 private env/DB/OAuth의 실제 계정 ID·수업/Drive ID·CLOVA/NOVA/Google 비밀값 35개를 Git 후보 파일 67개 및 전체 reachable history blob 199개와 대조했고 일치 0을 확인했다. 운영 DB는 schema v9, `integrity_check=ok`, FK 오류 0이다. 실제 Gmail Drive에 기존 WAV 10개/236,776,806바이트를 3개의 사용자 폴더로 이전했고, 기존 루트 pilot 1개는 재업로드 없이 parent만 옮겼다. 이전 후 10개 전부의 object·크기·checksum·정확한 사용자 parent를 전수 재검증했으며 mismatch 0, organization/attention/retry/deleting 0, 로컬 WAV 0개/0바이트다. 이전 전 DB는 `.data/backups/pre-drive-user-folders-20260905.sqlite3`(schema v8, mode `0600`, integrity ok)에 보존했다. 최신 변경은 아직 GitHub에 푸시·Pages 배포하지 않았다.
 
 ### 이전까지 확인된 누적 기록
 
@@ -281,7 +299,9 @@ Whisper는 빠르고 전체 파일 기준선도 양호했지만, 현재 수업�
 
 ### 아직 확인하지 못함
 
-- Windows Chrome의 네이티브 임시 프로필과 localhost 합성 WAV 하네스로 IndexedDB/Web Locks 실동작 확인을 시도했다. WSL UNC 프로필의 Chrome DB 잠금 오류는 Windows 네이티브 프로필로 분리했지만, `--dump-dom` 실행기가 비동기 완료 상태를 폴링하지 못해 제품 성공·실패를 판정할 결과 마커를 얻지 못했다. 운영 origin·계정·API에는 접근하지 않았고 제품 실패로 판정된 항목도 없다. 따라서 영속 IndexedDB 대기열의 페이지 재실행 복구, Web Locks의 두 탭 상호 배제, 새 Quick Tunnel 재로그인, AudioContext 재개와 영구 track 종료 뒤 입력 재연결을 함께 반복하는 실제 브라우저 장시간 시험은 아직 하지 않았다. 자동 상태/오디오 계약은 위 135개 Node 회귀에 포함된다.
+- 첫 pilot WAV는 사용자가 Drive에서 수동 재생해 확인했고, 이후 같은 Drive file ID를 유지한 metadata-only parent 이동과 전체 10개의 checksum/parent 재검증까지 완료했다. 다만 사용자별 폴더로 옮긴 후 브라우저에서 10개를 전부 새로 재생하는 수동 검사는 하지 않았다.
+- 실제 Drive로 옮긴 WAV를 외부 브라우저에서 Range 중단·재개해 내려받기, 다른 계정의 404 격리, 수업 삭제 후 Drive 휴지통 이동, 만료/철회된 refresh token과 용량 부족 시 로컬 보존은 fake Drive 회귀 외에 실계정 end-to-end로 다시 확인해야 한다.
+- Windows Chrome의 네이티브 임시 프로필과 localhost 합성 WAV 하네스로 IndexedDB/Web Locks 실동작 확인을 시도했다. WSL UNC 프로필의 Chrome DB 잠금 오류는 Windows 네이티브 프로필로 분리했지만, `--dump-dom` 실행기가 비동기 완료 상태를 폴링하지 못해 제품 성공·실패를 판정할 결과 마커를 얻지 못했다. 운영 origin·계정·API에는 접근하지 않았고 제품 실패로 판정된 항목도 없다. 따라서 영속 IndexedDB 대기열의 페이지 재실행 복구, Web Locks의 두 탭 상호 배제, 새 Quick Tunnel 재로그인, AudioContext 재개와 영구 track 종료 뒤 입력 재연결을 함께 반복하는 실제 브라우저 장시간 시험은 아직 하지 않았다. 자동 상태/오디오 계약은 위 136개 Node 회귀에 포함된다.
 - 사용자가 실제로 들을 45~90분 한국어 수업 샘플의 인식 품질
 - 교실 거리·잔향·잡음·여러 화자·전문용어 조건
 - 90분 연속 실행 중 thermal throttling과 WSL 공유 메모리 회수
@@ -363,14 +383,25 @@ setup.ps1        style.css    test_api.py  transcriber.py  tunnel.ps1
 - Git의 `web/config.json`에 Quick Tunnel URL, 계정, 초대 코드가 없음. Actions가 만든 공개 산출물에는 현재 Quick Tunnel origin과 상태·시각만 있음
 - Pages source가 GitHub Actions이고 배포 URL에서 정적 자산과 마이크 UI가 정상임
 
+2026-09-05 Google Drive archive 적용 전 운영 DB를 `.data/backups/pre-drive-user-folders-20260905.sqlite3`에 mode `0600`으로 백업했다. 실제 개인 Gmail Desktop OAuth와 첫 pilot WAV 수동 재생 확인 뒤, 기존 루트 pilot을 재업로드 없이 소유자 폴더로 이동하고 나머지 9개를 업로드했다. 최종 상태는 schema v9, Drive ready 10개, 사용자 폴더 3개, organization/attention/retry/deleting 0, 로컬 WAV 0개이다. 원격 10개의 object·크기·checksum·정확한 parent를 전수 재검증해 mismatch 0, DB integrity ok/FK 오류 0을 확인했다. 재시작 과정에서 PID 파일이 없는 이 프로젝트의 예전 Uvicorn을 발견해 정확한 cwd/argv와 DB의 pending chunk·import·correction·deleting 건수가 모두 0임을 확인한 뒤 SIGTERM으로 정상 종료했다. 이후 PID 파일이 없어도 `/proc`에서 같은 project Uvicorn을 탐지해 auth/migrate를 차단하도록 보강했고, 최신 API를 Qwen warmup으로 재시작해 managed PID·로컬 health 200·기존 Quick Tunnel 외부 health 200을 확인했다. 이 변경분은 아직 커밋·푸시·Pages 배포하지 않았다.
+
+### Google Drive 릴리스 사전 검증 (2026-09-05)
+
+- Python 전체 271개(37.096초), Node 전체 136개(1.796초)가 통과했다. 최초 Drive 바인딩 전 pristine pending 수업의 삭제 영구 대기를 수정하고, 업로드 claim·응답 유실·원격 locator 흔적을 보존하는 회귀 3개를 추가했다.
+- 기존 원격 파일 10개의 크기·MD5·SHA-256 appProperty·object·사용자 parent를 다시 확인했다. 표본 1개(255,446바이트)는 실제 전체 다운로드 SHA-256, 두 HTTP Range의 재조립 SHA-256, 조기 연결 종료 후 재다운로드가 모두 통과했다. 녹음을 출력·수정·삭제하지 않았다. 이는 서버의 Drive storage 계층 실통신 검증이며, 실제 로그인 브라우저에서 API 티켓을 받아 다운로드·삭제하는 end-to-end 시험과는 다르다.
+- 운영 DB schema v9, integrity ok/FK 오류 0, ready 10개/사용자 폴더 3개, pending chunk/import/correction/deleting/미완료 수업 0, 로컬 WAV 0개를 읽기 전용으로 확인했다. 배포 직전 `.data/backups/pre-drive-release-20260905.sqlite3`에 일관된 private DB 백업을 추가했다.
+- 정확도·실시간성 검토 결과는 [ASR_REVIEW.md](ASR_REVIEW.md)에 있다. CLOVA 전송 전 실패의 안전한 자동 복구, 전문용어 사전, IndexedDB 정리 전 결과 표시, Qwen 경계 보강과 CLOVA 전송·확정 분리를 제안했다. ASR 동작은 이번 배포에서 바꾸지 않았고 새 유료 ASR 호출·실음성 정확도 평가를 하지 않았다.
+
 ## 다음 단계 우선순위
 
-1. 실계정 CLOVA에서 자연 경과 4분 이상 스트림, 완전 무음 ACK, pause/resume과 실제 단절·재연결을 비개인 샘플로 확인한다.
-2. 같은 실제 한국어 수업 샘플로 CLOVA와 Qwen의 누락·고유명사·경계 중복 및 비용을 비교한다.
-3. 실제 관리자 계정으로 외부 dialog를 열어 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 확인한다.
-4. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
-5. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
-6. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
+1. 서버 코드를 적용한 뒤 로컬/외부 API Range 다운로드, 소유권 격리, Drive trash를 실계정 end-to-end로 확인한다. token 만료·철회·용량 부족에서 로컬 staging을 보존하는 것도 별도로 확인한다.
+2. 사용자가 개인 Drive의 `STT 수업 녹음/<계정 ID>` 3개 폴더 구조와 표본 WAV를 필요한 범위에서 다시 열어 확인한다.
+3. 실계정 CLOVA에서 자연 경과 4분 이상 스트림, 완전 무음 ACK, pause/resume과 실제 단절·재연결을 비개인 샘플로 확인한다.
+4. 같은 실제 한국어 수업 샘플로 CLOVA와 Qwen의 누락·고유명사·경계 중복 및 비용을 비교한다.
+5. 실제 관리자 계정으로 외부 dialog를 열어 상태 갱신·다른 계정 세션 해제·운영 중지/재개를 확인한다.
+6. 구성된 각 계정으로 실제 외부 로그인, 마이크 WAV와 녹음 파일 업로드, 기록 조회·텍스트 다운로드와 계정 간 격리를 확인한다.
+7. 데스크톱 Chrome/Edge에서 유튜브 탭 오디오를 공유해 영상 미전송, 종료 tail, 일시 mute를 실제 확인한다.
+8. 학교 Wi-Fi/태블릿에서 연결 중단·복구, 종료 tail, 화면 잠금까지 실제 운용 시험을 한다.
 
 ## 재현 명령
 
@@ -396,12 +427,14 @@ node --test tests/*.test.mjs
 ```text
 server/.env
 .data/                       # DB, 초대 원문, PID, 로그, tunnel URL
+.data/google-drive/          # OAuth client/token, identity key, upload session/lock
 .models/
 .samples/                    # 실제/평가 음성
 *.wav *.webm *.m4a *.mp3 *.flac *.ogg *.oga *.opus *.mp4 *.mkv *.mov
 *.aif *.aiff *.ape *.asf *.wma *.au
 GitHub token, 비밀번호, 초대 링크
 Mindlogic/NOVA API key, provider 요청·응답 원문
+Google OAuth client secret, refresh/access token, Drive file ID·resumable URL
 ```
 
 `.gitignore`는 사고를 줄이는 장치일 뿐이다. push 직전 staging 목록을 사람이 다시 확인해야 한다.

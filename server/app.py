@@ -16,11 +16,12 @@ import wave
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Mapping
+from urllib.parse import quote
 
 import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, StringConstraints
 from starlette.concurrency import run_in_threadpool
@@ -28,6 +29,8 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .db import Database
+from .drive_archive import DriveArchiveManager
+from .drive_storage import DriveStorageError
 from .clova_transcriber import ClovaStreamingTranscriber, ClovaTranscriptionError
 from .importer import ImportDurationError, ImportInterrupted, ImportMediaError, iter_audio_chunks
 from .recordings import (
@@ -47,6 +50,43 @@ from .transcriber import LocalTranscriber
 log = logging.getLogger("classroom")
 Username = Annotated[str, StringConstraints(min_length=1, max_length=32)]
 Password = Annotated[str, StringConstraints(min_length=4, max_length=128)]
+
+
+def _single_byte_range(value: str | None, total: int) -> tuple[int | None, int | None]:
+    """Translate one HTTP byte range to a half-open interval."""
+
+    if total <= 0:
+        raise ValueError("invalid total")
+    if value is None:
+        return None, None
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("unsupported range")
+    bounds = value[6:].split("-", 1)
+    if len(bounds) != 2 or (not bounds[0] and not bounds[1]):
+        raise ValueError("invalid range")
+    try:
+        if not bounds[0]:
+            if not bounds[1].isascii() or not bounds[1].isdigit():
+                raise ValueError
+            suffix = int(bounds[1], 10)
+            if suffix <= 0:
+                raise ValueError
+            return max(0, total - suffix), total
+        if not bounds[0].isascii() or not bounds[0].isdigit():
+            raise ValueError
+        start = int(bounds[0], 10)
+        if start < 0 or start >= total:
+            raise ValueError
+        if not bounds[1]:
+            return start, total
+        if not bounds[1].isascii() or not bounds[1].isdigit():
+            raise ValueError
+        inclusive_end = int(bounds[1], 10)
+        if inclusive_end < start:
+            raise ValueError
+        return start, min(total, inclusive_end + 1)
+    except (OverflowError, ValueError):
+        raise ValueError("invalid range") from None
 
 
 class ActivateBody(BaseModel):
@@ -121,6 +161,24 @@ class DescriptorFileResponse(FileResponse):
                     os.close(descriptor)
                 except OSError:
                     pass
+
+
+class CloseableStreamingResponse(StreamingResponse):
+    """Close a synchronous upstream stream even when ASGI cancels iteration."""
+
+    def __init__(self, content, *, close, **kwargs):
+        self._close_stream = close
+        super().__init__(content, **kwargs)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette may cancel its threadpool wrapper before the sync
+            # generator resumes its own ``finally`` block on disconnect.
+            # This close is idempotent and non-blocking; call it synchronously
+            # so a second task cancellation cannot skip cleanup.
+            self._close_stream()
 
 
 class BodySizeLimitMiddleware:
@@ -249,6 +307,7 @@ def create_app(
     postprocessor=None,
     *,
     clova_transcriber=None,
+    drive_storage=None,
     tunnel_status=None,
     tunnel_restart=None,
 ) -> FastAPI:
@@ -287,10 +346,16 @@ def create_app(
         # in-memory queue to continue into the same recording.
         max_gap_seconds=180,
     )
+    archive_manager = DriveArchiveManager(
+        settings,
+        database,
+        recording_store,
+        client=drive_storage,
+    )
     download_ticket_lock = threading.Lock()
     # A small reuse budget lets a browser resume a Range download after a
     # Wi-Fi interruption without ever putting the login bearer in a URL.
-    download_tickets: dict[str, tuple[float, str, str, int]] = {}
+    download_tickets: dict[str, tuple[float, str, str, int, str]] = {}
     if settings.max_upload_bytes < settings.import_part_bytes:
         raise RuntimeError("MAX_UPLOAD_BYTES must be at least the fixed import part size")
     import_part_bytes = settings.import_part_bytes
@@ -320,13 +385,14 @@ def create_app(
         # running the account setup CLI must not disturb an active request.
         with database.connect() as connection:
             connection.execute("DELETE FROM chunks WHERE status = 'pending'")
-        recover_lecture_deletions()
+        archive_manager.recover()
         recover_import_jobs()
         recover_correction_jobs()
         if settings.model_warmup and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
         ensure_import_worker()
         ensure_correction_worker()
+        archive_manager.start()
         try:
             yield
         finally:
@@ -334,13 +400,19 @@ def create_app(
             # waits share one deadline inside stop.sh's process grace time.
             request_correction_worker_shutdown()
             request_import_worker_shutdown()
+            archive_manager.request_shutdown()
             shutdown_deadline = time.monotonic() + 18
             correction_stopped = stop_correction_worker(timeout=8)
             stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
+            archive_stopped = archive_manager.stop(
+                timeout=max(0.0, shutdown_deadline - time.monotonic())
+            )
             if hasattr(clova_engine, "close"):
                 clova_engine.close()
             if correction_stopped and hasattr(correction_engine, "close"):
                 correction_engine.close()
+            if archive_stopped:
+                archive_manager.close()
 
     app = FastAPI(title="Classroom Transcription", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings = settings
@@ -349,6 +421,7 @@ def create_app(
     app.state.clova_transcriber = clova_engine
     app.state.postprocessor = correction_engine
     app.state.recording_store = recording_store
+    app.state.archive_manager = archive_manager
     app.state.tunnel_status = tunnel_status
     app.state.tunnel_restart = tunnel_restart
 
@@ -840,6 +913,7 @@ def create_app(
             connection.execute("BEGIN IMMEDIATE")
             revoked = connection.execute("DELETE FROM sessions WHERE username = ?", (target,)).rowcount
             audit(connection, "sessions_revoked", "success", target)
+        purge_account_download_tickets(target)
         with presence_lock:
             presence.pop(target, None)
         return {"status": "ok", "revoked_sessions": revoked}
@@ -886,13 +960,21 @@ def create_app(
             raise HTTPException(404, "수업을 찾을 수 없습니다.")
         return dict(lecture)
 
+    def recording_flags(username: str, lecture_id: str, finalized: bool) -> dict:
+        result = archive_manager.storage(username, lecture_id, finalized)
+        result["recording_finalized"] = bool(finalized)
+        return result
+
     def lecture_result(lecture: dict, *, segments: list[dict] | None = None) -> dict:
         result = {
             key: lecture[key]
             for key in ("id", "title", "language", "created_at", "asr_provider")
         }
-        result["recording_available"] = recording_store.available(lecture["username"], lecture["id"])
-        result["recording_finalized"] = bool(lecture["recording_finalized"])
+        result.update(
+            recording_flags(
+                lecture["username"], lecture["id"], bool(lecture["recording_finalized"])
+            )
+        )
         if segments is not None:
             result["segments"] = segments
         return result
@@ -940,6 +1022,7 @@ def create_app(
     def logout(user: dict = Depends(identity)):
         with database.connect() as connection:
             connection.execute("DELETE FROM sessions WHERE token_hash = ?", (user["token_hash"],))
+        purge_session_download_tickets(user["token_hash"])
         with presence_lock:
             presence.pop(user["username"], None)
         return {"status": "ok"}
@@ -1236,15 +1319,34 @@ def create_app(
             if ticket[0] <= now:
                 download_tickets.pop(token_hash, None)
 
+    def queue_completed_recording(username: str, lecture_id: str) -> None:
+        """Queue a finalized local WAV without holding locks during Drive I/O."""
+
+        if not archive_manager.enabled:
+            return
+        queued = False
+        with recording_store.lock:
+            if not recording_store.available(username, lecture_id):
+                return
+            with database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    "SELECT recording_finalized FROM lectures "
+                    "WHERE id = ? AND username = ? AND deleting = 0",
+                    (lecture_id, username),
+                ).fetchone()
+                if current is not None and current["recording_finalized"]:
+                    queued = archive_manager.queue(connection, username, lecture_id)
+        if queued:
+            archive_manager.wake()
+
     @app.post("/lectures/{lecture_id}/recording-download-ticket")
     def create_recording_download_ticket(lecture_id: str, user: dict = Depends(data_identity)):
         lecture = owned_lecture(lecture_id, user["username"])
-        try:
-            recording = recording_store.info(user["username"], lecture["id"])
-        except RecordingCorruptError as error:
-            log.exception("Stored recording is not readable for lecture %s", lecture["id"])
-            raise HTTPException(503, "저장된 녹음 파일을 확인하지 못했습니다.") from error
-        if recording is None:
+        recording = recording_flags(
+            user["username"], lecture["id"], bool(lecture["recording_finalized"])
+        )
+        if not recording["recording_available"]:
             raise HTTPException(404, "이 수업에는 내려받을 녹음이 없습니다.")
         if not lecture["recording_finalized"]:
             raise HTTPException(409, "녹음이 완전히 저장된 뒤 내려받아 주세요.")
@@ -1257,7 +1359,13 @@ def create_app(
             for token_hash, granted in tuple(download_tickets.items()):
                 if granted[1:3] == (user["username"], lecture["id"]):
                     download_tickets.pop(token_hash, None)
-            download_tickets[digest(ticket)] = (expires_at, user["username"], lecture["id"], 16)
+            download_tickets[digest(ticket)] = (
+                expires_at,
+                user["username"],
+                lecture["id"],
+                16,
+                user["token_hash"],
+            )
         return {"path": f"/recording-downloads/{ticket}", "expires_in": 60}
 
     def final_guard_chunk_id() -> str:
@@ -1417,10 +1525,10 @@ def create_app(
                 clova_engine.close_session(user["username"], lecture_id)
             except Exception:
                 log.warning("Could not close a completed CLOVA Speech session")
+            queue_completed_recording(user["username"], lecture_id)
             return {
                 "segments": [],
-                "recording_available": recording_store.available(user["username"], lecture_id),
-                "recording_finalized": True,
+                **recording_flags(user["username"], lecture_id, True),
             }
         guard_chunk_id = final_guard_chunk_id()
         with database.connect() as connection:
@@ -1435,10 +1543,10 @@ def create_app(
                 ensure_recording_can_finalize(connection, lecture_id)
                 segments = None
         if segments is not None:
+            queue_completed_recording(user["username"], lecture_id)
             return {
                 "segments": segments,
-                "recording_available": recording_store.available(user["username"], lecture_id),
-                "recording_finalized": True,
+                **recording_flags(user["username"], lecture_id, True),
             }
 
         # Read a stable snapshot, then release both storage and database locks
@@ -1487,10 +1595,10 @@ def create_app(
                     claimed_guard = True
                     replayed = None
             if replayed is not None:
+                queue_completed_recording(user["username"], lecture_id)
                 return {
                     "segments": replayed,
-                    "recording_available": recording_store.available(user["username"], lecture_id),
-                    "recording_finalized": True,
+                    **recording_flags(user["username"], lecture_id, True),
                 }
 
         acquired_capacity = False
@@ -1597,11 +1705,10 @@ def create_app(
                             "WHERE id = ? AND username = ? AND deleting = 0",
                             (lecture_id, user["username"]),
                         )
-                available = current_recording is not None
+            queue_completed_recording(user["username"], lecture_id)
             return {
                 "segments": segments,
-                "recording_available": available,
-                "recording_finalized": True,
+                **recording_flags(user["username"], lecture_id, True),
             }
         except HTTPException:
             raise
@@ -1624,7 +1731,7 @@ def create_app(
                     )
 
     @app.get("/recording-downloads/{ticket}")
-    def download_recording(ticket: str):
+    def download_recording(ticket: str, request: Request):
         if not 32 <= len(ticket) <= 128:
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
         now = time.monotonic()
@@ -1637,6 +1744,16 @@ def create_app(
         # Validate the unguessable grant before revealing the paused state, but
         # do not consume a retry while the operator has disabled data access.
         require_data_access()
+        with database.connect() as connection:
+            session_is_live = connection.execute(
+                "SELECT 1 FROM sessions WHERE token_hash = ? AND username = ? "
+                "AND expires_at > ?",
+                (granted[4], granted[1], time.time()),
+            ).fetchone()
+        if session_is_live is None:
+            with download_ticket_lock:
+                download_tickets.pop(token_hash, None)
+            raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
         now = time.monotonic()
         with download_ticket_lock:
             clear_expired_download_tickets(now)
@@ -1645,24 +1762,74 @@ def create_app(
                 if granted[3] <= 1:
                     download_tickets.pop(token_hash, None)
                 else:
-                    download_tickets[token_hash] = (*granted[:3], granted[3] - 1)
+                    download_tickets[token_hash] = (
+                        *granted[:3],
+                        granted[3] - 1,
+                        granted[4],
+                    )
         if granted is None or granted[0] <= now:
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
-        _, username, lecture_id, _ = granted
+        _, username, lecture_id, _, _ = granted
         lecture = owned_lecture(lecture_id, username)
         if not lecture["recording_finalized"]:
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
-        try:
-            recording = recording_store.open_info(username, lecture_id)
-        except RecordingCorruptError as error:
-            log.exception("Stored recording is not readable for lecture %s", lecture_id)
-            raise HTTPException(503, "저장된 녹음 파일을 확인하지 못했습니다.") from error
-        if recording is None:
-            raise HTTPException(404, "이 수업에는 내려받을 녹음이 없습니다.")
         filename = "".join(
             "_" if character in '<>:"/\\|?*' or ord(character) < 32 else character
             for character in lecture["title"]
         ).strip(" .")[:100] or "수업-녹음"
+        try:
+            recording = recording_store.open_info(username, lecture_id)
+        except RecordingCorruptError as error:
+            recording = None
+            if archive_manager.remote_size(lecture_id) is None:
+                log.exception("Stored recording is not readable for lecture %s", lecture_id)
+                raise HTTPException(503, "저장된 녹음 파일을 확인하지 못했습니다.") from error
+        if recording is not None and not archive_manager.local_download_matches_archive(
+            lecture_id, recording
+        ):
+            os.close(recording["descriptor"])
+            recording = None
+        if recording is None:
+            total = archive_manager.remote_size(lecture_id)
+            if total is None:
+                raise HTTPException(404, "이 수업에는 내려받을 녹음이 없습니다.")
+            try:
+                start, end = _single_byte_range(request.headers.get("range"), total)
+            except ValueError as error:
+                raise HTTPException(
+                    416,
+                    "요청한 녹음 구간을 내려받을 수 없습니다.",
+                    headers={"Content-Range": f"bytes */{total}", "Accept-Ranges": "bytes"},
+                ) from error
+            try:
+                stream = archive_manager.open_download(lecture_id, start=start, end=end)
+            except DriveStorageError as error:
+                raise HTTPException(
+                    503,
+                    "Google Drive에서 녹음을 불러오지 못했습니다. 잠시 후 다시 시도하세요.",
+                    headers={"Retry-After": "5"} if error.retryable else None,
+                ) from None
+            encoded_filename = quote(f"{filename}.wav", safe="")
+            headers = {
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(stream.content_length),
+                "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}",
+            }
+            if stream.content_range:
+                headers["Content-Range"] = stream.content_range
+            try:
+                return CloseableStreamingResponse(
+                    stream.iter_bytes(),
+                    close=stream.close,
+                    status_code=stream.status_code,
+                    media_type="audio/wav",
+                    headers=headers,
+                )
+            except BaseException:
+                stream.close()
+                raise
         descriptor = recording["descriptor"]
         try:
             return DescriptorFileResponse(
@@ -1734,11 +1901,14 @@ def create_app(
         # Never wait for the recording filesystem lock while a SQLite
         # connection/transaction is held; DELETE and normal writes use the
         # opposite (filesystem -> SQLite) order.
+        if replay["recording_finalized"]:
+            queue_completed_recording(replay["_recording_owner"], lecture_id)
         return {
             "segments": replay["segments"],
             "processing_seconds": replay["processing_seconds"],
-            "recording_available": recording_store.available(replay["_recording_owner"], lecture_id),
-            "recording_finalized": replay["recording_finalized"],
+            **recording_flags(
+                replay["_recording_owner"], lecture_id, replay["recording_finalized"]
+            ),
         }
 
     def process_chunk(
@@ -1886,12 +2056,12 @@ def create_app(
                             "UPDATE lectures SET recording_finalized = 1 WHERE id = ?",
                             (lecture_id,),
                         )
-            recording_available = recording_store.available(lecture["username"], lecture_id)
+            if final_chunk:
+                queue_completed_recording(lecture["username"], lecture_id)
             return {
                 "segments": segments,
                 "processing_seconds": processing_seconds,
-                "recording_available": recording_available,
-                "recording_finalized": final_chunk,
+                **recording_flags(lecture["username"], lecture_id, final_chunk),
             }
         except (HTTPException, ImportInterrupted):
             raise
@@ -2065,8 +2235,20 @@ def create_app(
                 if ticket[2] == lecture_id:
                     download_tickets.pop(token_hash, None)
 
+    def purge_session_download_tickets(session_hash: str) -> None:
+        with download_ticket_lock:
+            for token_hash, ticket in tuple(download_tickets.items()):
+                if secrets.compare_digest(ticket[4], session_hash):
+                    download_tickets.pop(token_hash, None)
+
+    def purge_account_download_tickets(username: str) -> None:
+        with download_ticket_lock:
+            for token_hash, ticket in tuple(download_tickets.items()):
+                if secrets.compare_digest(ticket[1], username):
+                    download_tickets.pop(token_hash, None)
+
     def finalize_lecture_deletion(lecture_id: str, username: str) -> bool:
-        """Remove private audio before committing the final metadata deletion."""
+        """Trash remote audio, remove staging audio, then delete metadata."""
 
         try:
             clova_engine.close_session(username, lecture_id)
@@ -2074,10 +2256,15 @@ def create_app(
             # Never reflect a provider/channel diagnostic while deleting
             # private data. A failed channel close must not retain local data.
             log.warning("Could not close a CLOVA Speech session during deletion")
+        if not archive_manager.trash_for_deletion(lecture_id):
+            archive_manager.wake()
+            return False
         try:
-            recording_store.delete(username, lecture_id)
+            with recording_store.lock:
+                recording_store.delete(username, lecture_id)
         except (OSError, RecordingCorruptError):
             log.exception("Could not remove private recording for lecture %s", lecture_id)
+            archive_manager.wake()
             return False
         with database.connect() as connection:
             connection.execute(
@@ -2087,23 +2274,14 @@ def create_app(
         purge_download_tickets(lecture_id)
         return True
 
-    def recover_lecture_deletions() -> None:
-        """Finish durable deletions and remove UUID recordings with no DB owner."""
+    def recover_recording_orphans() -> None:
+        """Remove ownerless local WAVs without doing provider I/O at startup."""
 
+        with database.connect() as connection:
+            expected = {username: set() for username in settings.accounts}
+            for row in connection.execute("SELECT id, username FROM lectures").fetchall():
+                expected[row["username"]].add(row["id"])
         with recording_store.lock:
-            with database.connect() as connection:
-                deleting = [
-                    dict(row)
-                    for row in connection.execute(
-                        "SELECT id, username FROM lectures WHERE deleting = 1"
-                    ).fetchall()
-                ]
-            for lecture in deleting:
-                finalize_lecture_deletion(lecture["id"], lecture["username"])
-            with database.connect() as connection:
-                expected = {username: set() for username in settings.accounts}
-                for row in connection.execute("SELECT id, username FROM lectures").fetchall():
-                    expected[row["username"]].add(row["id"])
             try:
                 recording_store.remove_orphans(expected)
             except (OSError, RecordingCorruptError):
@@ -2111,90 +2289,103 @@ def create_app(
 
     @app.delete("/lectures/{lecture_id}")
     def delete_lecture(lecture_id: str, user: dict = Depends(data_identity)):
-        with import_fs_lock, recording_store.lock:
-            try:
-                lecture = owned_lecture(lecture_id, user["username"], include_deleting=True)
-            except HTTPException as error:
-                if error.status_code == 404:
-                    # DELETE is idempotent across a lost Quick Tunnel response.
-                    # The same response for absent and other-owned UUIDs keeps
-                    # another account's lesson existence private.
-                    return {"status": "deleted"}
-                raise
-            if lecture["deleting"]:
-                if not finalize_lecture_deletion(lecture["id"], user["username"]):
-                    raise HTTPException(503, "녹음 파일 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
+        try:
+            lecture = owned_lecture(lecture_id, user["username"], include_deleting=True)
+        except HTTPException as error:
+            if error.status_code == 404:
+                # DELETE is idempotent across a lost Quick Tunnel response.
+                # The same response for absent and other-owned UUIDs keeps
+                # another account's lesson existence private.
                 return {"status": "deleted"}
-
-            with database.connect() as connection:
-                active = connection.execute(
-                    "SELECT 1 FROM imports WHERE lecture_id = ? "
-                    "AND status IN ('uploading', 'queued', 'processing')",
-                    (lecture["id"],),
-                ).fetchone()
-                pending = connection.execute(
-                    "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
-                    (lecture["id"],),
-                ).fetchone()
-                correcting = connection.execute(
-                    "SELECT 1 FROM transcript_corrections "
-                    "WHERE lecture_id = ? AND status = 'processing'",
-                    (lecture["id"],),
-                ).fetchone()
-                terminal_jobs = [
-                    dict(row)
-                    for row in connection.execute(
-                        "SELECT * FROM imports WHERE lecture_id = ?",
-                        (lecture["id"],),
-                    ).fetchall()
-                ]
-            if active is not None or pending is not None or correcting is not None:
-                raise HTTPException(409, "진행 중인 음성 처리나 후보정이 끝난 뒤 수업을 삭제하세요.")
-            for job in terminal_jobs:
-                if not remove_private_upload(job):
-                    raise HTTPException(503, "업로드 원본 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
-
-            with database.connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                current = connection.execute(
-                    "SELECT deleting FROM lectures WHERE id = ? AND username = ?",
-                    (lecture["id"], user["username"]),
-                ).fetchone()
-                if current is None:
-                    raise HTTPException(404, "수업을 찾을 수 없습니다.")
-                if not current["deleting"]:
-                    active = connection.execute(
-                        "SELECT 1 FROM imports WHERE lecture_id = ? "
-                        "AND status IN ('uploading', 'queued', 'processing')",
-                        (lecture["id"],),
-                    ).fetchone()
-                    pending = connection.execute(
-                        "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
-                        (lecture["id"],),
-                    ).fetchone()
-                    correcting = connection.execute(
-                        "SELECT 1 FROM transcript_corrections "
-                        "WHERE lecture_id = ? AND status = 'processing'",
-                        (lecture["id"],),
-                    ).fetchone()
+            raise
+        if not lecture["deleting"]:
+            with import_fs_lock, recording_store.lock:
+                try:
+                    lecture = owned_lecture(
+                        lecture_id, user["username"], include_deleting=True
+                    )
+                except HTTPException as error:
+                    if error.status_code == 404:
+                        return {"status": "deleted"}
+                    raise
+                if lecture["deleting"]:
+                    terminal_jobs = []
+                else:
+                    with database.connect() as connection:
+                        active = connection.execute(
+                            "SELECT 1 FROM imports WHERE lecture_id = ? "
+                            "AND status IN ('uploading', 'queued', 'processing')",
+                            (lecture["id"],),
+                        ).fetchone()
+                        pending = connection.execute(
+                            "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        correcting = connection.execute(
+                            "SELECT 1 FROM transcript_corrections "
+                            "WHERE lecture_id = ? AND status = 'processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        terminal_jobs = [
+                            dict(row)
+                            for row in connection.execute(
+                                "SELECT * FROM imports WHERE lecture_id = ?",
+                                (lecture["id"],),
+                            ).fetchall()
+                        ]
                     if active is not None or pending is not None or correcting is not None:
                         raise HTTPException(409, "진행 중인 음성 처리나 후보정이 끝난 뒤 수업을 삭제하세요.")
-                    # A queued correction has not sent anything yet. Removing
-                    # it in this same transaction wins atomically against the
-                    # worker's queued->processing claim.
-                    connection.execute(
-                        "DELETE FROM transcript_corrections "
-                        "WHERE lecture_id = ? AND status = 'queued'",
-                        (lecture["id"],),
-                    )
-                    connection.execute("DELETE FROM imports WHERE lecture_id = ?", (lecture["id"],))
-                    connection.execute("UPDATE lectures SET deleting = 1 WHERE id = ?", (lecture["id"],))
-            purge_download_tickets(lecture["id"])
-            if not finalize_lecture_deletion(lecture["id"], user["username"]):
-                raise HTTPException(503, "녹음 파일 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
+                for job in terminal_jobs:
+                    if not remove_private_upload(job):
+                        raise HTTPException(503, "업로드 원본 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
+
+                with database.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = connection.execute(
+                        "SELECT deleting FROM lectures WHERE id = ? AND username = ?",
+                        (lecture["id"], user["username"]),
+                    ).fetchone()
+                    if current is None:
+                        return {"status": "deleted"}
+                    if not current["deleting"]:
+                        active = connection.execute(
+                            "SELECT 1 FROM imports WHERE lecture_id = ? "
+                            "AND status IN ('uploading', 'queued', 'processing')",
+                            (lecture["id"],),
+                        ).fetchone()
+                        pending = connection.execute(
+                            "SELECT 1 FROM chunks WHERE lecture_id = ? AND status = 'pending'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        correcting = connection.execute(
+                            "SELECT 1 FROM transcript_corrections "
+                            "WHERE lecture_id = ? AND status = 'processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        if active is not None or pending is not None or correcting is not None:
+                            raise HTTPException(409, "진행 중인 음성 처리나 후보정이 끝난 뒤 수업을 삭제하세요.")
+                        # A queued correction has not sent anything yet. Removing
+                        # it in this same transaction wins atomically against the
+                        # worker's queued->processing claim.
+                        connection.execute(
+                            "DELETE FROM transcript_corrections "
+                            "WHERE lecture_id = ? AND status = 'queued'",
+                            (lecture["id"],),
+                        )
+                        connection.execute("DELETE FROM imports WHERE lecture_id = ?", (lecture["id"],))
+                        connection.execute("UPDATE lectures SET deleting = 1 WHERE id = ?", (lecture["id"],))
+        purge_download_tickets(lecture["id"])
+        if not finalize_lecture_deletion(lecture["id"], user["username"]):
+            raise HTTPException(503, "Google Drive 녹음을 휴지통으로 옮기지 못했습니다. 잠시 후 다시 시도하세요.")
         return {"status": "deleted"}
 
-    def abandon_import(import_id: str, status: str, message: str | None) -> None:
+    def abandon_import(
+        import_id: str,
+        status: str,
+        message: str | None,
+        *,
+        finalize_deletion: bool = True,
+    ) -> None:
         """Finish a failed/cancelled job and remove its partial lecture."""
 
         with import_fs_lock:
@@ -2218,10 +2409,15 @@ def create_app(
                         (lecture_id, current["username"]),
                     )
             if lecture_id:
-                finalize_lecture_deletion(lecture_id, job["username"])
+                if finalize_deletion:
+                    finalize_lecture_deletion(lecture_id, job["username"])
+                else:
+                    # The archive worker handles Drive access after startup is
+                    # serving; a provider outage must not block /health.
+                    archive_manager.wake()
             remove_private_upload(job)
 
-    def maintain_import_jobs() -> None:
+    def maintain_import_jobs(*, finalize_deletions: bool = True) -> None:
         """Expire abandoned uploads and retry truthful terminal-file cleanup."""
 
         stale_before = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace("+00:00", "Z")
@@ -2239,6 +2435,7 @@ def create_app(
                     import_id,
                     "failed",
                     "7일 동안 완료되지 않아 임시 파일을 삭제했습니다. 다시 올려 주세요.",
+                    finalize_deletion=finalize_deletions,
                 )
             with database.connect() as connection:
                 terminal = [
@@ -2281,15 +2478,20 @@ def create_app(
                 )
                 rows = [dict(row) for row in connection.execute("SELECT * FROM imports").fetchall()]
 
-            for lecture_id, username in cancelled_lectures:
-                finalize_lecture_deletion(lecture_id, username)
+            if cancelled_lectures:
+                archive_manager.wake()
 
             for job in rows:
                 path = import_path(job["username"], job["id"], create_parent=True)
                 if job["status"] in {"completed", "failed", "cancelled"}:
                     continue
                 if path.is_symlink() or not path.is_file():
-                    abandon_import(job["id"], "failed", "임시 업로드 파일을 찾을 수 없어 다시 올려야 합니다.")
+                    abandon_import(
+                        job["id"],
+                        "failed",
+                        "임시 업로드 파일을 찾을 수 없어 다시 올려야 합니다.",
+                        finalize_deletion=False,
+                    )
                     continue
                 path.chmod(0o600)
                 size = path.stat().st_size
@@ -2303,9 +2505,14 @@ def create_app(
                     size = job["uploaded_bytes"]
                 expected = job["total_bytes"] if job["status"] == "queued" else job["uploaded_bytes"]
                 if size != expected:
-                    abandon_import(job["id"], "failed", "임시 업로드 파일이 손상되어 다시 올려야 합니다.")
+                    abandon_import(
+                        job["id"],
+                        "failed",
+                        "임시 업로드 파일이 손상되어 다시 올려야 합니다.",
+                        finalize_deletion=False,
+                    )
 
-            maintain_import_jobs()
+            maintain_import_jobs(finalize_deletions=False)
 
             with database.connect() as connection:
                 rows = [dict(row) for row in connection.execute("SELECT * FROM imports").fetchall()]
@@ -2322,7 +2529,7 @@ def create_app(
                 for candidate in account_directory.glob("*.upload"):
                     if candidate not in expected_uploads:
                         candidate.unlink(missing_ok=True)
-            recover_lecture_deletions()
+            recover_recording_orphans()
 
     def import_was_cancelled(import_id: str) -> bool:
         job = fetch_import(import_id)

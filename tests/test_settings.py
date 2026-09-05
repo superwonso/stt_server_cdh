@@ -348,6 +348,45 @@ class UrlValidationTests(unittest.TestCase):
         ):
             self.assertEqual(Settings.from_env().max_upload_bytes, 480 * 1024)
 
+    def test_google_drive_archive_settings_are_private_and_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch(
+            "server.settings.load_dotenv"
+        ), mock.patch.dict(
+            "os.environ",
+            {
+                "ACCOUNT_USERNAMES": "user-alpha,user-beta",
+                "DATA_DIR": temporary,
+                "GOOGLE_DRIVE_RECORDINGS": "true",
+                "GOOGLE_DRIVE_UPLOAD_CHUNK_BYTES": str(512 * 1024),
+                "GOOGLE_DRIVE_CONNECT_TIMEOUT_SECONDS": "1",
+                "GOOGLE_DRIVE_READ_TIMEOUT_SECONDS": "999",
+                "GOOGLE_DRIVE_RETRY_MAX_SECONDS": "9999",
+            },
+            clear=True,
+        ):
+            settings = Settings.from_env()
+
+        private_root = Path(temporary) / "google-drive"
+        self.assertTrue(settings.google_drive_enabled)
+        self.assertEqual(
+            settings.google_drive_oauth_client_path,
+            private_root / "oauth-client.json",
+        )
+        self.assertEqual(settings.google_drive_token_path, private_root / "token.json")
+        self.assertEqual(settings.google_drive_upload_chunk_bytes, 512 * 1024)
+        self.assertEqual(settings.google_drive_connect_timeout_seconds, 2.0)
+        self.assertEqual(settings.google_drive_read_timeout_seconds, 300.0)
+        self.assertEqual(settings.google_drive_retry_max_seconds, 3600)
+        self.assertNotIn("google_drive_oauth_client_path", repr(settings))
+        self.assertNotIn("google_drive_token_path", repr(settings))
+
+        with self.assertRaisesRegex(ValueError, "256 KiB"):
+            Settings(
+                data_dir=Path(temporary),
+                model_cache_dir=Path(temporary) / "models",
+                google_drive_upload_chunk_bytes=300_000,
+            )
+
     def test_mindlogic_bearer_is_pinned_to_the_official_gateway(self):
         self.assertEqual(
             mindlogic_gateway_base_url(

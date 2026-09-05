@@ -124,6 +124,17 @@ class Settings:
     max_import_seconds: int = 4 * 60 * 60
     max_recordings_bytes: int = 20 * 1024 * 1024 * 1024
     recording_free_reserve_bytes: int = 1024 * 1024 * 1024
+    # When enabled, completed recordings are copied to the operator's private
+    # Google Drive and the local staging WAV is removed only after checksum
+    # verification.  OAuth material remains under DATA_DIR and is never sent
+    # to the browser.
+    google_drive_enabled: bool = False
+    google_drive_oauth_client_path: Path | None = field(default=None, repr=False)
+    google_drive_token_path: Path | None = field(default=None, repr=False)
+    google_drive_upload_chunk_bytes: int = 8 * 1024 * 1024
+    google_drive_connect_timeout_seconds: float = 10.0
+    google_drive_read_timeout_seconds: float = 60.0
+    google_drive_retry_max_seconds: int = 300
     # CLOVA Speech streaming credentials never leave this process. The target
     # is intentionally not configurable so a typo or injected environment
     # value cannot send a bearer credential and private audio to another host.
@@ -163,10 +174,20 @@ class Settings:
             or any(character.isspace() or ord(character) < 0x20 for character in self.clova_speech_secret_key)
         ):
             raise ValueError("CLOVA_SPEECH_SECRET_KEY has an invalid format")
+        if (
+            self.google_drive_upload_chunk_bytes < 256 * 1024
+            or self.google_drive_upload_chunk_bytes > 32 * 1024 * 1024
+            or self.google_drive_upload_chunk_bytes % (256 * 1024)
+        ):
+            raise ValueError(
+                "GOOGLE_DRIVE_UPLOAD_CHUNK_BYTES must be a 256 KiB multiple "
+                "between 256 KiB and 32 MiB"
+            )
 
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv(PROJECT_DIR / "server" / ".env", override=False)
+        data_dir = _path(os.getenv("DATA_DIR", ".data"))
         accounts = account_usernames(os.getenv("ACCOUNT_USERNAMES"))
         origins = tuple(
             url_origin(value.strip())
@@ -174,7 +195,7 @@ class Settings:
             if value.strip()
         )
         return cls(
-            data_dir=_path(os.getenv("DATA_DIR", ".data")),
+            data_dir=data_dir,
             model_cache_dir=_path(os.getenv("MODEL_CACHE_DIR", ".models")),
             accounts=accounts,
             admin_username=(os.getenv("ADMIN_USERNAME") or "").strip() or None,
@@ -204,6 +225,32 @@ class Settings:
             recording_free_reserve_bytes=max(
                 256 * 1024 * 1024,
                 min(int(os.getenv("RECORDING_FREE_RESERVE_BYTES", str(1024 * 1024 * 1024))), 20 * 1024 * 1024 * 1024),
+            ),
+            google_drive_enabled=os.getenv("GOOGLE_DRIVE_RECORDINGS", "0").strip().lower()
+            in {"1", "true", "yes", "on"},
+            google_drive_oauth_client_path=_path(
+                os.getenv(
+                    "GOOGLE_DRIVE_OAUTH_CLIENT_FILE",
+                    str(data_dir / "google-drive" / "oauth-client.json"),
+                )
+            ),
+            google_drive_token_path=_path(
+                os.getenv(
+                    "GOOGLE_DRIVE_TOKEN_FILE",
+                    str(data_dir / "google-drive" / "token.json"),
+                )
+            ),
+            google_drive_upload_chunk_bytes=int(
+                os.getenv("GOOGLE_DRIVE_UPLOAD_CHUNK_BYTES", str(8 * 1024 * 1024))
+            ),
+            google_drive_connect_timeout_seconds=max(
+                2.0, min(float(os.getenv("GOOGLE_DRIVE_CONNECT_TIMEOUT_SECONDS", "10")), 30.0)
+            ),
+            google_drive_read_timeout_seconds=max(
+                10.0, min(float(os.getenv("GOOGLE_DRIVE_READ_TIMEOUT_SECONDS", "60")), 300.0)
+            ),
+            google_drive_retry_max_seconds=max(
+                30, min(int(os.getenv("GOOGLE_DRIVE_RETRY_MAX_SECONDS", "300")), 3600)
             ),
             clova_speech_secret_key=(os.getenv("CLOVA_SPEECH_SECRET_KEY") or "").strip() or None,
             clova_stream_response_timeout_seconds=max(

@@ -2,6 +2,11 @@
 server/.env*
 .data/
 invitations*.txt
+client_secret_*.json
+oauth-client.json
+token.json
+authorization-url.txt
+identity.key
 *.sqlite
 *.sqlite3
 *.sqlite3-*
