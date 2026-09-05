@@ -64,7 +64,7 @@ const CORRECTION_POLL_MS = 2500;
 const ADMIN_REFRESH_MS = 10000;
 const PRESENCE_INTERVAL_MS = 15000;
 const PRESENCE_IDLE_MS = 5 * 60 * 1000;
-const CLOVA_PRIVACY_NOTICE = '선택한 마이크 음성과 인식 결과는 브라우저 → 이 서버 → NAVER Cloud로 전송되며 사용량에 따라 비용이 청구될 수 있습니다. 스트리밍 인식 결과는 해당 도메인의 고객 Object Storage에 자동 저장되며, 이 앱에서 수업을 삭제해도 그 클라우드 사본은 삭제되지 않습니다.';
+const CLOVA_PRIVACY_NOTICE = '선택한 마이크 음성은 브라우저 → 이 서버 → 이 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인으로 전송됩니다. 인식 결과는 운영자가 연결한 Object Storage에 자동 저장되며, 이 앱에서 수업을 삭제해도 그 클라우드 사본은 삭제되지 않습니다.';
 const fmt = seconds => { const n = Math.max(0, Math.floor(seconds || 0)); return `${Math.floor(n / 60).toString().padStart(2, '0')}:${(n % 60).toString().padStart(2, '0')}`; };
 const KST_DATE_FORMATTER = new Intl.DateTimeFormat('ko-KR', {timeZone:'Asia/Seoul',year:'numeric',month:'long',day:'numeric'});
 const KST_DATE_PARTS = new Intl.DateTimeFormat('en', {timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'});
@@ -1073,7 +1073,7 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
   micProviderPreference = null;
   $('lecture-title').value = ''; $('language').value = 'ko'; $('audio-source').value = 'microphone';
   $('asr-provider').value = 'qwen'; $('asr-provider-clova').disabled = true;
-  $('asr-provider-clova').textContent = 'NAVER CLOVA Speech · 서버 설정 필요';
+  $('asr-provider-clova').textContent = 'NAVER CLOVA Speech · 운영자 설정 필요';
   $('elapsed').textContent = '00:00';
   $('current-user').textContent = '내 계정'; document.querySelector('.user-avatar').textContent = '–';
   $('delete-lecture-title').textContent = '선택한 수업';
@@ -1250,7 +1250,7 @@ $('auth-form').onsubmit = async event => {
     clearInterval(statusTimer); statusTimer = setInterval(updateStatus, 20000);
     if (pending.length || draft) {
       if (clovaManualRetryRequired()) {
-        notice('CLOVA 대기 음성은 중복 기록과 추가 과금을 막기 위해 자동 재전송하지 않았어요. 안내를 확인한 뒤 직접 선택해 주세요.');
+        notice('CLOVA 대기 음성은 중복 기록을 막기 위해 자동 재전송하지 않았어요. 안내를 확인한 뒤 직접 선택해 주세요.');
       } else {
         sendError = ''; void retryPending();
       }
@@ -1277,7 +1277,7 @@ async function updateStatus() {
     $('asr-provider-qwen').disabled = !qwenConfigured;
     $('asr-provider-clova').disabled = !clovaConfigured;
     $('asr-provider-clova').textContent = clovaConfigured
-      ? 'NAVER CLOVA Speech · 클라우드 · 기본' : 'NAVER CLOVA Speech · 서버 설정 필요';
+      ? 'NAVER CLOVA Speech · 운영자 클라우드 · 기본' : 'NAVER CLOVA Speech · 운영자 설정 필요';
     applyNewLectureProvider();
     $('model-status').textContent = ({unloaded:'첫 받아쓰기 준비됨',loading:'음성 인식 모델 준비 중',ready:'음성 인식 모델 연결됨',error:'음성 인식 모델 확인 필요'})[status.model_state] || '서버 연결됨';
     updateProviderGuidance(); updateControls();
@@ -1285,7 +1285,7 @@ async function updateStatus() {
     if (!requestIsCurrent()) return;
     transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
     $('asr-provider-qwen').disabled = false; $('asr-provider-clova').disabled = true;
-    $('asr-provider-clova').textContent = 'NAVER CLOVA Speech · 서버 설정 필요';
+    $('asr-provider-clova').textContent = 'NAVER CLOVA Speech · 운영자 설정 필요';
     applyNewLectureProvider();
     updateProviderGuidance(); updateControls();
     $('model-status').textContent = '서버 연결 확인 필요';
@@ -2463,7 +2463,7 @@ function updateProviderGuidance() {
   } else if (clova && !transcriptionProviders.clova.configured && !current) {
     $('provider-guidance').textContent = 'CLOVA Speech를 사용하려면 서버 컴퓨터에 스트리밍 Secret Key를 먼저 설정해야 합니다.';
   } else if (clova) {
-    $('provider-guidance').textContent = '이 수업의 마이크 음성을 NAVER CLOVA Speech 스트리밍으로 처리합니다.';
+    $('provider-guidance').textContent = '이 수업의 마이크 음성을 사이트 운영자가 설정한 NAVER CLOVA Speech로 처리합니다.';
   } else {
     $('provider-guidance').textContent = '마이크 음성을 이 PC의 Qwen으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.';
   }
@@ -2557,7 +2557,7 @@ function updateControls() {
     ? '현재 수업은 일시정지 상태로 안전하게 유지 중이에요.'
     : '지난 기록을 보는 동안에도 현재 수업을 계속 녹음하고 있어요.';
   $('live-capture-detail').textContent = captureSession?.asrProvider === 'clova'
-    ? '음성은 현재 녹음 수업에만 연결되며, CLOVA 처리를 위해 이 서버를 거쳐 NAVER Cloud로 계속 전송됩니다.'
+    ? '음성은 현재 녹음 수업에만 연결되며, CLOVA 처리를 위해 이 서버를 거쳐 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인으로 계속 전송됩니다.'
     : '음성과 받아쓰기 결과는 현재 녹음 수업에만 저장되며, 이 PC의 Qwen으로 계속 처리됩니다.';
   $('return-live-capture').disabled = !stableLiveCapture();
   $('lecture-date').disabled = historyNavigationBusy();
@@ -2597,8 +2597,8 @@ function updateControls() {
           : queued ? '남은 음성을 받아쓰고 있어요' : current ? '수업 기록을 저장했어요' : '시작할 준비가 됐어요';
   $('record-hint').textContent = inputUnavailable ? (inputUnavailableMessage || '이미 받은 음성은 보관 중입니다. 입력 복구 버튼으로 같은 수업을 이어갈 수 있어요.')
     : paused ? '정지한 동안의 소리는 녹음하거나 전송하지 않으며, 재개하면 같은 수업에 이어집니다.'
-      : recording ? (system ? '선택한 탭이나 화면을 재생해 주세요. 화면 영상은 전송하지 않아요.' : clova ? '마이크 음성을 이 서버를 거쳐 NAVER Cloud로 보내 받아씁니다.' : '서버가 늦어도 음성을 이 기기에 보관하며 녹음을 계속합니다.')
-        : current ? '새 수업을 시작하거나 기록을 내려받을 수 있어요.' : system ? '시작한 뒤 재생할 탭·화면을 고르고 오디오 공유를 켜세요.' : clova ? 'CLOVA를 선택하면 마이크 음성이 NAVER Cloud로 전송되고 사용량이 과금될 수 있어요.' : '약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.';
+      : recording ? (system ? '선택한 탭이나 화면을 재생해 주세요. 화면 영상은 전송하지 않아요.' : clova ? '마이크 음성을 이 서버를 거쳐 운영자가 설정한 NAVER Cloud CLOVA Speech로 보내 받아씁니다.' : '서버가 늦어도 음성을 이 기기에 보관하며 녹음을 계속합니다.')
+        : current ? '새 수업을 시작하거나 기록을 내려받을 수 있어요.' : system ? '시작한 뒤 재생할 탭·화면을 고르고 오디오 공유를 켜세요.' : clova ? '사이트 운영자가 설정한 CLOVA Speech로 마이크 음성을 받아써요.' : '약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.';
   const localQueueSize = liveQueueBytes > 0 ? ` · ${bytesLabel(liveQueueBytes)}` : '';
   $('save-state').textContent = retryMessage ? `${queued}개 음성${localQueueSize} · 기기에 보관하고 재전송 대기`
     : queued ? `${queued}개 음성${localQueueSize} · 기기에 임시 보관`
@@ -3243,7 +3243,7 @@ function manualUploadError(error) {
   return `${errorText(error)} ${reason}`;
 }
 function clovaManualUploadError(error) {
-  return `${errorText(error)} CLOVA 처리 결과를 확인할 수 없어 자동 재전송하지 않았어요. 같은 음성 조각을 다시 보내면 중복 기록이나 추가 과금이 생길 수 있습니다. 실패 WAV를 내려받아 보관하고 새 수업으로 다시 시작하거나, 위험을 이해한 경우에만 수동 재전송하세요.`;
+  return `${errorText(error)} CLOVA 처리 결과를 확인할 수 없어 자동 재전송하지 않았어요. 같은 음성 조각을 다시 보내면 중복 기록이 생길 수 있습니다. 실패 WAV를 내려받아 보관하고 새 수업으로 다시 시작하거나, 위험을 이해한 경우에만 수동 재전송하세요.`;
 }
 function mergeChunkSegments(lecture, response) {
   if (!lecture) return;

@@ -1898,7 +1898,7 @@ def create_app(
         except ClovaTranscriptionError as error:
             # A gRPC timeout or disconnect can be ambiguous after audio left
             # this PC. Do not let the browser's generic 5xx retry loop resend
-            # and potentially bill the same audio repeatedly. The adapter's
+            # and potentially process the same audio repeatedly. The adapter's
             # error code is a closed, non-secret enum; provider bodies and RPC
             # diagnostic strings are never logged.
             safe_code = "provider_error"
@@ -1908,7 +1908,7 @@ def create_app(
             log.warning("CLOVA Speech transcription failed (%s)", safe_code)
             raise HTTPException(
                 424,
-                "CLOVA Speech 응답을 안전하게 확정하지 못했습니다. 다시 보내면 같은 음성이 중복 과금될 수 있습니다.",
+                "CLOVA Speech 응답을 안전하게 확정하지 못했습니다. 다시 보내면 같은 음성이 중복 기록될 수 있습니다.",
             ) from None
         except Exception as error:
             log.exception("Local transcription failed")

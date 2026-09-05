@@ -25,6 +25,9 @@ test('page has no remote assets or inline executable content and declares privac
   assert.ok(!connectSources.includes('https:'), 'arbitrary HTTPS destinations must not be allowed');
   assert.ok(!connectSources.includes('http:'), 'arbitrary HTTP destinations must not be allowed');
   assert.match(html, /name="referrer" content="no-referrer"/);
+  assert.match(html, /사이트 운영자가 관리하는 NAVER Cloud 계정/);
+  assert.doesNotMatch(html, /비용이 청구|추가 과금|중복 과금|과금될/);
+  assert.doesNotMatch(app, /비용이 청구|추가 과금|중복 과금|과금될/);
   assert.doesNotMatch(html, /<(?:script|style)(?![^>]*\bsrc=)[^>]*>\s*[^<\s]/i);
   assert.doesNotMatch(html, /\s(?:src|href)="https?:/i);
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i);

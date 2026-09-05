@@ -455,7 +455,9 @@ test('authenticated status enables only the advertised CLOVA choice and ignores 
   assert.equal(app.element('language').value,'ko');
   assert.equal(app.element('provider-privacy').hidden,false);
   assert.match(app.element('provider-privacy').textContent,/NAVER Cloud/);
-  assert.match(app.element('provider-privacy').textContent,/비용이 청구/);
+  assert.match(app.element('provider-privacy').textContent,/사이트 운영자가 관리하는.*계정/);
+  assert.match(app.element('provider-privacy').textContent,/전송/);
+  assert.doesNotMatch(app.element('provider-privacy').textContent,/비용|과금/);
   assert.match(app.element('provider-privacy').textContent,/Object Storage/);
   assert.match(app.element('provider-privacy').textContent,/자동 저장/);
   assert.match(app.element('provider-privacy').textContent,/삭제해도 그 클라우드 사본은 삭제되지/);
@@ -2751,7 +2753,8 @@ test('an ambiguous CLOVA chunk failure never auto-retries or silently switches t
   assert.equal(app.run('pending.length'),1,'the failed chunk stays available for manual recovery');
   assert.ok(app.run("pending.every(item => item.asrProvider === 'clova')"));
   assert.match(app.run('sendError'),/자동 재전송하지 않았/);
-  assert.match(app.run('sendError'),/중복 기록이나 추가 과금/);
+  assert.match(app.run('sendError'),/중복 기록/);
+  assert.doesNotMatch(app.run('sendError'),/비용|과금/);
   assert.match(app.element('retry').textContent,/위험 이해.*수동 재전송/);
   assert.doesNotMatch(app.run('sendError'),/Qwen으로/);
 
@@ -2801,7 +2804,8 @@ test('re-login preserves the manual CLOVA retry gate until the user explicitly r
   assert.equal(app.run('token'),'renewed-clova-token');
   assert.equal(uploads,1,'successful re-login must not implicitly resend an ambiguous CLOVA chunk');
   assert.equal(app.run('pending.length'),2);
-  assert.ok(app.run("sendError.includes('추가 과금')"));
+  assert.ok(app.run("sendError.includes('중복 기록')"));
+  assert.doesNotMatch(app.run('sendError'),/비용|과금/);
   assert.match(app.element('retry').textContent,/위험 이해.*수동 재전송/);
 
   app.element('retry').onclick();

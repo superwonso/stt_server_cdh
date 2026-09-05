@@ -183,13 +183,13 @@
               <label for="asr-provider">마이크 음성 인식</label>
               <select id="asr-provider" name="asr-provider" aria-describedby="provider-guidance provider-privacy">
                 <option id="asr-provider-qwen" value="qwen" selected>이 PC의 Qwen · 로컬</option>
-                <option id="asr-provider-clova" value="clova" disabled>NAVER CLOVA Speech · 서버 설정 필요</option>
+                <option id="asr-provider-clova" value="clova" disabled>NAVER CLOVA Speech · 운영자 설정 필요</option>
               </select>
             </div>
             <p id="source-guidance" class="source-guidance">마이크로 주변의 수업 소리를 받아씁니다.</p>
             <p id="source-privacy" class="source-privacy" hidden>공유 대상으로 선택한 범위의 알림·다른 앱 소리도 함께 전송될 수 있습니다. 수업 외 소리는 끄고 공유 범위를 확인하세요.</p>
             <p id="provider-guidance" class="provider-guidance">마이크 음성을 이 PC의 Qwen으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.</p>
-            <p id="provider-privacy" class="provider-privacy" hidden>선택한 마이크 음성과 인식 결과는 브라우저 → 이 서버 → NAVER Cloud로 전송되며 사용량에 따라 비용이 청구될 수 있습니다. 스트리밍 인식 결과는 해당 도메인의 고객 Object Storage에 자동 저장되며, 이 앱에서 수업을 삭제해도 그 클라우드 사본은 삭제되지 않습니다.</p>
+            <p id="provider-privacy" class="provider-privacy" hidden>선택한 마이크 음성은 브라우저 → 이 서버 → 이 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인으로 전송됩니다. 인식 결과는 운영자가 연결한 Object Storage에 자동 저장되며, 이 앱에서 수업을 삭제해도 그 클라우드 사본은 삭제되지 않습니다.</p>
           </div>
 
           <div class="record-panel">
