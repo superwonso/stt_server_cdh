@@ -24,6 +24,7 @@ from server.drive_storage import (
     DriveIntegrityError,
     DriveProtocolError,
     DriveStorageError,
+    DriveStorageQuota,
     DriveTransportError,
     GoogleDriveStorage,
     UploadCheckpoint,
@@ -185,6 +186,96 @@ class DriveStorageTests(unittest.TestCase):
         self.assertEqual(requested_fields, ["user(permissionId)"])
         self.assertNotIn("opaqueUser_123", repr(identity))
         client.close()
+
+    def test_storage_quota_requests_only_aggregate_fields(self):
+        requested_fields = []
+
+        def handler(request):
+            if str(request.url) == GOOGLE_TOKEN_URL:
+                return self.token_response(request)
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.url.path, "/drive/v3/about")
+            requested_fields.append(request.url.params["fields"])
+            return httpx.Response(200, json={
+                "storageQuota": {"limit": "1000", "usage": "800", "usageInDrive": "400", "usageInDriveTrash": "50"},
+                "user": {"emailAddress": "private-extra-provider-field"},
+            })
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            storage = GoogleDriveStorage.from_token_file(self.token_path, client=client)
+            value = storage.storage_quota().to_dict()
+        self.assertEqual(requested_fields, ["storageQuota(limit,usage,usageInDrive,usageInDriveTrash)"])
+        self.assertEqual(value, {"limit_bytes": 1000, "usage_bytes": 800, "drive_bytes": 400,
+                                 "trash_bytes": 50, "remaining_bytes": 200})
+        self.assertNotIn("private-extra", repr(value))
+
+    def test_quota_unlimited_missing_fields_overflow_and_over_capacity(self):
+        for quota, expected in (
+            ({"usage": "80"}, {"limit_bytes": None, "usage_bytes": 80, "drive_bytes": None,
+                                "trash_bytes": None, "remaining_bytes": None}),
+            ({"limit": "0", "usage": "80"}, {"limit_bytes": 0, "usage_bytes": 80, "drive_bytes": None,
+                                               "trash_bytes": None, "remaining_bytes": 0}),
+        ):
+            with self.subTest(quota=quota):
+                def handler(request):
+                    return self.token_response(request) if str(request.url) == GOOGLE_TOKEN_URL else httpx.Response(200, json={"storageQuota": quota})
+                with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                    self.assertEqual(GoogleDriveStorage(self.token_path, client=client).storage_quota().to_dict(), expected)
+
+    def test_quota_rejects_invalid_or_missing_required_counts(self):
+        for quota in (None, {}, {"usage": True}, {"usage": 5}, {"usage": "-1"}, {"usage": "1.5"},
+                      {"usage": "1e9"}, {"usage": "9" * 100}, {"usage": str(2**53)}, {"usage": "1", "limit": "NaN"}):
+            with self.subTest(quota=quota):
+                def handler(request):
+                    return self.token_response(request) if str(request.url) == GOOGLE_TOKEN_URL else httpx.Response(200, json={"storageQuota": quota})
+                with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                    with self.assertRaises(DriveProtocolError):
+                        GoogleDriveStorage(self.token_path, client=client).storage_quota()
+        with self.assertRaises(DriveProtocolError):
+            DriveStorageQuota(None, True)
+
+    def test_refresh_transient_failures_do_not_require_reauthorization(self):
+        for status in (429, 500, 503):
+            with self.subTest(status=status):
+                self.write_token(self.token_document())
+                def handler(request):
+                    self.assertEqual(str(request.url), GOOGLE_TOKEN_URL)
+                    return httpx.Response(status, content=b"PRIVATE-provider-detail")
+                with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                    with self.assertRaises(DriveTransportError) as raised:
+                        GoogleDriveStorage(self.token_path, client=client).storage_quota()
+                self.assertTrue(raised.exception.retryable)
+                self.assertNotIn("PRIVATE", str(raised.exception))
+
+    def test_refresh_only_invalid_grant_is_definite_reauthorization(self):
+        for reason, expected in (("invalid_grant", "token_reauthorization_required"),
+                                 ("invalid_client", "token_refresh_rejected")):
+            with self.subTest(reason=reason):
+                self.write_token(self.token_document())
+                with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
+                    400, json={"error": reason, "error_description": "PRIVATE-detail"},
+                ))) as client:
+                    with self.assertRaises(DriveAuthenticationError) as raised:
+                        GoogleDriveStorage(self.token_path, client=client).storage_quota()
+                self.assertEqual(raised.exception.code, expected)
+                self.assertNotIn("PRIVATE", str(raised.exception))
+
+    def test_drive_403_rate_and_storage_limits_are_not_auth_errors(self):
+        for reason, expected in (("rateLimitExceeded", "drive_rate_limited"),
+                                 ("userRateLimitExceeded", "drive_rate_limited"),
+                                 ("storageQuotaExceeded", "drive_storage_full")):
+            with self.subTest(reason=reason):
+                def handler(request):
+                    if str(request.url) == GOOGLE_TOKEN_URL:
+                        return self.token_response(request)
+                    return httpx.Response(403, json={"error": {"errors": [{"reason": reason}], "message": "PRIVATE"}})
+                with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                    with self.assertRaises(DriveStorageError) as raised:
+                        GoogleDriveStorage(self.token_path, client=client).storage_quota()
+                self.assertEqual(raised.exception.code, expected)
+                self.assertNotIsInstance(raised.exception, DriveAuthenticationError)
+                self.assertTrue(raised.exception.retryable)
+
 
     def test_refresh_reloads_a_completed_oauth_replacement_before_writing(self) -> None:
         new_client_id = "replacement-client.apps.googleusercontent.com"

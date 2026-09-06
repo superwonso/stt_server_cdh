@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import vm from 'node:vm';
 import {
-  StreamingResampler, encodeWav, MicrophoneCapture, OVERLAP_SECONDS,
+  StreamingResampler, encodeWav, MicrophoneCapture, OVERLAP_SECONDS, PCM_SNAPSHOT_SECONDS,
 } from '../web/audio.js';
 
 function join(parts) {
@@ -82,6 +82,102 @@ function prepareCapture(inputRate, chunks, options = {}) {
 }
 
 function pcmSamples(chunk) { return (chunk.blob.size - 44) / 2; }
+
+test('local PCM snapshots preserve two-second durability without early ASR chunks', async () => {
+  const snapshots = [], chunks = [];
+  const capture = prepareCapture(16000, chunks, { onSnapshot: item => snapshots.push(item) });
+  for (let index = 0; index < 3; index += 1) {
+    capture._consumePCM(new Float32Array(16000 * PCM_SNAPSHOT_SECONDS).fill(0.125));
+    await capture.flushSnapshots();
+  }
+  assert.equal(chunks.length, 0);
+  assert.deepEqual(snapshots.map(item => item.durationSamples), [32000, 64000, 96000]);
+  assert.ok(snapshots.every(item => item.sequence === 0 && item.startSamples === 0 && item.overlapSamples === 0));
+  await capture.stop();
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].final, true);
+  assert.equal(chunks[0].durationSeconds, 6);
+});
+
+test('PCM snapshots retain only one inflight and the newest pending bounded buffer', async () => {
+  const snapshots = [], chunks = [], releases = [];
+  const capture = prepareCapture(16000, chunks, {
+    onSnapshot: item => {
+      snapshots.push(item);
+      return new Promise(resolve => releases.push(resolve));
+    },
+  });
+  capture._consumePCM(new Float32Array(16000 * 90).fill(0.25));
+  assert.equal(snapshots.length, 1);
+  assert.ok(capture._snapshotInFlight);
+  assert.ok(capture._snapshotPending.blob.size <= 44 + 15 * 16000 * 2);
+  assert.ok(capture._chunk.byteLength <= 15 * 16000 * 4);
+  const snapshotEnd = capture._snapshotPending.startSamples + capture._snapshotPending.durationSamples;
+  assert.ok(90 * 16000 - snapshotEnd < PCM_SNAPSHOT_SECONDS * 16000);
+  assert.equal(capture._snapshotPending.sequence, chunks.length);
+  releases.shift()();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(snapshots.length, 2, 'intermediate snapshots were replaced, not accumulated');
+  releases.shift()();
+  await capture.flushSnapshots();
+  capture.onSnapshot = null;
+  await capture.stop();
+  assert.equal(acceptedSamples(chunks), 90 * 16000);
+});
+
+test('snapshot sequence and overlap track ASR boundary and forced checkpoints exactly', async () => {
+  const snapshots = [], chunks = [];
+  const capture = prepareCapture(16000, chunks, { onSnapshot: item => snapshots.push(item) });
+  capture._consumePCM(new Float32Array(15 * 16000).fill(0.2));
+  await capture.flushSnapshots();
+  assert.equal(chunks.length, 1);
+  capture._consumePCM(new Float32Array(2 * 16000).fill(0.2));
+  await capture.flushSnapshots();
+  const snapshot = snapshots.at(-1);
+  assert.equal(snapshot.sequence, 1);
+  assert.equal(snapshot.startSamples, 12 * 16000);
+  assert.equal(snapshot.durationSamples, 5 * 16000);
+  assert.equal(snapshot.overlapSamples, 3 * 16000);
+  capture.checkpoint();
+  await capture.flushSnapshots();
+  await capture.stop();
+  assert.equal(chunks.length, 3);
+  assert.equal(snapshots.at(-1).sequence, 2);
+  assert.equal(snapshots.at(-1).durationSamples, 3 * 16000);
+  assert.equal(snapshots.at(-1).overlapSamples, 3 * 16000);
+  assert.equal(acceptedSamples(chunks), 17 * 16000);
+});
+
+test('snapshot failure is reported, never stops capture, and final callbacks are drained', async () => {
+  const errors = [], chunks = [];
+  let calls = 0;
+  const capture = prepareCapture(16000, chunks, {
+    onSnapshot: () => { calls += 1; return Promise.reject(new Error('fake storage full')); },
+    onSnapshotError: error => errors.push(error.message),
+  });
+  capture._consumePCM(new Float32Array(3 * 16000).fill(0.2));
+  await capture.flushSnapshots();
+  assert.equal(capture.recording, true);
+  await capture.stop();
+  assert.equal(calls, 2);
+  assert.equal(errors.length, 2);
+  assert.equal(capture._snapshotInFlight, null);
+  assert.equal(capture._snapshotPending, null);
+  assert.equal(chunks[0].durationSeconds, 3);
+});
+
+test('snapshot callback cannot mutate subsequent PCM and chunk encoding', async () => {
+  const snapshots = [], chunks = [];
+  const capture = prepareCapture(16000, chunks, { onSnapshot: item => snapshots.push(item) });
+  capture._consumePCM(new Float32Array(2 * 16000).fill(0.5));
+  await capture.flushSnapshots();
+  capture._consumePCM(new Float32Array(2 * 16000).fill(-0.5));
+  await capture.stop();
+  const saved = new DataView(await snapshots[0].blob.arrayBuffer());
+  assert.equal(saved.getInt16(44 + 31999 * 2, true), 16384);
+  const final = new DataView(await chunks[0].blob.arrayBuffer());
+  assert.equal(final.getInt16(44 + 63999 * 2, true), -16384);
+});
 
 test('capture retains a three-second guard while every source sample contributes once', async () => {
   const chunks = [];

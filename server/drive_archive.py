@@ -25,6 +25,7 @@ from .drive_storage import (
     DriveIntegrityError,
     DriveNotFoundError,
     DriveStorageError,
+    DriveStorageQuota,
     DriveUploadSessionExpired,
     GoogleDriveStorage,
     UploadCheckpoint,
@@ -40,6 +41,8 @@ _ROOT_FOLDER_NAME = "STT 수업 녹음"
 _FOLDER_SCHEMA = "stt-archive-folder-v1"
 _FOLDER_LAYOUT_VERSION = 1
 _UPLOAD_SESSION_EXPIRY_GRACE_SECONDS = 8 * 24 * 60 * 60
+_HEALTH_REFRESH_SECONDS = 300.0
+_HEALTH_MIN_INTERVAL_SECONDS = 60.0
 _RECOVERABLE_AUTH_ERRORS = (
     "credential_directory",
     "credential_invalid",
@@ -52,11 +55,24 @@ _RECOVERABLE_AUTH_ERRORS = (
     "drive_binding_mismatch",
     "token_refresh_invalid",
     "token_refresh_rejected",
+    "token_reauthorization_required",
 )
 
 
 def _now_text() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _public_time(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except ValueError:
+        return None
 
 
 def _token_path(settings: Settings) -> Path:
@@ -205,6 +221,158 @@ class DriveArchiveManager:
         self.worker_shutdown = threading.Event()
         self.worker_thread: threading.Thread | None = None
         self.deletion_retry: dict[str, tuple[int, float]] = {}
+        self.health_lock = threading.Lock()
+        self.health_wake = threading.Event()
+        self.health_thread: threading.Thread | None = None
+        self.health_refreshing = False
+        self.health_next_attempt = 0.0
+        self.health_next_manual_attempt = 0.0
+        self.health_last_success_monotonic: float | None = None
+        self.health_failures = 0
+        self.health_cache: dict[str, Any] = {
+            "state": "disabled" if not self.enabled else ("unchecked" if self.client else "unconfigured"),
+            "checked_at": None, "last_successful_check_at": None,
+            "reauth_required": False, "quota": None,
+        }
+
+    def admin_snapshot(self) -> dict[str, Any]:
+        """Return local aggregates and a cache; never issue an external request."""
+
+        with self.database.connect() as connection:
+            counts = connection.execute(
+                "SELECT "
+                "COALESCE(SUM(a.state='pending'),0) AS pending_count, "
+                "COALESCE(SUM(a.state='uploading'),0) AS uploading_count, "
+                "COALESCE(SUM(a.state='attention'),0) AS attention_count, "
+                "COALESCE(SUM(a.state='ready'),0) AS ready_count, "
+                "COALESCE(SUM(a.state='ready' AND a.local_deleted=0),0) AS cleanup_pending_count, "
+                "COALESCE(SUM(CASE WHEN a.state!='ready' THEN COALESCE(a.queued_bytes,a.source_bytes,0) "
+                "ELSE 0 END),0) AS pending_bytes, "
+                "COALESCE(SUM(a.state!='ready' AND a.queued_bytes IS NULL AND a.source_bytes IS NULL),0) "
+                "AS pending_bytes_unknown_count, "
+                "MIN(CASE WHEN a.state!='ready' THEN a.queued_at END) AS oldest_pending_at, "
+                "COALESCE(SUM(a.state!='ready' AND a.queued_at IS NULL),0) AS oldest_pending_unknown_count "
+                "FROM recording_archives a JOIN lectures l ON l.id=a.lecture_id WHERE l.deleting=0"
+            ).fetchone()
+            aggregate = dict(counts)
+            aggregate["deleting_count"] = connection.execute(
+                "SELECT COUNT(*) FROM lectures WHERE deleting=1"
+            ).fetchone()[0]
+            row = connection.execute(
+                "SELECT last_verified_upload_at FROM drive_archive_statistics WHERE singleton=1"
+            ).fetchone()
+            aggregate["last_verified_upload_at"] = _public_time(row[0]) if row else None
+            aggregate["oldest_pending_at"] = _public_time(aggregate["oldest_pending_at"])
+        with self.health_lock:
+            cache = dict(self.health_cache)
+            if cache["quota"] is not None:
+                cache["quota"] = dict(cache["quota"])
+            stale = (
+                self.health_last_success_monotonic is None
+                or cache["state"] != "ready"
+                or time.monotonic() - self.health_last_success_monotonic >= _HEALTH_REFRESH_SECONDS
+            )
+            refreshing = self.health_refreshing
+        return {
+            "enabled": self.enabled, "configured": bool(self.enabled and self.client is not None),
+            **cache, "refreshing": refreshing, "stale": stale, "archive": aggregate,
+        }
+
+    def request_refresh(self) -> bool:
+        """Queue at most one refresh; API handlers never wait for Google."""
+
+        with self.health_lock:
+            if (
+                not self.enabled or self.client is None or self.worker_shutdown.is_set()
+                or self.health_refreshing or time.monotonic() < self.health_next_manual_attempt
+            ):
+                return False
+            self.health_refreshing = True
+            self.health_next_manual_attempt = time.monotonic() + _HEALTH_MIN_INTERVAL_SECONDS
+            if self.health_thread is None or not self.health_thread.is_alive():
+                self.health_thread = threading.Thread(
+                    target=self._health_main, name="google-drive-status", daemon=True,
+                )
+                self.health_thread.start()
+            self.health_wake.set()
+            return True
+
+    def _health_main(self) -> None:
+        while not self.worker_shutdown.is_set():
+            with self.health_lock:
+                pending = self.health_refreshing
+                delay = max(0.0, self.health_next_attempt - time.monotonic())
+            if not pending:
+                self.health_wake.wait(min(delay, _HEALTH_REFRESH_SECONDS))
+                self.health_wake.clear()
+                if self.worker_shutdown.is_set():
+                    break
+                with self.health_lock:
+                    if not self.health_refreshing and time.monotonic() >= self.health_next_attempt:
+                        self.health_refreshing = True
+                    pending = self.health_refreshing
+                if not pending:
+                    continue
+            self._refresh_health_once()
+        with self.health_lock:
+            self.health_refreshing = False
+
+    def _refresh_health_once(self) -> None:
+        """Read-only provider operations, outside DB/store/archive operation locks."""
+
+        with self.health_lock:
+            self.health_next_manual_attempt = time.monotonic() + _HEALTH_MIN_INTERVAL_SECONDS
+        state = "ready"
+        quota = None
+        reauth = False
+        try:
+            # Do not call _ensure_folder: a status check must not initialize
+            # remote folders/bindings. Check both sides of the quota request
+            # so an OAuth replacement cannot associate another account's data.
+            identity = self.client.account_identity()
+            if not isinstance(identity, DriveAccountIdentity):
+                raise DriveIntegrityError("drive_binding_invalid", "Drive identity is unavailable.")
+            before_key = self._binding_key(identity)
+            with self.database.connect() as connection:
+                binding = connection.execute(
+                    "SELECT binding_key FROM drive_archive_binding WHERE singleton=1"
+                ).fetchone()
+            if binding is not None and not hmac.compare_digest(binding[0], before_key):
+                raise DriveIntegrityError("drive_binding_mismatch", "Drive account does not match.")
+            result = self.client.storage_quota()
+            if not isinstance(result, DriveStorageQuota):
+                raise DriveIntegrityError("invalid_storage_quota", "Drive storage counts are unavailable.")
+            after_identity = self.client.account_identity()
+            if not isinstance(after_identity, DriveAccountIdentity) or not hmac.compare_digest(
+                before_key, self._binding_key(after_identity)
+            ):
+                raise DriveIntegrityError("drive_binding_mismatch", "Drive account changed during check.")
+            quota = result.to_dict()
+        except Exception as error:
+            if getattr(error, "code", None) == "token_reauthorization_required":
+                state, reauth = "reauth_required", True
+            elif isinstance(error, DriveStorageError) and error.retryable:
+                state = "temporary_error"
+            else:
+                state = "attention"
+        checked = _now_text()
+        with self.health_lock:
+            previous = self.health_cache
+            success = state == "ready"
+            self.health_failures = 0 if success else self.health_failures + 1
+            if success:
+                self.health_last_success_monotonic = time.monotonic()
+            self.health_cache = {
+                "state": state, "checked_at": checked,
+                "last_successful_check_at": checked if success else previous["last_successful_check_at"],
+                "reauth_required": reauth,
+                "quota": quota if success else (previous["quota"] if state == "temporary_error" else None),
+            }
+            self.health_refreshing = False
+            delay = _HEALTH_REFRESH_SECONDS if success else min(
+                _HEALTH_REFRESH_SECONDS, _HEALTH_MIN_INTERVAL_SECONDS * 2**min(self.health_failures - 1, 3)
+            )
+            self.health_next_attempt = time.monotonic() + delay
 
     @contextmanager
     def _exclusive_operation(self):
@@ -248,10 +416,21 @@ class DriveArchiveManager:
         if not self.enabled:
             return False
         object_key = self._object_key(username, lecture_id)
+        # Metadata only: never acquire the RecordingStore lock from a caller's
+        # SQLite transaction. A missing/unsafe file remains explicitly unknown.
+        queued_bytes = None
+        try:
+            details = self.recording_store.path(username, lecture_id).lstat()
+            if stat.S_ISREG(details.st_mode) and 44 <= details.st_size <= 2**53 - 1:
+                queued_bytes = details.st_size
+        except (OSError, ValueError, RecordingCorruptError):
+            pass
+        now = _now_text()
         changed = connection.execute(
             "INSERT OR IGNORE INTO recording_archives"
-            "(lecture_id, state, object_key, updated_at) VALUES (?, 'pending', ?, ?)",
-            (lecture_id, object_key, _now_text()),
+            "(lecture_id, state, object_key, updated_at, queued_at, queued_bytes) "
+            "VALUES (?, 'pending', ?, ?, ?, ?)",
+            (lecture_id, object_key, now, now, queued_bytes),
         ).rowcount
         return changed == 1
 
@@ -361,9 +540,9 @@ class DriveArchiveManager:
                 with self.database.connect() as connection:
                     changed = connection.execute(
                         "INSERT OR IGNORE INTO recording_archives"
-                        "(lecture_id, state, object_key, last_error_code, updated_at) "
-                        "VALUES (?, 'attention', ?, 'local_recording_corrupt', ?)",
-                        (lecture["id"], object_key, _now_text()),
+                        "(lecture_id, state, object_key, last_error_code, updated_at, queued_at) "
+                        "VALUES (?, 'attention', ?, 'local_recording_corrupt', ?, ?)",
+                        (lecture["id"], object_key, _now_text(), _now_text()),
                     ).rowcount
                 attention += int(changed == 1)
                 examined += 1
@@ -1145,13 +1324,14 @@ class DriveArchiveManager:
                     root_folder_id=root_folder_id,
                     user_folder_id=user_folder_id,
                 )
+                verified_at = _now_text()
                 with self.database.connect() as connection:
                     changed = connection.execute(
                         "UPDATE recording_archives SET state = 'ready', drive_file_id = ?, "
                         "source_bytes = ?, source_sha256 = ?, source_md5 = ?, uploaded_bytes = ?, "
                         "folder_layout_version = ?, "
                         "upload_session_uri = NULL, last_error_code = NULL, next_attempt_at = 0, "
-                        "updated_at = ? WHERE lecture_id = ? AND state = 'uploading'",
+                        "verified_at = ?, updated_at = ? WHERE lecture_id = ? AND state = 'uploading'",
                         (
                             metadata.file_id,
                             metadata.size,
@@ -1159,10 +1339,16 @@ class DriveArchiveManager:
                             metadata.md5_checksum,
                             metadata.size,
                             _FOLDER_LAYOUT_VERSION,
-                            _now_text(),
+                            verified_at,
+                            verified_at,
                             row["lecture_id"],
                         ),
                     ).rowcount
+                    if changed == 1:
+                        connection.execute(
+                            "UPDATE drive_archive_statistics SET last_verified_upload_at = ? WHERE singleton=1",
+                            (verified_at,),
+                        )
                 if changed != 1:
                     raise DriveIntegrityError(
                         "archive_state_changed",
@@ -1470,18 +1656,27 @@ class DriveArchiveManager:
                 daemon=True,
             )
             self.worker_thread.start()
+        with self.health_lock:
+            if self.health_thread is None or not self.health_thread.is_alive():
+                self.health_next_manual_attempt = 0.0
+        self.request_refresh()
 
     def request_shutdown(self) -> None:
         self.worker_shutdown.set()
         self.worker_wake.set()
+        self.health_wake.set()
 
     def stop(self, *, timeout: float = 10.0) -> bool:
         self.request_shutdown()
+        deadline = time.monotonic() + max(0.0, timeout)
         with self.worker_lock:
             worker = self.worker_thread
-        if worker and worker.is_alive():
-            worker.join(timeout=max(0.0, timeout))
-        return not worker or not worker.is_alive()
+        with self.health_lock:
+            health = self.health_thread
+        for thread in (worker, health):
+            if thread and thread.is_alive():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        return all(thread is None or not thread.is_alive() for thread in (worker, health))
 
 
 def _manager(settings: Settings) -> DriveArchiveManager:

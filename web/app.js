@@ -1,4 +1,7 @@
 import { MicrophoneCapture } from './audio.js';
+import { renderDriveStatus } from './admin-storage.js';
+import { renderMaintenanceStatus } from './admin-maintenance.js';
+import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';
 import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';
 import { liveCoordination } from './live-coordination.js';
 import { TabAuthSessionStore } from './auth-session.js';
@@ -25,6 +28,8 @@ let liveQueue = null, liveQueueReady = null, liveQueueAvailable = false;
 let liveQueueRecoveryPromise = null;
 let liveQueueWarning = '', liveQueueBytes = 0, liveQueuePersisting = 0;
 const recoveryFinalizationRequired = new Set();
+// PCM Blobs remain in IndexedDB; this map only holds small UI metadata.
+const localPcmSnapshots = new Map();
 const manualRetryApprovedIds = new Set();
 let liveCoordinationWarning = '';
 let volatilePendingWarning = '';
@@ -58,6 +63,10 @@ let transcriptRenderState = {scope:'',rows:new Map()};
 let micProviderPreference = null;
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30000;
+const STORAGE_RETRY_BASE_MS = 5000;
+const STORAGE_RETRY_MAX_MS = 60000;
+const RAM_AUDIO_WARNING_BYTES = 16 * 1024 * 1024;
+const RAM_AUDIO_WARNING_SECONDS = 300;
 const MAX_RECORDING_FINALIZE_CONTENTION_RETRIES = 8;
 const RETRYABLE_UPLOAD_STATUSES = new Set([408, 425, 429]);
 const PERMANENT_UPLOAD_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 424, 507]);
@@ -141,6 +150,235 @@ function setLiveQueueWarning(error) {
   updateControls();
 }
 
+function storageSessionIsCurrent(session, server = apiUrl) {
+  return !!session && liveSessions.get(session.id) === session && session.owner === user
+    && !session.discardAudio && server === apiUrl;
+}
+
+function volatileAudioStats(owner = user) {
+  const stats = {count:0,bytes:0,seconds:0};
+  const coveredThrough = new Map();
+  for (const item of pending) {
+    if (item.owner !== owner) continue;
+    const end = Math.round(((Number(item.startSeconds) || 0) + (Number(item.durationSeconds) || 0)) * 16000);
+    coveredThrough.set(item.captureId,Math.max(coveredThrough.get(item.captureId) || 0,end));
+    if (item.durable || item.serverConfirmed) continue;
+    stats.count += 1;
+    stats.bytes += item.blob instanceof Blob ? item.blob.size : Math.max(0,Number(item.byteLength) || 0);
+    stats.seconds += Math.max(0,(Number(item.durationSeconds) || 0) - (Number(item.overlapSeconds) || 0));
+  }
+  for (const session of liveSessions.values()) {
+    const snapshot = session.latestSnapshot;
+    if (session.owner !== owner || session.discardAudio || session.finalPersisted || !snapshot
+        || snapshot.sequence < (session.durableNextSequence || 0)) continue;
+    const stored = localPcmSnapshots.get(session.id);
+    const storedEnd = stored?.owner === owner ? stored.startSamples + stored.durationSamples : 0;
+    const start = Math.max(snapshot.startSamples + snapshot.overlapSamples,storedEnd,
+      coveredThrough.get(session.id) || 0);
+    const fresh = Math.max(0,snapshot.startSamples + snapshot.durationSamples - start);
+    if (!fresh) continue;
+    stats.count += 1;
+    stats.bytes += snapshot.blob instanceof Blob ? snapshot.blob.size : fresh * 2 + 44;
+    stats.seconds += fresh / 16000;
+  }
+  return stats;
+}
+
+function cancelStorageRetry(session) {
+  if (session?.storageRetryTimer !== undefined) clearTimeout(session.storageRetryTimer);
+  if (session) session.storageRetryTimer = null;
+}
+
+function scheduleStorageRecovery(session) {
+  if (!storageSessionIsCurrent(session) || !session.storageFailed || session.storageRepairUnsafe
+      || session.storageRetryTimer != null) return;
+  const server = apiUrl;
+  const attempt = Math.min(4,session.storageRetryAttempt || 0);
+  const delay = Math.min(STORAGE_RETRY_MAX_MS,
+    (session.storageErrorCode === 'live_queue_quota' ? 30000 : STORAGE_RETRY_BASE_MS) * (2 ** attempt));
+  session.storageRetryAttempt = attempt + 1;
+  session.storageRetryTimer = setTimeout(() => {
+    session.storageRetryTimer = null;
+    if (storageSessionIsCurrent(session,server)) void recoverSessionStorage(session);
+  },delay);
+}
+
+function noteStorageFailure(session, error) {
+  session.storageFailed = true;
+  session.storageErrorCode = error?.code || '';
+  session.storageRepairUnsafe = ['live_queue_validation','live_queue_corrupt','live_queue_conflict',
+    'live_queue_owner_mismatch'].includes(error?.code);
+  if (storageSessionIsCurrent(session)) {
+    setLiveQueueWarning(error);
+    scheduleStorageRecovery(session);
+  }
+}
+
+function blockUploadUntilStored(chunk) {
+  // No provider request has left this tab. This is distinct from an ambiguous
+  // CLOVA response and must never grant approval to replay an inflight request.
+  chunk.storageBlocked = true;
+  chunk.storageBlockMessage = '음성을 기기에 안전하게 저장하지 못해 전송을 보류했어요. 공간을 확보한 뒤 임시 저장을 다시 시도해 주세요.';
+  sendError = chunk.storageBlockMessage;
+  scheduleStorageRecovery(liveSessions.get(chunk.captureId));
+}
+
+function clearRecoveredStorageBlock(session) {
+  const first = pending[0];
+  if (first?.captureId !== session.id || !first.storageBlocked || !first.durable) return;
+  first.storageBlocked = false;
+  if (sendError === first.storageBlockMessage) sendError = '';
+}
+
+function applyStoredPendingChunk(session, item, stored, server = apiUrl) {
+  if (stored.id !== item.id || stored.owner !== session.owner || stored.captureId !== session.id
+      || stored.asrProvider !== session.asrProvider || stored.sequence !== item.sequence) {
+    const error = new Error('기기에 저장된 음성의 계정·순서가 현재 녹음과 맞지 않습니다.');
+    error.code = 'live_queue_conflict'; throw error;
+  }
+  const wasDurable = item.durable;
+  item.durable = true;
+  item.sessionCreatedAt = stored.sessionCreatedAt;
+  item.byteLength = stored.byteLength;
+  session.durableNextSequence = Math.max(session.durableNextSequence || 0,stored.sequence + 1);
+  if (stored.final) session.finalPersisted = true;
+  if (session.latestSnapshot?.sequence < session.durableNextSequence) session.latestSnapshot = null;
+  if (stored.final && storageSessionIsCurrent(session,server)) localPcmSnapshots.delete(session.id);
+  else if (!stored.final && storageSessionIsCurrent(session,server)) {
+    const retained = Math.min(48000,stored.durationSamples);
+    localPcmSnapshots.set(session.id,{captureId:session.id,owner:session.owner,
+      sequence:stored.sequence + 1,startSamples:stored.startSamples + stored.durationSamples - retained,
+      durationSamples:retained,overlapSamples:retained,byteLength:44 + retained * 2});
+  }
+  if (stored.state === 'inflight' || stored.state === 'blocked') {
+    item.blocked = true;
+    item.inflight = stored.state === 'inflight';
+    if (item.asrProvider === 'clova') item.recoveryOnly = true;
+  }
+  // A successful write is the only point at which the RAM copy can be freed.
+  item.blob = null;
+  if (!wasDurable && storageSessionIsCurrent(session,server)) liveQueueBytes += stored.byteLength;
+}
+
+async function saveLatestPcmSnapshot(session, queue, snapshot = session.latestSnapshot, server = apiUrl) {
+  if (!snapshot || session.finalPersisted || snapshot.sequence < (session.durableNextSequence || 0)) return;
+  // Capture continues while an earlier chunk is being repaired. The newest
+  // snapshot may belong to a chunk whose queued persistence has not run yet.
+  // Keep that single RAM snapshot until its predecessor commits; never submit
+  // it ahead of the durable cursor or turn normal capture progress into a
+  // permanent conflict latch.
+  if (snapshot.sequence > (session.durableNextSequence || 0)) return;
+  const result = await queue.saveSnapshot(session.owner,session.id,snapshot);
+  if (result?.snapshot && storageSessionIsCurrent(session,server)) localPcmSnapshots.set(session.id,result.snapshot);
+  if (session.latestSnapshot === snapshot) session.latestSnapshot = null;
+}
+
+function persistPcmSnapshot(session, snapshot) {
+  const server = apiUrl;
+  if (!storageSessionIsCurrent(session,server) || session.finalPersisted
+      || snapshot.sequence < (session.durableNextSequence || 0)) return Promise.resolve();
+  session.latestSnapshot = snapshot;
+  const previous = session.persistChain || Promise.resolve();
+  const tracked = previous.catch(() => {}).then(async () => {
+    await session.storeReady;
+    if (!storageSessionIsCurrent(session,server) || session.finalPersisted) return;
+    if (session.storageFailed || !session.durable || !liveQueueAvailable) {
+      scheduleStorageRecovery(session);
+      return;
+    }
+    await saveLatestPcmSnapshot(session,liveQueue,snapshot);
+  }).catch(error => {
+    if (storageSessionIsCurrent(session,server) && !session.finalPersisted) noteStorageFailure(session,error);
+  });
+  session.persistChain = tracked;
+  return tracked;
+}
+
+function rememberSettledVolatileChunk(session, chunk, {strict = false} = {}) {
+  if (!session || chunk.durable || (!chunk.serverConfirmed && !(strict && chunk.downloadRequested))) return;
+  session.storageReceipts ||= new Map();
+  session.storageReceipts.set(chunk.id,{
+    value:{...storedChunkInput(chunk),sequence:chunk.sequence},
+    evidence:{serverConfirmed:!!chunk.serverConfirmed,downloadRequested:!!(strict && chunk.downloadRequested)},
+  });
+  // Receipts retain offsets and IDs, never the already saved/downloaded audio.
+  delete session.storageReceipts.get(chunk.id).value.blob;
+  session.storageFailed = true;
+  scheduleStorageRecovery(session);
+}
+
+function recoverSessionStorage(session) {
+  if (!storageSessionIsCurrent(session)) return Promise.resolve(false);
+  if (session.storageRecoveryPromise) return session.storageRecoveryPromise;
+  cancelStorageRetry(session);
+  const server = apiUrl, sessionToken = token;
+  const previous = session.persistChain || Promise.resolve();
+  liveQueuePersisting += 1;
+  let tracked;
+  tracked = previous.catch(() => {}).then(async () => {
+    await session.storeReady;
+    if (!storageSessionIsCurrent(session,server)) return false;
+    const queue = await openLiveQueue();
+    if (!queue) throw new Error('브라우저의 음성 임시 저장소를 아직 열지 못했습니다.');
+    if (!storageSessionIsCurrent(session,server)) return false;
+    const storedSession = await queue.createSession(storedSessionInput(session));
+    if (!storageSessionIsCurrent(session,server)) return false;
+    session.durable = true;
+    session.durableNextSequence = Math.max(session.durableNextSequence || 0,storedSession.nextSequence);
+    const work = [
+      ...Array.from(session.storageReceipts?.values() || [],receipt => ({sequence:receipt.value.sequence,receipt})),
+      ...pending.filter(item => item.captureId === session.id && item.owner === session.owner && !item.durable && !item.locallySkipped)
+        .map(item => ({sequence:item.sequence,item})),
+    ].sort((left,right) => left.sequence - right.sequence);
+    for (const {receipt,item} of work) {
+      if (!storageSessionIsCurrent(session,server)) return false;
+      if (receipt) {
+        await queue.advanceSettledChunk(session.owner,session.id,receipt.value,receipt.evidence);
+        session.storageReceipts.delete(receipt.value.id);
+        session.durableNextSequence = Math.max(session.durableNextSequence,receipt.value.sequence + 1);
+      } else if (pending.includes(item) && !item.durable && !item.locallySkipped) {
+        const stored = await queue.enqueueChunk(session.owner,session.id,storedChunkInput(item));
+        applyStoredPendingChunk(session,item,stored,server);
+      }
+    }
+    if (!storageSessionIsCurrent(session,server)) return false;
+    await saveLatestPcmSnapshot(session,queue);
+    const repairedSession = await queue.getSession(session.owner,session.id);
+    if (repairedSession?.state !== 'completed') await queue.updateSession(session.owner,session.id,{
+      ...(session.lecture ? {lectureCreated:true} : {}),
+      state:pending.some(item => item.captureId === session.id && item.final) ? 'stopped'
+        : session.storageDesiredState || storedSession.state,
+    });
+    session.storageFailed = false; session.storageRepairUnsafe = false;
+    session.storageRetryAttempt = 0; session.storageErrorCode = '';
+    if (![...liveSessions.values()].some(other => other.owner === user && other.storageFailed)) liveQueueWarning = '';
+    await releaseStoppedSessionCaptureLeaseWhenSafe(session);
+    return true;
+  }).catch(error => {
+    noteStorageFailure(session,error);
+    return false;
+  }).finally(() => {
+    liveQueuePersisting = Math.max(0,liveQueuePersisting - 1);
+    if (session.storageRecoveryPromise === tracked) session.storageRecoveryPromise = null;
+    if (!storageSessionIsCurrent(session,server)) return;
+    clearRecoveredStorageBlock(session);
+    scheduleStorageRecovery(session);
+    updateControls();
+    if (token && token === sessionToken && !sendError) void drain();
+  });
+  session.storageRecoveryPromise = tracked;
+  session.persistChain = tracked;
+  return tracked;
+}
+
+function nudgeStorageRecovery() {
+  for (const session of liveSessions.values()) {
+    if (session.owner === user && session.storageFailed && !session.storageRepairUnsafe) {
+      void recoverSessionStorage(session);
+    }
+  }
+}
+
 function noteCoordinationSupport(supported) {
   if (supported === false) {
     liveCoordinationWarning = '이 브라우저는 탭 간 녹음 잠금을 지원하지 않아요. 같은 계정의 실시간 수업은 반드시 한 탭에서만 열어 주세요.';
@@ -154,7 +392,10 @@ function activeCaptureInThisTab(owner = user) {
       || capture.reconnectNeeded === true);
 }
 
-async function runWhenOwnerCaptureIdle(owner, lectureId, work) {
+async function runWhenOwnerCaptureIdle(owner, lectureId, work, {allowSnapshot = false} = {}) {
+  if (allowSnapshot && liveCoordination.supported === false) {
+    throw new Error('이 브라우저에서는 다른 탭의 녹음을 안전하게 확인할 수 없어 마지막 음성을 자동 확정하지 않았어요. 탭 간 잠금을 지원하는 브라우저에서 복구해 주세요.');
+  }
   const result = await liveCoordination.runDestructiveLectureAction(owner,lectureId,async () => {
     // Capture may already be stopped while its final queue is still uploading
     // in another tab. Serialize deletion/finalization with that uploader too,
@@ -169,7 +410,11 @@ async function runWhenOwnerCaptureIdle(owner, lectureId, work) {
       if (!queue) {
         throw new Error('기기의 미전송 음성 상태를 확인할 수 없어 삭제하거나 마무리하지 않았어요. 브라우저 저장소를 확인한 뒤 다시 시도해 주세요.');
       }
-      if (await queue.hasPendingChunks(owner,lectureId)) {
+      const retained = allowSnapshot && typeof queue.getSnapshot === 'function'
+        ? await queue.getSnapshot(owner,lectureId) : null;
+      const queued = retained ? (await queue.recoverOwner(owner)).chunks
+        .some(chunk => chunk.captureId === lectureId) : await queue.hasPendingChunks(owner,lectureId);
+      if (queued) {
         throw new Error('다른 탭이 보관 중인 미전송 음성이 있어 삭제하거나 마무리하지 않았어요. 해당 탭의 전송 또는 실패 음성 처리를 끝내 주세요.');
       }
       return work();
@@ -218,6 +463,7 @@ async function finishRemovedPendingChunk(chunk) {
     volatilePendingWarning = '';
   }
   if (chunk?.final && !pending.some(item => item.captureId === chunk.captureId)) {
+    cancelStorageRetry(session);
     if (session?.durable && liveQueueAvailable) {
       try {
         const cleanup = await liveQueue.deleteSession(session.owner,session.id);
@@ -227,6 +473,7 @@ async function finishRemovedPendingChunk(chunk) {
       }
     }
     liveSessions.delete(chunk.captureId);
+    localPcmSnapshots.delete(chunk.captureId);
     recoveryFinalizationRequired.delete(chunk.captureId);
   }
 }
@@ -271,21 +518,18 @@ async function refreshLiveQueueStats() {
   updateControls();
 }
 
+function storedSessionInput(session) {
+  return {id:session.id,owner:session.owner,title:session.title,language:session.language,
+    source:session.source,asrProvider:session.asrProvider,createdAt:session.createdAt};
+}
+
 async function prepareStoredLiveSession(session) {
   let stored = null, lastError = null;
   for (let attempt = 0; attempt < 4 && !stored; attempt += 1) {
     const queue = await openLiveQueue();
     if (queue) {
       try {
-        stored = await queue.createSession({
-          id:session.id,
-          owner:session.owner,
-          title:session.title,
-          language:session.language,
-          source:session.source,
-          asrProvider:session.asrProvider,
-          createdAt:session.createdAt,
-        });
+        stored = await queue.createSession(storedSessionInput(session));
       } catch (error) {
         lastError = error;
       }
@@ -298,8 +542,7 @@ async function prepareStoredLiveSession(session) {
   }
   if (!stored) {
     session.durable = false;
-    session.storageFailed = true;
-    setLiveQueueWarning(lastError);
+    noteStorageFailure(session,lastError);
     return null;
   }
   session.durable = true;
@@ -329,11 +572,13 @@ function storedChunkInput(chunk) {
 }
 
 function persistPendingChunk(session, item) {
+  const server = apiUrl;
   liveQueuePersisting += 1;
   const previous = session.persistChain || Promise.resolve();
   item.persistPromise = session.persistChain = previous.then(async () => {
     await session.storeReady;
-    if (!liveQueueAvailable || !session.durable || session.storageFailed) return;
+    if (!storageSessionIsCurrent(session,server) || !pending.includes(item) || item.durable || item.locallySkipped
+        || !liveQueueAvailable || !session.durable || session.storageFailed) return;
     let stored = null, lastError = null;
     for (let attempt = 0; attempt < 4 && !stored; attempt += 1) {
       try {
@@ -344,25 +589,22 @@ function persistPendingChunk(session, item) {
       }
     }
     if (!stored) {
-      session.storageFailed = true;
       item.durable = false;
-      setLiveQueueWarning(lastError);
+      noteStorageFailure(session,lastError);
       return;
     }
-    item.durable = true;
-    if (Number.isSafeInteger(item.sequence) && stored.sequence !== item.sequence) {
-      throw new Error('기기에 저장된 음성 순서가 현재 녹음 순서와 맞지 않습니다.');
+    applyStoredPendingChunk(session,item,stored,server);
+    // A snapshot received during repair can be newer than that repair's fixed
+    // work list. Flush it as soon as this queued predecessor reaches disk.
+    // Its failure must not undo the already committed chunk or discard its
+    // only remaining (IndexedDB) copy.
+    if (storageSessionIsCurrent(session,server)) {
+      try { await saveLatestPcmSnapshot(session,liveQueue,undefined,server); }
+      catch (error) { noteStorageFailure(session,error); }
     }
-    item.sequence = stored.sequence;
-    item.sessionCreatedAt = stored.sessionCreatedAt;
-    item.byteLength = stored.byteLength;
-    // IndexedDB now owns the large Blob. Keep only metadata in JS memory.
-    item.blob = null;
-    liveQueueBytes += stored.byteLength;
   }).catch(error => {
-    session.storageFailed = true;
     item.durable = false;
-    setLiveQueueWarning(error);
+    noteStorageFailure(session,error);
   }).finally(() => {
     liveQueuePersisting = Math.max(0,liveQueuePersisting - 1);
     updateControls();
@@ -372,12 +614,13 @@ function persistPendingChunk(session, item) {
 
 function persistLiveSessionState(session, state) {
   if (!session) return Promise.resolve();
+  session.storageDesiredState = state;
   const previous = session.persistChain || Promise.resolve();
   session.persistChain = previous.then(async () => {
     await session.storeReady;
     if (!liveQueueAvailable || !session.durable || session.storageFailed) return;
     await liveQueue.updateSession(session.owner,session.id,{state});
-  }).catch(error => setLiveQueueWarning(error));
+  }).catch(error => noteStorageFailure(session,error));
   return session.persistChain;
 }
 
@@ -398,6 +641,45 @@ async function pendingChunkBlob(chunk) {
 
 async function acknowledgePendingChunk(chunk, { strict = false } = {}) {
   manualRetryApprovedIds.delete(chunk?.id);
+  const session = liveSessions.get(chunk?.captureId);
+  if (strict && session) {
+    const server = apiUrl;
+    const previous = session.persistChain || Promise.resolve();
+    const decision = previous.catch(() => {}).then(async () => {
+      if (!storageSessionIsCurrent(session,server)) throw new Error('계정이나 서버 연결이 바뀌어 음성을 건너뛰지 않았어요.');
+      await settlePendingChunkStorage(chunk,{strict,session});
+      // Keep the decision inside the same chain as repair/chunk writes. A
+      // repair already waiting on this promise must not capture the discarded
+      // WAV in its work list before the caller removes the UI queue entry.
+      chunk.locallySkipped = true;
+    });
+    session.persistChain = decision.catch(() => {});
+    return decision;
+  }
+  if (session) await session.persistChain;
+  return settlePendingChunkStorage(chunk,{strict,session});
+}
+
+async function settlePendingChunkStorage(chunk, { strict = false, session } = {}) {
+  if (strict && chunk && !chunk.durable) {
+    const queue = await openLiveQueue();
+    if (!queue || !session || !chunk.downloadRequested) {
+      throw new Error('WAV를 내려받았더라도 기기의 건너뛰기 기록을 저장하기 전에는 음성을 버리지 않습니다.');
+    }
+    await queue.createSession(storedSessionInput(session));
+    const value = {...storedChunkInput(chunk),sequence:chunk.sequence};
+    delete value.blob;
+    // Persist the user's decision and remove any older PCM journal atomically
+    // before releasing RAM. A crash cannot resurrect a skipped snapshot.
+    await queue.advanceSettledChunk(chunk.owner,chunk.captureId,value,{downloadRequested:true});
+    session.storageReceipts?.delete(chunk.id);
+    session.durableNextSequence = Math.max(session.durableNextSequence || 0,chunk.sequence + 1);
+    if (chunk.final) session.finalPersisted = true;
+    if (session.latestSnapshot?.sequence <= chunk.sequence) session.latestSnapshot = null;
+    if ((localPcmSnapshots.get(chunk.captureId)?.sequence ?? Infinity) <= chunk.sequence) localPcmSnapshots.delete(chunk.captureId);
+    return;
+  }
+  rememberSettledVolatileChunk(session,chunk,{strict});
   if (strict && chunk?.durable && (!chunk.owner
       || (!liveQueueAvailable && !(await openLiveQueue())))) {
     throw new Error('기기에 보관된 음성의 삭제를 확인할 수 없어 건너뛰지 않았어요. 브라우저 저장소를 확인한 뒤 다시 시도해 주세요.');
@@ -514,6 +796,8 @@ async function performDurableLiveAudioRecovery(owner) {
   if (owner !== user) return;
   recoveryFinalizationRequired.clear();
   liveQueueBytes = recovered.stats.bytes;
+  localPcmSnapshots.clear();
+  for (const snapshot of recovered.snapshots || []) localPcmSnapshots.set(snapshot.captureId,snapshot);
   const byId = new Map(recovered.sessions.map(stored => {
     let session = liveSessions.get(stored.id);
     if (!session) {
@@ -597,6 +881,7 @@ async function performDurableLiveAudioRecovery(owner) {
   });
   for (const [id,session] of byId) {
     const sessionChunks = pending.filter(chunk => chunk.captureId === id);
+    const snapshot = localPcmSnapshots.get(id);
     const stillCapturedHere = session === captureSession && !!capture
       && (recording || paused || starting || pausing || resuming || inputUnavailable);
     const recoveredActiveSession = session.recovered && !stillCapturedHere
@@ -604,9 +889,16 @@ async function performDurableLiveAudioRecovery(owner) {
     if (recoveredActiveSession) recoveryFinalizationRequired.add(id);
     if (stillCapturedHere && !sessionChunks.length) continue;
     if (!sessionChunks.length) {
+      if (snapshot && snapshot.durationSamples > snapshot.overlapSamples) {
+        recoveryFinalizationRequired.add(id);
+        if (!session.lecture) void ensureLectureAssigned(session);
+        // A remote finalized flag alone cannot prove this PCM was received.
+        continue;
+      }
       if (session.lecture?.recording_finalized === true) {
         recoveryFinalizationRequired.delete(id);
         liveSessions.delete(id);
+        localPcmSnapshots.delete(id);
         await queue.deleteSession(owner,id).catch(() => {});
         continue;
       }
@@ -615,7 +907,7 @@ async function performDurableLiveAudioRecovery(owner) {
         // new destructive work in this browser but is not persisted in this
         // record, so recovery never guesses that an active row is stale.
         continue;
-      } else {
+      } else if (!snapshot) {
         recoveryFinalizationRequired.delete(id);
         liveSessions.delete(id);
         await queue.deleteSession(owner,id).catch(() => {});
@@ -679,7 +971,7 @@ function nativeDownloadUrl(value, server = apiUrl) {
   }
   return url.href;
 }
-function setServer(value) { apiUrl = normalizeUrl(value); storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl; }
+function setServer(value) { const next = normalizeUrl(value); if (next !== apiUrl) resetRecordingReview(); apiUrl = next; storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl; }
 function clearActiveAuthExpiry() {
   if (authSessionExpiryTimer !== null) clearTimeout(authSessionExpiryTimer);
   authSessionExpiryTimer = null;
@@ -724,6 +1016,7 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
   const {
     anonymous:_anonymous,
     uploaderAlreadyLocked:_uploaderAlreadyLocked,
+    responseType,
     ...requestOptions
   } = options;
   const requestedServer = baseUrl || apiUrl, requestedToken = token;
@@ -753,6 +1046,7 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
   if (requestOptions.body && !(requestOptions.body instanceof Blob)) headers.set('Content-Type', 'application/json');
   try {
     const response = await fetch(baseUrl + path, {...requestOptions, headers, signal:controller.signal, credentials:'omit', cache:'no-store', referrerPolicy:'no-referrer'});
+    if (response.ok && responseType === 'recording-clip') return await readRecordingClip(response);
     const data = response.status === 204 ? null : await response.json().catch(() => null);
     if (!response.ok) {
       let message = typeof data?.detail === 'string' ? data.detail : `요청을 처리하지 못했습니다 (${response.status}).`;
@@ -1145,7 +1439,8 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
   current = null; lectures = []; lectureDateFilter = '';
   sampleSeconds = 0; elapsedActiveMs = 0; elapsedStartedAt = 0; captureWarning = '';
   inputUnavailable = false; inputReconnectNeeded = false; inputUnavailableMessage = '';
-  liveQueueBytes = 0; liveSessions.clear(); recoveryFinalizationRequired.clear(); manualRetryApprovedIds.clear();
+  for (const session of liveSessions.values()) cancelStorageRetry(session);
+  liveQueueBytes = 0; liveSessions.clear(); localPcmSnapshots.clear(); recoveryFinalizationRequired.clear(); manualRetryApprovedIds.clear();
   if (!capture && !draft && !pending.length && !sending) captureSession = null;
   if (!pending.length) { sendError = ''; clearUploadRetry(); }
   $('recording-file').value = '';
@@ -1169,6 +1464,7 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
   renderCurrent(); renderHistory();
 }
 function showLogin(clear = true) {
+  resetRecordingReview();
   const preserveOwner = !!user && hasOwnerLockedWork();
   const retainWorkspaceState = !clear || preserveOwner;
   ++requestGeneration;
@@ -1301,6 +1597,7 @@ async function enterAuthenticatedWorkspace(response, authServer, {notAfter = Inf
     try {
       await refreshLectures();
       await recoverDurableLiveAudio(user);
+      nudgeStorageRecovery();
       await recoverFileImport();
     } catch (error) { notice(errorText(error)); }
     if (!token) return;
@@ -1441,9 +1738,10 @@ async function updateStatus() {
   }
 }
 async function refreshLectures() {
-  const owner = user, sessionToken = token, refreshGeneration = ++lectureRefreshGeneration;
+  const owner = user, sessionToken = token, server = apiUrl, refreshGeneration = ++lectureRefreshGeneration;
   const result = await api('/lectures');
-  if (owner !== user || sessionToken !== token || refreshGeneration !== lectureRefreshGeneration) return;
+  if (owner !== user || sessionToken !== token || server !== apiUrl || refreshGeneration !== lectureRefreshGeneration) return;
+  const previouslyPlayable = canPlayRecording();
   const refreshed = Array.isArray(result) ? result : result.lectures || [];
   const selectedSummary = refreshed.find(lecture => lecture.id === current?.id);
   const captureSummary = refreshed.find(lecture => lecture.id === captureSession?.lecture?.id);
@@ -1455,7 +1753,9 @@ async function refreshLectures() {
       target.recording_storage_state = summary.recording_storage_state;
     }
   }
-  lectures = refreshed; renderHistory(); updateControls();
+  lectures = refreshed; renderHistory();
+  if (previouslyPlayable !== canPlayRecording()) renderCurrent();
+  else updateControls();
 }
 function defaultImportTitle(file) {
   const base = String(file?.name || '').replace(/\.[^.]+$/, '').trim() || `${dateLabel(new Date())} 녹음`;
@@ -2102,6 +2402,8 @@ function resetAdminState() {
   if ($('admin-dialog').open) $('admin-dialog').close();
   if ($('admin-confirm-dialog').open) $('admin-confirm-dialog').close();
   scrubAdminDom();
+  renderDriveStatus(null,{document});
+  renderMaintenanceStatus({document});
 }
 function adminOperationIsCurrent(sequence, owner, sessionToken, server) {
   return sequence === adminSequence && owner === user && sessionToken === token && server === apiUrl;
@@ -2238,6 +2540,10 @@ function renderAdminOverview() {
   $('admin-open').hidden = !adminAuthorized;
   const overview = adminOverview || {};
   const busy = adminLoading || !!adminAction;
+  renderDriveStatus(adminAuthorized ? overview.drive : null,{document,busy,
+    onRefresh:adminAuthorized ? refreshAdminDrive : undefined});
+  renderMaintenanceStatus({document,backup:adminAuthorized ? overview.backup : null,
+    lease:adminAuthorized ? overview.api_address : null});
   $('admin-refresh').disabled = busy;
   $('admin-refresh').textContent = adminLoading ? '새로고침 중…' : '새로고침';
   $('admin-error').hidden = !adminError;
@@ -2327,6 +2633,26 @@ function renderAdminOverview() {
   renderAdminAccounts(overview.accounts);
   renderAdminAudit(overview.recent_audit);
 }
+async function refreshAdminDrive() {
+  if (!adminAuthorized || !token || adminLoading || adminAction) return;
+  const owner = user, sessionToken = token, server = apiUrl, sequence = ++adminSequence;
+  clearAdminRefresh(); adminAction = 'drive'; adminError = ''; renderAdminOverview();
+  try {
+    const result = await api('/admin/drive/refresh',{method:'POST'});
+    if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
+    if (adminOverview) adminOverview.drive = result?.drive;
+    notice(result?.accepted ? 'Google Drive 저장 상태를 확인합니다.' : '이미 확인 중이거나 최근 확인한 상태입니다.');
+  } catch (error) {
+    if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
+    if (error?.status === 403) { resetAdminState(); return; }
+    adminError = errorText(error);
+  } finally {
+    if (adminOperationIsCurrent(sequence,owner,sessionToken,server)) {
+      adminAction = ''; renderAdminOverview(); scheduleAdminRefresh();
+    }
+  }
+}
+
 function scheduleAdminRefresh() {
   clearAdminRefresh();
   if (!adminAuthorized || !$('admin-dialog').open || !token) return;
@@ -2555,6 +2881,160 @@ function startPresence() {
 document.addEventListener('pointerdown',notePresenceInteraction,{passive:true});
 document.addEventListener('keydown',notePresenceInteraction);
 
+let reviewView = {scope:'',query:'',bookmarks:[],loaded:false,loading:false,busy:false,error:'',pending:null,rendered:''};
+let reviewPlayer = null, reviewAbort = null;
+function recordingReviewScope() { return JSON.stringify([user,token,apiUrl,current?.id || '']); }
+function reviewIsCurrent(view) { return reviewView === view && view.scope === recordingReviewScope() && !!token; }
+function canPlayRecording() { return !!(token && current?.recording_finalized && current?.recording_available); }
+function resetRecordingReview() {
+  reviewAbort?.abort(); reviewAbort = null;
+  reviewPlayer?.reset(); reviewPlayer = null;
+  reviewView = {scope:'',query:'',bookmarks:[],loaded:false,loading:false,busy:false,error:'',pending:null,rendered:''};
+  $('transcript-search').value = ''; $('bookmark-label').value = '';
+  $('bookmark-list').replaceChildren(); $('bookmark-state').textContent = '';
+  $('playback-state').textContent = ''; $('review-details').open = false;
+  $('recording-review').hidden = true;
+}
+function renderRecordingReview() {
+  const scope = recordingReviewScope();
+  if (reviewView.scope !== scope) { resetRecordingReview(); reviewView.scope = scope; }
+  const view = reviewView;
+  $('recording-review').hidden = !(user && token && current);
+  const playable = canPlayRecording();
+  if (!playable && reviewPlayer) {
+    const player = reviewPlayer; reviewPlayer = null; player.reset();
+  }
+  $('playback-start').disabled = !playable;
+  $('playback-previous').disabled = !playable || !reviewPlayer?.clip || reviewPlayer.clip.startSeconds <= 0;
+  const end = reviewPlayer?.clip ? reviewPlayer.clip.startSeconds + reviewPlayer.clip.durationSeconds : 0;
+  $('playback-next').disabled = !playable || !reviewPlayer?.clip || reviewPlayer.clip.durationSeconds < 60
+    || (Number(current?.recording_seconds) > 0 && end >= Number(current.recording_seconds));
+  if (!reviewPlayer) $('playback-state').textContent = playable
+    ? '문장 시각을 누르거나 처음부터 재생해 주세요. 한 번에 최대 60초를 불러옵니다.'
+    : '녹음 WAV를 마무리한 뒤 구간을 재생할 수 있어요.';
+  $('bookmark-add').disabled = !(user && token && current) || view.busy || view.loading;
+  $('bookmark-add').textContent = view.pending ? '★ 같은 책갈피 저장 재시도'
+    : capture && current?.id === activeCaptureLectureId() ? '★ 녹음 현재 위치에 책갈피'
+      : reviewPlayer?.clip ? '★ 재생 현재 위치에 책갈피' : '★ 수업 시작에 책갈피';
+  $('bookmark-refresh').disabled = !(user && token && current) || view.busy || view.loading;
+  $('bookmark-state').textContent = view.error || (view.busy ? '책갈피 저장 중…' : view.loading ? '책갈피를 불러오는 중…'
+    : view.loaded ? `${view.bookmarks.length}개 책갈피` : '복습 도구를 열면 책갈피를 불러옵니다.');
+  const signature = JSON.stringify([view.bookmarks,view.busy,playable]);
+  if (view.rendered === signature) return;
+  view.rendered = signature;
+  const target = $('bookmark-list'); target.replaceChildren();
+  for (const bookmark of view.bookmarks) {
+    const row = document.createElement('div'); row.className = 'bookmark-row';
+    const play = document.createElement('button'); play.className = 'secondary-button'; play.type = 'button';
+    play.textContent = fmt(bookmark.start_seconds); play.disabled = !playable;
+    play.setAttribute('aria-label',`${fmt(bookmark.start_seconds)} 책갈피부터 재생`);
+    play.onclick = () => { if (reviewIsCurrent(view)) void playRecordingClip(bookmark.start_seconds); };
+    const label = document.createElement('span'); label.textContent = bookmark.label || '책갈피';
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'secondary-button';
+    remove.textContent = '삭제'; remove.disabled = view.busy;
+    remove.setAttribute('aria-label',`${fmt(bookmark.start_seconds)} 책갈피 삭제`);
+    remove.onclick = () => { if (reviewIsCurrent(view)) void deleteBookmark(bookmark.id); };
+    row.append(play,label,remove); target.append(row);
+  }
+}
+function validBookmark(value) {
+  return value && typeof value.id === 'string' && /^[0-9a-f-]{36}$/i.test(value.id)
+    && typeof value.start_seconds === 'number' && Number.isFinite(value.start_seconds)
+    && value.start_seconds >= 0 && value.start_seconds <= 14400
+    && typeof value.label === 'string' && value.label.length <= 120;
+}
+async function loadBookmarks() {
+  const view = reviewView;
+  if (!reviewIsCurrent(view) || !current || view.busy || view.loading) return;
+  const lectureId = current.id, controller = new AbortController(); reviewAbort = controller;
+  view.loading = true; view.error = ''; renderRecordingReview();
+  try {
+    const data = await api(`/lectures/${lectureId}/bookmarks`,{signal:controller.signal});
+    if (!reviewIsCurrent(view)) return;
+    if (!Array.isArray(data?.bookmarks) || data.bookmarks.length > 500 || !data.bookmarks.every(validBookmark)) {
+      throw new Error('책갈피 응답을 확인하지 못했습니다.');
+    }
+    view.bookmarks = data.bookmarks.slice().sort((a,b)=>a.start_seconds - b.start_seconds || a.id.localeCompare(b.id));
+    view.loaded = true;
+    if (view.pending && view.bookmarks.some(item => item.id === view.pending.id)) view.pending = null;
+  } catch (error) { if (reviewIsCurrent(view)) view.error = errorText(error); }
+  finally {
+    if (reviewAbort === controller) reviewAbort = null;
+    if (reviewIsCurrent(view)) { view.loading = false; renderRecordingReview(); }
+  }
+}
+async function addBookmark() {
+  const view = reviewView;
+  if (!reviewIsCurrent(view) || !current || view.busy || view.loading) return;
+  const lectureId = current.id;
+  // Keep this UUID and time on an ambiguous POST failure. A retry must refer to
+  // the SAME bookmark even if the microphone/playhead has since moved.
+  if (!view.pending) {
+    const livePosition = capture && lectureId === activeCaptureLectureId() ? capture.capturedSeconds : null;
+    const seconds = Number.isFinite(livePosition) ? livePosition : reviewPlayer?.positionSeconds ?? 0;
+    view.pending = {id:crypto.randomUUID(),start_seconds:Math.max(0,Math.min(14400,seconds)),label:$('bookmark-label').value.trim().slice(0,120)};
+  }
+  const controller = new AbortController(); reviewAbort = controller;
+  view.busy = true; view.error = ''; renderRecordingReview();
+  try {
+    const data = await api(`/lectures/${lectureId}/bookmarks`,{method:'POST',body:JSON.stringify(view.pending),signal:controller.signal});
+    if (!reviewIsCurrent(view)) return;
+    if (!validBookmark(data?.bookmark) || data.bookmark.id !== view.pending.id) throw new Error('책갈피 저장 결과를 확인하지 못했습니다. 새로고침하거나 같은 요청을 재시도해 주세요.');
+    view.bookmarks = [...view.bookmarks.filter(item => item.id !== data.bookmark.id),data.bookmark]
+      .sort((a,b)=>a.start_seconds - b.start_seconds || a.id.localeCompare(b.id));
+    view.pending = null; $('bookmark-label').value = '';
+  } catch (error) { if (reviewIsCurrent(view)) view.error = errorText(error); }
+  finally {
+    if (reviewAbort === controller) reviewAbort = null;
+    if (reviewIsCurrent(view)) { view.busy = false; renderRecordingReview(); }
+  }
+}
+async function deleteBookmark(id) {
+  const view = reviewView;
+  if (!reviewIsCurrent(view) || !current || view.busy || view.loading || !view.bookmarks.some(item=>item.id === id)) return;
+  const controller = new AbortController(); reviewAbort = controller;
+  view.busy = true; view.error = ''; renderRecordingReview();
+  try {
+    await api(`/lectures/${current.id}/bookmarks/${encodeURIComponent(id)}`,{method:'DELETE',signal:controller.signal});
+    if (reviewIsCurrent(view)) view.bookmarks = view.bookmarks.filter(item=>item.id !== id);
+  } catch (error) {
+    if (reviewIsCurrent(view)) {
+      if (error.status === 404) view.bookmarks = view.bookmarks.filter(item=>item.id !== id);
+      else view.error = errorText(error);
+    }
+  } finally {
+    if (reviewAbort === controller) reviewAbort = null;
+    if (reviewIsCurrent(view)) { view.busy = false; renderRecordingReview(); }
+  }
+}
+async function playRecordingClip(start) {
+  if (!canPlayRecording()) return;
+  const view = reviewView, lectureId = current.id;
+  $('review-details').open = true;
+  if (!reviewPlayer) reviewPlayer = new RecordingClipPlayer({
+    audio:$('recording-player'),url:URL,
+    fetchClip:async (seconds,signal) => {
+      if (!reviewIsCurrent(view)) throw connectionChangedBeforeRequestError();
+      return api(`/lectures/${lectureId}/recording-clip?start=${seconds}&duration=60`,{signal,responseType:'recording-clip'},45000);
+    },
+    onState:state => {
+      if (!reviewIsCurrent(view)) return;
+      $('playback-state').textContent = state.state === 'loading' ? '녹음 구간을 불러오는 중…'
+        : state.state === 'error' ? state.error : state.clip
+          ? `${fmt(state.clip.startSeconds)}–${fmt(state.clip.startSeconds + state.clip.durationSeconds)}${state.manualPlay ? ' · 재생 버튼을 눌러 주세요.' : state.state === 'ended' ? ' · 구간 재생 완료' : ''}` : '';
+      renderRecordingReview();
+    },
+  });
+  await reviewPlayer.play(start);
+}
+$('transcript-search').oninput = () => { reviewView.query = $('transcript-search').value.slice(0,120); renderCurrent(); };
+$('review-details').ontoggle = () => { if ($('review-details').open && !reviewView.loaded) void loadBookmarks(); };
+$('bookmark-refresh').onclick = () => void loadBookmarks();
+$('bookmark-add').onclick = () => void addBookmark();
+$('playback-start').onclick = () => void playRecordingClip(0);
+$('playback-previous').onclick = () => { if (reviewPlayer?.clip) void playRecordingClip(Math.max(0,reviewPlayer.clip.startSeconds - 60)); };
+$('playback-next').onclick = () => { if (reviewPlayer?.clip) void playRecordingClip(reviewPlayer.clip.startSeconds + reviewPlayer.clip.durationSeconds); };
+
 function renderTranscriptSegments(transcript, segments, scope) {
   if (transcriptRenderState.scope !== scope || !segments.length) {
     transcript.replaceChildren();
@@ -2590,6 +3070,16 @@ function renderTranscriptSegments(transcript, segments, scope) {
       entry.textValue = text;
     }
     const time = timed ? fmt(segment.start) : null;
+    if (entry.time) {
+      const playable = canPlayRecording();
+      entry.time.setAttribute('role',playable ? 'button' : 'text');
+      entry.time.tabIndex = playable ? 0 : -1;
+      entry.time.setAttribute('aria-label',playable ? `${time}부터 녹음 재생` : time);
+      entry.time.onclick = playable ? () => void playRecordingClip(Number(segment.start)) : null;
+      entry.time.onkeydown = playable ? event => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void playRecordingClip(Number(segment.start)); }
+      } : null;
+    }
     if (entry.timeValue !== time) {
       entry.time.textContent = time;
       entry.timeValue = time;
@@ -2921,7 +3411,9 @@ function renderCurrent() {
   renderCorrection();
   renderSummary();
   renderTranslation();
-  const segments = displayedTranscriptSegments();
+  renderRecordingReview();
+  const allSegments = displayedTranscriptSegments();
+  const segments = filterTranscript(allSegments,reviewView.query);
   const transcript = $('transcript');
   const transcriptVersion = correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw';
   const transcriptScope = JSON.stringify([user,apiUrl,lectureId,current?.asr_provider || 'qwen',transcriptVersion]);
@@ -2930,14 +3422,14 @@ function renderCurrent() {
     const activeCaptureView = hasLiveCaptureSession() && current?.id === activeCaptureLectureId();
     const empty = document.createElement('div'); empty.className = 'empty-note';
     const mark = document.createElement('span'); mark.className = 'empty-symbol'; mark.ariaHidden = 'true'; mark.textContent = '≋';
-    const heading = document.createElement('h3'); heading.textContent = activeCaptureView ? '첫 문장을 기다리고 있어요.' : current ? '아직 받아쓴 내용이 없어요.' : '첫 문장을 기다리고 있어요.';
+    const heading = document.createElement('h3'); heading.textContent = reviewView.query ? '일치하는 문장이 없어요.' : activeCaptureView ? '첫 문장을 기다리고 있어요.' : current ? '아직 받아쓴 내용이 없어요.' : '첫 문장을 기다리고 있어요.';
     const text = document.createElement('p'); text.textContent = activeCaptureView && paused
       ? '재개하면 같은 수업에 이어서 기록해요.'
       : activeCaptureView ? '목소리가 들어오면 이곳에 글이 나타나요.'
         : current ? '이 수업에는 표시할 받아쓰기 문장이 없어요.' : '수업 이름을 적고 받아쓰기를 시작해 보세요.';
     empty.append(mark,heading,text); transcript.append(empty);
   }
-  $('segment-count').textContent = segments.length;
+  $('segment-count').textContent = reviewView.query ? `${segments.length} / ${allSegments.length}` : segments.length;
   $('transcript-title').textContent = correctionView === 'corrected' && correctionIsReady() ? 'AI 후보정본' : '받아쓴 원문';
   updateControls();
 }
@@ -3072,8 +3564,10 @@ function updateControls() {
   $('lecture-date').disabled = historyNavigationBusy();
   $('export-format').disabled = noteToolsBusy || !hasTranscript;
   $('download').disabled = noteToolsBusy || !hasTranscript;
-  $('recording-download').disabled = noteToolsBusy || !current?.recording_available;
+  const recoverablePcm = !!current && localPcmSnapshots.has(current.id);
+  $('recording-download').disabled = noteToolsBusy || (!current?.recording_available && !recoverablePcm);
   $('recording-download').textContent = !current ? '↓ 녹음 WAV'
+    : recoverablePcm && !current.recording_finalized ? '기기 음성 복구 · WAV 마무리'
     : !current.recording_available ? '저장된 녹음 없음'
       : current.recording_finalized ? '↓ 녹음 WAV' : '녹음 WAV 마무리';
   $('delete-lecture').disabled = noteToolsBusy || correctionLoading || correctionStarting || !current;
@@ -3109,11 +3603,17 @@ function updateControls() {
       : recording ? (system ? '선택한 탭이나 화면을 재생해 주세요. 화면 영상은 전송하지 않아요.' : clova ? '마이크 음성을 이 서버를 거쳐 운영자가 설정한 NAVER Cloud CLOVA Speech로 보내 받아씁니다.' : '서버가 늦어도 음성을 이 기기에 보관하며 녹음을 계속합니다.')
         : current ? '새 수업을 시작하거나 기록을 내려받을 수 있어요.' : system ? '시작한 뒤 재생할 탭·화면을 고르고 오디오 공유를 켜세요.' : clova ? '사이트 운영자가 설정한 CLOVA Speech로 마이크 음성을 받아써요.' : '약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.';
   const localQueueSize = liveQueueBytes > 0 ? ` · ${bytesLabel(liveQueueBytes)}` : '';
+  const volatile = volatileAudioStats();
+  const volatileFailed = volatile.count > 0 && [...liveSessions.values()]
+    .some(session => session.owner === user && session.storageFailed);
+  const volatileDetail = volatile.count
+    ? `메모리에만 ${fmt(volatile.seconds)} · ${bytesLabel(volatile.bytes)}${volatileFailed ? '' : ' · 기기에 저장 중'}` : '';
   $('save-state').textContent = retryMessage ? `${queued}개 음성${localQueueSize} · 기기에 보관하고 재전송 대기`
     : queued ? `${queued}개 음성${localQueueSize} · 기기에 임시 보관`
       : liveQueuePersisting ? '방금 받은 음성을 기기에 안전하게 보관 중'
         : recoveryFinalizationRequired.size ? `${recoveryFinalizationRequired.size}개 수업 · 마지막 문장 마무리 확인 필요`
         : captureWarning ? '마지막 오디오 일부 누락 가능 · 받은 내용만 저장됨' : recordingStorageLabel(current);
+  if (volatileDetail) $('save-state').textContent += ` · ${volatileDetail}`;
   $('processing').hidden = !recording && !starting && !pausing && !resuming && !inputUnavailable && !queued && !sending;
   $('processing-text').textContent = sendError ? '음성은 계속 보관 중입니다. 안내를 확인해 전송을 이어 주세요.'
     : inputUnavailable ? '서버 전송과 별개로 오디오 입력 복구를 기다리고 있어요…'
@@ -3125,10 +3625,14 @@ function updateControls() {
     || !!volatilePendingWarning
     || (!!liveQueueWarning && (liveSession || queued || liveQueuePersisting));
   $('queue-warning').hidden = !showQueueWarning;
-  $('queue-message').textContent = [sendError ? `${sendError} 이미 받은 음성은 기기에 보관되어 있습니다.` : '',recoveryWarning,liveQueueWarning,liveCoordinationWarning,volatilePendingWarning].filter(Boolean).join(' ');
+  const ramWarning = volatileFailed ? `${volatileDetail}. 이 음성은 아직 안전한 임시 저장을 확인하지 못했어요. 탭을 닫거나 새로고침하면 잃을 수 있어요.`
+    + (volatile.bytes >= RAM_AUDIO_WARNING_BYTES || volatile.seconds >= RAM_AUDIO_WARNING_SECONDS
+      ? ' 메모리에 남은 음성이 많이 쌓였습니다. 계속 녹음하면 탭이 종료될 위험이 있으니 직접 일시정지하고 공간을 확보하거나 실패 WAV를 내려받아 주세요.' : '') : '';
+  $('queue-message').textContent = [sendError ? `${sendError} 이미 받은 음성은 기기에 보관되어 있습니다.` : '',recoveryWarning,liveQueueWarning,ramWarning,liveCoordinationWarning,volatilePendingWarning].filter(Boolean).join(' ');
   $('retry').hidden = !sendError;
   $('retry').disabled = !sendError || sending || starting || pausing || resuming || stopping;
-  $('retry').textContent = sendError && pending[0]?.asrProvider === 'clova' ? '위험 이해 · 수동 재전송' : '다시 전송';
+  $('retry').textContent = pending[0]?.storageBlocked ? '임시 저장 다시 시도'
+    : sendError && pending[0]?.asrProvider === 'clova' ? '위험 이해 · 수동 재전송' : '다시 전송';
   $('save-failed').hidden = !sendError || !pending.length;
   $('save-failed').disabled = sending || starting || pausing || resuming || stopping || !pending.length;
   $('skip-failed').hidden = !sendError || !pending[0]?.downloadRequested;
@@ -3370,6 +3874,8 @@ async function startRecording() {
   const microphone = new MicrophoneCapture({
     source:session.source,
     onChunk:queue,
+    onSnapshot:snapshot => persistPcmSnapshot(session,snapshot),
+    onSnapshotError:error => { if (storageSessionIsCurrent(session) && !session.finalPersisted) noteStorageFailure(session,error); },
     onLevel:level => { $('mic-level').style.width = `${Math.min(100,Math.max(0,level) * 180)}%`; },
     onInputUnavailable:handleInputUnavailable,
     onInputRecovered:handleInputRecovered,
@@ -3892,6 +4398,12 @@ async function drain() {
         sendError = '기기에 보관된 음성과 수업의 인식 설정을 안전하게 확인하지 못해 전송을 보류했어요.';
         break;
       }
+      await chunk.persistPromise;
+      if (!token || user !== drainOwner || pending[0] !== chunk) break;
+      if (!chunk.durable) {
+        blockUploadUntilStored(chunk);
+        break;
+      }
       // Recheck even a previously ready item. A lecture list refresh or a
       // recovered in-memory flag must never route locally captured Qwen audio
       // into a CLOVA lecture (or the reverse).
@@ -4050,6 +4562,12 @@ async function drain() {
 }
 async function retryPending({manual = true} = {}) {
   if (sending || starting || pausing || resuming || stopping) return;
+  if (pending[0]?.storageBlocked) {
+    const session = liveSessions.get(pending[0].captureId);
+    if (session) await recoverSessionStorage(session);
+    if (!sendError) void drain();
+    return;
+  }
   clearUploadRetry(); sendError = '';
   if (manual && pending[0]) manualRetryApprovedIds.add(pending[0].id);
   if (draft) {
@@ -4202,17 +4720,22 @@ async function skipFailedChunk() {
   if (!sendError || sending || starting || pausing || resuming || stopping || !pending[0]?.downloadRequested) return;
   const skipped = pending[0];
   const owner = user;
+  const server = apiUrl, sessionToken = token, generation = requestGeneration;
+  const operationIsCurrent = () => owner === user && server === apiUrl
+    && sessionToken === token && generation === requestGeneration;
   const unresolvedError = sendError;
   sending = true; updateControls();
   try {
     const coordinated = await liveCoordination.runUploader(owner,async () => {
-      if (owner !== user || pending[0]?.id !== skipped.id) return false;
+      if (!operationIsCurrent() || pending[0] !== skipped) return false;
       await acknowledgePendingChunk(skipped,{strict:true});
-      const skippedIndex = pending.findIndex(item => item.id === skipped.id);
+      const skippedIndex = pending.indexOf(skipped);
       if (skippedIndex >= 0) pending.splice(skippedIndex,1);
+      if (!operationIsCurrent()) return false;
       await finishRemovedPendingChunk(skipped);
-      return true;
+      return operationIsCurrent();
     });
+    if (!operationIsCurrent()) return;
     noteCoordinationSupport(coordinated.supported);
     if (!coordinated.value) return;
     clearUploadRetry();
@@ -4221,6 +4744,7 @@ async function skipFailedChunk() {
       && !draft.lecture && captureSession?.id === skipped.captureId && !!capture;
     sendError = activeUnassignedCapture ? unresolvedError : '';
     const discardedDraft = !hasRemaining && await discardEmptyUnassignedDraft(skipped.captureId);
+    if (!operationIsCurrent()) return;
     notice(activeUnassignedCapture
       ? '파일 저장을 확인한 음성 조각을 건너뛰었어요. 녹음은 계속되며, 수업 연결을 다시 시도하거나 다음 실패 음성을 확인해 주세요.'
       : discardedDraft
@@ -4229,10 +4753,12 @@ async function skipFailedChunk() {
     renderCurrent();
     if (!hasRemaining && !activeUnassignedCapture && !discardedDraft) void finalizeSkippedRecording(skipped.lectureId);
   } catch (error) {
-    notice(`음성 조각을 건너뛰지 못했습니다. ${errorText(error)}`);
+    if (operationIsCurrent()) notice(`음성 조각을 건너뛰지 못했습니다. ${errorText(error)}`);
   } finally {
-    sending = false; updateControls();
-    if (pending.length && token && !sendError && retryTimer === null) void drain();
+    if (operationIsCurrent()) {
+      sending = false; updateControls();
+      if (pending.length && token && !sendError && retryTimer === null) void drain();
+    }
   }
 }
 $('skip-failed').onclick = () => { void skipFailedChunk(); };
@@ -4248,13 +4774,43 @@ $('download').onclick = () => {
   link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
 };
 async function downloadRecording() {
-  if (isBusy() || importIsActive() || importStarting || !current?.recording_available) return;
+  if (isBusy() || importIsActive() || importStarting || !current
+      || (!current.recording_available && !localPcmSnapshots.has(current.id))) return;
   const lectureId = current.id, title = current.title, owner = user, sessionToken = token, server = apiUrl;
   const generation = requestGeneration, sequence = ++noteActionSequence;
   const operationIsCurrent = () => sequence === noteActionSequence && generation === requestGeneration
     && owner === user && sessionToken === token && server === apiUrl && current?.id === lectureId;
   recordingDownloadPending = true; updateControls();
   try {
+    if (localPcmSnapshots.has(lectureId)) {
+      if (current.recording_finalized) throw new Error('서버는 종료됐지만 기기에 별도 음성이 남아 있어요. 보관된 음성을 확인하기 전에는 버리지 않습니다.');
+      const stored = await runWhenOwnerCaptureIdle(owner,lectureId,async () => {
+        if (!operationIsCurrent()) throw connectionChangedBeforeRequestError();
+        const snapshot = await liveQueue.getSnapshot(owner,lectureId);
+        if (!snapshot) return null;
+        return liveQueue.promoteSnapshot(owner,lectureId,{
+          id:crypto.randomUUID(),expectedRevision:snapshot.revision,final:true,
+        });
+      },{allowSnapshot:true});
+      if (!operationIsCurrent()) return;
+      if (stored) {
+        const session = liveSessions.get(lectureId);
+        if (!session || stored.owner !== owner || stored.captureId !== lectureId) throw new Error('복구할 음성의 수업을 다시 확인해 주세요.');
+        const item = {id:stored.id,captureId:lectureId,lectureId,owner,asrProvider:stored.asrProvider,
+          startSeconds:stored.startSamples / 16000,durationSeconds:stored.durationSamples / 16000,
+          overlapSeconds:stored.overlapSamples / 16000,final:true,blob:null,
+          sequence:stored.sequence,sessionCreatedAt:stored.sessionCreatedAt,byteLength:stored.byteLength,
+          durable:true,lectureReady:!!session.lecture,persistPromise:Promise.resolve()};
+        pending.push(item);
+        session.finalPersisted = true; session.latestSnapshot = null;
+        session.nextRuntimeSequence = stored.sequence + 1;
+        localPcmSnapshots.delete(lectureId); liveQueueBytes += stored.byteLength;
+        notice('기기에 남아 있던 마지막 음성을 복구해 전송합니다. 저장이 끝나면 녹음 WAV를 내려받아 주세요.');
+        void drain();
+        return;
+      }
+      localPcmSnapshots.delete(lectureId);
+    }
     if (!current.recording_finalized) {
       const result = await runWhenOwnerCaptureIdle(
         owner,
@@ -4316,6 +4872,7 @@ function finishDeletedLecture(target) {
   scheduledCorrections.delete(target.id);
   recoveryFinalizationRequired.delete(target.id);
   liveSessions.delete(target.id);
+  localPcmSnapshots.delete(target.id);
   if (liveQueueAvailable) void liveQueue.deleteSession(target.owner,target.id).catch(setLiveQueueWarning);
   if (!capture && captureSession?.lecture?.id === target.id) captureSession = null;
   deleteTarget = null;
@@ -4381,9 +4938,11 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden && recording) notice(selectedCaptureSource() === 'system' ? '공유 중인 탭이나 화면을 유지해 주세요. 브라우저가 오디오 공유를 중단할 수 있어요.' : '이 탭과 화면을 유지해 주세요. 기기가 녹음을 중단할 수 있어요.');
   notePresenceStateChange();
   if (!document.hidden) nudgeQueuedUpload();
+  if (!document.hidden) nudgeStorageRecovery();
   if (!document.hidden && adminAuthorized && $('admin-dialog').open && !adminLoading && !adminAction) void loadAdminOverview();
 });
 window.addEventListener('online',nudgeQueuedUpload);
+window.addEventListener('online',nudgeStorageRecovery);
 
 async function init() {
   void openLiveQueue();

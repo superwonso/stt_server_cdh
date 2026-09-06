@@ -4,6 +4,7 @@ export const CHUNK_SECONDS = 15;
 export const OVERLAP_SECONDS = 3;
 export const PAUSE_SECONDS = 0.24;
 export const PAUSE_RMS = 0.006;
+export const PCM_SNAPSHOT_SECONDS = 2;
 const AUTO_RESUME_RETRY_MS = 2000;
 const RECONNECT_DRAIN_TIMEOUT_MS = 350;
 const MIN_UPLOAD_SAMPLES = Math.ceil(PCM_SAMPLE_RATE * 0.05);
@@ -197,6 +198,8 @@ export class MicrophoneCapture {
     onInputUnavailable = () => {},
     onInputRecovered = () => {},
     onReconnectNeeded = () => {},
+    onSnapshot = null,
+    onSnapshotError = () => {},
     source = 'microphone',
   } = {}) {
     if (typeof onChunk !== 'function') throw new TypeError('onChunk 콜백이 필요합니다.');
@@ -204,6 +207,15 @@ export class MicrophoneCapture {
       throw new TypeError('오디오 입력은 microphone 또는 system이어야 합니다.');
     }
     this.onChunk = onChunk;
+    if (onSnapshot !== null && typeof onSnapshot !== 'function') {
+      throw new TypeError('PCM 임시 저장 콜백이 올바르지 않습니다.');
+    }
+    this.onSnapshot = onSnapshot;
+    this.onSnapshotError = onSnapshotError;
+    this._snapshotSequence = 0;
+    this._snapshotAtSamples = 0;
+    this._snapshotInFlight = null;
+    this._snapshotPending = null;
     this.onLevel = onLevel;
     // Kept so older callers do not fail construction. Interruptions no longer
     // invoke it because those callers historically finalized the lecture.
@@ -267,6 +279,9 @@ export class MicrophoneCapture {
     this._hasEmitted = false;
     this._chunk = new Float32Array(PCM_SAMPLE_RATE * CHUNK_SECONDS);
     this._chunkUsed = 0;
+    this._snapshotSequence = 0;
+    this._snapshotAtSamples = 0;
+    this._snapshotPending = null;
     this._installSessionListeners();
     const cancelled = new Promise((_, reject) => {
       this._cancelStart = () => reject(new Error(
@@ -760,10 +775,15 @@ export class MicrophoneCapture {
     // unavailable input may interrupt capture; amplitude never removes PCM.
     let offset = 0;
     while (offset < samples.length) {
-      const count = Math.min(samples.length - offset, this._chunk.length - this._chunkUsed);
+      const untilSnapshot = this.onSnapshot
+        ? Math.max(1, PCM_SAMPLE_RATE * PCM_SNAPSHOT_SECONDS
+          - (this._chunkStartSamples + this._chunkUsed - this._snapshotAtSamples))
+        : samples.length;
+      const count = Math.min(samples.length - offset, this._chunk.length - this._chunkUsed, untilSnapshot);
       this._chunk.set(samples.subarray(offset, offset + count), this._chunkUsed);
       this._chunkUsed += count;
       offset += count;
+      this._queueSnapshot();
       if (this._chunkUsed === this._chunk.length || this._endsInPause()) this._emitChunk();
     }
   }
@@ -791,6 +811,7 @@ export class MicrophoneCapture {
     // final WAV even when no new PCM arrived. This lets the server finalize the
     // last boundary without fabricating timeline duration.
     if (final && fresh === 0 && !this._hasEmitted) return false;
+    this._queueSnapshot(true);
     const count = this._chunkUsed;
     const item = {
       blob: encodeWav(this._chunk.subarray(0, count)),
@@ -812,8 +833,48 @@ export class MicrophoneCapture {
       this._chunkOverlap = retained;
     }
     // The caller owns upload queueing; capture must never wait for the network.
+    this._snapshotSequence += 1;
     this.onChunk(item);
     return true;
+  }
+
+  // A snapshot is local durability only: it never changes ASR boundaries or
+  // emits onChunk. One write plus one replaceable latest Blob bounds memory
+  // even when IndexedDB stalls; callback failures are reported to the caller.
+  _queueSnapshot(force = false) {
+    if (!this.onSnapshot || !this._chunkUsed) return false;
+    const end = this._chunkStartSamples + this._chunkUsed;
+    if (!force && end - this._snapshotAtSamples < PCM_SAMPLE_RATE * PCM_SNAPSHOT_SECONDS) return false;
+    this._snapshotAtSamples = end;
+    const snapshot = {
+      sequence: this._snapshotSequence,
+      startSamples: this._chunkStartSamples,
+      durationSamples: this._chunkUsed,
+      overlapSamples: this._chunkOverlap,
+      blob: encodeWav(this._chunk.subarray(0, this._chunkUsed)),
+    };
+    if (this._snapshotInFlight) this._snapshotPending = snapshot;
+    else this._writeSnapshot(snapshot);
+    return true;
+  }
+
+  _writeSnapshot(snapshot) {
+    this._snapshotInFlight = Promise.resolve();
+    let written;
+    try { written = this.onSnapshot(snapshot); }
+    catch (error) { written = Promise.reject(error); }
+    this._snapshotInFlight = Promise.resolve(written).catch(error => {
+      this._notify(this.onSnapshotError, error);
+    }).finally(() => {
+      this._snapshotInFlight = null;
+      const pending = this._snapshotPending;
+      this._snapshotPending = null;
+      if (pending) this._writeSnapshot(pending);
+    });
+  }
+
+  async flushSnapshots() {
+    while (this._snapshotInFlight) await this._snapshotInFlight;
   }
 
   checkpoint() {
@@ -1074,6 +1135,7 @@ export class MicrophoneCapture {
       }
       if (this._resampler) this._consumePCM(this._resampler.flush());
       this._emitChunk(true);
+      await this.flushSnapshots();
     } finally {
       await this._releaseResources();
       this._resampler = null;

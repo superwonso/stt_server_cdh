@@ -85,6 +85,33 @@ class DriveUploadSessionExpired(DriveStorageError):
     """A resumable upload session expired before it could be completed."""
 
 
+@dataclass(frozen=True)
+class DriveStorageQuota:
+    """Aggregate byte counts only, never a Google account or file locator."""
+
+    limit_bytes: int | None
+    usage_bytes: int
+    drive_bytes: int | None = None
+    trash_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("limit_bytes", "usage_bytes", "drive_bytes", "trash_bytes"):
+            value = getattr(self, name)
+            if value is None and name != "usage_bytes":
+                continue
+            if type(value) is not int or not 0 <= value <= 2**53 - 1:
+                raise DriveProtocolError("invalid_storage_quota", "Drive storage counts are invalid.")
+
+    def to_dict(self) -> dict[str, int | None]:
+        return {
+            "limit_bytes": self.limit_bytes, "usage_bytes": self.usage_bytes,
+            "drive_bytes": self.drive_bytes, "trash_bytes": self.trash_bytes,
+            "remaining_bytes": (
+                None if self.limit_bytes is None else max(0, self.limit_bytes - self.usage_bytes)
+            ),
+        }
+
+
 def _open_private_directory(path: Path) -> int:
     flags = (
         os.O_RDONLY
@@ -584,9 +611,24 @@ class _AuthorizedUserToken:
                 retryable=True,
             ) from None
         try:
+            if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+                raise DriveTransportError(
+                    "token_refresh_unavailable", "Google OAuth is temporarily unavailable.",
+                    retryable=True,
+                )
             if response.status_code != 200:
+                # Only a definitive revoked/expired grant requires renewed
+                # consent. Never reflect the provider's description.
+                try:
+                    payload = _bounded_json(response, max_bytes=_MAX_TOKEN_JSON_BYTES)
+                except DriveProtocolError:
+                    payload = {}
+                if payload.get("error") == "invalid_grant":
+                    raise DriveAuthenticationError(
+                        "token_reauthorization_required", "Google authorization must be renewed."
+                    )
                 raise DriveAuthenticationError(
-                    "token_refresh_rejected", "Google OAuth authorization must be renewed."
+                    "token_refresh_rejected", "Google OAuth authorization could not be refreshed."
                 )
             payload = _bounded_json(response, max_bytes=_MAX_TOKEN_JSON_BYTES)
         finally:
@@ -832,6 +874,31 @@ class GoogleDriveStorage:
         return DriveAccountIdentity(
             permission_id=user.get("permissionId"),
             oauth_client_fingerprint=self._credentials.oauth_client_fingerprint(),
+        )
+
+    def storage_quota(self) -> DriveStorageQuota:
+        """Read Google-wide shared quota under the existing drive.file scope."""
+
+        payload = self._request_json(
+            "GET", f"{DRIVE_API_ROOT}/about",
+            params={"fields": "storageQuota(limit,usage,usageInDrive,usageInDriveTrash)"},
+            expected={200}, operation="storage_quota",
+        )
+        quota = payload.get("storageQuota")
+        if not isinstance(quota, dict):
+            raise DriveProtocolError("invalid_storage_quota", "Drive storage counts are unavailable.")
+
+        def count(name: str, *, required: bool = False) -> int | None:
+            value = quota.get(name)
+            if value is None and not required:
+                return None
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,16}", value):
+                raise DriveProtocolError("invalid_storage_quota", "Drive storage counts are invalid.")
+            return int(value)
+
+        return DriveStorageQuota(
+            limit_bytes=count("limit"), usage_bytes=count("usage", required=True),
+            drive_bytes=count("usageInDrive"), trash_bytes=count("usageInDriveTrash"),
         )
 
     def ensure_folder(
@@ -1588,6 +1655,25 @@ class GoogleDriveStorage:
             raise DriveProtocolError(
                 "unexpected_redirect", "Google Drive returned an unexpected redirect."
             )
+        if status == 403:
+            try:
+                payload = _bounded_json(response, max_bytes=_MAX_TOKEN_JSON_BYTES)
+            except DriveProtocolError:
+                payload = {}
+            detail = payload.get("error")
+            errors = detail.get("errors", []) if isinstance(detail, dict) else []
+            reasons = {
+                item.get("reason") for item in errors[:32]
+                if isinstance(item, dict) and isinstance(item.get("reason"), str)
+            } if isinstance(errors, list) else set()
+            if reasons & {"rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"}:
+                raise DriveTransportError(
+                    "drive_rate_limited", "Google Drive requests are temporarily limited.", retryable=True,
+                )
+            if "storageQuotaExceeded" in reasons:
+                raise DriveStorageError(
+                    "drive_storage_full", "Google storage capacity is exhausted.", retryable=True,
+                )
         if status in {401, 403}:
             raise DriveAuthenticationError(
                 "drive_authorization_rejected", "Google Drive authorization was rejected."

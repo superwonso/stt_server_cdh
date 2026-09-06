@@ -172,6 +172,27 @@ try {
   assert.ok(Math.abs(state.lectures[0].recording_seconds - lastChunk.start_seconds - lastCall.samples/16000) < 0.001);
   note('manual-pause-resume-final-wav-and-queue-recovery',{recordingSeconds:state.lectures[0].recording_seconds,chunks:state.chunks.length});
 
+  await poll(() => page.locator('#playback-start').isEnabled(), 'bounded recording preview ready');
+  await page.locator('#transcript-search').fill('no synthetic sentence matches this');
+  assert.equal(await page.locator('#transcript .segment').count(),0);
+  await page.locator('#transcript-search').fill('Plants');
+  assert.ok(await page.locator('#transcript .segment').count() > 0);
+  await page.locator('#transcript-search').fill('');
+  await page.locator('#transcript time[role="button"]').first().click();
+  await poll(() => page.locator('#recording-player').evaluate(audio=>audio.src.startsWith('blob:') && audio.readyState >= 1), 'real authenticated WAV clip and native audio');
+  assert.ok(await page.locator('#recording-player').evaluate(audio=>audio.duration > 0 && audio.duration <= 60));
+  await page.locator('#recording-player').evaluate(audio=>{ audio.pause(); audio.currentTime = 1; });
+  await poll(() => page.locator('#bookmark-add').isEnabled(),'bookmarks first GET finished');
+  await page.locator('#bookmark-label').fill('Synthetic bookmark');
+  await page.locator('#bookmark-add').click();
+  await poll(async () => (await page.locator('#bookmark-list').textContent()).includes('Synthetic bookmark'),'saved bookmark');
+  await page.locator('#bookmark-refresh').click();
+  await poll(() => page.locator('#bookmark-refresh').isEnabled(),'bookmark refresh completed');
+  assert.ok((await page.locator('#bookmark-list').textContent()).includes('00:01'));
+  await page.locator('#bookmark-list button').last().click();
+  await poll(() => page.locator('#bookmark-list .bookmark-row').count().then(n=>n === 0),'bookmark deletion');
+  note('transcript-search-authenticated-bounded-wav-playback-and-bookmark-roundtrip');
+
   await poll(() => page.locator('#summarize-lecture').isEnabled(), 'summary button after finalized transcript');
   await page.locator('#summarize-lecture').click();
   await poll(async () => (await page.locator('#summary-content').textContent()).includes('식물은 빛'), 'actual HTTP fake summary worker/UI');
@@ -196,6 +217,8 @@ try {
   note('real-summary-translation-jobs-ui-and-markdown-downloads');
   await page.locator('#logout').click();
   await poll(() => page.locator('#auth-screen').isVisible(), 'logout');
+  assert.equal(await page.locator('#recording-player').getAttribute('src'),null);
+  assert.equal(await page.locator('#bookmark-list .bookmark-row').count(),0);
   assert.equal(await page.evaluate(() => sessionStorage.getItem('yeobaek-auth-session-v1')),null);
   await page.locator('#username').fill(metadata.accounts[1]);
   await page.locator('#password').fill(metadata.password);

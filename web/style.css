@@ -1480,6 +1480,19 @@ button {
   box-shadow: var(--shadow);
 }
 
+.recording-review { margin: 1rem 0; padding: 1rem; border: 1px solid var(--line, #deded4); border-radius: 12px; }
+.recording-review summary { cursor: pointer; font-weight: 600; }
+.recording-review p { font-size: .85rem; color: var(--muted, #656d67); }
+.recording-review audio { display: block; width: 100%; margin: .75rem 0; }
+.review-search { display: flex; align-items: center; flex-wrap: wrap; gap: .6rem; margin: .65rem 0; font-size: .85rem; }
+.review-search input { flex: 1; min-width: 160px; border: 1px solid var(--line, #deded4); padding: .55rem; border-radius: 6px; background: transparent; color: inherit; }
+.review-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+#bookmark-list { max-height: 250px; overflow-y: auto; }
+.bookmark-row { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .5rem 0; border-bottom: 1px solid var(--line, #deded4); }
+.bookmark-row button { cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+.segment time[role="button"] { cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.segment time[role="button"]:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+
 .admin-dialog {
   width: min(94vw, 920px);
   max-width: 920px;
@@ -1712,6 +1725,94 @@ button {
 .admin-badge[data-state="paused"] {
   color: var(--danger);
   background: var(--danger-soft);
+}
+
+.admin-drive-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.admin-drive .admin-metric small {
+  margin-top: 7px;
+}
+
+.admin-drive-history {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.admin-drive-history p {
+  margin: 3px 0;
+}
+
+.admin-drive .admin-badge[data-state="stale"],
+.admin-drive .admin-badge[data-state="temporary_error"],
+.admin-drive .admin-badge[data-state="attention"] {
+  color: #6d5723;
+  background: #fff3cf;
+}
+
+.admin-drive .admin-badge[data-state="reauth_required"] {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+@media (max-width: 640px) {
+  .admin-drive-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.admin-maintenance-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.admin-maintenance .admin-metric small {
+  margin-top: 7px;
+}
+
+.admin-maintenance-history {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.admin-maintenance-history p {
+  margin: 3px 0;
+}
+
+.admin-maintenance .admin-badge[data-state="waiting"] {
+  color: var(--forest-700);
+  background: var(--forest-100);
+}
+
+.admin-maintenance .admin-badge[data-state="renewing"],
+.admin-maintenance .admin-badge[data-state="pending"],
+.admin-maintenance .admin-badge[data-state="retrying"],
+.admin-maintenance .admin-badge[data-state="attention"] {
+  color: #6d5723;
+  background: #fff3cf;
+}
+
+.admin-maintenance .admin-badge[data-state="blocked"] {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+@media (max-width: 640px) {
+  .admin-maintenance-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .admin-accounts {

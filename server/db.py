@@ -161,6 +161,15 @@ class Database:
                         REFERENCES chunks(lecture_id, chunk_id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS segments_lecture ON segments(lecture_id, start);
+                CREATE TABLE IF NOT EXISTS lecture_bookmarks (
+                    id TEXT PRIMARY KEY CHECK (length(id) = 36),
+                    lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
+                    start_seconds REAL NOT NULL CHECK (start_seconds >= 0 AND start_seconds <= 14400),
+                    label TEXT NOT NULL CHECK (length(label) <= 120),
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS lecture_bookmarks_time
+                    ON lecture_bookmarks(lecture_id, start_seconds, created_at, id);
                 CREATE TABLE IF NOT EXISTS recording_archives (
                     lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
                     state TEXT NOT NULL CHECK (
@@ -197,6 +206,9 @@ class Database:
                         last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 64
                     ),
                     updated_at TEXT NOT NULL,
+                    queued_at TEXT,
+                    queued_bytes INTEGER CHECK (queued_bytes IS NULL OR queued_bytes >= 44),
+                    verified_at TEXT,
                     CHECK (
                         state != 'ready' OR (
                             drive_file_id IS NOT NULL AND source_bytes IS NOT NULL
@@ -215,6 +227,11 @@ class Database:
                     folder_id TEXT NOT NULL CHECK (length(folder_id) BETWEEN 1 AND 256),
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS drive_archive_statistics (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    last_verified_upload_at TEXT
+                );
+                INSERT OR IGNORE INTO drive_archive_statistics(singleton) VALUES (1);
                 CREATE TABLE IF NOT EXISTS drive_archive_user_folders (
                     username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
                     folder_key TEXT NOT NULL UNIQUE CHECK (
@@ -404,6 +421,15 @@ class Database:
                     "ALTER TABLE recording_archives ADD COLUMN folder_layout_version "
                     "INTEGER NOT NULL DEFAULT 0 CHECK (folder_layout_version BETWEEN 0 AND 1)"
                 )
+            # Old updated_at values include retries and cleanup, not original
+            # queue/verification times. Preserve unknown history as NULL.
+            for name, declaration in (
+                ("queued_at", "TEXT"),
+                ("queued_bytes", "INTEGER CHECK (queued_bytes IS NULL OR queued_bytes >= 44)"),
+                ("verified_at", "TEXT"),
+            ):
+                if name not in archive_columns:
+                    connection.execute(f"ALTER TABLE recording_archives ADD COLUMN {name} {declaration}")
             if schema_version < 4:
                 # Before retained WAV recordings existed, completed text-only
                 # lectures had no lecture-level final flag and all old chunks
@@ -431,5 +457,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 12:
-                connection.execute("PRAGMA user_version = 12")
+            if schema_version < 14:
+                connection.execute("PRAGMA user_version = 14")

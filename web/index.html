@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#315c4c">
   <meta name="referrer" content="no-referrer">
   <meta name="robots" content="noindex, nofollow, noarchive">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://*.trycloudflare.com http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:* http://[::1]:* https://[::1]:*; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://*.trycloudflare.com http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:* http://[::1]:* https://[::1]:*; media-src blob:; object-src 'none'; frame-src 'none'; worker-src 'self'; base-uri 'none'; form-action 'none'">
   <title>여백 · 수업 받아쓰기</title>
   <meta name="description" content="내 서버에 안전하게 저장하는 한국어 수업 받아쓰기">
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
@@ -255,6 +255,27 @@
             </div>
             <span><strong id="segment-count">0</strong>개 문장</span>
           </header>
+          <section id="recording-review" class="recording-review" aria-label="수업 복습 도구" hidden>
+            <label class="review-search">본문 검색 <input id="transcript-search" type="search" maxlength="120" placeholder="현재 수업의 단어나 문장" autocomplete="off"></label>
+            <details id="review-details">
+              <summary>녹음 재생 · 책갈피</summary>
+              <p>완료된 수업의 문장 시각을 누르면 해당 위치부터 최대 60초씩 듣습니다. 마이크 녹음 중에는 이어폰을 사용하세요.</p>
+              <audio id="recording-player" controls preload="none" aria-label="선택한 수업 녹음 구간"></audio>
+              <p id="playback-state" role="status" aria-live="polite">문장 시각을 누르거나 처음부터 들어보세요.</p>
+              <div class="review-actions">
+                <button id="playback-start" class="secondary-button" type="button" disabled>처음부터 듣기</button>
+                <button id="playback-previous" class="secondary-button" type="button" disabled>이전 60초</button>
+                <button id="playback-next" class="secondary-button" type="button" disabled>다음 구간</button>
+              </div>
+              <label class="review-search">책갈피 메모 <input id="bookmark-label" type="text" maxlength="120" placeholder="중요한 부분" autocomplete="off"></label>
+              <div class="review-actions">
+                <button id="bookmark-add" class="secondary-button" type="button" disabled>★ 현재 위치에 책갈피</button>
+                <button id="bookmark-refresh" class="secondary-button" type="button" disabled>책갈피 새로고침</button>
+              </div>
+              <p id="bookmark-state" role="status" aria-live="polite"></p>
+              <div id="bookmark-list"></div>
+            </details>
+          </section>
           <div id="transcript-versions" class="transcript-versions" role="group" aria-label="표시할 받아쓰기 버전" hidden>
             <button id="transcript-raw" class="active" type="button" aria-pressed="true">받아쓴 원문</button>
             <button id="transcript-corrected" type="button" aria-pressed="false" disabled>AI 후보정본</button>
@@ -394,6 +415,87 @@
             <small id="admin-disk-detail">저장 공간을 불러오고 있어요.</small>
           </article>
         </div>
+      </section>
+
+      <section id="admin-drive-panel" class="admin-section admin-drive" aria-labelledby="admin-drive-title">
+        <div class="admin-operation-row">
+          <div>
+            <p class="eyebrow">RECORDING STORAGE</p>
+            <h3 id="admin-drive-title">Google Drive 녹음 보관</h3>
+            <p id="admin-drive-detail">Google 연결 상태를 아직 확인하지 못했습니다.</p>
+          </div>
+          <div class="admin-operation-actions">
+            <span id="admin-drive-state" class="admin-badge" data-state="unchecked">아직 확인 전</span>
+            <button id="admin-drive-refresh" class="secondary-button" type="button" disabled>Drive 상태 확인</button>
+          </div>
+        </div>
+        <p id="admin-drive-cache-note" class="admin-section-detail" role="status">이 화면 조회만으로 녹음을 옮기거나 삭제하지 않습니다.</p>
+        <div class="admin-drive-grid">
+          <article class="admin-metric">
+            <span>Google 계정 전체 공유 용량</span>
+            <strong id="admin-drive-quota">용량 미확인</strong>
+            <progress id="admin-drive-progress" max="100" value="0" aria-label="Google 계정 전체 공유 용량 사용률" hidden></progress>
+            <small id="admin-drive-quota-detail">용량을 아직 확인하지 못했습니다.</small>
+            <small>이 서비스 폴더만의 용량이 아닙니다. Gmail 등 Google 서비스의 공유 사용량이 포함됩니다.</small>
+          </article>
+          <article class="admin-metric">
+            <span>Drive 보관 확인 대기</span>
+            <strong id="admin-drive-pending-bytes">대기 크기 미확인</strong>
+            <small id="admin-drive-pending-detail">일부 녹음의 크기가 확인되지 않았을 수 있습니다.</small>
+          </article>
+        </div>
+        <div class="admin-drive-history">
+          <p id="admin-drive-counts">대기·보관 건수 미확인</p>
+          <p id="admin-drive-cleanup">서버 사본·삭제 대기 미확인</p>
+          <p id="admin-drive-oldest">가장 오래된 대기 시작: 미확인</p>
+          <p id="admin-drive-last-upload">마지막 녹음 검증 완료: 미확인</p>
+          <p id="admin-drive-checked">마지막 조회: 미확인 · 마지막 정상 조회: 미확인 (한국 시간)</p>
+        </div>
+        <p class="admin-section-detail">녹음은 서버에 임시 보관하며, Drive 파일의 크기·체크섬 검증 후 서버 WAV 사본을 정리합니다. 업로드·검증이 실패하면 서버 사본을 남깁니다. 계정·텍스트 DB 백업과는 별개입니다.</p>
+      </section>
+
+      <section id="admin-backup-panel" class="admin-section admin-maintenance" aria-labelledby="admin-backup-title">
+        <div class="admin-section-heading">
+          <div>
+            <p class="eyebrow">RECOVERY BACKUP</p>
+            <h3 id="admin-backup-title">암호화 복구 백업</h3>
+          </div>
+          <span id="admin-backup-state" class="admin-badge" data-state="unknown">미확인</span>
+        </div>
+        <p id="admin-backup-detail" class="admin-section-detail" role="status">암호화 복구 백업 상태를 아직 확인하지 못했습니다.</p>
+        <div class="admin-maintenance-grid">
+          <article class="admin-metric"><span>예약 실행</span><strong id="admin-backup-schedule">미확인</strong><small>서버가 켜져 있는 동안 실행합니다.</small></article>
+          <article class="admin-metric"><span>목적지 복사 대기</span><strong id="admin-backup-pending">미확인</strong><small>복사와 검증이 끝나야 보관 완료입니다.</small></article>
+          <article class="admin-metric"><span>최근 연속 실패</span><strong id="admin-backup-failures">미확인</strong><small>성공하면 실패 횟수가 초기화됩니다.</small></article>
+        </div>
+        <div class="admin-maintenance-history">
+          <p id="admin-backup-last-success">마지막 검증 복사 완료: 미확인 (한국 시간)</p>
+          <p id="admin-backup-size">마지막 완료 파일 크기: 미확인</p>
+          <p id="admin-backup-error">최근 작업 안내: 미확인</p>
+        </div>
+        <p class="admin-section-detail">계정·텍스트 DB와 복구에 필요한 설정의 암호화 백업입니다. Drive의 녹음 파일 보관과는 별개이며, 이 화면에서 키 생성·설정 변경·복원을 실행하지 않습니다. 복구 키는 암호화 백업과 분리해 안전하게 보관해야 합니다.</p>
+      </section>
+
+      <section id="admin-lease-panel" class="admin-section admin-maintenance" aria-labelledby="admin-lease-title">
+        <div class="admin-section-heading">
+          <div>
+            <p class="eyebrow">API ADDRESS</p>
+            <h3 id="admin-lease-title">자동 서버 주소 갱신</h3>
+          </div>
+          <span id="admin-lease-state" class="admin-badge" data-state="unknown">미확인</span>
+        </div>
+        <p id="admin-lease-detail" class="admin-section-detail" role="status">자동 주소 갱신 상태를 아직 확인하지 못했습니다.</p>
+        <div class="admin-maintenance-grid">
+          <article class="admin-metric"><span>자동 갱신</span><strong id="admin-lease-enabled">미확인</strong><small>확인된 기존 연결만 갱신합니다.</small></article>
+          <article class="admin-metric"><span>조회 시점 만료까지</span><strong id="admin-lease-expiry">미확인</strong><small>게시된 주소 정보의 유효기간입니다.</small></article>
+          <article class="admin-metric"><span>현재 갱신 작업</span><strong id="admin-lease-running">미확인</strong><small>터널 연결 상태와는 별개입니다.</small></article>
+        </div>
+        <div class="admin-maintenance-history">
+          <p id="admin-lease-last-attempt">마지막 갱신 시도: 미확인 (한국 시간)</p>
+          <p id="admin-lease-last-success">마지막 갱신 확인: 미확인 (한국 시간)</p>
+          <p id="admin-lease-error">최근 작업 안내: 미확인</p>
+        </div>
+        <p class="admin-section-detail">이미 연결된 주소의 유효기간을 갱신합니다. 꺼진 서버·터널을 다시 켜거나 Wi-Fi 변경으로 끊긴 연결을 복구하는 기능은 아닙니다. 표시된 값은 마지막 조회 기준이며 연결을 보장하지 않습니다.</p>
       </section>
 
       <section class="admin-section" aria-labelledby="admin-queue-title">

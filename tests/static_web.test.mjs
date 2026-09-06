@@ -17,6 +17,7 @@ test('page has no remote assets or inline executable content and declares privac
   assert.match(html, /form-action 'none'/);
   assert.match(html, /script-src 'self'/);
   assert.match(html, /style-src 'self'/);
+  assert.equal(html.match(/media-src ([^;]+)/)[1].trim(),'blob:', 'recording playback may only use bounded authenticated in-memory clips');
   const connectSources = html.match(/connect-src ([^;]+)/)[1].trim().split(/\s+/);
   assert.ok(connectSources.includes("'self'"));
   assert.ok(connectSources.includes('https://*.trycloudflare.com'));

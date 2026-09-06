@@ -18,6 +18,7 @@ CLOUDFLARED=${CLOUDFLARED_BIN:-}
 TUNNEL_PID=
 PID_TEMPORARY=
 START_CLEANUP_ARMED=0
+RENEW_ONLY=0
 
 usage() {
     cat <<'EOF'
@@ -31,6 +32,8 @@ Options:
   --port PORT             Local API port (default: 8765, or PORT)
   --cloudflared PATH      Explicit cloudflared executable
   --timeout SEC           Wait for public URL (default: 60)
+  --renew-only            Republish only the verified current online tunnel;
+                          never start, stop, or replace a tunnel
   -h, --help              Show this help
 
 Lookup order: --cloudflared, CLOUDFLARED_BIN, .tools/cloudflared, PATH.
@@ -59,6 +62,10 @@ while (($#)); do
             (($# >= 2)) || die "--timeout 뒤에 초가 필요합니다."
             TUNNEL_TIMEOUT=$2
             shift 2
+            ;;
+        --renew-only)
+            RENEW_ONLY=1
+            shift
             ;;
         -h|--help)
             usage
@@ -90,8 +97,14 @@ fi
 CLOUDFLARED=$(readlink -f -- "$CLOUDFLARED")
 "$CLOUDFLARED" --version >/dev/null 2>&1 || die "cloudflared 실행 파일을 확인하지 못했습니다: $CLOUDFLARED"
 
-mkdir -p -- "$DATA_DIR"
-chmod 0700 "$DATA_DIR"
+if ((RENEW_ONLY == 0)); then
+    mkdir -p -- "$DATA_DIR"
+    chmod 0700 "$DATA_DIR"
+else
+    [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || die "갱신할 기존 터널 상태를 확인하지 못했습니다."
+    # Do not repair permissions or create a data directory in renewal mode.
+    # The bounded Python reader validates the directory and every state file.
+fi
 
 process_is_tunnel() {
     local pid=$1 cwd argument first= saw_tunnel=0 saw_url=0
@@ -212,9 +225,37 @@ publish_public_url() {
 
 command -v flock >/dev/null 2>&1 || die "시작 동시 실행을 막는 flock 명령을 찾을 수 없습니다. util-linux를 확인하세요."
 command -v setsid >/dev/null 2>&1 || die "터미널 종료 뒤에도 터널을 유지하는 setsid 명령을 찾을 수 없습니다. util-linux를 확인하세요."
+if ((RENEW_ONLY == 1)); then
+    [[ ! -L "$LOCK_FILE" && ( ! -e "$LOCK_FILE" || -f "$LOCK_FILE" ) ]] \
+        || die "터널 갱신 잠금 파일을 안전하게 확인하지 못했습니다."
+    renewal_python="$PROJECT_ROOT/.venv/bin/python"
+    [[ -x "$renewal_python" ]] || die "터널 갱신을 검증할 Python을 찾을 수 없습니다."
+    current_renewal_url() {
+        (cd -- "$PROJECT_ROOT" && "$renewal_python" -m server.lease_renewal \
+            --check-current --port "$PORT" --cloudflared "$CLOUDFLARED") 2>/dev/null
+    }
+    # Fail closed before even opening the lifecycle lock in an unsafe/missing
+    # data directory. Repeat the authoritative state check inside that lock.
+    current_renewal_url >/dev/null || die "갱신할 기존 온라인 터널을 안전하게 확인하지 못했습니다."
+fi
 exec 9>"$LOCK_FILE"
 chmod 0600 "$LOCK_FILE"
 flock -n 9 || die "다른 터널 시작 작업이 진행 중입니다. 잠시 후 다시 실행하세요."
+
+if ((RENEW_ONLY == 1)); then
+    # This branch must stay before every PID cleanup, URL write, signal, and
+    # start trap below. Both checks run under the lifecycle lock. In particular
+    # an OFFLINE state which won that lock is never changed back to online.
+    public_url=$(current_renewal_url) || die "기존 온라인 터널의 소유권 또는 게시 상태를 확인하지 못했습니다."
+    [[ "$public_url" =~ ^https://[[:alnum:]-]+\.trycloudflare\.com$ ]] \
+        || die "갱신할 기존 공개 주소가 올바르지 않습니다."
+    local_health_ok && external_health_ok "$public_url" \
+        || die "기존 터널의 health를 확인하지 못해 주소를 갱신하지 않았습니다."
+    verified_url=$(current_renewal_url) || die "갱신 중 기존 터널 상태가 바뀌었습니다."
+    [[ "$verified_url" == "$public_url" ]] || die "갱신 중 공개 주소가 바뀌었습니다."
+    publish_public_url "$public_url"
+    exit 0
+fi
 
 terminate_owned_tunnel() {
     local pid=$1 deadline

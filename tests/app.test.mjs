@@ -4,10 +4,16 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 import { encodeWav } from '../web/audio.js';
+import { renderDriveStatus } from '../web/admin-storage.js';
+import { renderMaintenanceStatus } from '../web/admin-maintenance.js';
+import { readRecordingClip, RecordingClipPlayer, filterTranscript } from '../web/recording-review.js';
 import { AUTH_SESSION_STORAGE_KEY, TabAuthSessionStore } from '../web/auth-session.js';
 
 const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'))
   .replace("import { MicrophoneCapture } from './audio.js';", 'const MicrophoneCapture = TestCapture;')
+  .replace("import { renderDriveStatus } from './admin-storage.js';", 'const renderDriveStatus = TestRenderDriveStatus;')
+  .replace("import { renderMaintenanceStatus } from './admin-maintenance.js';", 'const renderMaintenanceStatus = TestRenderMaintenanceStatus;')
+  .replace("import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';", 'const { readRecordingClip, RecordingClipPlayer, filterTranscript } = TestRecordingReview;')
   .replace("import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';", `
     const FileImportCancelledError = class extends Error {};
     const RecordingFileUploader = TestFileUploader;
@@ -68,7 +74,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
   let id = 0, mic;
   const makeElement = (name, value = '') => {
     const node = {
-    name,tagName:name.toUpperCase(),value,style:{},children:[],open:false,
+    name,tagName:name.toUpperCase(),value,style:{},dataset:{},children:[],open:false,
     classList:{values:new Set(),toggle(className,force){
       const enabled = force === undefined ? !this.values.has(className) : !!force;
       if (enabled) this.values.add(className); else this.values.delete(className);
@@ -106,6 +112,9 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       return matches;
     },
     focus(){ this.focused = true; },
+    pause(){ this.paused = true; },
+    async play(){ this.paused = false; },
+    load(){ this.loadCalls = (this.loadCalls || 0) + 1; },
     showModal(){ this.open = true; },
     close(){ this.open = false; },
     removeAttribute(attribute){ delete this[attribute]; },
@@ -203,6 +212,9 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     TestAuthSessionStore:class extends TabAuthSessionStore {
       constructor() { super({getStorage:() => tabStorage}); }
     },
+    TestRenderDriveStatus:renderDriveStatus,
+    TestRenderMaintenanceStatus:renderMaintenanceStatus,
+    TestRecordingReview:{readRecordingClip,RecordingClipPlayer,filterTranscript},
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },
     clearTimeout:value => timeouts.delete(value),
     setInterval:(callback,delay = 0) => { const value = ++id; intervals.set(value,{callback,delay}); return value; },clearInterval:value => intervals.delete(value),
@@ -243,7 +255,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       }
     },
     TestDurableLiveQueue:class {
-      constructor() { this.sessions = new Map(); this.chunks = new Map(); }
+      constructor() { this.sessions = new Map(); this.chunks = new Map(); this.snapshots = new Map(); }
       async open() { return this; }
       async createSession(value) {
         requireUuid(value.id,'captureId'); requireOwner(value.owner);
@@ -261,17 +273,62 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
         const stored = this.sessions.get(id); if (!stored || stored.owner !== owner) throw new Error('missing session');
         Object.assign(stored,updates); return {...stored};
       }
+      async getSession(owner,id) {
+        requireOwner(owner); requireUuid(id,'captureId');
+        const stored = this.sessions.get(id);
+        if (stored && stored.owner !== owner) throw new Error('session ownership mismatch');
+        return stored ? {...stored} : null;
+      }
+      async saveSnapshot(owner,captureId,value) {
+        const session = await this.getSession(owner,captureId);
+        if (!session) throw new Error('missing session');
+        if (session.finalQueued || value.sequence < session.nextSequence) return {saved:false,reason:'settled'};
+        assert.equal(value.sequence,session.nextSequence);
+        assert.equal(value.startSamples + value.overlapSamples,session.capturedSamples);
+        const previous = this.snapshots.get(captureId);
+        const snapshot = {...value,owner,captureId,byteLength:value.blob.size,revision:(previous?.revision || 0) + 1};
+        this.snapshots.set(captureId,snapshot);
+        return {saved:true,snapshot:{...snapshot,blob:undefined}};
+      }
+      async getSnapshot(owner,captureId) {
+        const session = await this.getSession(owner,captureId);
+        return session && this.snapshots.has(captureId) ? {...this.snapshots.get(captureId)} : null;
+      }
+      async promoteSnapshot(owner,captureId,{id,expectedRevision,final}) {
+        const snapshot = await this.getSnapshot(owner,captureId);
+        assert.equal(snapshot?.revision,expectedRevision); assert.equal(final,true);
+        return this.enqueueChunk(owner,captureId,{id,startSamples:snapshot.startSamples,
+          durationSamples:snapshot.durationSamples,overlapSamples:snapshot.overlapSamples,blob:snapshot.blob,final:true});
+      }
       async enqueueChunk(owner,captureId,value) {
         requireOwner(owner); requireUuid(captureId,'captureId'); requireUuid(value.id,'chunkId');
         const session = this.sessions.get(captureId); if (!session || session.owner !== owner) throw new Error('missing session');
+        const previous = this.chunks.get(value.id);
+        if (previous) {
+          assert.equal(previous.owner,owner); assert.equal(previous.captureId,captureId);
+          for (const key of ['startSamples','durationSamples','overlapSamples','final']) assert.equal(previous[key],value[key]);
+          assert.deepEqual(new Uint8Array(await previous.blob.arrayBuffer()),new Uint8Array(await value.blob.arrayBuffer()));
+          return {...previous};
+        }
         if (session.finalQueued || session.state === 'completed') throw new Error('session already finalized');
         if (value.startSamples + value.overlapSamples !== session.capturedSamples) throw new Error('chunk timeline conflict');
         const stored = {...value,owner,captureId,lectureId:captureId,asrProvider:session.asrProvider,
           sessionCreatedAt:session.createdAt,sequence:session.nextSequence++,byteLength:value.blob.size,
           state:'queued',attempts:0,errorKind:'',downloadRequested:false,inflightAt:null};
         session.capturedSamples = value.startSamples + value.durationSamples;
-        if (value.final) { session.finalQueued = true; session.state = 'stopped'; }
+        if (value.final) { session.finalQueued = true; session.state = 'stopped'; this.snapshots.delete(captureId); }
         this.chunks.set(value.id,stored); return {...stored};
+      }
+      async advanceSettledChunk(owner,captureId,value,evidence) {
+        requireOwner(owner); requireUuid(captureId,'captureId'); requireUuid(value.id,'chunkId');
+        assert.ok(evidence.serverConfirmed || evidence.downloadRequested);
+        const session = this.sessions.get(captureId); assert.equal(session?.owner,owner);
+        if (value.sequence < session.nextSequence) return {...session};
+        assert.equal(value.sequence,session.nextSequence);
+        assert.equal(value.startSamples + value.overlapSamples,session.capturedSamples);
+        session.nextSequence += 1; session.capturedSamples = value.startSamples + value.durationSamples;
+        if (value.final) { session.finalQueued = true; session.state = 'completed'; }
+        return {...session};
       }
       async getChunk(owner,id) {
         requireOwner(owner); requireUuid(id,'chunkId');
@@ -322,7 +379,8 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       }
       async hasPendingChunks(owner,captureId) {
         requireOwner(owner); requireUuid(captureId,'captureId');
-        return [...this.chunks.values()].some(item => item.owner === owner && item.captureId === captureId);
+        return [...this.chunks.values()].some(item => item.owner === owner && item.captureId === captureId)
+          || this.snapshots.get(captureId)?.owner === owner;
       }
       async deleteSession(owner,id) {
         requireOwner(owner); requireUuid(id,'captureId');
@@ -335,7 +393,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
             deletedChunks += 1; deletedBytes += item.byteLength; this.chunks.delete(chunkId);
           }
         }
-        this.sessions.delete(id); return {deletedChunks,deletedBytes};
+        this.sessions.delete(id); this.snapshots.delete(id); return {deletedChunks,deletedBytes};
       }
     },
     TestLiveCoordination:coordination,
@@ -395,6 +453,108 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
   };
   return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,runInterval,dispatchDocument,document,location,historyCalls,storedServer:() => storedServerValue,microphone:() => mic,coordination,seedDurableFailedFinal};
 }
+
+function reviewApp(fetch) {
+  return setup((url,options) => url.endsWith('/summary') ? response({configured:false,summary:null}) : fetch(url,options));
+}
+function openReviewFixture(app) {
+  app.run(`current={id:'review-lesson',title:'Synthetic review',language:'ko',created_at:'2026-01-01T00:00:00Z',
+    recording_available:true,recording_finalized:true,recording_seconds:10,
+    segments:[{id:'s1',start:0,end:5,text:'첫 문장 Alpha'},{id:'s2',start:5,end:10,text:'둘째 문장 Beta'}]}; renderCurrent();`);
+}
+test('review search filters the display only and bookmark loading is explicit',async () => {
+  const requests=[];
+  const app=reviewApp((url,options)=>{ requests.push([url,options]); return response({bookmarks:[]}); });
+  openReviewFixture(app);
+  assert.equal(requests.length,0);
+  app.element('transcript-search').value='beta'; app.element('transcript-search').oninput();
+  assert.equal(app.element('transcript').children.length,1);
+  assert.equal(app.element('segment-count').textContent,'1 / 2');
+  assert.ok(app.run("exportText(current,'text')").includes('Alpha'));
+  await app.run('loadBookmarks()');
+  assert.equal(requests.length,1); assert.match(requests[0][0],/\/bookmarks$/);
+});
+test('an ambiguous bookmark POST retry keeps its UUID, label and original live audio position',async () => {
+  const submitted=[];
+  const app=reviewApp((_url,options)=>{
+    const body=JSON.parse(options.body); submitted.push(body);
+    if(submitted.length === 1) throw new TypeError('lost response');
+    return response({bookmark:{...body,created_at:'2026-01-01T00:00:00Z'}});
+  });
+  openReviewFixture(app);
+  app.run("capture={capturedSeconds:12}; captureSession={id:'review-lesson',lecture:current}; recording=true;");
+  app.element('bookmark-label').value='original';
+  await app.run('addBookmark()');
+  app.run('capture.capturedSeconds=40'); app.element('bookmark-label').value='changed';
+  await app.run('addBookmark()');
+  assert.equal(submitted.length,2); assert.deepEqual(submitted[0],submitted[1]);
+  assert.equal(submitted[0].start_seconds,12); assert.equal(submitted[0].label,'original');
+  assert.equal(app.run('recording'),true); assert.equal(app.run('reviewView.bookmarks.length'),1);
+});
+test('late bookmark reads and writes never cross owner, token, origin or lecture selection',async () => {
+  for(const change of ["user='other'","token='new'","setServer('https://other-tunnel.trycloudflare.com')","current={...current,id:'other-lesson'}"]){
+    for(const action of ['loadBookmarks()','addBookmark()']){
+      const gate=deferred();
+      const app=reviewApp(()=>gate.promise); openReviewFixture(app);
+      const task=app.run(action);
+      const id=app.run('reviewView.pending?.id') || webcrypto.randomUUID();
+      app.run(`${change}; renderRecordingReview();`);
+      gate.resolve(response({bookmarks:[{id,start_seconds:0,label:'PRIVATE'}],bookmark:{id,start_seconds:0,label:'PRIVATE'}}));
+      await task;
+      assert.equal(app.run('reviewView.bookmarks.length'),0);
+      assert.equal(app.element('bookmark-list').children.length,0);
+    }
+  }
+});
+test('clip playback uses authenticated bounded audio and clears the object URL on logout',async () => {
+  let clipOptions;
+  const wav=encodeWav(new Float32Array(16000));
+  const app=reviewApp((_url,options)=>{
+    clipOptions=options;
+    return new Response(wav,{headers:{'Content-Type':'audio/wav','Content-Length':String(wav.size),
+      'X-Clip-Start-Seconds':'5','X-Clip-Duration-Seconds':'1'}});
+  });
+  openReviewFixture(app);
+  await app.run('playRecordingClip(5)');
+  assert.equal(clipOptions.headers.get('Authorization'),'Bearer old-token');
+  assert.equal(clipOptions.responseType,undefined);
+  const url=app.element('recording-player').src; assert.ok(app.objectUrlBlob(url));
+  assert.equal(app.element('recording-player').paused,false);
+  app.run("token=''; showLogin(false)");
+  assert.equal(app.element('recording-player').src,undefined); assert.equal(app.objectUrlBlob(url),undefined);
+});
+test('pending clip requests are aborted when switching lessons and cannot install late audio',async () => {
+  const gate=deferred(); let options;
+  const app=reviewApp((_url,request)=>{options=request; return gate.promise;}); openReviewFixture(app);
+  const task=app.run('playRecordingClip(0)'); await tick();
+  app.run("current={...current,id:'other'}; renderRecordingReview()");
+  assert.equal(options.signal.aborted,true);
+  const wav=encodeWav(new Float32Array(16000));
+  gate.resolve(new Response(wav,{headers:{'Content-Type':'audio/wav','Content-Length':String(wav.size),
+    'X-Clip-Start-Seconds':'0','X-Clip-Duration-Seconds':'1'}}));
+  await task; assert.equal(app.element('recording-player').src,undefined);
+});
+
+test('lecture status refresh updates timestamp playback and discards audio if no longer available',async () => {
+  let available=true;
+  const wav=encodeWav(new Float32Array(16000));
+  const app=reviewApp(url => url.endsWith('/lectures')
+    ? response({lectures:[{id:'review-lesson',created_at:'2026-01-01T00:00:00Z',recording_available:available,recording_finalized:available}]})
+    : new Response(wav,{headers:{'Content-Type':'audio/wav','Content-Length':String(wav.size),
+      'X-Clip-Start-Seconds':'0','X-Clip-Duration-Seconds':'1'}}));
+  openReviewFixture(app);
+  app.run('current.recording_available=false; current.recording_finalized=false; renderCurrent()');
+  assert.equal(app.element('playback-start').disabled,true);
+  await app.run('refreshLectures()');
+  assert.equal(app.element('playback-start').disabled,false);
+  assert.equal(app.element('transcript').children[0].children[0].role,'button');
+  await app.run('playRecordingClip(0)'); const url=app.element('recording-player').src;
+  available=false; await app.run('refreshLectures()');
+  assert.equal(app.element('playback-start').disabled,true);
+  assert.equal(app.element('transcript').children[0].children[0].role,'text');
+  assert.equal(app.element('recording-player').src,undefined);
+  assert.equal(app.objectUrlBlob(url),undefined);
+});
 
 function translationFixture(status = 'completed') {
   return {configured:true,model:'solar-pro4',translation:{lecture_id:'english-lesson',status,segments:status === 'completed' ? [
@@ -3264,6 +3424,7 @@ test('an expired lease renews from Pages and sends queued audio only after anony
 test('a renewed lease with a new tunnel preserves queued-audio ownership until same-account login', async () => {
   const oldUrl = 'https://old-lease.trycloudflare.com';
   const newUrl = 'https://new-lease.trycloudflare.com';
+  const durableChunkId = webcrypto.randomUUID();
   const requests = [];
   const app = setup((url, options = {}) => {
     requests.push({url,options});
@@ -3280,7 +3441,7 @@ test('a renewed lease with a new tunnel preserves queued-audio ownership until s
     connectionState='connected'; token='old-token'; user='user-alpha';
     current={id:'lesson',title:'수업',created_at:'2026-01-01T00:00:00Z',segments:[],asr_provider:'qwen'}; lectures=[current];
     liveSessions.set('lesson',{id:'lesson',owner:'user-alpha',asrProvider:'qwen',lecture:current});
-    pending=[{blob:new Blob([new Uint8Array(1644)],{type:'audio/wav'}),startSeconds:0,durationSeconds:0.05,overlapSeconds:0,final:false,id:'stable-id',captureId:'lesson',lectureId:'lesson',owner:'user-alpha',asrProvider:'qwen',lectureReady:true}];
+    pending=[{blob:new Blob([new Uint8Array(1644)],{type:'audio/wav'}),startSeconds:0,durationSeconds:0.05,overlapSeconds:0,final:false,id:${JSON.stringify(durableChunkId)},captureId:'lesson',lectureId:'lesson',owner:'user-alpha',asrProvider:'qwen',lectureReady:true,durable:true}];
     setConnectionState('connected'); renderCurrent();
   `);
   await app.run('drain()');
@@ -3290,7 +3451,7 @@ test('a renewed lease with a new tunnel preserves queued-audio ownership until s
   assert.equal(app.run('apiUrl'), newUrl);
   assert.equal(app.run('token'), '');
   assert.equal(app.run('user'), 'user-alpha');
-  assert.equal(app.run('pending[0].id'), 'stable-id');
+  assert.equal(app.run('pending[0].id'), durableChunkId);
   assert.equal(app.element('username').value, 'user-alpha');
 
   app.element('username').value = 'user-alpha';
@@ -4356,4 +4517,445 @@ test('automatic silence controls and callbacks are absent rather than disabled b
   assert.doesNotMatch(source,/onSilenceStateChange|setAutoPauseEnabled|autoPauseEnabled|autoPaused/);
   assert.doesNotMatch(audio,/AUTO_SILENCE|_silenceEnabled|onSilenceStateChange|setAutoPauseEnabled|autoPauseEnabled|autoPaused/);
   assert.match(html,/id="pause-button"/,'the normal manual pause control remains');
+});
+
+async function storageFailureFixture({provider = 'clova',code = 'live_queue_error'} = {}) {
+  const uploads = [];
+  const app = setup((url,options = {}) => {
+    if (url.endsWith('/lectures')) return response({id:options.headers.get('X-Lecture-Id'),
+      title:'Storage recovery fixture',created_at:new Date().toISOString(),asr_provider:provider,segments:[]},201);
+    if (url.includes('/chunks')) {
+      uploads.push({id:options.headers.get('X-Chunk-Id'),final:options.headers.get('X-Final-Chunk'),
+        start:options.headers.get('X-Start-Seconds'),body:options.body});
+      return response({segments:[],recording_available:true,recording_finalized:options.headers.get('X-Final-Chunk') === 'true'});
+    }
+    throw new Error(`unexpected fixture request: ${url}`);
+  });
+  await app.run('openLiveQueue()');
+  const queue = app.run('liveQueue'), originalEnqueue = queue.enqueueChunk.bind(queue);
+  const failure = {enabled:true,calls:0};
+  queue.enqueueChunk = async (...args) => {
+    failure.calls += 1;
+    if (failure.enabled) { const error = new Error('synthetic storage failure'); error.code = code; throw error; }
+    return originalEnqueue(...args);
+  };
+  app.run(`transcriptionProviders.clova={configured:true}; micProviderPreference=${JSON.stringify(provider)};
+    $('asr-provider').value=${JSON.stringify(provider)};`);
+  await app.run('startRecording()');
+  app.microphone().callbacks.onChunk(chunk(0));
+  await until(() => failure.calls === 1,'first failed local write');
+  for (const delay of [500,1000,2000]) await app.runTimeout(delay);
+  await until(() => app.run('!!captureSession.storageFailed && !sending'),'storage failure upload gate');
+  return {app,queue,uploads,failure,originalEnqueue};
+}
+
+test('local storage recovery preserves Qwen and CLOVA chunk identity, ordering and final audio without restarting capture', async () => {
+  for (const provider of ['qwen','clova']) {
+    const {app,queue,uploads,failure} = await storageFailureFixture({provider});
+    assert.equal(uploads.length,0,'even local Qwen waits for durable audio before transmission');
+    assert.equal(app.run('pending[0].storageBlocked'),true);
+    assert.equal(app.element('retry').textContent,'임시 저장 다시 시도');
+    app.microphone().callbacks.onChunk(chunk(5,11,3));
+    await app.run('captureSession.persistChain');
+    assert.equal(failure.calls,4,'new chunks do not spin on a failed storage latch');
+    const expectedIds = app.run('pending.map(item => item.id)');
+    const expectedBlobs = app.run('pending.map(item => item.blob)');
+    assert.match(app.element('save-state').textContent,/메모리에만 00:16/);
+    assert.equal(app.run('volatileAudioStats().seconds'),16,'overlap is not counted as new audio');
+    failure.enabled = false;
+    await app.runTimeout(5000);
+    await until(() => uploads.length === 2 && app.run('pending.length') === 0,'stored backlog upload');
+    assert.deepEqual(uploads.map(item => item.id),Array.from(expectedIds));
+    for (let i = 0; i < uploads.length; i += 1) {
+      assert.deepEqual(new Uint8Array(await uploads[i].body.arrayBuffer()),new Uint8Array(await expectedBlobs[i].arrayBuffer()));
+    }
+    assert.equal(app.run('captureSession.storageFailed'),false);
+    assert.equal(app.run('volatileAudioStats().bytes'),0);
+    assert.equal(app.run('recording'),true);
+    assert.equal(app.microphone().stopCalls || 0,0);
+    app.microphone().tail = chunk(13,3,3,true);
+    await app.run('stopRecording()');
+    await until(() => uploads.length === 3 && app.run('pending.length') === 0,'final stored tail');
+    assert.equal(uploads[2].final,'true');
+    assert.equal(new Set(uploads.map(item => item.id)).size,3);
+    assert.equal(queue.chunks.size,0);
+  }
+});
+
+test('quota retries are bounded in frequency while RAM-only duration warns without automatically pausing or stopping', async () => {
+  const {app,uploads,failure} = await storageFailureFixture({code:'live_queue_quota'});
+  assert.equal([...app.timeouts.values()].filter(timer => timer.delay === 30000).length,1);
+  for (let index = 1; index < 39; index += 1) app.microphone().callbacks.onChunk(chunk(index * 8 - 3,11,3));
+  await app.run('captureSession.persistChain');
+  assert.equal(failure.calls,4);
+  assert.equal(app.run('volatileAudioStats().seconds'),312);
+  assert.match(app.element('queue-message').textContent,/메모리에 남은 음성이 많이 쌓였습니다/);
+  assert.match(app.element('queue-message').textContent,/직접 일시정지/);
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.microphone().pauseCalls || 0,0);
+  assert.equal(app.microphone().stopCalls || 0,0);
+  await app.runTimeout(30000);
+  await until(() => failure.calls === 5,'single quota probe');
+  assert.equal([...app.timeouts.values()].filter(timer => timer.delay === 60000).length,1);
+  assert.equal(uploads.length,0);
+  assert.equal(app.element('save-failed').hidden,false,'manual WAV rescue remains available');
+});
+
+test('manual storage recovery is single-flight and does not grant CLOVA replay approval', async () => {
+  const {app,queue,uploads,failure,originalEnqueue} = await storageFailureFixture();
+  const gate = deferred(); let blockedWrites = 0;
+  failure.enabled = false;
+  queue.enqueueChunk = async (...args) => { blockedWrites += 1; await gate.promise; return originalEnqueue(...args); };
+  const first = app.run('retryPending()');
+  const second = app.run('retryPending()');
+  await until(() => blockedWrites === 1,'single recovery write');
+  assert.equal(app.run('manualRetryApprovedIds.size'),0);
+  assert.equal(uploads.length,0);
+  gate.resolve(); await Promise.all([first,second]);
+  await until(() => uploads.length === 1 && app.run('pending.length') === 0,'one safe upload');
+  assert.equal(blockedWrites,1);
+  assert.equal(app.run('manualRetryApprovedIds.size'),0);
+});
+
+test('recovering local storage cannot turn an already inflight CLOVA row into a new POST', async () => {
+  const {app,queue,failure,originalEnqueue} = await storageFailureFixture();
+  const item = app.run('pending[0]'), session = app.run('captureSession');
+  await originalEnqueue(session.owner,session.id,app.run('storedChunkInput(pending[0])'));
+  await queue.markChunkInflight(session.owner,item.id);
+  failure.enabled = false;
+  // Prevent the independent GET reconciler from starting: this test checks
+  // exactly the storage operation's persisted and runtime safety gates.
+  app.run("sendError='unresolved provider request'; token='';");
+  await app.run('recoverSessionStorage(captureSession)');
+  assert.equal(app.run('pending[0].durable'),true);
+  assert.equal(app.run('pending[0].blocked'),true);
+  assert.equal(app.run('pending[0].recoveryOnly'),true);
+  assert.equal(app.run('pending[0].inflight'),true);
+  assert.equal(app.run('sendError'),'unresolved provider request');
+  assert.equal(queue.markInflightCalls,1);
+  assert.equal(app.run('manualRetryApprovedIds.size'),0);
+});
+
+test('storage recovery stops across owner, server and capture-session boundaries without sending stale audio', async () => {
+  for (const change of ["user='user-beta'; token='other-token';",
+    "apiUrl='https://other.trycloudflare.com'; token='other-token';",'liveSessions.clear();']) {
+    const {app,queue,uploads,failure,originalEnqueue} = await storageFailureFixture();
+    app.microphone().callbacks.onChunk(chunk(5,11,3)); await app.run('captureSession.persistChain');
+    const gate = deferred(); let writes = 0;
+    failure.enabled = false;
+    queue.enqueueChunk = async (...args) => { writes += 1; await gate.promise; return originalEnqueue(...args); };
+    const recovering = app.run('recoverSessionStorage(captureSession)');
+    await until(() => writes === 1,'pending old-scope storage commit');
+    app.run(change); app.run("sendError='new scope status';");
+    gate.resolve(); await recovering;
+    assert.equal(writes,1,'a committed old-owner write is kept, but the next write is not started');
+    assert.equal(uploads.length,0);
+    assert.equal(app.run('sendError'),'new scope status');
+    assert.equal(app.run('pending[1].durable'),false);
+    assert.equal(app.run('pending[1].blob instanceof Blob'),true);
+  }
+});
+
+test('a downloaded and explicitly skipped RAM-only chunk advances storage metadata without ever replaying its audio', async () => {
+  const {app,uploads,failure,queue} = await storageFailureFixture();
+  app.microphone().callbacks.onChunk(chunk(5,11,3)); await app.run('captureSession.persistChain');
+  const skippedId = app.run('pending[0].id'), remainingId = app.run('pending[1].id');
+  await app.run('saveFailedChunk()');
+  await app.run('skipFailedChunk()');
+  await until(() => app.run('pending.length') === 1 && !app.run('sending'),'manual RAM-only skip');
+  assert.equal([...queue.sessions.values()][0].nextSequence,1,'skip cursor is durable before RAM is discarded');
+  assert.equal(app.run('pending.some(item => item.id === ' + JSON.stringify(skippedId) + ')'),false);
+  failure.enabled = false;
+  await app.run('recoverSessionStorage(captureSession)');
+  await until(() => uploads.length === 1 && app.run('pending.length') === 0,'remaining audio only');
+  assert.equal(uploads[0].id,remainingId);
+  const storedSession = [...queue.sessions.values()][0];
+  assert.equal(storedSession.nextSequence,2); assert.equal(storedSession.capturedSamples,16 * 16000);
+  assert.equal(app.run('captureSession.storageReceipts?.size || 0'),0);
+});
+
+test('storage recovery restores a paused session but never resumes its microphone or clock', async () => {
+  const {app,queue,failure} = await storageFailureFixture();
+  await app.run('pauseRecording()');
+  await app.run('captureSession.persistChain');
+  assert.equal(app.run('paused'),true);
+  failure.enabled = false;
+  await app.run('recoverSessionStorage(captureSession)');
+  assert.equal(app.run('paused'),true); assert.equal(app.run('recording'),false);
+  assert.equal(app.run('timer'),null); assert.equal(app.microphone().resumeCalls || 0,0);
+  assert.equal([...queue.sessions.values()][0].state,'paused');
+});
+
+test('PCM snapshots wait behind failed earlier chunks and are saved before the same session resumes uploads', async () => {
+  const {app,queue,uploads,failure} = await storageFailureFixture();
+  const snapshot = {sequence:1,startSamples:80000,durationSamples:80000,overlapSamples:48000,
+    blob:encodeWav(new Float32Array(80000).fill(0.125))};
+  await app.microphone().callbacks.onSnapshot(snapshot);
+  assert.equal(queue.snapshots.size,0,'never store future PCM ahead of the failed chunk');
+  assert.equal(app.run('captureSession.latestSnapshot.sequence'),1);
+  failure.enabled = false;
+  await app.run('recoverSessionStorage(captureSession)');
+  await until(() => uploads.length === 1 && !app.run('sending'));
+  const id = app.run('captureSession.id');
+  assert.equal(queue.snapshots.get(id).durationSamples,80000);
+  assert.equal(app.run('localPcmSnapshots.get(captureSession.id).durationSamples'),80000);
+  assert.equal(app.run('captureSession.latestSnapshot'),null);
+  assert.equal(app.run('captureSession.storageFailed'),false);
+  app.microphone().tail = chunk(5,5,3,true);
+  await app.run('stopRecording()');
+  await until(() => uploads.length === 2 && app.run('pending.length') === 0);
+  assert.equal(app.run('localPcmSnapshots.size'),0);
+  assert.equal(queue.snapshots.size,0);
+  await app.microphone().callbacks.onSnapshot(snapshot);
+  assert.equal(queue.snapshots.size,0,'late callbacks do not resurrect a finalized session');
+});
+
+test('PCM snapshot state is not exposed after owner or server changes during a write', async () => {
+  for (const change of ["user='user-beta'; localPcmSnapshots.clear()", "apiUrl='https://changed.example'"]) {
+    const {app,queue,failure} = await storageFailureFixture();
+    failure.enabled = false;
+    await app.run('recoverSessionStorage(captureSession)');
+    await until(() => !app.run('sending'));
+    const original = queue.saveSnapshot.bind(queue), gate = deferred();
+    queue.saveSnapshot = async (...args) => { await gate.promise; return original(...args); };
+    const snapshot = {sequence:1,startSamples:80000,durationSamples:80000,overlapSamples:48000,
+      blob:encodeWav(new Float32Array(80000))};
+    const saving = app.microphone().callbacks.onSnapshot(snapshot);
+    await tick();
+    app.run(change);
+    gate.resolve(); await saving;
+    if (change.startsWith('user')) assert.equal(app.run('localPcmSnapshots.size'),0);
+    else assert.notEqual(app.run('localPcmSnapshots.get(captureSession.id)?.durationSamples'),80000);
+  }
+});
+
+test('completed explicit-skip storage receipts do not move a completed session back to stopped', async () => {
+  const {app,queue,uploads,failure} = await storageFailureFixture();
+  const session = app.run('captureSession');
+  app.run('pending[0].downloadRequested=true');
+  await app.run('skipFailedChunk()');
+  app.microphone().tail = chunk(5,3,3,true);
+  await app.run('stopRecording()');
+  await until(() => !!app.run('sendError') && !app.run('sending'));
+  app.run('pending[0].downloadRequested=true');
+  await app.run('skipFailedChunk()');
+  failure.enabled = false;
+  const update = queue.updateSession.bind(queue);
+  queue.updateSession = async (owner,id,changes) => {
+    if (queue.sessions.get(id)?.state === 'completed' && changes.state !== 'completed') throw new Error('illegal completed transition');
+    return update(owner,id,changes);
+  };
+  // The app may already have released an explicitly discarded final session.
+  // In that case there is no remaining automatic upload or state rewrite.
+  if (app.run('liveSessions.has(captureSession.id)')) await app.run('recoverSessionStorage(captureSession)');
+  assert.equal(uploads.length,0);
+  assert.equal(session.storageRepairUnsafe || false,false);
+});
+
+test('a downloaded RAM-only chunk is kept when its durable skip decision cannot remove the PCM journal', async () => {
+  const {app,queue,uploads} = await storageFailureFixture();
+  const id = app.run('pending[0].id');
+  app.run('pending[0].downloadRequested=true');
+  queue.advanceSettledChunk = async () => { throw new Error('temporary journal write failure'); };
+  await app.run('skipFailedChunk()');
+  assert.equal(app.run('pending[0].id'),id);
+  assert.equal(app.run('pending[0].blob instanceof Blob'),true);
+  assert.equal(uploads.length,0);
+  assert.match(app.element('notice').textContent,/건너뛰지 못했습니다/);
+});
+
+test('an initially unavailable local session can be recreated with the same identity before any audio is sent', async () => {
+  const uploads = [];
+  const app = setup((url,options = {}) => {
+    if (url.endsWith('/lectures')) return response({id:options.headers.get('X-Lecture-Id'),title:'Session retry',
+      created_at:new Date().toISOString(),asr_provider:'qwen',segments:[]},201);
+    uploads.push(options.headers.get('X-Chunk-Id'));
+    return response({segments:[],recording_available:true,recording_finalized:false});
+  });
+  await app.run('openLiveQueue()');
+  const queue = app.run('liveQueue'), create = queue.createSession.bind(queue);
+  let available = false, attempts = 0;
+  queue.createSession = async value => { attempts += 1; if (!available) throw new Error('temporary unavailable'); return create(value); };
+  await app.run('startRecording()');
+  app.microphone().callbacks.onChunk(chunk(0));
+  await until(() => attempts === 1);
+  for (const delay of [500,1000,2000]) await app.runTimeout(delay);
+  await until(() => app.run('!!captureSession.storageFailed && !sending'));
+  const sessionId = app.run('captureSession.id'), chunkId = app.run('pending[0].id');
+  assert.equal(uploads.length,0); assert.equal(app.run('captureSession.durable'),false);
+  available = true;
+  await app.run('retryPending()');
+  await until(() => uploads.length === 1 && app.run('pending.length') === 0);
+  assert.deepEqual(uploads,[chunkId]); assert.equal(app.run('captureSession.id'),sessionId);
+  assert.equal(queue.sessions.get(sessionId).nextSequence,1);
+});
+
+test('logout scrubs recovery timers and stale callbacks cannot recreate another account storage', async () => {
+  const {app,queue,failure} = await storageFailureFixture();
+  const timer = [...app.timeouts.values()].find(item => item.delay === 5000);
+  const create = queue.createSession.bind(queue); let creates = 0;
+  queue.createSession = async value => { creates += 1; return create(value); };
+  failure.enabled = false;
+  // Forced identity clearing simulates a revoked login. Normal logout already
+  // refuses to discard active capture or unsent, owner-locked audio.
+  app.run("user='user-beta'; token='new-token'; scrubAccountWorkspace();");
+  assert.equal([...app.timeouts.values()].some(item => item === timer),false);
+  timer.callback(); await tick(); await tick();
+  assert.equal(creates,0);
+  assert.equal(app.run('liveQueueBytes'),0);
+  assert.equal(app.run('volatileAudioStats().count'),0);
+});
+
+test('local ownership and corruption errors do not enter automatic storage repair loops', async () => {
+  for (const code of ['live_queue_owner_mismatch','live_queue_conflict','live_queue_corrupt']) {
+    const {app,uploads} = await storageFailureFixture({code});
+    assert.equal(app.run('captureSession.storageRepairUnsafe'),true);
+    assert.equal([...app.timeouts.values()].some(item => item.delay === 5000 || item.delay === 30000),false);
+    app.run('nudgeStorageRecovery()'); await tick();
+    assert.equal(uploads.length,0);
+    assert.equal(app.run('recording'),true);
+  }
+});
+
+test('capture advancing during a slow storage repair defers future PCM until its own predecessor is durable', async () => {
+  for (const provider of ['qwen','clova']) {
+    const {app,queue,uploads,failure,originalEnqueue} = await storageFailureFixture({provider});
+    const gate = deferred(); let writes = 0;
+    failure.enabled = false;
+    queue.enqueueChunk = async (...args) => {
+      if (++writes === 1) await gate.promise;
+      return originalEnqueue(...args);
+    };
+    const save = queue.saveSnapshot.bind(queue), savedSequences = [];
+    queue.saveSnapshot = async (owner,id,snapshot) => {
+      if (snapshot.sequence > queue.sessions.get(id).nextSequence) {
+        const error = new Error('future PCM cursor'); error.code = 'live_queue_conflict'; throw error;
+      }
+      savedSequences.push(snapshot.sequence);
+      return save(owner,id,snapshot);
+    };
+    const firstId = app.run('pending[0].id');
+    const recovering = app.run('recoverSessionStorage(captureSession)');
+    await until(() => writes === 1,'repair stopped inside the first chunk write');
+    app.microphone().callbacks.onChunk(chunk(5,11,3));
+    const secondId = app.run('pending[1].id');
+    const snapshot = {sequence:2,startSamples:208000,durationSamples:80000,overlapSamples:48000,
+      blob:encodeWav(Float32Array.from({length:80000},(_,index) => (index % 31) / 64))};
+    const snapshotSaving = app.microphone().callbacks.onSnapshot(snapshot);
+    assert.equal(app.run('captureSession.latestSnapshot.sequence'),2);
+    gate.resolve();
+    assert.equal(await recovering,true);
+    await snapshotSaving;
+    await until(() => uploads.length === 2 && app.run('pending.length') === 0,'new queued chunk and latest PCM finish');
+    assert.deepEqual(uploads.map(value => value.id),[firstId,secondId]);
+    assert.equal(writes,2,'the fixed repair batch and queued writer never both insert the new chunk');
+    assert.ok(savedSequences.every(sequence => sequence === 2));
+    const stored = queue.snapshots.get(app.run('captureSession.id'));
+    assert.equal(stored.sequence,2); assert.equal(stored.durationSamples,80000);
+    assert.deepEqual(new Uint8Array(await stored.blob.arrayBuffer()),new Uint8Array(await snapshot.blob.arrayBuffer()));
+    assert.equal(app.run('captureSession.latestSnapshot'),null);
+    assert.equal(app.run('captureSession.storageFailed'),false);
+    assert.equal(app.run('captureSession.storageRepairUnsafe || false'),false);
+    assert.equal(app.run('recording'),true);
+  }
+});
+
+test('a failed deferred PCM flush never marks its committed predecessor RAM-only or drops the newest PCM', async () => {
+  const {app,queue,failure,originalEnqueue} = await storageFailureFixture();
+  const gate = deferred(); let writes = 0;
+  failure.enabled = false;
+  queue.enqueueChunk = async (...args) => {
+    if (++writes === 1) await gate.promise;
+    return originalEnqueue(...args);
+  };
+  const save = queue.saveSnapshot.bind(queue);
+  queue.saveSnapshot = async () => { const error = new Error('snapshot quota'); error.code = 'live_queue_quota'; throw error; };
+  app.run("token='';");
+  const recovering = app.run('recoverSessionStorage(captureSession)');
+  await until(() => writes === 1);
+  app.microphone().callbacks.onChunk(chunk(5,11,3));
+  const snapshot = {sequence:2,startSamples:208000,durationSamples:80000,overlapSamples:48000,
+    blob:encodeWav(new Float32Array(80000).fill(0.25))};
+  const snapshotSaving = app.microphone().callbacks.onSnapshot(snapshot);
+  gate.resolve(); await recovering; await snapshotSaving;
+  assert.equal(app.run('pending[1].durable'),true);
+  assert.equal(app.run('pending[1].blob'),null);
+  assert.equal(app.run('captureSession.latestSnapshot'),snapshot);
+  assert.equal(app.run('captureSession.storageFailed'),true);
+  assert.equal(app.run('captureSession.storageRepairUnsafe'),false);
+  assert.equal(app.run('volatileAudioStats().seconds'),2,'only PCM beyond both committed chunks remains volatile');
+  queue.saveSnapshot = save;
+  assert.equal(await app.run('recoverSessionStorage(captureSession)'),true);
+  assert.equal(writes,2,'committed chunks are not reconstructed from their cleared RAM blobs');
+  assert.equal(app.run('captureSession.latestSnapshot'),null);
+  assert.equal(app.run('volatileAudioStats().count'),0);
+});
+
+test('unfinished PCM alone warns about RAM-only audio and excludes overlap, queued coverage and other owners', async () => {
+  const app = await ongoingRecordingFixture();
+  const queue = app.run('liveQueue'), save = queue.saveSnapshot.bind(queue);
+  queue.saveSnapshot = async () => { const error = new Error('snapshot quota'); error.code = 'live_queue_quota'; throw error; };
+  const snapshot = {sequence:0,startSamples:0,durationSamples:32000,overlapSamples:0,
+    blob:encodeWav(new Float32Array(32000))};
+  await app.microphone().callbacks.onSnapshot(snapshot);
+  assert.equal(app.run('pending.length'),0);
+  assert.equal(app.run('volatileAudioStats().seconds'),2);
+  assert.equal(app.run('volatileAudioStats().bytes'),snapshot.blob.size);
+  assert.match(app.element('save-state').textContent,/메모리에만 00:02/);
+  assert.equal(app.run("volatileAudioStats('user-beta').count"),0);
+  app.microphone().callbacks.onChunk(chunk(0));
+  await app.run('captureSession.persistChain');
+  assert.equal(app.run('volatileAudioStats().seconds'),8,'the same PCM in a queued WAV is not counted twice');
+  queue.saveSnapshot = save;
+  assert.equal(await app.run('recoverSessionStorage(captureSession)'),true);
+  assert.equal(app.run('volatileAudioStats().count'),0);
+});
+
+test('explicit RAM-only skip serializes its durable decision ahead of a concurrent storage retry', async () => {
+  const {app,queue,uploads,failure,originalEnqueue} = await storageFailureFixture();
+  app.microphone().callbacks.onChunk(chunk(5,11,3));
+  await app.run('captureSession.persistChain');
+  const skippedId = app.run('pending[0].id'), remainingId = app.run('pending[1].id');
+  app.run('pending[0].downloadRequested=true');
+  const gate = deferred(), advance = queue.advanceSettledChunk.bind(queue);
+  let deciding = false;
+  queue.advanceSettledChunk = async (...args) => { deciding = true; await gate.promise; return advance(...args); };
+  const enqueued = [];
+  failure.enabled = false;
+  queue.enqueueChunk = async (...args) => { enqueued.push(args[2].id); return originalEnqueue(...args); };
+  const skipping = app.run('skipFailedChunk()');
+  await until(() => deciding,'skip decision paused before its durable commit');
+  const repairing = app.run('recoverSessionStorage(captureSession)');
+  await tick(); await tick();
+  assert.deepEqual(enqueued,[],'storage retry waits for the earlier explicit decision');
+  gate.resolve(); await skipping; assert.equal(await repairing,true);
+  await until(() => uploads.length === 1 && app.run('pending.length') === 0);
+  assert.deepEqual(enqueued,[remainingId]);
+  assert.deepEqual(uploads.map(item => item.id),[remainingId]);
+  assert.equal(queue.chunks.has(skippedId),false);
+  assert.equal(app.run('captureSession.storageRepairUnsafe || false'),false);
+});
+
+test('a late durable skip commit never clears a different account or server upload state', async () => {
+  for (const change of ["user='user-beta'; token='next-account-token';", "apiUrl='https://next-server.example';",
+    "token='new-session-token'; requestGeneration += 1;"]) {
+    const {app,queue,uploads} = await storageFailureFixture();
+    const oldSession = app.run('captureSession');
+    app.run('pending[0].downloadRequested=true');
+    const gate = deferred(), advance = queue.advanceSettledChunk.bind(queue);
+    let deciding = false;
+    queue.advanceSettledChunk = async (...args) => { deciding = true; await gate.promise; return advance(...args); };
+    const skipping = app.run('skipFailedChunk()');
+    await until(() => deciding);
+    app.run(`${change} sendError='new scope upload status'; sending=true;
+      pending=[{id:'new-scope-audio',owner:user,captureId:'new-scope-capture'}];
+      $('notice').textContent='new scope notice';`);
+    gate.resolve(); await skipping;
+    assert.equal(queue.sessions.get(oldSession.id).nextSequence,1,'old owner decision safely committed');
+    assert.equal(app.run('pending[0].id'),'new-scope-audio');
+    assert.equal(app.run('sendError'),'new scope upload status');
+    assert.equal(app.run('sending'),true);
+    assert.equal(app.element('notice').textContent,'new scope notice');
+    assert.equal(uploads.length,0);
+  }
 });

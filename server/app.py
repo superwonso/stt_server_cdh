@@ -31,6 +31,9 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .db import Database
 from .drive_archive import DriveArchiveManager
 from .drive_storage import DriveStorageError
+from . import lecture_tools
+from .lease_renewal import create_lease_renewer
+from .recovery_backup import BackupScheduler, RecoveryBackupManager
 from .clova_transcriber import ClovaStreamingTranscriber, ClovaTranscriptionError
 from .importer import ImportDurationError, ImportInterrupted, ImportMediaError, iter_audio_chunks
 from .recordings import (
@@ -373,6 +376,13 @@ def create_app(
         recording_store,
         client=drive_storage,
     )
+    # Only the real uvicorn factory may load private backup configuration or
+    # renew a live Pages address. Explicit Settings fixtures stay isolated.
+    lease_renewer = create_lease_renewer(
+        data_dir=settings.data_dir,
+        enabled=production_factory and os.getenv("AUTO_RENEW_API_URL", "1").strip().lower() in {"1", "true", "yes"},
+    )
+    backup_scheduler = BackupScheduler(RecoveryBackupManager(settings)) if production_factory else None
     download_ticket_lock = threading.Lock()
     # A small reuse budget lets a browser resume a Range download after a
     # Wi-Fi interruption without ever putting the login bearer in a URL.
@@ -413,12 +423,16 @@ def create_app(
         translation_service.recover()
         if settings.model_warmup and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
-        ensure_import_worker()
-        ensure_correction_worker()
-        summary_service.start()
-        translation_service.start()
-        archive_manager.start()
         try:
+            # Even a partially failed startup must stop workers already started.
+            ensure_import_worker()
+            ensure_correction_worker()
+            summary_service.start()
+            translation_service.start()
+            archive_manager.start()
+            lease_renewer.start()
+            if backup_scheduler is not None:
+                backup_scheduler.start()
             yield
         finally:
             # Signal both workers before joining either one. Their bounded
@@ -428,6 +442,9 @@ def create_app(
             summary_service.request_shutdown()
             translation_service.request_shutdown()
             archive_manager.request_shutdown()
+            lease_renewer.request_shutdown()
+            if backup_scheduler is not None:
+                backup_scheduler.request_shutdown()
             shutdown_deadline = time.monotonic() + 18
             correction_stopped = stop_correction_worker(timeout=8)
             summary_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
@@ -436,6 +453,9 @@ def create_app(
             archive_stopped = archive_manager.stop(
                 timeout=max(0.0, shutdown_deadline - time.monotonic())
             )
+            lease_renewer.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
+            if backup_scheduler is not None:
+                backup_scheduler.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             if hasattr(clova_engine, "close"):
                 clova_engine.close()
             if correction_stopped and hasattr(correction_engine, "close"):
@@ -453,6 +473,8 @@ def create_app(
     app.state.translation_service = translation_service
     app.state.recording_store = recording_store
     app.state.archive_manager = archive_manager
+    app.state.lease_renewer = lease_renewer
+    app.state.backup_scheduler = backup_scheduler
     app.state.tunnel_status = tunnel_status
     app.state.tunnel_restart = tunnel_restart
 
@@ -488,7 +510,7 @@ def create_app(
             "X-Upload-Offset",
             "X-Part-SHA256",
         ],
-        expose_headers=["Retry-After"],
+        expose_headers=["Retry-After", "X-Clip-Start-Seconds", "X-Clip-Duration-Seconds"],
         max_age=600,
     )
     # add_middleware inserts at the front, so this guard is the outermost
@@ -934,10 +956,25 @@ def create_app(
                 "gpu": gpu_resources(),
             },
             "queues": queues,
+            # This is a cached, account-free aggregate. It must never perform
+            # a Drive request while handling the administrator's overview.
+            "drive": archive_manager.admin_snapshot(),
+            "api_address": lease_renewer.status(),
+            "backup": backup_scheduler.status() if backup_scheduler is not None else {"configured": False, "enabled": False, "running": False},
             "tunnel": sanitized_tunnel_status(),
             "accounts": account_results,
             "recent_audit": recent_audit,
         }
+
+    @app.post("/admin/drive/refresh", status_code=202)
+    def refresh_admin_drive(user: dict = Depends(admin_identity)):
+        del user
+        if not limiter.allow(("admin-drive-refresh", "service"), 3, 300):
+            raise HTTPException(429, "저장 상태 확인 요청이 너무 많습니다.", headers={"Retry-After": "300"})
+        # A bounded background worker owns the network request. Repeated clicks
+        # cannot create independent requests or block transcription/overview.
+        accepted = archive_manager.request_refresh()
+        return {"accepted": accepted, "drive": archive_manager.admin_snapshot()}
 
     @app.post("/admin/access")
     def set_admin_access(body: AdminAccessBody, user: dict = Depends(admin_identity)):
@@ -3420,4 +3457,6 @@ def create_app(
                             raw_segments=raw_segments, transcript_revision=transcript_revision)
     translation_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
                                 raw_segments=raw_segments, transcript_revision=transcript_revision)
+    lecture_tools.install(app, settings, database, recording_store, archive_manager,
+                          identity=data_identity, owned_lecture=owned_lecture, limiter=limiter)
     return app

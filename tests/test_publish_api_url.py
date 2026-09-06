@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import stat
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,11 @@ class PublishApiUrlTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         directory = Path(self.temporary.name)
         self.directory = directory
+        scripts = directory / "scripts"
+        scripts.mkdir()
+        self.publish = scripts / "publish-api-url.sh"
+        shutil.copy2(PUBLISH, self.publish)
+        shutil.copy2(ROOT / "scripts" / "runtime_config.py", scripts / "runtime_config.py")
         self.log = directory / "gh.log"
         self.mock_gh = directory / "gh"
         self.mock_gh.write_text(
@@ -64,8 +70,8 @@ class PublishApiUrlTests(unittest.TestCase):
     def run_publish(self, *arguments: str, input_value: str | None = None, **environment):
         values = self.environment | environment
         return subprocess.run(
-            [str(PUBLISH), *arguments],
-            cwd=ROOT,
+            [str(self.publish), *arguments],
+            cwd=self.directory,
             env=values,
             input=input_value,
             capture_output=True,
@@ -147,8 +153,8 @@ class PublishApiUrlTests(unittest.TestCase):
         }
         url = "https://gentle-classroom-voice.trycloudflare.com"
         online = subprocess.Popen(
-            [str(PUBLISH), "--stdin"],
-            cwd=ROOT,
+            [str(self.publish), "--stdin"],
+            cwd=self.directory,
             env=environment,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -169,8 +175,8 @@ class PublishApiUrlTests(unittest.TestCase):
                 self.fail("online publication did not reach workflow dispatch")
 
             offline = subprocess.run(
-                [str(PUBLISH), "--offline", "--no-wait"],
-                cwd=ROOT,
+                [str(self.publish), "--offline", "--no-wait"],
+                cwd=self.directory,
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -184,6 +190,20 @@ class PublishApiUrlTests(unittest.TestCase):
             if online.poll() is None:
                 online.terminate()
                 online.wait(timeout=2)
+
+    def test_cli_timeouts_keep_the_publication_process_group(self):
+        fake_timeout = self.directory / "timeout"
+        timeout_log = self.directory / "timeout.log"
+        fake_timeout.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "%s\\n" "$1" >>"$MOCK_TIMEOUT_LOG"\n'
+            'exec /usr/bin/timeout "$@"\n', encoding="utf-8")
+        fake_timeout.chmod(0o700)
+        result = self.run_publish("--offline", "--no-wait",
+                                  PATH=f"{self.directory}:{self.environment['PATH']}",
+                                  MOCK_TIMEOUT_LOG=str(timeout_log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(timeout_log.read_text().splitlines(), ["--foreground", "--foreground"])
 
 
 if __name__ == "__main__":

@@ -329,6 +329,33 @@ class TunnelControllerTests(unittest.TestCase):
         pid_file.symlink_to(data / "missing")
         self.assertEqual(controller._read_pid("tunnel"), ("conflict", None))
 
+    def test_renewal_is_read_only_and_has_only_the_fixed_renew_command(self):
+        controller = self.controller()
+        self.assertTrue(controller.renewal_processes_owned())
+        self.assertEqual(controller.renewal_command(), (
+            str(self.root / "scripts" / "start-tunnel.sh"), "--renew-only", "--port", "8765",
+            "--cloudflared", str(self.cloudflared)))
+        for kind in ("server", "tunnel"):
+            for state in ("stopped", "conflict"):
+                self.runtime.states[kind] = state
+                self.assertFalse(controller.renewal_processes_owned())
+            self.runtime.states[kind] = "owned"
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_script_renewal_can_verify_the_api_parent_but_not_skip_its_binding_checks(self):
+        controller = self.controller()
+        command = ["python", "-m", "uvicorn", "server.app:create_app", "--factory",
+                   "--host", "127.0.0.1", "--port", "8765", "--workers", "1"]
+        with (mock.patch.object(controller, "_read_pid", return_value=("candidate", os.getpid() + 1000)),
+              mock.patch.object(controller, "_process_is_live", return_value=True),
+              mock.patch.object(controller, "_process_details", return_value=(self.root, command, self.root / "python")) as details):
+            self.assertEqual(controller._default_process_probe("server"), "conflict")
+            self.assertTrue(controller.renewal_processes_owned(script_check=True))
+            wrong = command.copy()
+            wrong[wrong.index("8765")] = "9999"
+            details.return_value = (self.root, wrong, self.root / "python")
+            self.assertFalse(controller.renewal_processes_owned(script_check=True))
+
 
 if __name__ == "__main__":
     unittest.main()

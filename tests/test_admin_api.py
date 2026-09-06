@@ -105,6 +105,39 @@ class AdminApiTests(unittest.TestCase):
     def headers(self, username: str = "user-alpha") -> dict[str, str]:
         return {"Authorization": f"Bearer {self.tokens[username]}"}
 
+    def test_drive_status_and_refresh_are_admin_only(self):
+        manager = self.app.state.archive_manager
+        with mock.patch.object(manager, "request_refresh", return_value=True) as refresh:
+            self.assertEqual(self.client.post("/admin/drive/refresh").status_code, 401)
+            self.assertEqual(self.client.post("/admin/drive/refresh", headers=self.headers("user-beta")).status_code, 403)
+            refresh.assert_not_called()
+            result = self.client.post("/admin/drive/refresh", headers=self.headers())
+            self.assertEqual(result.status_code, 202)
+            self.assertTrue(result.json()["accepted"])
+            refresh.assert_called_once_with()
+        overview = self.client.get("/admin/overview", headers=self.headers())
+        self.assertEqual(overview.status_code, 200)
+        self.assertFalse(overview.json()["drive"]["enabled"])
+        self.assertNotIn("quota", self.client.get("/status", headers=self.headers("user-beta")).json())
+
+    def test_overview_uses_cached_drive_status_without_requesting_refresh(self):
+        manager = self.app.state.archive_manager
+        with mock.patch.object(manager, "request_refresh", side_effect=AssertionError("GET must not refresh")):
+            for _ in range(3):
+                result = self.client.get("/admin/overview", headers=self.headers())
+                self.assertEqual(result.status_code, 200)
+                self.assertIn("drive", result.json())
+
+    def test_drive_refresh_has_global_rate_limit(self):
+        with mock.patch.object(self.app.state.archive_manager, "request_refresh", return_value=False) as refresh:
+            for _ in range(3):
+                result = self.client.post("/admin/drive/refresh", headers=self.headers())
+                self.assertEqual(result.status_code, 202)
+                self.assertFalse(result.json()["accepted"])
+            result = self.client.post("/admin/drive/refresh", headers=self.headers())
+            self.assertEqual(result.status_code, 429)
+            self.assertEqual(refresh.call_count, 3)
+
     def test_admin_setting_is_private_and_missing_configuration_fails_closed(self):
         self.assertNotIn("user-alpha", repr(self.settings))
         invalid_value = "not-a-configured-private-account"

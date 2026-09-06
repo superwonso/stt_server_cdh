@@ -1,12 +1,15 @@
 export const LIVE_QUEUE_DB_NAME = 'yeobaek-live-audio';
-export const LIVE_QUEUE_DB_VERSION = 1;
+export const LIVE_QUEUE_DB_VERSION = 2;
 export const LIVE_AUDIO_SAMPLE_RATE = 16000;
 export const MAX_LIVE_CHUNK_BYTES = 4 * 1024 * 1024;
+export const MAX_PCM_SNAPSHOT_SAMPLES = LIVE_AUDIO_SAMPLE_RATE * 15;
+const PCM_GUARD_SAMPLES = LIVE_AUDIO_SAMPLE_RATE * 3;
 const INDEXED_DB_OPEN_TIMEOUT_MS = 10000;
 const INDEXED_DB_TRANSACTION_TIMEOUT_MS = 10000;
 
 const SESSION_STORE = 'sessions';
 const CHUNK_STORE = 'chunks';
+const SNAPSHOT_STORE = 'pcmSnapshots';
 const SESSION_STATES = new Set([
   'recording',
   'paused',
@@ -345,6 +348,64 @@ function normalizeChunkInput(value) {
   return normalized;
 }
 
+function normalizeSnapshotInput(value) {
+  onlyKeys(value, new Set(['sequence', 'startSamples', 'durationSamples', 'overlapSamples', 'blob']), 'PCM 임시 저장');
+  const result = {
+    sequence: finiteInteger(value.sequence, 'PCM 청크 순서'),
+    startSamples: finiteInteger(value.startSamples, 'PCM 시작 위치'),
+    durationSamples: finiteInteger(value.durationSamples, 'PCM 길이', { min: 1, max: MAX_PCM_SNAPSHOT_SAMPLES }),
+    overlapSamples: finiteInteger(value.overlapSamples, 'PCM 겹침 길이'),
+    blob: value.blob,
+  };
+  if (result.overlapSamples > result.durationSamples || result.overlapSamples > PCM_GUARD_SAMPLES
+      || !Number.isSafeInteger(result.startSamples + result.durationSamples)) {
+    throw new LiveQueueValidationError('PCM 임시 저장의 음성 범위가 올바르지 않습니다.');
+  }
+  return result;
+}
+
+function validateSnapshotRecord(value) {
+  const keys = new Set(['captureId', 'owner', 'sequence', 'startSamples', 'durationSamples',
+    'overlapSamples', 'blob', 'byteLength', 'revision', 'updatedAt']);
+  onlyKeys(value, keys, '저장된 PCM');
+  if (Object.keys(value).length !== keys.size) throw new LiveQueueValidationError('저장된 PCM 정보가 부족합니다.');
+  cleanUuid(value.captureId, '녹음 세션 ID');
+  cleanOwner(value.owner);
+  normalizeSnapshotInput({ sequence: value.sequence, startSamples: value.startSamples,
+    durationSamples: value.durationSamples, overlapSamples: value.overlapSamples, blob: value.blob });
+  finiteInteger(value.revision, 'PCM 저장 버전', { min: 1 });
+  finiteInteger(value.updatedAt, 'PCM 저장 시각', { min: 1, max: MAX_TIMESTAMP });
+  if (!isBlob(value.blob) || value.byteLength !== value.blob.size
+      || value.byteLength !== 44 + value.durationSamples * 2) {
+    throw new LiveQueueValidationError('저장된 PCM 파일 크기가 올바르지 않습니다.');
+  }
+  return value;
+}
+
+function snapshotCopy(value, { includeBlob = true } = {}) {
+  const { blob, ...copy } = value;
+  if (includeBlob) copy.blob = blob;
+  return copy;
+}
+
+function snapshotMatchesSession(snapshot, session) {
+  return snapshot.captureId === session.id && snapshot.owner === session.owner
+    && snapshot.sequence === session.nextSequence && !session.finalQueued
+    && snapshot.startSamples + snapshot.overlapSamples === session.capturedSamples;
+}
+
+// Prepared before opening an IDB transaction: Blob.arrayBuffer() may complete
+// after the browser auto-commits an otherwise idle transaction.
+async function retainedPcmBlob(input) {
+  if (input.final) return null;
+  const retained = Math.min(PCM_GUARD_SAMPLES, input.durationSamples);
+  const header = await input.blob.slice(0, 44).arrayBuffer();
+  const view = new DataView(header);
+  view.setUint32(4, 36 + retained * 2, true);
+  view.setUint32(40, retained * 2, true);
+  return new Blob([header, input.blob.slice(44 + (input.durationSamples - retained) * 2)], { type: 'audio/wav' });
+}
+
 function validateChunkRecord(value) {
   const expected = new Set([
     'id', 'captureId', 'owner', 'sessionCreatedAt', 'sequence', 'startSamples',
@@ -620,6 +681,10 @@ export class DurableLiveQueue {
             { unique: false },
           );
         }
+        if (!database.objectStoreNames.contains(SNAPSHOT_STORE)) {
+          const snapshots = database.createObjectStore(SNAPSHOT_STORE, { keyPath: 'captureId' });
+          snapshots.createIndex('owner', 'owner', { unique: false });
+        }
       };
       request.onblocked = () => {
         if (settled) return;
@@ -838,17 +903,101 @@ export class DurableLiveQueue {
     }, '녹음 세션 상태를 기기에 저장하지 못했습니다.');
   }
 
-  async enqueueChunk(ownerValue, captureIdValue, value) {
+  async saveSnapshot(ownerValue, captureIdValue, value) {
+    const owner = cleanOwner(ownerValue);
+    const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
+    const input = normalizeSnapshotInput(value);
+    await validateWavBlob(input.blob, input.durationSamples);
+    const now = this._clock();
+    return this._transaction([SESSION_STORE, SNAPSHOT_STORE], 'readwrite', async stores => {
+      const rawSession = await requestPromise(stores[SESSION_STORE].get(captureId));
+      if (!rawSession) throw new LiveQueueNotFoundError('PCM을 저장할 녹음 세션을 찾을 수 없습니다.');
+      const session = storedValue(rawSession, validateSessionRecord, '저장된 녹음 세션');
+      if (session.owner !== owner) throw new LiveQueueOwnershipError();
+      // A delayed/coalesced callback must never resurrect already queued (or
+      // acknowledged) PCM, even when its earlier storage attempt failed.
+      if (session.finalQueued || session.state === 'completed' || input.sequence < session.nextSequence) {
+        return { saved: false, reason: 'settled' };
+      }
+      if (input.sequence !== session.nextSequence
+          || input.startSamples + input.overlapSamples !== session.capturedSamples) {
+        throw new LiveQueueConflictError('앞선 음성 조각을 저장한 뒤 PCM을 보관해 주세요.');
+      }
+      const raw = await requestPromise(stores[SNAPSHOT_STORE].get(captureId));
+      const previous = raw && storedValue(raw, validateSnapshotRecord, '저장된 PCM');
+      if (previous && !snapshotMatchesSession(previous, session)) {
+        throw new LiveQueueCorruptError('PCM과 녹음 세션의 위치가 일치하지 않습니다.');
+      }
+      if (previous && input.startSamples + input.durationSamples <= previous.startSamples + previous.durationSamples) {
+        return { saved: false, reason: 'not_newer', snapshot: snapshotCopy(previous, { includeBlob: false }) };
+      }
+      const snapshot = { ...input, captureId, owner, byteLength: input.blob.size,
+        revision: (previous?.revision || 0) + 1, updatedAt: now };
+      validateSnapshotRecord(snapshot);
+      await requestPromise(stores[SNAPSHOT_STORE].put(snapshot));
+      return { saved: true, snapshot: snapshotCopy(snapshot, { includeBlob: false }) };
+    }, '분할 전 음성을 기기에 안전하게 저장하지 못했습니다.');
+  }
+
+  async getSnapshot(ownerValue, captureIdValue) {
+    const owner = cleanOwner(ownerValue);
+    const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
+    const snapshot = await this._transaction([SESSION_STORE, SNAPSHOT_STORE], 'readonly', async stores => {
+      const rawSession = await requestPromise(stores[SESSION_STORE].get(captureId));
+      if (!rawSession) return null;
+      const session = storedValue(rawSession, validateSessionRecord, '저장된 녹음 세션');
+      if (session.owner !== owner) throw new LiveQueueOwnershipError();
+      const raw = await requestPromise(stores[SNAPSHOT_STORE].get(captureId));
+      if (!raw) return null;
+      const value = storedValue(raw, validateSnapshotRecord, '저장된 PCM');
+      if (!snapshotMatchesSession(value, session)) {
+        throw new LiveQueueCorruptError('PCM과 녹음 세션의 위치가 일치하지 않습니다.');
+      }
+      return snapshotCopy(value);
+    }, '분할 전 음성을 기기에서 읽지 못했습니다.');
+    if (snapshot) await validateWavBlob(snapshot.blob, snapshot.durationSamples);
+    return snapshot;
+  }
+
+  /** Explicit recovery only, after the app holds the owner's idle-capture lock. */
+  async promoteSnapshot(owner, captureId, { id, expectedRevision, final = true } = {}) {
+    cleanUuid(id, '복구할 음성 조각 ID');
+    finiteInteger(expectedRevision, '복구할 PCM 버전', { min: 1 });
+    if (final !== true) throw new LiveQueueValidationError('복구한 PCM은 마지막 음성으로 저장해야 합니다.');
+    const snapshot = await this.getSnapshot(owner, captureId);
+    if (!snapshot) {
+      const previous = await this.getChunk(owner, id);
+      if (previous?.captureId === captureId && previous.final) return previous;
+      throw new LiveQueueNotFoundError('복구할 PCM을 찾을 수 없습니다.');
+    }
+    if (snapshot.revision !== expectedRevision) throw new LiveQueueConflictError('PCM이 변경되어 복구를 다시 확인해야 합니다.');
+    return this.enqueueChunk(owner, captureId, { id, startSamples: snapshot.startSamples,
+      durationSamples: snapshot.durationSamples, overlapSamples: snapshot.overlapSamples,
+      blob: snapshot.blob, final: true }, { snapshotRevision: expectedRevision, snapshotSequence: snapshot.sequence });
+  }
+
+  async enqueueChunk(ownerValue, captureIdValue, value, options = {}) {
     const owner = cleanOwner(ownerValue);
     const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
     const input = normalizeChunkInput(value);
     await validateWavBlob(input.blob, input.durationSamples);
+    onlyKeys(options, new Set(['snapshotRevision', 'snapshotSequence']), 'PCM 전환 조건');
+    if (options.snapshotRevision !== undefined) {
+      finiteInteger(options.snapshotRevision, 'PCM 전환 버전', { min: 1 });
+      finiteInteger(options.snapshotSequence, 'PCM 전환 순서');
+    }
+    const guardBlob = await retainedPcmBlob(input);
     const now = this._clock();
-    return this._transaction([SESSION_STORE, CHUNK_STORE], 'readwrite', async stores => {
+    return this._transaction([SESSION_STORE, CHUNK_STORE, SNAPSHOT_STORE], 'readwrite', async stores => {
       const sessionValue = await requestPromise(stores[SESSION_STORE].get(captureId));
       if (!sessionValue) throw new LiveQueueNotFoundError('음성을 저장할 녹음 세션을 찾을 수 없습니다.');
       const session = storedValue(sessionValue, validateSessionRecord, '저장된 녹음 세션');
       if (session.owner !== owner) throw new LiveQueueOwnershipError();
+      const snapshotValue = await requestPromise(stores[SNAPSHOT_STORE].get(captureId));
+      const snapshot = snapshotValue && storedValue(snapshotValue, validateSnapshotRecord, '저장된 PCM');
+      if (snapshot && !snapshotMatchesSession(snapshot, session)) {
+        throw new LiveQueueCorruptError('PCM과 녹음 세션의 위치가 일치하지 않습니다.');
+      }
       const existing = await requestPromise(stores[CHUNK_STORE].get(input.id));
       if (existing) {
         const previous = storedValue(existing, validateChunkRecord, '저장된 음성 조각');
@@ -865,11 +1014,19 @@ export class DurableLiveQueue {
         await validateWavBlob(previous.blob, previous.durationSamples);
         return chunkCopy(previous);
       }
+      if (options.snapshotRevision !== undefined
+          && (!snapshot || snapshot.revision !== options.snapshotRevision
+            || snapshot.sequence !== options.snapshotSequence)) {
+        throw new LiveQueueConflictError('PCM이 변경되어 복구를 다시 확인해야 합니다.');
+      }
       if (session.state === 'completed' || session.finalQueued) {
         throw new LiveQueueConflictError('이미 마지막 음성이 저장된 세션에는 음성을 더 추가할 수 없습니다.');
       }
       if (input.startSamples + input.overlapSamples !== session.capturedSamples) {
         throw new LiveQueueConflictError('음성 조각의 순서가 현재 녹음 길이와 맞지 않습니다.');
+      }
+      if (snapshot && snapshot.startSamples + snapshot.durationSamples > input.startSamples + input.durationSamples) {
+        throw new LiveQueueConflictError('저장된 PCM의 뒷부분을 잃는 짧은 음성 조각으로 바꿀 수 없습니다.');
       }
       if (session.nextSequence >= Number.MAX_SAFE_INTEGER) {
         throw new LiveQueueConflictError('한 녹음 세션에 저장할 수 있는 음성 조각 수를 초과했습니다.');
@@ -906,8 +1063,98 @@ export class DurableLiveQueue {
       validateSessionRecord(session);
       await requestPromise(stores[CHUNK_STORE].add(chunk));
       await requestPromise(stores[SESSION_STORE].put(session));
+      if (input.final) {
+        await requestPromise(stores[SNAPSHOT_STORE].delete(captureId));
+      } else {
+        const retained = Math.min(PCM_GUARD_SAMPLES, input.durationSamples);
+        const guard = { captureId, owner, sequence: session.nextSequence,
+          startSamples: session.capturedSamples - retained, durationSamples: retained,
+          overlapSamples: retained, blob: guardBlob, byteLength: guardBlob.size,
+          revision: (snapshot?.revision || 0) + 1, updatedAt: now };
+        validateSnapshotRecord(guard);
+        await requestPromise(stores[SNAPSHOT_STORE].put(guard));
+      }
       return chunkCopy(chunk);
     }, '음성 조각을 기기에 안전하게 저장하지 못했습니다.');
+  }
+
+  /**
+   * Trusted app receipt: validated server ACK or an explicit download-and-skip.
+   * Never send audio here. Already advanced non-final ranges are no-ops; this
+   * does not prove a server receipt or authorize uploads by an arbitrary ID.
+   */
+  async advanceSettledChunk(ownerValue, captureIdValue, value, {
+    serverConfirmed = false, downloadRequested = false,
+  } = {}) {
+    const owner = cleanOwner(ownerValue);
+    const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
+    onlyKeys(value, new Set(['id', 'sequence', 'startSamples', 'durationSamples', 'overlapSamples', 'final']), '완료한 음성 정보');
+    const sequence = finiteInteger(value.sequence, '완료한 음성 순서');
+    const { sequence: ignored, ...metadata } = value;
+    const input = normalizeChunkInput(metadata);
+    if (typeof serverConfirmed !== 'boolean' || typeof downloadRequested !== 'boolean'
+        || !(serverConfirmed || downloadRequested)) {
+      throw new LiveQueueValidationError('서버 저장 확인 또는 명시한 음성 다운로드가 필요합니다.');
+    }
+    const end = input.startSamples + input.durationSamples;
+    const now = this._clock();
+    return this._transaction([SESSION_STORE, CHUNK_STORE, SNAPSHOT_STORE], 'readwrite', async stores => {
+      const rawSession = await requestPromise(stores[SESSION_STORE].get(captureId));
+      if (!rawSession) throw new LiveQueueNotFoundError('완료한 음성의 녹음 세션을 찾을 수 없습니다.');
+      const session = storedValue(rawSession, validateSessionRecord, '저장된 녹음 세션');
+      if (session.owner !== owner) throw new LiveQueueOwnershipError();
+      const rawChunk = await requestPromise(stores[CHUNK_STORE].get(input.id));
+      const chunk = rawChunk && storedValue(rawChunk, validateChunkRecord, '저장된 음성 조각');
+      if (chunk && chunk.owner !== owner) throw new LiveQueueOwnershipError();
+      if (chunk && (chunk.captureId !== captureId || chunk.sequence !== sequence
+          || chunk.startSamples !== input.startSamples || chunk.durationSamples !== input.durationSamples
+          || chunk.overlapSamples !== input.overlapSamples || chunk.final !== input.final)) {
+        throw new LiveQueueConflictError('완료한 음성 정보가 기기에 저장된 내용과 다릅니다.');
+      }
+      if (!chunk) {
+        const sameSequence = await firstCursorValue(stores[CHUNK_STORE].index('captureOrder').openCursor(
+          this.keyRange.bound([owner, captureId, sequence, ''], [owner, captureId, sequence, HIGH_TEXT]),
+        ));
+        if (sameSequence) throw new LiveQueueConflictError('같은 순서에 다른 ID의 음성이 남아 있어 완료 위치를 바꾸지 않았습니다.');
+      }
+      const alreadyAdvanced = sequence < session.nextSequence && end <= session.capturedSamples;
+      if (!alreadyAdvanced && (sequence !== session.nextSequence || session.finalQueued
+          || input.startSamples + input.overlapSamples !== session.capturedSamples)) {
+        throw new LiveQueueConflictError('앞선 음성의 완료 정보를 먼저 복구해 주세요.');
+      }
+      if (input.final) {
+        if (alreadyAdvanced && (!session.finalQueued || sequence !== session.nextSequence - 1
+            || end !== session.capturedSamples)) {
+          throw new LiveQueueConflictError('녹음의 마지막 위치가 완료 정보와 다릅니다.');
+        }
+        const count = await requestPromise(stores[CHUNK_STORE].index('captureOrder').count(this._captureRange(owner, captureId)));
+        if (count !== (chunk ? 1 : 0)) throw new LiveQueueConflictError('남은 음성을 모두 확인한 뒤 마지막 음성을 완료해 주세요.');
+      }
+      const rawSnapshot = await requestPromise(stores[SNAPSHOT_STORE].get(captureId));
+      const snapshot = rawSnapshot && storedValue(rawSnapshot, validateSnapshotRecord, '저장된 PCM');
+      if (snapshot && !snapshotMatchesSession(snapshot, session)) {
+        throw new LiveQueueCorruptError('PCM과 녹음 세션의 위치가 일치하지 않습니다.');
+      }
+      if (snapshot && snapshot.sequence <= sequence) {
+        if (snapshot.startSamples + snapshot.durationSamples > end) {
+          throw new LiveQueueConflictError('완료한 범위 뒤에 남은 PCM이 있어 그대로 보존합니다.');
+        }
+        await requestPromise(stores[SNAPSHOT_STORE].delete(captureId));
+      }
+      if (chunk) await requestPromise(stores[CHUNK_STORE].delete(input.id));
+      if (!alreadyAdvanced) {
+        finiteInteger(session.nextSequence + 1, '다음 음성 순서');
+        session.nextSequence += 1;
+        session.capturedSamples = end;
+      }
+      if (input.final) {
+        session.finalQueued = true;
+        session.state = 'completed';
+      }
+      session.updatedAt = now;
+      await requestPromise(stores[SESSION_STORE].put(session));
+      return { advanced: !alreadyAdvanced, deletedChunk: !!chunk, session: sessionCopy(session) };
+    }, '이미 완료한 음성의 저장 위치를 복구하지 못했습니다.');
   }
 
   async getChunk(ownerValue, chunkIdValue) {
@@ -950,7 +1197,7 @@ export class DurableLiveQueue {
     const owner = cleanOwner(ownerValue);
     const chunkId = cleanUuid(chunkIdValue, '음성 조각 ID');
     const now = this._clock();
-    return this._transaction([SESSION_STORE, CHUNK_STORE], 'readwrite', async stores => {
+    return this._transaction([SESSION_STORE, CHUNK_STORE, SNAPSHOT_STORE], 'readwrite', async stores => {
       const value = await requestPromise(stores[CHUNK_STORE].get(chunkId));
       if (!value) return null;
       const chunk = storedValue(value, validateChunkRecord, '저장된 음성 조각');
@@ -986,6 +1233,7 @@ export class DurableLiveQueue {
         // WAV so a later cleanup failure cannot leave account/title metadata
         // orphaned on a shared device.
         await requestPromise(stores[SESSION_STORE].delete(chunk.captureId));
+        await requestPromise(stores[SNAPSHOT_STORE].delete(chunk.captureId));
       }
       return {
         chunk: chunkCopy(chunk, { includeBlob: false }),
@@ -1067,8 +1315,9 @@ export class DurableLiveQueue {
 
   async getStats(ownerValue) {
     const owner = cleanOwner(ownerValue);
-    return this._transaction([CHUNK_STORE], 'readonly', async stores => {
-      const stats = { count: 0, bytes: 0, queued: 0, inflight: 0, blocked: 0 };
+    return this._transaction([CHUNK_STORE, SNAPSHOT_STORE], 'readonly', async stores => {
+      const stats = { count: 0, bytes: 0, queued: 0, inflight: 0, blocked: 0,
+        snapshotCount: 0, snapshotBytes: 0, snapshotFreshSamples: 0 };
       await countCursor(
         stores[CHUNK_STORE].index('ownerOrder').openCursor(this._ownerChunkRange(owner)),
         value => {
@@ -1081,18 +1330,25 @@ export class DurableLiveQueue {
           }
         },
       );
+      await countCursor(stores[SNAPSHOT_STORE].index('owner').openCursor(this.keyRange.bound(owner, owner)), value => {
+        const snapshot = storedValue(value, validateSnapshotRecord, '저장된 PCM');
+        stats.snapshotCount += 1;
+        stats.snapshotBytes += snapshot.byteLength;
+        stats.snapshotFreshSamples += snapshot.durationSamples - snapshot.overlapSamples;
+      });
       return stats;
     }, '음성 대기열 크기를 확인하지 못했습니다.');
   }
 
   async recoverOwner(ownerValue) {
     const owner = cleanOwner(ownerValue);
-    const recovered = await this._transaction([SESSION_STORE, CHUNK_STORE], 'readonly', async stores => {
+    const recovered = await this._transaction([SESSION_STORE, CHUNK_STORE, SNAPSHOT_STORE], 'readonly', async stores => {
       const sessionRequest = stores[SESSION_STORE].index('ownerCreated')
         .openCursor(this._ownerSessionRange(owner));
       const chunkRequest = stores[CHUNK_STORE].index('ownerOrder')
         .openCursor(this._ownerChunkRange(owner));
-      const [sessions, chunks] = await Promise.all([
+      const snapshotRequest = stores[SNAPSHOT_STORE].index('owner').openCursor(this.keyRange.bound(owner, owner));
+      const [sessions, chunks, snapshots] = await Promise.all([
         cursorValues(sessionRequest, value => sessionCopy(
           storedValue(value, validateSessionRecord, '저장된 녹음 세션'),
         )),
@@ -1100,8 +1356,11 @@ export class DurableLiveQueue {
           storedValue(value, validateChunkRecord, '저장된 음성 조각'),
           { includeBlob: false },
         )),
+        cursorValues(snapshotRequest, value => snapshotCopy(
+          storedValue(value, validateSnapshotRecord, '저장된 PCM'), { includeBlob: false },
+        )),
       ]);
-      return { sessions, chunks };
+      return { sessions, chunks, snapshots };
     }, '계정의 음성 대기열을 복구하지 못했습니다.');
 
     // Keep recovery memory-bounded even after a long outage. Structural record
@@ -1110,6 +1369,12 @@ export class DurableLiveQueue {
     const sessionsById = new Map(recovered.sessions.map(session => [session.id, session]));
     const sequencesBySession = new Map();
     const finalBySession = new Set();
+    for (const snapshot of recovered.snapshots) {
+      const session = sessionsById.get(snapshot.captureId);
+      if (!session || !snapshotMatchesSession(snapshot, session)) {
+        throw new LiveQueueCorruptError('PCM과 녹음 세션의 연결 정보가 올바르지 않습니다.');
+      }
+    }
     for (const chunk of recovered.chunks) {
       const session = sessionsById.get(chunk.captureId);
       if (!session || session.owner !== owner || chunk.asrProvider !== session.asrProvider
@@ -1136,7 +1401,10 @@ export class DurableLiveQueue {
         throw new LiveQueueCorruptError('녹음 세션의 마지막 음성 상태가 올바르지 않습니다.');
       }
     }
-    const stats = { count: 0, bytes: 0, queued: 0, inflight: 0, blocked: 0 };
+    const stats = { count: 0, bytes: 0, queued: 0, inflight: 0, blocked: 0,
+      snapshotCount: recovered.snapshots.length,
+      snapshotBytes: recovered.snapshots.reduce((sum, item) => sum + item.byteLength, 0),
+      snapshotFreshSamples: recovered.snapshots.reduce((sum, item) => sum + item.durationSamples - item.overlapSamples, 0) };
     const chunkMetadata = recovered.chunks.map(chunk => {
       stats.count += 1;
       stats.bytes += chunk.byteLength;
@@ -1146,7 +1414,7 @@ export class DurableLiveQueue {
     const inflightChunks = chunkMetadata.filter(chunk => chunk.state === 'inflight');
     const activeIds = new Set(chunkMetadata.map(chunk => chunk.captureId));
     const sessions = recovered.sessions.filter(session => session.state !== 'completed' || activeIds.has(session.id));
-    return { sessions, chunks: chunkMetadata, inflightChunks, stats };
+    return { sessions, chunks: chunkMetadata, snapshots: recovered.snapshots, inflightChunks, stats };
   }
 
   async hasWorkForOtherOwner(ownerValue) {
@@ -1171,11 +1439,16 @@ export class DurableLiveQueue {
   async hasPendingChunks(ownerValue, captureIdValue) {
     const owner = cleanOwner(ownerValue);
     const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
-    return this._transaction([CHUNK_STORE], 'readonly', async stores => {
+    return this._transaction([CHUNK_STORE, SNAPSHOT_STORE], 'readonly', async stores => {
       const count = await requestPromise(
         stores[CHUNK_STORE].index('captureOrder').count(this._captureRange(owner,captureId)),
       );
-      return count > 0;
+      if (count > 0) return true;
+      const raw = await requestPromise(stores[SNAPSHOT_STORE].get(captureId));
+      if (!raw) return false;
+      const snapshot = storedValue(raw, validateSnapshotRecord, '저장된 PCM');
+      if (snapshot.owner !== owner) throw new LiveQueueOwnershipError();
+      return true;
     }, '수업의 미전송 음성을 확인하지 못했습니다.');
   }
 
@@ -1183,7 +1456,7 @@ export class DurableLiveQueue {
   async deleteSession(ownerValue, captureIdValue) {
     const owner = cleanOwner(ownerValue);
     const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
-    return this._transaction([SESSION_STORE, CHUNK_STORE], 'readwrite', async stores => {
+    return this._transaction([SESSION_STORE, CHUNK_STORE, SNAPSHOT_STORE], 'readwrite', async stores => {
       const value = await requestPromise(stores[SESSION_STORE].get(captureId));
       if (!value) return { deletedChunks: 0, deletedBytes: 0 };
       const session = storedValue(value, validateSessionRecord, '저장된 녹음 세션');
@@ -1200,6 +1473,7 @@ export class DurableLiveQueue {
         },
       );
       await requestPromise(stores[SESSION_STORE].delete(captureId));
+      await requestPromise(stores[SNAPSHOT_STORE].delete(captureId));
       return { deletedChunks, deletedBytes };
     }, '기기의 녹음 세션을 정리하지 못했습니다.');
   }

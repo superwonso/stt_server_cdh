@@ -200,6 +200,9 @@ class TunnelController:
         return cwd, arguments, executable
 
     def _default_process_probe(self, kind: ProcessKind) -> str:
+        return self._inspect_owned_process(kind)
+
+    def _inspect_owned_process(self, kind: ProcessKind, *, require_current_server: bool = True) -> str:
         pid_state, pid = self._read_pid(kind)
         if pid_state != "candidate" or pid is None:
             return pid_state
@@ -213,7 +216,7 @@ class TunnelController:
             return "conflict"
 
         if kind == "server":
-            if pid != os.getpid():
+            if require_current_server and pid != os.getpid():
                 return "conflict"
             module_pair = any(
                 left == "-m" and right == "uvicorn"
@@ -257,6 +260,28 @@ class TunnelController:
         except Exception:
             return "conflict"
         return result if result in _PROCESS_STATES else "conflict"
+
+    def renewal_processes_owned(self, *, script_check: bool = False) -> bool:
+        """Read-only renewal boundary; never schedules start/restart/stop.
+
+        The API worker must itself own server.pid. A fixed local check invoked
+        by start-tunnel.sh is necessarily a different Python process, but still
+        validates that server PID's uid/cwd/full uvicorn arguments and port.
+        """
+        if self.cloudflared_path is None:
+            return False
+        server = (self._inspect_owned_process("server", require_current_server=False)
+                  if script_check else self._probe("server"))
+        return server == "owned" and self._probe("tunnel") == "owned"
+
+    def renewal_command(self) -> tuple[str, ...]:
+        """Fixed publication-only command, independent of restart scheduling."""
+        if self.cloudflared_path is None:
+            raise TunnelControlSetupError("fixed tunnel executable is unavailable")
+        self._fixed_executable(self.start_script)
+        self._fixed_executable(self.cloudflared_path)
+        return (str(self.start_script), "--renew-only", "--port", str(self.port),
+                "--cloudflared", str(self.cloudflared_path))
 
     @staticmethod
     def _run_script(

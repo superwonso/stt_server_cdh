@@ -215,7 +215,12 @@ class TranslationService:
             if self.shutdown.is_set() or not self.configured or (self.thread is not None and self.thread.is_alive()):
                 return
             self.thread = threading.Thread(target=self._run, name="lecture-translation", daemon=True)
-            self.thread.start()
+            try:
+                self.thread.start()
+            except Exception:
+                # An unstarted Thread cannot be joined during lifespan cleanup.
+                self.thread = None
+                raise
 
     def _run(self):
         failure_cleanup = False
@@ -252,7 +257,7 @@ class TranslationService:
 
     def stop(self, timeout=5):
         self.request_shutdown()
-        if self.thread is not None:
+        if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=max(0, timeout))
         stopped = self.thread is None or not self.thread.is_alive()
         if stopped and hasattr(self.engine, "close"):

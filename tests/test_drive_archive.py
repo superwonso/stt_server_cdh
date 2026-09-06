@@ -22,9 +22,11 @@ from server.db import Database
 from server.drive_archive import DriveArchiveManager
 from server.drive_storage import (
     DriveAccountIdentity,
+    DriveAuthenticationError,
     DriveFileMetadata,
     DriveIntegrityError,
     DriveNotFoundError,
+    DriveStorageQuota,
     DriveTransportError,
     DriveUploadSessionExpired,
     UploadCheckpoint,
@@ -211,6 +213,9 @@ class FakeDrive:
 
     def verify_connection(self):
         return True
+
+    def storage_quota(self):
+        return DriveStorageQuota(1000000, 100, 80, 10)
 
     def upload_recording(
         self,
@@ -510,6 +515,189 @@ class DriveArchiveManagerTests(unittest.TestCase):
             ).fetchone()
         self.assertIsNotNone(row)
         return dict(row)
+
+    def test_admin_snapshot_is_pure_local_aggregate_and_unknown_is_explicit(self):
+        lecture_id, content = self.add_finalized_recording()
+        with self.database.connect() as connection:
+            self.manager.queue(connection, "user-alpha", lecture_id)
+        with mock.patch.object(self.drive, "account_identity", side_effect=AssertionError("No network")), \
+                mock.patch.object(self.store, "info", side_effect=AssertionError("No WAV reads")):
+            snapshot = self.manager.admin_snapshot()
+        archive = snapshot["archive"]
+        self.assertEqual(snapshot["state"], "unchecked")
+        self.assertTrue(snapshot["stale"])
+        self.assertIsNone(snapshot["quota"])
+        self.assertEqual(archive["pending_count"], 1)
+        self.assertEqual(archive["pending_bytes"], len(content))
+        self.assertEqual(archive["pending_bytes_unknown_count"], 0)
+        self.assertIsNotNone(archive["oldest_pending_at"])
+        for private in (lecture_id, "private title", "user-alpha", self.drive.permission_id, "privateFolder"):
+            self.assertNotIn(private, str(snapshot))
+        with self.database.connect() as connection:
+            connection.execute("UPDATE recording_archives SET queued_bytes=NULL,queued_at=NULL")
+        archive = self.manager.admin_snapshot()["archive"]
+        self.assertEqual(archive["pending_bytes_unknown_count"], 1)
+        self.assertEqual(archive["oldest_pending_unknown_count"], 1)
+        self.assertIsNone(archive["oldest_pending_at"])
+
+    def test_queue_time_survives_retry_and_verified_success_survives_deletion(self):
+        lecture_id, _ = self.add_finalized_recording()
+        self.manager.enqueue_existing()
+        queued_at = self.archive_row(lecture_id)["queued_at"]
+        with self.database.connect() as connection:
+            connection.execute("UPDATE recording_archives SET updated_at='later',attempts=2")
+            self.manager.queue(connection, "user-alpha", lecture_id)
+        self.assertEqual(self.archive_row(lecture_id)["queued_at"], queued_at)
+        self.assertIsNone(self.manager.admin_snapshot()["archive"]["last_verified_upload_at"])
+        self.manager.run_once(delete_local=False)
+        verified_at = self.archive_row(lecture_id)["verified_at"]
+        self.assertIsNotNone(verified_at)
+        self.assertEqual(self.manager.admin_snapshot()["archive"]["last_verified_upload_at"], verified_at)
+        self.assertEqual(self.manager.admin_snapshot()["archive"]["cleanup_pending_count"], 1)
+        with self.database.connect() as connection:
+            connection.execute("DELETE FROM lectures WHERE id=?", (lecture_id,))
+        self.assertEqual(self.manager.admin_snapshot()["archive"]["last_verified_upload_at"], verified_at)
+
+    def test_failed_upload_never_updates_last_verified_time(self):
+        lecture_id, _ = self.add_finalized_recording()
+        self.manager.enqueue_existing()
+        with mock.patch.object(self.drive, "upload_recording", side_effect=DriveTransportError(
+            "drive_unavailable", "PRIVATE-provider-body", retryable=True,
+        )):
+            self.assertEqual(self.manager.run_once()["failed_count"], 1)
+        self.assertIsNone(self.archive_row(lecture_id)["verified_at"])
+        self.assertIsNone(self.manager.admin_snapshot()["archive"]["last_verified_upload_at"])
+
+    def test_refresh_is_single_flight_nonblocking_and_does_not_lock_uploads(self):
+        entered, release = threading.Event(), threading.Event()
+        lecture_id, _ = self.add_finalized_recording()
+        self.manager.enqueue_existing()
+        calls = []
+
+        def slow_quota():
+            calls.append(1)
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return DriveStorageQuota(1000, 300)
+
+        try:
+            with mock.patch.object(self.drive, "storage_quota", side_effect=slow_quota):
+                self.assertTrue(self.manager.request_refresh())
+                self.assertTrue(entered.wait(2))
+                self.assertFalse(self.manager.request_refresh())
+                self.assertTrue(self.manager.admin_snapshot()["refreshing"])
+                # Google quota is blocked, yet the independent archive upload
+                # and its verification/DB commit can complete.
+                self.assertEqual(self.manager.run_once(delete_local=False)["migrated_count"], 1)
+                self.assertEqual(self.archive_row(lecture_id)["state"], "ready")
+                self.assertEqual(len(calls), 1)
+                release.set()
+                deadline = time.monotonic() + 2
+                while self.manager.admin_snapshot()["refreshing"] and time.monotonic() < deadline:
+                    threading.Event().wait(0.005)
+                snapshot = self.manager.admin_snapshot()
+                self.assertEqual(snapshot["state"], "ready")
+                self.assertFalse(snapshot["stale"])
+                self.assertEqual(snapshot["quota"]["remaining_bytes"], 700)
+                self.assertFalse(self.manager.request_refresh())
+                snapshot["quota"]["remaining_bytes"] = 0
+                self.assertEqual(self.manager.admin_snapshot()["quota"]["remaining_bytes"], 700)
+        finally:
+            release.set()
+
+    def test_refresh_stale_cache_and_redacted_error_classification(self):
+        self.manager._refresh_health_once()
+        successful = self.manager.admin_snapshot()
+        for error, state, reauth, keep_quota in (
+            (DriveTransportError("temporary", "PRIVATE", retryable=True), "temporary_error", False, True),
+            (DriveAuthenticationError("token_reauthorization_required", "PRIVATE"), "reauth_required", True, False),
+            (DriveAuthenticationError("token_refresh_rejected", "PRIVATE"), "attention", False, False),
+            (RuntimeError("PRIVATE"), "attention", False, False),
+        ):
+            self.manager._refresh_health_once()
+            with mock.patch.object(self.drive, "storage_quota", side_effect=error):
+                self.manager._refresh_health_once()
+            result = self.manager.admin_snapshot()
+            self.assertEqual(result["state"], state)
+            self.assertEqual(result["reauth_required"], reauth)
+            self.assertTrue(result["stale"])
+            self.assertIsNotNone(result["last_successful_check_at"])
+            self.assertEqual(result["quota"] is not None, keep_quota)
+            self.assertNotIn("PRIVATE", str(result))
+        self.assertIsNotNone(successful["checked_at"])
+
+    def test_health_check_never_creates_a_remote_folder_or_binding(self):
+        self.manager._refresh_health_once()
+        self.assertEqual(self.manager.admin_snapshot()["state"], "ready")
+        self.assertEqual(self.drive.folder_calls, [])
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM drive_archive_binding").fetchone()[0], 0)
+
+    def test_health_rejects_changed_account_and_clears_previous_quota(self):
+        with self.manager._exclusive_operation():
+            self.manager._ensure_folder()
+        self.manager._refresh_health_once()
+        self.drive.permission_id = "different-google-account"
+        with mock.patch.object(self.drive, "storage_quota", side_effect=AssertionError("Must stop before quota")):
+            self.manager._refresh_health_once()
+        result = self.manager.admin_snapshot()
+        self.assertEqual(result["state"], "attention")
+        self.assertIsNone(result["quota"])
+        self.assertFalse(result["reauth_required"])
+        self.assertNotIn("different-google-account", str(result))
+
+    def test_health_rejects_account_replacement_during_quota_read(self):
+        def replacement():
+            self.drive.permission_id = "different-google-account"
+            return DriveStorageQuota(100, 90)
+        with mock.patch.object(self.drive, "storage_quota", side_effect=replacement):
+            self.manager._refresh_health_once()
+        self.assertEqual(self.manager.admin_snapshot()["state"], "attention")
+        self.assertIsNone(self.manager.admin_snapshot()["quota"])
+
+    def test_disabled_status_never_starts_a_provider_worker(self):
+        manager = DriveArchiveManager(replace(self.settings, google_drive_enabled=False), self.database, self.store)
+        with mock.patch.object(threading.Thread, "start", side_effect=AssertionError("No thread")):
+            self.assertFalse(manager.request_refresh())
+            result = manager.admin_snapshot()
+        self.assertEqual(result["state"], "disabled")
+        self.assertFalse(result["configured"])
+        self.assertIsNone(result["quota"])
+
+    def test_shutdown_bounds_health_wait_and_rejects_new_refresh(self):
+        entered, release = threading.Event(), threading.Event()
+        def slow():
+            entered.set()
+            release.wait(5)
+            return DriveStorageQuota(100, 10)
+        try:
+            with mock.patch.object(self.drive, "storage_quota", side_effect=slow):
+                self.assertTrue(self.manager.request_refresh())
+                self.assertTrue(entered.wait(2))
+                self.assertFalse(self.manager.stop(timeout=0))
+                self.assertFalse(self.manager.request_refresh())
+                release.set()
+                self.assertTrue(self.manager.stop(timeout=2))
+                self.assertFalse(self.manager.admin_snapshot()["refreshing"])
+        finally:
+            release.set()
+
+    def test_stale_after_ttl_and_db_time_cannot_leak_arbitrary_text(self):
+        self.manager._refresh_health_once()
+        last = self.manager.health_last_success_monotonic
+        with mock.patch("server.drive_archive.time.monotonic", return_value=last + 301):
+            self.assertTrue(self.manager.admin_snapshot()["stale"])
+        with self.database.connect() as connection:
+            connection.execute("UPDATE drive_archive_statistics SET last_verified_upload_at='PRIVATE-value'")
+        self.assertIsNone(self.manager.admin_snapshot()["archive"]["last_verified_upload_at"])
+
+    def test_explicit_refresh_can_update_fresh_cache_after_minimum_interval(self):
+        self.manager._refresh_health_once()
+        self.assertFalse(self.manager.request_refresh())
+        with self.manager.health_lock:
+            self.manager.health_next_manual_attempt = 0.0
+        self.assertTrue(self.manager.request_refresh())
+        self.assertTrue(self.manager.stop(timeout=2))
 
     def test_existing_finalized_recording_uploads_verifies_commits_then_deletes_local(self):
         lecture_id, content = self.add_finalized_recording()

@@ -169,11 +169,11 @@ flock 9
 # Suppress CLI diagnostics so an unusual credential helper can never copy a
 # credential into the classroom operator's terminal or runtime log.
 if ! printf '%s' "$DESIRED_CONFIG" \
-    | timeout --signal=TERM --kill-after=5 "$GITHUB_TIMEOUT" \
+    | timeout --foreground --signal=TERM --kill-after=5 "$GITHUB_TIMEOUT" \
         "$GH" variable set "$VARIABLE" --repo "$REPOSITORY" >/dev/null 2>&1; then
     die "GitHub Actions 설정을 갱신하지 못했습니다. 이 컴퓨터의 GitHub 로그인을 확인하세요."
 fi
-if ! timeout --signal=TERM --kill-after=5 "$GITHUB_TIMEOUT" \
+if ! timeout --foreground --signal=TERM --kill-after=5 "$GITHUB_TIMEOUT" \
     "$GH" workflow run "$WORKFLOW" --repo "$REPOSITORY" --ref main >/dev/null 2>&1; then
     die "GitHub Pages 자동 배포를 요청하지 못했습니다. GitHub 로그인과 Actions 설정을 확인하세요."
 fi
