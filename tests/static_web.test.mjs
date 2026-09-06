@@ -23,6 +23,8 @@ test('page has no remote assets or inline executable content and declares privac
   assert.ok(connectSources.includes('https://*.trycloudflare.com'));
   assert.ok(connectSources.includes('http://localhost:*'));
   assert.ok(connectSources.includes('http://127.0.0.1:*'));
+  assert.ok(!connectSources.some(value => value.includes('[')),
+    'Chromium ignores bracketed IPv6 CSP host-sources and emits console errors; use localhost or 127.0.0.1');
   assert.ok(!connectSources.includes('https:'), 'arbitrary HTTPS destinations must not be allowed');
   assert.ok(!connectSources.includes('http:'), 'arbitrary HTTP destinations must not be allowed');
   assert.ok(!connectSources.some(value => /google(?:apis)?\.com/i.test(value)),
