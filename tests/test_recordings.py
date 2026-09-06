@@ -763,13 +763,13 @@ class RecordingApiTests(unittest.TestCase):
             headers=self.headers(),
         ).json()["path"]
 
-        hidden = self.client.delete(f"/lectures/{lecture_id}", headers=self.headers("user-beta"))
+        hidden = self.client.delete(f"/lectures/{lecture_id}/permanent", headers=self.headers("user-beta"))
         self.assertEqual(hidden.status_code, 200, hidden.text)
         self.assertEqual(hidden.json(), {"status": "deleted"})
         self.assertTrue(recording.exists(), "another account's generic DELETE response must not remove data")
         self.assertEqual(self.client.get(f"/lectures/{lecture_id}", headers=self.headers()).status_code, 200)
         preflight = self.client.options(
-            f"/lectures/{lecture_id}",
+            f"/lectures/{lecture_id}/permanent",
             headers={
                 "Origin": "https://student.github.io",
                 "Access-Control-Request-Method": "DELETE",
@@ -778,13 +778,17 @@ class RecordingApiTests(unittest.TestCase):
         self.assertEqual(preflight.status_code, 200)
         self.assertIn("DELETE", preflight.headers["access-control-allow-methods"])
 
-        deleted = self.client.delete(f"/lectures/{lecture_id}", headers=self.headers())
+        trashed = self.client.post(f"/lectures/{lecture_id}/trash", headers=self.headers())
+        self.assertEqual(trashed.status_code, 200, trashed.text)
+        self.assertTrue(recording.exists(), "moving to the app trash must retain the recording")
+        self.assertEqual(self.client.get(ticket).status_code, 404)
+        deleted = self.client.delete(f"/lectures/{lecture_id}/permanent", headers=self.headers())
         self.assertEqual(deleted.status_code, 200, deleted.text)
         self.assertEqual(deleted.json(), {"status": "deleted"})
         self.assertFalse(recording.exists())
         self.assertEqual(self.client.get(f"/lectures/{lecture_id}", headers=self.headers()).status_code, 404)
         self.assertEqual(self.client.get(ticket).status_code, 404)
-        repeated = self.client.delete(f"/lectures/{lecture_id}", headers=self.headers())
+        repeated = self.client.delete(f"/lectures/{lecture_id}/permanent", headers=self.headers())
         self.assertEqual(repeated.status_code, 200, repeated.text)
         self.assertEqual(repeated.json(), {"status": "deleted"})
         with self.database.connect() as connection:
@@ -817,17 +821,23 @@ class RecordingApiTests(unittest.TestCase):
                 self.engine.release.set()
             self.assertEqual(request.result(timeout=5).status_code, 200)
         self.engine.block = False
+        finalized = self.client.post(f"/lectures/{lecture_id}/recording-finalize", headers=self.headers())
+        self.assertEqual(finalized.status_code, 200, finalized.text)
+        trashed = self.client.post(f"/lectures/{lecture_id}/trash", headers=self.headers())
+        self.assertEqual(trashed.status_code, 200, trashed.text)
         self.assertEqual(
-            self.client.delete(f"/lectures/{lecture_id}", headers=self.headers()).status_code,
+            self.client.delete(f"/lectures/{lecture_id}/permanent", headers=self.headers()).status_code,
             200,
         )
 
     def test_failed_unlink_leaves_durable_deletion_for_safe_retry(self):
         lecture_id, _ = self.finalized_recording()
         recording = self.app.state.recording_store.path("user-alpha", lecture_id)
+        trashed = self.client.post(f"/lectures/{lecture_id}/trash", headers=self.headers())
+        self.assertEqual(trashed.status_code, 200, trashed.text)
         with mock.patch.object(self.app.state.recording_store, "delete", side_effect=OSError("locked")):
             with self.assertLogs("classroom", level="ERROR"):
-                failed = self.client.delete(f"/lectures/{lecture_id}", headers=self.headers())
+                failed = self.client.delete(f"/lectures/{lecture_id}/permanent", headers=self.headers())
         self.assertEqual(failed.status_code, 503, failed.text)
         self.assertTrue(recording.exists())
         self.assertEqual(self.client.get(f"/lectures/{lecture_id}", headers=self.headers()).status_code, 404)
@@ -837,7 +847,7 @@ class RecordingApiTests(unittest.TestCase):
                 1,
             )
 
-        retried = self.client.delete(f"/lectures/{lecture_id}", headers=self.headers())
+        retried = self.client.delete(f"/lectures/{lecture_id}/permanent", headers=self.headers())
         self.assertEqual(retried.status_code, 200, retried.text)
         self.assertFalse(recording.exists())
         with self.database.connect() as connection:

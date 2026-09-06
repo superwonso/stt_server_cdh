@@ -37,7 +37,7 @@ class TranslationService:
             with self.database.connect() as connection:
                 row = connection.execute(
                     "SELECT s.* FROM lecture_translations s JOIN lectures l ON l.id=s.lecture_id "
-                    "WHERE l.id=? AND l.username=? AND l.deleting=0",
+                    "WHERE l.id=? AND l.username=? AND l.deleting=0 AND l.trashed_at IS NULL",
                     (lecture_id, user["username"]),
                 ).fetchone()
                 result = self.result(row, connection)
@@ -51,7 +51,7 @@ class TranslationService:
             with self.database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 lecture = connection.execute(
-                    "SELECT * FROM lectures WHERE id=? AND username=? AND deleting=0",
+                    "SELECT * FROM lectures WHERE id=? AND username=? AND deleting=0 AND trashed_at IS NULL",
                     (lecture_id, user["username"]),
                 ).fetchone()
                 if lecture is None:
@@ -78,7 +78,8 @@ class TranslationService:
                         return self.envelope(saved)
                 active = connection.execute(
                     "SELECT 1 FROM lecture_translations s JOIN lectures l ON l.id=s.lecture_id "
-                    "WHERE l.username=? AND s.status IN ('queued','processing')", (user["username"],)
+                    "WHERE l.username=? AND l.deleting=0 AND l.trashed_at IS NULL "
+                    "AND s.status IN ('queued','processing')", (user["username"],)
                 ).fetchone()
                 if active is not None:
                     raise HTTPException(409, "진행 중인 수업 번역이 끝난 뒤 다시 시도하세요.")
@@ -129,16 +130,19 @@ class TranslationService:
                 connection.execute(
                     "UPDATE lecture_translations SET status='failed',error_code='not_configured',"
                     "error='수업 번역 API 키가 서버에 설정되지 않았습니다.',updated_at=? "
-                    "WHERE status IN ('queued','processing')", (_now(),)
+                    "WHERE status IN ('queued','processing') AND lecture_id IN "
+                    "(SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)", (_now(),)
                 )
                 return
             connection.execute(
                 "UPDATE lecture_translations SET status='failed',error_code='interrupted',"
                 "error='번역이 여러 번 중단되었습니다. 다시 요청하세요.',updated_at=? "
-                "WHERE status='processing' AND attempts>=3", (_now(),)
+                "WHERE status='processing' AND attempts>=3 AND lecture_id IN "
+                "(SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)", (_now(),)
             )
             connection.execute(
-                "UPDATE lecture_translations SET status='queued',updated_at=? WHERE status='processing'", (_now(),)
+                "UPDATE lecture_translations SET status='queued',updated_at=? WHERE status='processing' "
+                "AND lecture_id IN (SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)", (_now(),)
             )
 
     def process_next(self):
@@ -151,7 +155,7 @@ class TranslationService:
                 return False
             row = connection.execute(
                 "SELECT s.*,l.username,l.language,l.recording_finalized FROM lecture_translations s "
-                "JOIN lectures l ON l.id=s.lecture_id WHERE s.status='queued' AND l.deleting=0 "
+                "JOIN lectures l ON l.id=s.lecture_id WHERE s.status='queued' AND l.deleting=0 AND l.trashed_at IS NULL "
                 "ORDER BY s.created_at,s.lecture_id LIMIT 1"
             ).fetchone()
             if row is None:
@@ -181,7 +185,7 @@ class TranslationService:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
                 "SELECT l.recording_finalized FROM lecture_translations s JOIN lectures l ON l.id=s.lecture_id "
-                "WHERE s.job_id=? AND s.status='processing' AND l.username=? AND l.deleting=0",
+                "WHERE s.job_id=? AND s.status='processing' AND l.username=? AND l.deleting=0 AND l.trashed_at IS NULL",
                 (job["job_id"], job["username"]),
             ).fetchone()
             if current is None:

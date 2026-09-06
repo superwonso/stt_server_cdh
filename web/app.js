@@ -2,6 +2,9 @@ import { MicrophoneCapture } from './audio.js';
 import { renderDriveStatus } from './admin-storage.js';
 import { renderMaintenanceStatus } from './admin-maintenance.js';
 import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';
+import { lectureTitle, filterLibrary, libraryOptions, validMetadata, validLibrarySearch } from './lecture-library.js';
+import { validManualState, manualSegments, validManualHistory } from './manual-notes.js';
+import { validQuestionJob, validQuestionPage } from './lecture-questions.js';
 import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';
 import { liveCoordination } from './live-coordination.js';
 import { TabAuthSessionStore } from './auth-session.js';
@@ -41,6 +44,13 @@ let importStarting = false, importCancelling = false, importPromise = null, impo
 let importLectureRequest = null, lastImportLectureRefresh = 0, selectImportLecture = false;
 let lectureRefreshGeneration = 0, importLectureSequence = 0;
 let lectureDateFilter = '', recordingDownloadPending = false, recordingFinalizePending = false;
+let libraryCourse = '', librarySemester = '', librarySearchSequence = 0, librarySearchAbort = null;
+let librarySearchPage = null, librarySearchQuery = null, metadataScope = '', metadataRevision = null, metadataAbort = null;
+let trashSequence = 0, trashAbort = null, trashRows = [], trashBusy = false, purgeTarget = null;
+let manualView = {scope:'',row:null,loaded:false,busy:false,error:'',pending:null,noteId:'',noteSegment:null,editSegment:'',rendered:''};
+let manualAbort = null, manualHistoryAbort = null, manualHistorySequence = 0, manualHistoryQuery = {}, manualHistoryPage = null;
+let questionView = {scope:'',page:null,busy:false,error:'',pending:null,rendered:'',polls:0};
+let questionAbort = null, questionPollTimer = null;
 let deletingLecture = false, deleteTarget = null;
 let noteActionSequence = 0;
 let correction = null, correctionView = 'raw', correctionLectureId = '';
@@ -125,18 +135,19 @@ const hasSegmentStart = segment => segment?.start !== null && segment?.start !==
   && segment.start !== '' && Number.isFinite(Number(segment.start));
 function exportText(lecture, format) {
   const segments = lecture?.segments || [];
-  const corrected = lecture?.transcript_version === 'corrected';
-  const versionLine = corrected ? 'AI 후보정본 · 받아쓴 원문은 서버에 별도 보관\n' : '';
+  const corrected = lecture?.transcript_version === 'corrected', manual = lecture?.transcript_version === 'manual';
+  const versionName = manual ? '직접 수정본' : corrected ? 'AI 후보정본' : '받아쓴 원문';
+  const versionLine = corrected || manual ? `${versionName} · 받아쓴 원문은 서버에 별도 보관\n` : '';
   if (format === 'text') {
     const body = segments.map(segment => hasSegmentStart(segment)
       ? `[${fmt(segment.start)}] ${segment.text}` : segment.text).join('\n\n');
-    return `${lecture.title}\n${dateLabel(lecture.created_at)}\n${versionLine}\n${body}\n`;
+    return `${lectureTitle(lecture)}\n${dateLabel(lecture.created_at)}\n${versionLine}\n${body}\n`;
   }
   const language = ({ko:'한국어',en:'영어'})[lecture.language] || '자동 감지';
   const body = segments.map(segment => hasSegmentStart(segment)
     ? `**\\[${fmt(segment.start)}\\]** ${escapeMarkdown(segment.text)}` : escapeMarkdown(segment.text)).join('\n\n');
-  const version = corrected ? '\n- 버전: AI 후보정본 (받아쓴 원문 별도 보관)' : '';
-  return `# ${escapeMarkdown(lecture.title)}\n\n- 날짜: ${dateLabel(lecture.created_at)}\n- 언어: ${language}${version}\n\n## ${corrected ? 'AI 후보정본' : '받아쓴 원문'}\n\n${body}\n`;
+  const version = corrected || manual ? `\n- 버전: ${versionName} (받아쓴 원문 별도 보관)` : '';
+  return `# ${escapeMarkdown(lectureTitle(lecture))}\n\n- 날짜: ${dateLabel(lecture.created_at)}\n- 언어: ${language}${version}\n\n## ${versionName}\n\n${body}\n`;
 }
 const storage = { get() { try { return localStorage.getItem('yeobaek-server') || ''; } catch { return ''; } }, set(value) { try { localStorage.setItem('yeobaek-server', value); } catch {} } };
 function notice(message) { $('notice').textContent = message; $('notice').hidden = false; clearTimeout(noticeTimer); noticeTimer = setTimeout(() => $('notice').hidden = true, 6000); }
@@ -971,7 +982,7 @@ function nativeDownloadUrl(value, server = apiUrl) {
   }
   return url.href;
 }
-function setServer(value) { const next = normalizeUrl(value); if (next !== apiUrl) resetRecordingReview(); apiUrl = next; storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl; }
+function setServer(value) { const next = normalizeUrl(value); if (next !== apiUrl) { resetRecordingReview(); resetLibraryWorkspace(); } apiUrl = next; storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl; }
 function clearActiveAuthExpiry() {
   if (authSessionExpiryTimer !== null) clearTimeout(authSessionExpiryTimer);
   authSessionExpiryTimer = null;
@@ -1464,6 +1475,7 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
   renderCurrent(); renderHistory();
 }
 function showLogin(clear = true) {
+  resetLibraryWorkspace();
   resetRecordingReview();
   const preserveOwner = !!user && hasOwnerLockedWork();
   const retainWorkspaceState = !clear || preserveOwner;
@@ -1747,6 +1759,9 @@ async function refreshLectures() {
   const captureSummary = refreshed.find(lecture => lecture.id === captureSession?.lecture?.id);
   for (const [target,summary] of [[current,selectedSummary],[captureSession?.lecture,captureSummary]]) {
     if (!target || !summary) continue;
+    for (const key of ['display_title','course','semester','metadata_revision']) {
+      if (key in summary) target[key] = summary[key];
+    }
     target.recording_available = !!summary.recording_available;
     target.recording_finalized = !!summary.recording_finalized;
     if (typeof summary.recording_storage_state === 'string') {
@@ -2015,6 +2030,7 @@ async function selectLecture(lecture) {
   } catch (error) { notice(errorText(error)); }
 }
 function renderHistory() {
+  renderLibraryFilters();
   const dateCounts = new Map();
   for (const lecture of lectures) {
     const key = dateKey(lecture.created_at);
@@ -2030,15 +2046,17 @@ function renderHistory() {
   }
   dateSelect.value = lectureDateFilter;
 
-  const visible = lectureDateFilter ? lectures.filter(lecture => dateKey(lecture.created_at) === lectureDateFilter) : lectures;
-  $('lecture-count').textContent = lectureDateFilter ? `${visible.length}/${lectures.length}` : lectures.length;
-  $('lecture-count').ariaLabel = lectureDateFilter ? `선택한 날짜 수업 ${visible.length}개, 전체 ${lectures.length}개` : `저장된 수업 ${lectures.length}개`;
+  const classified = filterLibrary(lectures,{course:libraryCourse,semester:librarySemester});
+  const visible = lectureDateFilter ? classified.filter(lecture => dateKey(lecture.created_at) === lectureDateFilter) : classified;
+  const filtered = !!(lectureDateFilter || libraryCourse || librarySemester);
+  $('lecture-count').textContent = filtered ? `${visible.length}/${lectures.length}` : lectures.length;
+  $('lecture-count').ariaLabel = filtered ? `선택한 조건의 수업 ${visible.length}개, 전체 ${lectures.length}개` : `저장된 수업 ${lectures.length}개`;
   const list = $('lecture-list'); list.replaceChildren();
   if (!lectures.length) {
     const empty = document.createElement('p'); empty.className = 'empty-history'; empty.textContent = '아직 기록한 수업이 없어요.'; list.append(empty); return;
   }
   if (!visible.length) {
-    const empty = document.createElement('p'); empty.className = 'empty-history'; empty.textContent = '이 날짜에 저장된 수업이 없어요.'; list.append(empty); return;
+    const empty = document.createElement('p'); empty.className = 'empty-history'; empty.textContent = '선택한 조건에 저장된 수업이 없어요.'; list.append(empty); return;
   }
   const groups = new Map();
   for (const lecture of visible) {
@@ -2057,14 +2075,18 @@ function renderHistory() {
       button.className = `lecture-item${current?.id === lecture.id ? ' selected' : ''}${live ? ' live-capture' : ''}`;
       button.disabled = historyNavigationBusy();
       if (current?.id === lecture.id) button.setAttribute('aria-current','page');
-      const title = document.createElement('strong'); title.textContent = lecture.title;
+      const title = document.createElement('strong'); title.textContent = lectureTitle(lecture);
       const date = document.createElement('span'); date.textContent = dateLabel(lecture.created_at); button.append(title,date);
+      if (lecture.course || lecture.semester) {
+        const classification = document.createElement('span'); classification.textContent = [lecture.semester,lecture.course].filter(Boolean).join(' · ');
+        button.append(classification);
+      }
       if (live) {
         const badge = document.createElement('span'); badge.className = 'lecture-live-label';
         badge.textContent = livePaused ? 'Ⅱ 일시정지' : '● 현재 녹음'; button.append(badge);
         button.setAttribute('aria-label',livePaused
-          ? `${lecture.title}, 현재 받아쓰기 일시정지`
-          : `${lecture.title}, 현재 녹음 중인 수업`);
+          ? `${lectureTitle(lecture)}, 현재 받아쓰기 일시정지`
+          : `${lectureTitle(lecture)}, 현재 녹음 중인 수업`);
       }
       button.onclick = () => selectLecture(lecture);
       items.append(button);
@@ -2074,11 +2096,384 @@ function renderHistory() {
 }
 $('lecture-date').onchange = () => { lectureDateFilter = $('lecture-date').value; renderHistory(); updateControls(); };
 $('return-live-capture').onclick = returnToLiveCapture;
+function libraryAuthScope() { return JSON.stringify([user,token,apiUrl]); }
+function resetLibraryWorkspace() {
+  resetQuestionWorkspace();
+  resetManualWorkspace();
+  resetTrashWorkspace();
+  ++librarySearchSequence; librarySearchAbort?.abort(); librarySearchAbort = null;
+  metadataAbort?.abort(); metadataAbort = null; metadataScope = ''; metadataRevision = null;
+  libraryCourse = ''; librarySemester = ''; librarySearchPage = null; librarySearchQuery = null;
+  for (const id of ['library-search-dialog','metadata-dialog']) if ($(id).open) $(id).close();
+  for (const id of ['library-query','metadata-title','metadata-course','metadata-semester']) $(id).value = '';
+  $('library-search-results').replaceChildren(); $('library-search-state').textContent = '';
+  $('library-search-filter').textContent = ''; $('metadata-state').textContent = '';
+  $('metadata-save').disabled = true;
+}
+function renderLibraryFilters() {
+  for (const field of ['course','semester']) {
+    const options = libraryOptions(lectures,field), selected = field === 'course' ? libraryCourse : librarySemester;
+    const select = $(`library-${field}`), suggestions = $(`${field}-options`);
+    select.replaceChildren(); suggestions.replaceChildren();
+    const all = document.createElement('option'); all.value = ''; all.textContent = field === 'course' ? '전체 과목' : '전체 학기'; select.append(all);
+    for (const value of options) {
+      const option = document.createElement('option'); option.value = value; option.textContent = value; select.append(option);
+      const suggestion = document.createElement('option'); suggestion.value = value; suggestions.append(suggestion);
+    }
+    select.value = options.includes(selected) ? selected : '';
+    if (field === 'course') libraryCourse = select.value; else librarySemester = select.value;
+    select.disabled = historyNavigationBusy();
+  }
+}
+for (const field of ['course','semester']) $(`library-${field}`).onchange = () => {
+  if (field === 'course') libraryCourse = $('library-course').value; else librarySemester = $('library-semester').value;
+  renderHistory();
+};
+function metadataIsCurrent(scope, id, controller = null) { return metadataScope === scope && scope === libraryAuthScope() && !!token && current?.id === id && $('metadata-dialog').open && (!controller || metadataAbort === controller); }
+$('metadata-open').onclick = async () => {
+  if (!token || !current?.recording_finalized || historyNavigationBusy()) return;
+  metadataAbort?.abort(); const controller = new AbortController(); metadataAbort = controller;
+  const scope = libraryAuthScope(), id = current.id; metadataScope = scope; metadataRevision = null;
+  $('metadata-dialog').showModal(); $('metadata-save').disabled = true; $('metadata-state').textContent = '현재 분류를 확인하고 있어요…';
+  $('metadata-title').value = lectureTitle(current); $('metadata-course').value = current.course || ''; $('metadata-semester').value = current.semester || '';
+  try {
+    const data = await api(`/lectures/${id}/metadata`,{signal:controller.signal});
+    if (!metadataIsCurrent(scope,id,controller)) return;
+    if (!validMetadata(data,id)) throw new Error('수업 분류 응답을 확인하지 못했습니다.');
+    metadataRevision = data.revision;
+    $('metadata-title').value = data.display_title; $('metadata-course').value = data.course; $('metadata-semester').value = data.semester;
+    $('metadata-state').textContent = ''; $('metadata-save').disabled = false;
+  } catch (error) { if (metadataIsCurrent(scope,id,controller)) $('metadata-state').textContent = errorText(error); }
+  finally { if (metadataAbort === controller) metadataAbort = null; }
+};
+$('metadata-close').onclick = () => { metadataAbort?.abort(); metadataScope = ''; $('metadata-dialog').close(); };
+$('metadata-dialog').oncancel = () => { metadataAbort?.abort(); metadataScope = ''; };
+$('metadata-form').onsubmit = async event => {
+  event.preventDefault();
+  const scope = metadataScope, id = current?.id;
+  if (!metadataIsCurrent(scope,id) || metadataRevision === null || metadataAbort) return;
+  const controller = new AbortController(); metadataAbort = controller;
+  const body = {revision:metadataRevision,display_title:$('metadata-title').value.trim(),course:$('metadata-course').value.trim(),semester:$('metadata-semester').value.trim()};
+  $('metadata-save').disabled = true; $('metadata-state').textContent = '저장하고 있어요…';
+  try {
+    const data = await api(`/lectures/${id}/metadata`,{method:'PATCH',body:JSON.stringify(body),signal:controller.signal});
+    if (!metadataIsCurrent(scope,id,controller)) return;
+    if (!validMetadata(data,id)) throw new Error('저장 결과를 확인하지 못했습니다. 창을 다시 열어 확인하세요.');
+    const fields = {display_title:data.display_title,course:data.course,semester:data.semester,metadata_revision:data.revision};
+    Object.assign(current,fields);
+    lectures = lectures.map(lecture => lecture.id === id ? {...lecture,...fields} : lecture);
+    $('metadata-dialog').close(); metadataScope = ''; metadataRevision = null;
+    renderCurrent(); renderHistory(); notice('수업 이름과 분류를 저장했어요.');
+  } catch (error) {
+    if (metadataIsCurrent(scope,id,controller)) { metadataRevision = null; $('metadata-state').textContent = `${errorText(error)} 창을 다시 열어 저장된 상태를 확인하세요.`; }
+  } finally { if (metadataAbort === controller) metadataAbort = null; }
+};
+$('library-search-open').onclick = () => {
+  if (!token || historyNavigationBusy()) return;
+  ++librarySearchSequence; librarySearchAbort?.abort(); librarySearchAbort = null;
+  librarySearchPage = null; librarySearchQuery = null;
+  $('library-search-results').replaceChildren(); $('library-search-state').textContent = '검색어를 입력하거나 빈 검색으로 수업 이름을 찾아보세요.';
+  $('library-search-prev').disabled = true; $('library-search-next').disabled = true;
+  $('library-search-filter').textContent = [librarySemester || '전체 학기',libraryCourse || '전체 과목','날짜 제한 없이 검색'].join(' · ');
+  $('library-search-dialog').showModal(); $('library-query').focus();
+};
+function closeLibrarySearch() { ++librarySearchSequence; librarySearchAbort?.abort(); librarySearchAbort = null; $('library-search-dialog').close(); }
+$('library-search-close').onclick = closeLibrarySearch;
+$('library-search-dialog').oncancel = closeLibrarySearch;
+async function searchLibrary(offset = 0, reuse = false) {
+  if (!token || !$('library-search-dialog').open) return;
+  librarySearchAbort?.abort(); const controller = new AbortController(); librarySearchAbort = controller;
+  const sequence = ++librarySearchSequence, scope = libraryAuthScope();
+  const isCurrent = () => sequence === librarySearchSequence && scope === libraryAuthScope() && !!token && $('library-search-dialog').open;
+  if (!reuse || !librarySearchQuery) librarySearchQuery = {q:$('library-query').value.trim().slice(0,120),source:$('library-source').value || 'all',course:libraryCourse,semester:librarySemester};
+  const params = new URLSearchParams({...librarySearchQuery,offset:String(offset),limit:'20'});
+  librarySearchPage = null; $('library-search-results').replaceChildren();
+  $('library-search-state').textContent = '내 수업에서 검색하고 있어요…';
+  $('library-search-next').disabled = true; $('library-search-prev').disabled = true;
+  try {
+    const data = await api(`/library/search?${params}`,{signal:controller.signal});
+    if (!isCurrent()) return;
+    if (!validLibrarySearch(data)) throw new Error('검색 응답을 확인하지 못했습니다.');
+    librarySearchPage = data;
+    $('library-search-state').textContent = (data.items.length ? `${data.offset + 1}–${data.offset + data.items.length}번째 결과` : '일치하는 기록이 없어요.')
+      + (data.partial_corrected ? ' 일부 후보정본은 검증되지 않아 제외됐어요. 원문으로도 검색해 주세요.' : '');
+    for (const item of data.items) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'library-result';
+      const title = document.createElement('strong'); title.textContent = item.display_title;
+      const detail = document.createElement('small'); detail.textContent = `${dateLabel(item.created_at)} · ${({title:'수업 이름',raw:'원문',corrected:'AI 후보정본'})[item.source]}${item.source === 'title' ? '' : ` · ${fmt(item.start)}`}`;
+      const snippet = document.createElement('span'); snippet.textContent = item.snippet;
+      button.append(title,detail,snippet); button.onclick = () => void openLibraryResult(item,scope);
+      $('library-search-results').append(button);
+    }
+    $('library-search-prev').disabled = data.offset === 0;
+    $('library-search-next').disabled = !data.has_more;
+  } catch (error) { if (isCurrent()) $('library-search-state').textContent = errorText(error); }
+  finally { if (librarySearchAbort === controller) librarySearchAbort = null; }
+}
+async function openLibraryResult(item, scope) {
+  if (scope !== libraryAuthScope() || !token || historyNavigationBusy()) return;
+  closeLibrarySearch(); await selectLecture({id:item.lecture_id});
+  if (scope !== libraryAuthScope() || current?.id !== item.lecture_id) return;
+  if (item.source === 'corrected') await loadCorrection(item.lecture_id);
+  if (scope !== libraryAuthScope() || current?.id !== item.lecture_id) return;
+  correctionView = item.source === 'corrected' && correctionIsReady() ? 'corrected' : 'raw';
+  reviewView.query = ''; $('transcript-search').value = ''; renderCurrent();
+  const entry = transcriptRenderState.rows.get(JSON.stringify([`id:${item.segment_id}`,0]));
+  entry?.row.scrollIntoView?.({block:'center',behavior:'smooth'});
+  if (item.source !== 'title' && canPlayRecording()) await playRecordingClip(item.start);
+}
+$('library-search-form').onsubmit = event => { event.preventDefault(); void searchLibrary(); };
+$('library-search-prev').onclick = () => { if (librarySearchPage?.offset) void searchLibrary(Math.max(0,librarySearchPage.offset - 20),true); };
+$('library-search-next').onclick = () => { if (librarySearchPage?.has_more) void searchLibrary(librarySearchPage.offset + 20,true); };
+function resetTrashWorkspace() {
+  ++trashSequence; trashAbort?.abort(); trashAbort = null; trashRows = []; trashBusy = false; purgeTarget = null;
+  for (const id of ['trash-dialog','purge-dialog']) if ($(id).open) $(id).close();
+  $('trash-list').replaceChildren(); $('trash-state').textContent = ''; $('purge-title').textContent = '';
+}
+function renderTrashRows() {
+  $('trash-list').replaceChildren(); $('trash-refresh').disabled = trashBusy;
+  for (const item of trashRows) {
+    const row = document.createElement('section'); row.className = 'library-result';
+    const title = document.createElement('strong'); title.textContent = item.display_title;
+    const detail = document.createElement('small'); detail.textContent = [dateLabel(item.created_at),item.semester,item.course,item.deleting ? '영구 삭제 마무리 대기' : '복원 가능'].filter(Boolean).join(' · ');
+    const actions = document.createElement('div'); actions.className = 'study-actions';
+    const restore = document.createElement('button'); restore.type = 'button'; restore.className = 'secondary-button'; restore.textContent = '복원'; restore.disabled = trashBusy || item.deleting;
+    const scope = libraryAuthScope();
+    restore.onclick = () => { if (scope === libraryAuthScope()) void changeTrash(item,'restore'); };
+    const purge = document.createElement('button'); purge.type = 'button'; purge.className = 'danger-button'; purge.textContent = item.deleting ? '영구 삭제 재시도' : '영구 삭제'; purge.disabled = trashBusy || isBusy();
+    purge.onclick = () => {
+      if (scope !== libraryAuthScope() || !token || trashBusy || isBusy()) return;
+      purgeTarget = {item,scope}; $('purge-title').textContent = item.display_title;
+      $('purge-dialog').showModal(); $('purge-cancel').focus();
+    };
+    actions.append(restore,purge); row.append(title,detail,actions); $('trash-list').append(row);
+  }
+}
+async function loadTrash() {
+  if (!token || !$('trash-dialog').open || trashBusy) return;
+  trashAbort?.abort(); const controller = new AbortController(); trashAbort = controller;
+  const sequence = ++trashSequence, scope = libraryAuthScope();
+  const active = () => sequence === trashSequence && scope === libraryAuthScope() && !!token && $('trash-dialog').open;
+  $('trash-state').textContent = '휴지통을 확인하고 있어요…';
+  try {
+    const rows = await api('/library/trash',{signal:controller.signal});
+    if (!active()) return;
+    if (!Array.isArray(rows) || rows.length > 1000 || !rows.every(item => typeof item.lecture_id === 'string'
+      && /^[0-9a-f-]{36}$/i.test(item.lecture_id) && typeof item.display_title === 'string'
+      && Number.isFinite(Date.parse(item.created_at)) && typeof item.deleting === 'boolean')) throw new Error('휴지통 응답을 확인하지 못했습니다.');
+    trashRows = rows;
+    $('trash-state').textContent = rows.length ? `${rows.length}개 수업${rows.length === 1000 ? ' · 최근 1,000개 표시' : ''}` : '휴지통이 비어 있어요.';
+    renderTrashRows();
+  } catch (error) { if (active()) $('trash-state').textContent = errorText(error); }
+  finally { if (trashAbort === controller) trashAbort = null; }
+}
+async function changeTrash(item, action) {
+  if (!token || trashBusy || !$('trash-dialog').open || !['restore','permanent'].includes(action)) return;
+  if (action === 'permanent' && isBusy()) return;
+  trashAbort?.abort(); const controller = new AbortController(); trashAbort = controller;
+  const scope = libraryAuthScope(), sequence = ++trashSequence;
+  const active = () => sequence === trashSequence && scope === libraryAuthScope() && !!token && $('trash-dialog').open;
+  trashBusy = true; renderTrashRows(); $('trash-state').textContent = action === 'restore' ? '수업을 복원하고 있어요…' : '영구 삭제를 마무리하고 있어요…';
+  try {
+    const run = () => {
+      if (!active()) throw new Error('계정 또는 서버 연결이 변경되어 작업을 중단했어요.');
+      return api(`/lectures/${item.lecture_id}/${action}`,{method:action === 'restore' ? 'POST' : 'DELETE',signal:controller.signal,uploaderAlreadyLocked:action === 'permanent'});
+    };
+    const result = action === 'permanent' ? await runWhenOwnerCaptureIdle(user,item.lecture_id,run) : await run();
+    if (!active()) return;
+    if (result?.status !== (action === 'restore' ? 'restored' : 'deleted')) throw new Error('작업 결과를 확인하지 못했습니다.');
+    trashRows = trashRows.filter(row => row.lecture_id !== item.lecture_id); renderTrashRows();
+    await refreshLectures();
+    if (active()) $('trash-state').textContent = action === 'restore' ? '복원했어요. 지난 수업에서 다시 열 수 있어요.' : '앱 기록을 영구 삭제했어요. 연결된 녹음은 Drive 휴지통으로 옮겼어요.';
+  } catch (error) {
+    if (active()) $('trash-state').textContent = `${errorText(error)} 목록을 새로고침해 처리 결과를 확인한 뒤 다시 시도하세요.`;
+  } finally {
+    if (active()) { trashBusy = false; renderTrashRows(); }
+    if (trashAbort === controller) trashAbort = null;
+  }
+}
+$('trash-open').onclick = () => { if (!token || historyNavigationBusy()) return; resetTrashWorkspace(); $('trash-dialog').showModal(); void loadTrash(); };
+$('trash-close').onclick = resetTrashWorkspace;
+$('trash-dialog').oncancel = resetTrashWorkspace;
+$('trash-refresh').onclick = () => void loadTrash();
+$('purge-cancel').onclick = () => { purgeTarget = null; $('purge-dialog').close(); };
+$('purge-dialog').oncancel = () => { purgeTarget = null; };
+$('purge-confirm').onclick = () => {
+  const target = purgeTarget; purgeTarget = null; $('purge-dialog').close();
+  if (target?.scope === libraryAuthScope()) void changeTrash(target.item,'permanent');
+};
+function manualIsCurrent(view) { return manualView === view && view.scope === recordingReviewScope() && !!token && !!current?.recording_finalized; }
+function resetManualWorkspace() {
+  manualAbort?.abort(); manualAbort = null; manualHistoryAbort?.abort(); manualHistoryAbort = null; ++manualHistorySequence;
+  manualHistoryPage = null; manualHistoryQuery = {};
+  manualView = {scope:'',row:null,loaded:false,busy:false,error:'',pending:null,noteId:'',noteSegment:null,editSegment:'',rendered:''};
+  for (const id of ['manual-edit-dialog','manual-history-dialog']) if ($(id).open) $(id).close();
+  $('manual-details').open = false; $('manual-panel').hidden = true;
+  for (const id of ['manual-note-list','manual-history-list']) $(id).replaceChildren();
+  for (const id of ['manual-state','manual-edit-state','manual-edit-raw','manual-edit-time','manual-history-state']) $(id).textContent = '';
+  $('manual-note-text').value = ''; $('manual-edit-text').value = ''; $('manual-note-time').value = '0'; $('manual-note-target').textContent = '새 필기';
+}
+function renderManualView() {
+  const scope = recordingReviewScope();
+  if (manualView.scope !== scope) { resetManualWorkspace(); manualView.scope = scope; }
+  const view = manualView, eligible = manualIsCurrent(view);
+  $('manual-panel').hidden = !eligible;
+  const locked = !eligible || view.busy || !view.loaded;
+  $('manual-refresh').disabled = !eligible || view.busy;
+  $('manual-note-save').disabled = locked || (!!view.pending && view.pending.action !== 'note_upsert');
+  $('manual-note-new').disabled = locked || !!view.pending;
+  $('manual-note-text').disabled = locked || !!view.pending;
+  $('manual-note-time').disabled = locked || !!view.pending;
+  $('manual-note-save').textContent = view.pending?.action === 'note_upsert' ? '같은 필기 저장 재시도' : view.noteId ? '필기 수정 저장' : '필기 저장';
+  $('manual-history-all').disabled = locked || !!view.pending;
+  $('manual-download').disabled = locked || !view.row?.notes?.length;
+  $('manual-state').textContent = view.error || (view.busy ? '필기·수정본을 확인하고 있어요…' : view.loaded
+    ? `필기 ${view.row.notes.length}개 · 직접 수정한 문장 ${view.row.edits.length}개 · 수정 ${view.row.revision}차` : '불러오기를 누르면 이 수업의 필기와 직접 수정본을 확인해요.');
+  $('manual-edit-state').textContent = view.error || (view.busy ? '저장 상태를 확인하고 있어요…' : '');
+  for (const id of ['manual-edit-save','manual-edit-original','manual-edit-history']) $(id).disabled = locked;
+  $('manual-edit-original').disabled = locked || !!view.pending;
+  $('manual-edit-history').disabled = locked || !!view.pending;
+  $('manual-edit-save').disabled = locked || (!!view.pending && (view.pending.action !== 'segment_edit' || view.pending.segment_id !== view.editSegment));
+  $('manual-edit-text').disabled = locked || !!view.pending;
+  $('manual-edit-save').textContent = view.pending?.action === 'segment_edit' ? '같은 수정 저장 재시도' : '수정본 저장';
+  const signature = JSON.stringify([view.row?.revision,view.busy,view.pending?.id]);
+  if (view.rendered === signature) return; view.rendered = signature;
+  $('manual-note-list').replaceChildren();
+  for (const note of view.row?.notes || []) {
+    const row = document.createElement('section'); row.className = 'library-result';
+    const text = document.createElement('p'); text.className = 'manual-note-text'; text.textContent = note.text;
+    const actions = document.createElement('div'); actions.className = 'study-actions';
+    const button = (label, callback) => { const element = document.createElement('button'); element.type = 'button'; element.className = 'secondary-button'; element.textContent = label; element.disabled = locked || !!view.pending; element.onclick = () => { if (manualIsCurrent(view)) callback(); }; actions.append(element); return element; };
+    button(fmt(note.start_seconds),()=>void playRecordingClip(note.start_seconds)).disabled = !canPlayRecording();
+    button('수정',()=>{ view.noteId=note.id; view.noteSegment=note.segment_id || null; $('manual-note-text').value=note.text; $('manual-note-time').value=String(note.start_seconds); $('manual-note-target').textContent='기존 필기 수정'; renderManualView(); $('manual-note-text').focus(); });
+    button('이력',()=>void openManualHistory({note_id:note.id}));
+    button('삭제',()=>void writeManual({action:'note_delete',note_id:note.id}));
+    row.append(text,actions); $('manual-note-list').append(row);
+  }
+}
+async function loadManual() {
+  renderManualView(); const view = manualView;
+  if (!manualIsCurrent(view) || view.busy) return false;
+  manualAbort?.abort(); const controller = new AbortController(); manualAbort = controller;
+  view.busy = true; view.error = ''; renderManualView();
+  try {
+    const data = await api(`/lectures/${current.id}/manual`,{signal:controller.signal});
+    if (!manualIsCurrent(view)) return false;
+    if (!validManualState(data,current)) throw new Error('필기·수정본 응답을 확인하지 못했습니다.');
+    view.row = data; view.loaded = true; view.pending = null; return true;
+  } catch (error) { if (manualIsCurrent(view)) view.error = errorText(error); return false; }
+  finally { if (manualIsCurrent(view)) { view.busy = false; view.rendered = ''; renderCurrent(); } if (manualAbort === controller) manualAbort = null; }
+}
+async function writeManual(fields) {
+  const view = manualView;
+  if (!manualIsCurrent(view) || view.busy || !view.loaded) return;
+  if (view.pending && ['action','note_id','segment_id','start_seconds','text'].some(key => (view.pending[key] ?? null) !== (fields[key] ?? null))) {
+    view.error = '확인하지 못한 저장 요청이 있어요. 같은 요청을 재시도하거나 불러오기로 저장 상태를 먼저 확인해 주세요.'; renderManualView(); return;
+  }
+  if (!view.pending) view.pending = {id:crypto.randomUUID(),revision:view.row.revision,raw_revision:view.row.raw_revision,...fields};
+  const pending = view.pending, controller = new AbortController(); manualAbort = controller;
+  const lectureId = current.id; view.busy = true; view.error = ''; renderManualView();
+  try {
+    const ack = await api(`/lectures/${lectureId}/manual`,{method:'POST',body:JSON.stringify(pending),signal:controller.signal});
+    if (!manualIsCurrent(view)) return;
+    if (ack?.id !== pending.id || !Number.isSafeInteger(ack.revision) || ack.revision <= pending.revision) throw new Error('저장 확인 응답을 확인하지 못했습니다.');
+    const data = await api(`/lectures/${lectureId}/manual`,{signal:controller.signal});
+    if (!manualIsCurrent(view)) return;
+    if (!validManualState(data,current)) throw new Error('최신 저장 상태를 확인하지 못했습니다.');
+    view.row = data; view.pending = null; view.loaded = true;
+    if (fields.action.startsWith('note_')) { view.noteId=''; view.noteSegment=null; $('manual-note-text').value=''; $('manual-note-target').textContent='새 필기'; }
+    else correctionView = 'manual';
+    for (const id of ['manual-edit-dialog','manual-history-dialog']) if ($(id).open) $(id).close();
+    notice(fields.action === 'note_delete' ? '필기를 지웠어요. 이전 내용은 수정 이력에 남아 있어요.' : '저장했어요. 받아쓴 원문은 그대로 보관됩니다.');
+  } catch (error) { if (manualIsCurrent(view)) view.error = `${errorText(error)} 같은 요청을 재시도하거나 불러오기로 저장 상태를 확인하세요.`; }
+  finally { if (manualIsCurrent(view)) { view.busy = false; view.rendered=''; renderCurrent(); } if (manualAbort === controller) manualAbort = null; }
+}
+async function openManualEditor(segmentId) {
+  renderManualView(); const view = manualView;
+  if (!manualIsCurrent(view) || view.busy) return;
+  if (view.pending && (view.pending.action !== 'segment_edit' || view.pending.segment_id !== segmentId)) {
+    notice('확인하지 못한 저장이 있어요. 필기 불러오기로 저장 상태를 먼저 확인하세요.'); return;
+  }
+  if (!view.loaded && !await loadManual()) return;
+  if (!manualIsCurrent(view)) return;
+  const segment = current.segments.find(item => item.id === segmentId); if (!segment) return;
+  view.editSegment = segmentId;
+  $('manual-edit-raw').textContent = segment.text; $('manual-edit-time').textContent = `받아쓴 원문 · ${fmt(segment.start)}`;
+  $('manual-edit-text').value = view.pending?.text ?? view.row.edits.find(item => item.segment_id === segmentId)?.text ?? segment.text;
+  $('manual-edit-dialog').showModal(); renderManualView(); $('manual-edit-text').focus();
+}
+async function addNoteForSegment(segmentId) {
+  renderManualView(); const view = manualView;
+  if (!manualIsCurrent(view) || view.busy || view.pending) return;
+  if (!view.loaded && !await loadManual()) return;
+  if (!manualIsCurrent(view)) return;
+  const segment = current.segments.find(item => item.id === segmentId); if (!segment) return;
+  view.noteId=''; view.noteSegment=segmentId;
+  $('manual-note-time').value=String(segment.start); $('manual-note-target').textContent=`${fmt(segment.start)} 문장에 연결할 새 필기`;
+  $('manual-details').open = true; $('manual-note-text').focus();
+}
+async function openManualHistory(query = {}, offset = 0) {
+  const view = manualView; if (!manualIsCurrent(view) || view.busy || view.pending || !view.loaded) return;
+  manualHistoryAbort?.abort(); const controller = new AbortController(); manualHistoryAbort = controller;
+  const sequence = ++manualHistorySequence; manualHistoryQuery = query; manualHistoryPage = null;
+  const active = () => manualIsCurrent(view) && sequence === manualHistorySequence && $('manual-history-dialog').open;
+  $('manual-history-list').replaceChildren(); $('manual-history-state').textContent = '수정 이력을 불러오고 있어요…';
+  $('manual-history-prev').disabled = true; $('manual-history-next').disabled = true;
+  if (!$('manual-history-dialog').open) $('manual-history-dialog').showModal();
+  try {
+    const params = new URLSearchParams({...query,offset:String(offset),limit:'20'});
+    const data = await api(`/lectures/${current.id}/manual/history?${params}`,{signal:controller.signal});
+    if (!active()) return;
+    if (!validManualHistory(data,current,view.row,{...query,offset})) throw new Error('수정 이력의 수업·문장 연결을 확인하지 못했습니다.');
+    manualHistoryQuery = {...query,at_revision:data.at_revision};
+    manualHistoryPage = {...data,offset}; $('manual-history-state').textContent = data.items.length ? `${offset + 1}–${offset + data.items.length}번째 수정` : '아직 수정 이력이 없어요.';
+    for (const item of data.items) {
+      const row = document.createElement('section'); row.className='library-result';
+      const label = document.createElement('strong'); label.textContent=`수정 ${item.revision}차 · ${dateLabel(item.created_at)} · ${item.action === 'segment_edit' ? '문장' : '필기'}`;
+      const text = document.createElement('p'); text.className='manual-history-text'; text.textContent=item.text === null ? (item.action === 'segment_edit' ? '원문으로 되돌림' : '필기 삭제') : item.text;
+      const restore = document.createElement('button'); restore.type='button'; restore.className='secondary-button'; restore.textContent='이 내용으로 복원';
+      restore.disabled = item.action === 'note_delete' || !!view.pending;
+      restore.onclick = () => { if (active()) void writeManual(item.action === 'segment_edit'
+        ? {action:'segment_edit',segment_id:item.segment_id,text:item.text}
+        : {action:'note_upsert',note_id:item.note_id,segment_id:item.segment_id || null,start_seconds:item.start_seconds,text:item.text}); };
+      row.append(label,text,restore); $('manual-history-list').append(row);
+    }
+    $('manual-history-prev').disabled = offset === 0; $('manual-history-next').disabled = !data.has_more;
+  } catch (error) { if (active()) $('manual-history-state').textContent = errorText(error); }
+  finally { if (manualHistoryAbort === controller) manualHistoryAbort = null; }
+}
+$('manual-details').ontoggle = () => { if ($('manual-details').open && !manualView.loaded) void loadManual(); };
+$('manual-refresh').onclick = () => void loadManual();
+$('manual-note-new').onclick = () => { if (manualView.busy || manualView.pending) return; manualView.noteId=''; manualView.noteSegment=null; $('manual-note-text').value=''; $('manual-note-target').textContent='새 필기'; $('manual-note-time').value=String(reviewPlayer?.positionSeconds ?? 0); renderManualView(); };
+$('manual-note-form').onsubmit = event => { event.preventDefault(); if (manualView.pending && manualView.pending.action !== 'note_upsert') return; void writeManual(manualView.pending || {action:'note_upsert',note_id:manualView.noteId || crypto.randomUUID(),segment_id:manualView.noteSegment,start_seconds:Number($('manual-note-time').value),text:$('manual-note-text').value.trim()}); };
+$('manual-edit-form').onsubmit = event => { event.preventDefault(); if (manualView.pending && manualView.pending.action !== 'segment_edit') return; void writeManual(manualView.pending || {action:'segment_edit',segment_id:manualView.editSegment,text:$('manual-edit-text').value.trim()}); };
+$('manual-edit-original').onclick = () => void writeManual({action:'segment_edit',segment_id:manualView.editSegment,text:null});
+$('manual-edit-close').onclick = () => $('manual-edit-dialog').close();
+$('manual-edit-history').onclick = () => void openManualHistory({segment_id:manualView.editSegment});
+$('manual-history-all').onclick = () => void openManualHistory();
+function closeManualHistory() { ++manualHistorySequence; manualHistoryAbort?.abort(); manualHistoryAbort = null; $('manual-history-dialog').close(); }
+$('manual-history-close').onclick = closeManualHistory; $('manual-history-dialog').oncancel = closeManualHistory;
+$('manual-history-prev').onclick = () => { if (manualHistoryPage?.offset) void openManualHistory(manualHistoryQuery,Math.max(0,manualHistoryPage.offset - 20)); };
+$('manual-history-next').onclick = () => { if (manualHistoryPage?.has_more) void openManualHistory(manualHistoryQuery,manualHistoryPage.offset + 20); };
+$('transcript-manual').onclick = async () => {
+  renderManualView(); const view=manualView; if (!manualIsCurrent(view)) return;
+  if (!view.loaded && !await loadManual()) return;
+  if (manualIsCurrent(view) && view.loaded) { correctionView='manual'; renderCurrent(); }
+};
+$('manual-download').onclick = () => {
+  if (!manualIsCurrent(manualView) || !manualView.loaded || !manualView.row.notes.length) return;
+  const lines=[`# ${escapeMarkdown(lectureTitle(current))} · 내 필기`,'','받아쓴 원문과 별도로 작성한 개인 필기입니다.',''];
+  for (const note of manualView.row.notes) lines.push(`## ${fmt(note.start_seconds)}`,'',escapeMarkdown(note.text),'');
+  const url=URL.createObjectURL(new Blob(['\uFEFF',lines.join('\n')],{type:'text/markdown;charset=utf-8'}));
+  const link=document.createElement('a'); link.href=url; link.download=`${safeFilename(lectureTitle(current))}_내필기.md`; link.click(); setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
 function clearCorrectionPoll() {
   if (correctionPollTimer !== null) clearTimeout(correctionPollTimer);
   correctionPollTimer = null;
 }
 function resetCorrectionState(lectureId = '') {
+  resetQuestionWorkspace();
+  resetManualWorkspace();
   resetTranslationView();
   resetSummaryView();
   ++correctionSequence;
@@ -2124,6 +2519,9 @@ function correctionIsReady() {
   return correction?.status === 'completed' && normalizedCorrectedSegments().length > 0;
 }
 function displayedTranscriptSegments() {
+  if (correctionView === 'manual' && manualIsCurrent(manualView)) {
+    const segments = manualSegments(current,manualView.row); if (segments) return segments;
+  }
   return correctionView === 'corrected' && correctionIsReady()
     ? normalizedCorrectedSegments() : current?.segments || [];
 }
@@ -2131,7 +2529,8 @@ function selectedTranscriptLecture() {
   return {
     ...current,
     segments:displayedTranscriptSegments(),
-    transcript_version:correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw',
+    transcript_version:correctionView === 'manual' && manualIsCurrent(manualView) && manualView.loaded ? 'manual'
+      : correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw',
   };
 }
 function isCreditExhaustion(value) {
@@ -2178,6 +2577,7 @@ function updateCorrectionControls(noteToolsBusy = isBusy() || importIsActive() |
   $('transcript-versions').hidden = !hasTranscript;
   $('transcript-raw').disabled = !hasTranscript;
   $('transcript-corrected').disabled = !hasTranscript || !ready;
+  $('transcript-manual').disabled = !hasTranscript || !current?.recording_finalized || manualView.busy;
   $('correct-transcript').disabled = !hasTranscript || !sourceReady
     || (noteToolsBusy && !liveAction) || running || ready;
 }
@@ -2186,10 +2586,13 @@ function renderCorrection() {
   const ready = correctionIsReady();
   if (!ready && correctionView === 'corrected') correctionView = 'raw';
   const corrected = correctionView === 'corrected' && ready;
-  $('transcript-raw').classList.toggle('active', !corrected);
+  const manual = correctionView === 'manual' && manualIsCurrent(manualView) && manualView.loaded;
+  $('transcript-raw').classList.toggle('active', !corrected && !manual);
   $('transcript-corrected').classList.toggle('active', corrected);
-  $('transcript-raw').setAttribute('aria-pressed',String(!corrected));
+  $('transcript-manual').classList.toggle('active', manual);
+  $('transcript-raw').setAttribute('aria-pressed',String(!corrected && !manual));
   $('transcript-corrected').setAttribute('aria-pressed',String(corrected));
+  $('transcript-manual').setAttribute('aria-pressed',String(manual));
   $('correction-panel').hidden = !hasTranscript;
   const status = correctionStatus();
   $('correction-panel').setAttribute('data-state',status);
@@ -2465,7 +2868,7 @@ function adminActivityLabel(account) {
   })[account?.activity] || (account?.online ? '접속 중' : '오프라인');
 }
 function accountJobLabel(jobs) {
-  const values = [jobs?.transcription,jobs?.imports,jobs?.corrections,jobs?.summaries,jobs?.translations].map(value => {
+  const values = [jobs?.transcription,jobs?.imports,jobs?.corrections,jobs?.summaries,jobs?.translations,jobs?.questions].map(value => {
     if (typeof value === 'number') return Math.max(0,Math.floor(value));
     return Math.max(0,Math.floor(Number(value?.queued) || 0)) + Math.max(0,Math.floor(Number(value?.processing) || 0));
   });
@@ -2612,6 +3015,7 @@ function renderAdminOverview() {
   $('admin-correction-queue').textContent = queueLabel(queues.corrections);
   $('admin-summary-queue').textContent = queueLabel(queues.summaries);
   $('admin-translation-queue').textContent = queueLabel(queues.translations);
+  $('admin-question-queue').textContent = queueLabel(queues.questions);
 
   const tunnel = overview.tunnel || {};
   const reportedTunnelState = String(tunnel.state || 'unknown');
@@ -3044,6 +3448,7 @@ function renderTranscriptSegments(transcript, segments, scope) {
   const previous = transcriptRenderState.rows;
   if (!previous.size) transcript.replaceChildren();
   const next = new Map(), occurrences = new Map();
+  const editableIds = current?.recording_finalized ? new Set((current.segments || []).map(item => item.id)) : new Set();
   for (let index = 0; index < segments.length; index += 1) {
     const segment = segments[index];
     const base = typeof segment.id === 'string' && segment.id
@@ -3084,6 +3489,18 @@ function renderTranscriptSegments(transcript, segments, scope) {
       entry.time.textContent = time;
       entry.timeValue = time;
     }
+    if (editableIds.has(segment.id)) {
+      if (!entry.tools) {
+        entry.tools = document.createElement('div'); entry.tools.className='segment-tools';
+        entry.edit = document.createElement('button'); entry.edit.type='button'; entry.edit.textContent='직접 수정';
+        entry.note = document.createElement('button'); entry.note.type='button'; entry.note.textContent='필기';
+        entry.tools.append(entry.edit,entry.note);
+      }
+      if (entry.tools.parentNode !== entry.row) entry.row.append(entry.tools);
+      entry.edit.setAttribute('aria-label',`${time || ''} 문장 직접 수정`);
+      entry.edit.onclick = () => { if (scope === transcriptRenderState.scope) void openManualEditor(segment.id); };
+      entry.note.onclick = () => { if (scope === transcriptRenderState.scope) void addNoteForSegment(segment.id); };
+    } else if (entry.tools?.parentNode === entry.row) entry.row.removeChild(entry.tools);
     next.set(key,entry);
   }
   for (const [key,entry] of previous) {
@@ -3130,6 +3547,145 @@ function summaryDocument(value) {
   if (!value.review_questions.every(q => text(q?.question,300) && sources(q.source_ids))) return null;
   return value;
 }
+function questionIsCurrent(view) { return questionView === view && view.scope === recordingReviewScope() && !!token && !!current?.recording_finalized; }
+function resetQuestionWorkspace() {
+  questionAbort?.abort(); questionAbort = null; clearTimeout(questionPollTimer); questionPollTimer = null;
+  questionView = {scope:'',page:null,busy:false,error:'',pending:null,rendered:'',polls:0};
+  $('question-panel').hidden = true; $('question-details').open = false;
+  $('question-text').value = ''; $('question-state').textContent = ''; $('question-list').replaceChildren();
+}
+function renderQuestions() {
+  const scope = recordingReviewScope();
+  if (questionView.scope !== scope) { resetQuestionWorkspace(); questionView.scope = scope; }
+  const view = questionView, eligible = questionIsCurrent(view), page = view.page;
+  $('question-panel').hidden = !eligible;
+  $('question-text').disabled = !eligible || view.busy || !!view.pending;
+  $('question-submit').disabled = !eligible || view.busy || (!view.pending && (!page?.configured || page.total >= 100));
+  $('question-submit').textContent = view.pending ? (view.pending.notFound ? '같은 질문 요청 다시 전송' : '요청 상태 확인') : '원문을 참고해 답변 만들기';
+  $('question-refresh').disabled = !eligible || view.busy;
+  $('question-prev').disabled = !page?.offset || view.busy || !!view.pending;
+  $('question-next').disabled = !page?.has_more || view.busy || !!view.pending;
+  $('question-state').textContent = view.error || (view.busy ? '질문 상태를 확인하고 있어요…' : view.pending
+    ? '요청 결과를 확인하지 못했어요. 새 질문을 보내지 않고 같은 요청의 상태부터 확인합니다.'
+    : !page ? '질문 기록을 불러오면 새 질문을 작성할 수 있어요.' : !page.configured ? '운영자의 질문 API 설정이 필요해요.'
+    : `질문 ${page.total} / 100개 · 원문 기준 · 필기와 직접 수정본은 AI에 보내지 않아요.`);
+  const signature = JSON.stringify([page,view.busy,!!view.pending]);
+  if (view.rendered === signature) return; view.rendered = signature;
+  const target = $('question-list'); target.replaceChildren();
+  const sources = new Map((current?.segments || []).map(segment => [segment.id,segment]));
+  for (const job of page?.questions || []) {
+    const row = document.createElement('section'); row.className = 'library-result';
+    const heading = document.createElement('h4'); heading.textContent = job.question;
+    const status = document.createElement('p'); status.className = 'panel-help';
+    const labels = {queued:'답변 대기 중',processing:job.cancel_requested ? '취소 요청됨 · 처리 정리 중' : '원문을 참고해 답변 생성 중',failed:'답변 생성 실패 · 자동 재시도하지 않음',cancelled:'취소됨',completed:'답변 완료'};
+    status.textContent = labels[job.status]; row.append(heading,status);
+    if (job.status === 'completed') {
+      const scopeLabel = document.createElement('p'); scopeLabel.className = 'panel-help';
+      scopeLabel.textContent = job.scope === 'full' ? `전체 원문 ${job.total_segments}개 구간 참고`
+        : job.scope === 'retrieved' ? `일부 원문만 참고: 전체 ${job.total_segments}개 중 질문과 관련된 ${job.selected_count}개 구간 · 전체 수업을 검토한 답변이 아닙니다.` : '관련 원문을 찾지 못해 AI에 요청하지 않았어요.';
+      row.append(scopeLabel);
+      if (job.document.answerability === 'insufficient_evidence') {
+        const empty = document.createElement('p'); empty.textContent = '참고한 수업 원문에서 답할 근거가 부족해요. 질문을 더 구체적으로 적거나 원문을 확인해 주세요.'; row.append(empty);
+      }
+      for (const paragraph of job.document.paragraphs) {
+        const text = document.createElement('p'); text.className = 'manual-note-text'; text.textContent = paragraph.text; row.append(text);
+        const links = document.createElement('div'); links.className = 'study-actions';
+        for (const id of paragraph.source_ids) {
+          const source = sources.get(id), link = document.createElement('button'); link.type = 'button'; link.className = 'secondary-button'; link.textContent = `원문 ${fmt(source.start)}`;
+          link.onclick = () => {
+            if (!questionIsCurrent(view)) return;
+            correctionView = 'raw'; reviewView.query = ''; $('transcript-search').value = ''; renderCurrent();
+            transcriptRenderState.rows.get(JSON.stringify([`id:${id}`,0]))?.row?.scrollIntoView?.({block:'center',behavior:'smooth'});
+            if (canPlayRecording()) void playRecordingClip(source.start);
+          }; links.append(link);
+        }
+        row.append(links);
+      }
+    } else if (job.status === 'failed') {
+      const error = document.createElement('p'); error.textContent = job.error || '이 요청은 자동으로 다시 실행하지 않습니다.'; row.append(error);
+    }
+    if (['queued','processing'].includes(job.status)) {
+      const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'secondary-button'; cancel.textContent = '요청 취소'; cancel.disabled = view.busy || !!view.pending || job.cancel_requested;
+      cancel.onclick = () => { if (questionIsCurrent(view)) void cancelQuestion(job.id); }; row.append(cancel);
+    }
+    target.append(row);
+  }
+}
+function scheduleQuestionPoll(view) {
+  clearTimeout(questionPollTimer); questionPollTimer = null;
+  if (!questionIsCurrent(view) || !$('question-details').open || view.pending || view.error || view.polls >= 200
+      || !view.page?.questions.some(job => ['queued','processing'].includes(job.status))) return;
+  questionPollTimer = setTimeout(() => { questionPollTimer=null; if (questionIsCurrent(view)) { ++view.polls; void loadQuestions(view.page.offset,false); } },3000);
+}
+async function loadQuestions(offset = 0, manual = true) {
+  renderQuestions(); const view = questionView;
+  if (!questionIsCurrent(view) || view.busy) return;
+  if (manual) view.polls = 0;
+  view.busy = true; view.error = ''; const controller = new AbortController(); questionAbort = controller; renderQuestions();
+  try {
+    if (view.pending) {
+      const pending = view.pending;
+      try {
+        const data = await api(`/lectures/${current.id}/questions/${pending.id}`,{signal:controller.signal});
+        if (!questionIsCurrent(view)) return;
+        if (!validQuestionJob(data?.question,current) || data.question.id !== pending.id || data.question.question !== pending.question) throw new Error('같은 질문의 저장 상태를 확인하지 못했습니다.');
+        view.pending = null; $('question-text').value = ''; offset = 0;
+      } catch (error) {
+        if (!questionIsCurrent(view)) return;
+        if (error.status === 404) { pending.notFound = true; view.error = '저장된 요청을 찾지 못했어요. 같은 요청 다시 전송 버튼으로 재시도할 수 있어요.'; return; }
+        throw error;
+      }
+    }
+    const data = await api(`/lectures/${current.id}/questions?offset=${offset}&limit=20`,{signal:controller.signal});
+    if (!questionIsCurrent(view)) return;
+    if (!validQuestionPage(data,current,offset)) throw new Error('질문 기록과 원문 출처를 확인하지 못했습니다.');
+    view.page = data;
+  } catch (error) { if (questionIsCurrent(view)) view.error = errorText(error); }
+  finally { if (questionIsCurrent(view)) { view.busy=false; renderQuestions(); scheduleQuestionPoll(view); } if (questionAbort === controller) questionAbort=null; }
+}
+async function submitQuestion() {
+  const view = questionView;
+  if (!questionIsCurrent(view) || view.busy) return;
+  if (view.pending && !view.pending.notFound) return loadQuestions();
+  if (!view.pending) {
+    const question = $('question-text').value.trim();
+    if (!view.page?.configured || !question || Array.from(question).length > 1000) return;
+    view.pending = {id:crypto.randomUUID(),question};
+  }
+  const pending = view.pending; pending.notFound = false; view.busy=true; view.error=''; view.polls=0;
+  const controller = new AbortController(); questionAbort=controller; renderQuestions(); let accepted=false;
+  try {
+    const data = await api(`/lectures/${current.id}/questions`,{method:'POST',body:JSON.stringify({id:pending.id,question:pending.question}),signal:controller.signal});
+    if (!questionIsCurrent(view)) return;
+    if (!validQuestionJob(data?.question,current) || data.question.id !== pending.id || data.question.question !== pending.question) throw new Error('질문 접수 응답을 확인하지 못했습니다.');
+    view.pending=null; $('question-text').value=''; accepted=true;
+  } catch (error) {
+    if (questionIsCurrent(view)) {
+      if ([400,403,409,413,422,429].includes(error.status)) {
+        view.pending=null; view.error=errorText(error);
+      } else view.error = `${errorText(error)} 새 요청을 자동으로 보내지 않습니다. 요청 상태 확인을 눌러 주세요.`;
+    }
+  } finally { if (questionIsCurrent(view)) { view.busy=false; renderQuestions(); } if (questionAbort === controller) questionAbort=null; }
+  if (accepted && questionIsCurrent(view)) await loadQuestions();
+}
+async function cancelQuestion(id) {
+  const view=questionView; if (!questionIsCurrent(view) || view.busy || view.pending) return;
+  view.busy=true; view.error=''; const controller=new AbortController(); questionAbort=controller; renderQuestions(); let accepted=false;
+  try {
+    const data=await api(`/lectures/${current.id}/questions/${id}`,{method:'DELETE',signal:controller.signal});
+    if (!questionIsCurrent(view)) return;
+    if (!validQuestionJob(data?.question,current) || data.question.id !== id) throw new Error('취소 상태를 확인하지 못했습니다.');
+    accepted=true;
+  } catch (error) { if (questionIsCurrent(view)) view.error=`${errorText(error)} 요청 상태 확인으로 취소 여부를 확인해 주세요.`; }
+  finally { if (questionIsCurrent(view)) { view.busy=false; renderQuestions(); } if (questionAbort === controller) questionAbort=null; }
+  if (accepted && questionIsCurrent(view)) await loadQuestions(view.page?.offset || 0);
+}
+$('question-details').ontoggle = () => { if ($('question-details').open) void loadQuestions(); else { clearTimeout(questionPollTimer); questionPollTimer=null; } };
+$('question-refresh').onclick = () => void loadQuestions(questionView.page?.offset || 0);
+$('question-form').onsubmit = event => { event.preventDefault(); void submitQuestion(); };
+$('question-prev').onclick = () => void loadQuestions(Math.max(0,(questionView.page?.offset || 0)-20));
+$('question-next').onclick = () => { if (questionView.page?.has_more) void loadQuestions(questionView.page.offset+20); };
+
 function summarySources(ids) {
   const segments = new Map((current?.segments || []).map(s => [s.id,s]));
   return [...new Set(ids.map(id => segments.get(id)?.start).filter(Number.isFinite))]
@@ -3232,7 +3788,7 @@ $('summary-download').onclick = () => {
   const plain = value => String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/([\\`*_{}\[\]()#+.!|~\-])/g,'\\$1').replace(/[\r\n]+/g,' ');
   const point = (text,ids) => `${plain(text)} (원문 ${summarySources(ids)})`;
-  const lines = [`# ${plain(current.title)} · AI 수업 요약`,'',
+  const lines = [`# ${plain(lectureTitle(current))} · AI 수업 요약`,'',
     'AI가 만든 요약입니다. 원문과 비교해 확인하세요.','',
     point(documentValue.overview,documentValue.overview_source_ids),''];
   for (const section of documentValue.sections) {
@@ -3245,7 +3801,7 @@ $('summary-download').onclick = () => {
     for (const item of documentValue.review_questions) lines.push(`- ${point(item.question,item.source_ids)}`);
   }
   const url = URL.createObjectURL(new Blob(['\uFEFF',lines.join('\n')],{type:'text/markdown;charset=utf-8'}));
-  const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(current.title)}_수업요약.md`;
+  const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(lectureTitle(current))}_수업요약.md`;
   link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
 };
 
@@ -3382,7 +3938,7 @@ $('translation-download').onclick = () => {
   const plain = value => String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/([\\`*_{}\[\]()#+.!|~\-])/g,'\\$1').replace(/[\r\n]+/g,' ');
   const paired = translationView.mode === 'paired';
-  const lines = [`# ${plain(current.title)} · 한국어 번역`,'',
+  const lines = [`# ${plain(lectureTitle(current))} · 한국어 번역`,'',
     '전체 수업에서 추린 문맥을 참고한 AI 번역입니다. 원문·녹음과 비교해 확인하세요.',''];
   for (let i = 0; i < segments.length; i += 1) {
     lines.push(`## ${fmt(segments[i].start)}`,'');
@@ -3391,7 +3947,7 @@ $('translation-download').onclick = () => {
   }
   const url = URL.createObjectURL(new Blob(['\uFEFF',lines.join('\n')],{type:'text/markdown;charset=utf-8'}));
   const link = document.createElement('a'); link.href = url;
-  link.download = `${safeFilename(current.title)}_한국어번역${paired ? '_문장대조' : ''}.md`;
+  link.download = `${safeFilename(lectureTitle(current))}_한국어번역${paired ? '_문장대조' : ''}.md`;
   link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
 };
 
@@ -3402,20 +3958,23 @@ function renderCurrent() {
     if (current?.correction) correction = correctionPayload(current.correction);
   }
   $('note-date').textContent = dateLabel(current?.created_at || new Date());
-  $('view-label').textContent = current?.title || '새 수업';
-  document.querySelector('.note-heading h1').textContent = current?.title || '오늘의 배움을 담아보세요.';
+  $('view-label').textContent = current ? lectureTitle(current) : '새 수업';
+  document.querySelector('.note-heading h1').textContent = current ? lectureTitle(current) : '오늘의 배움을 담아보세요.';
   if (current) {
     $('lecture-title').value = current.title; $('language').value = current.language || 'auto';
     $('asr-provider').value = current.asr_provider === 'clova' ? 'clova' : 'qwen';
   }
+  renderManualView();
   renderCorrection();
+  renderQuestions();
   renderSummary();
   renderTranslation();
   renderRecordingReview();
   const allSegments = displayedTranscriptSegments();
   const segments = filterTranscript(allSegments,reviewView.query);
   const transcript = $('transcript');
-  const transcriptVersion = correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw';
+  const transcriptVersion = correctionView === 'manual' && manualIsCurrent(manualView) && manualView.loaded ? 'manual'
+    : correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw';
   const transcriptScope = JSON.stringify([user,apiUrl,lectureId,current?.asr_provider || 'qwen',transcriptVersion]);
   renderTranscriptSegments(transcript,segments,transcriptScope);
   if (!segments.length) {
@@ -3430,7 +3989,8 @@ function renderCurrent() {
     empty.append(mark,heading,text); transcript.append(empty);
   }
   $('segment-count').textContent = reviewView.query ? `${segments.length} / ${allSegments.length}` : segments.length;
-  $('transcript-title').textContent = correctionView === 'corrected' && correctionIsReady() ? 'AI 후보정본' : '받아쓴 원문';
+  $('transcript-title').textContent = transcriptVersion === 'manual' ? '직접 수정본'
+    : correctionView === 'corrected' && correctionIsReady() ? 'AI 후보정본' : '받아쓴 원문';
   updateControls();
 }
 function selectedCaptureSource() { return $('audio-source').value === 'system' ? 'system' : 'microphone'; }
@@ -3562,6 +4122,10 @@ function updateControls() {
     : '음성과 받아쓰기 결과는 현재 녹음 수업에만 저장되며, 이 PC의 Qwen으로 계속 처리됩니다.';
   $('return-live-capture').disabled = !stableLiveCapture();
   $('lecture-date').disabled = historyNavigationBusy();
+  $('library-course').disabled = historyNavigationBusy(); $('library-semester').disabled = historyNavigationBusy();
+  $('library-search-open').disabled = historyNavigationBusy();
+  $('trash-open').disabled = historyNavigationBusy();
+  $('metadata-open').disabled = historyNavigationBusy() || !current?.recording_finalized;
   $('export-format').disabled = noteToolsBusy || !hasTranscript;
   $('download').disabled = noteToolsBusy || !hasTranscript;
   const recoverablePcm = !!current && localPcmSnapshots.has(current.id);
@@ -3570,11 +4134,11 @@ function updateControls() {
     : recoverablePcm && !current.recording_finalized ? '기기 음성 복구 · WAV 마무리'
     : !current.recording_available ? '저장된 녹음 없음'
       : current.recording_finalized ? '↓ 녹음 WAV' : '녹음 WAV 마무리';
-  $('delete-lecture').disabled = noteToolsBusy || correctionLoading || correctionStarting || !current;
+  $('delete-lecture').disabled = noteToolsBusy || correctionLoading || correctionStarting || !current?.recording_finalized;
   $('delete-close').disabled = deletingLecture;
   $('delete-cancel').disabled = deletingLecture;
   $('delete-confirm').disabled = deletingLecture;
-  $('delete-confirm').textContent = deletingLecture ? '삭제하는 중…' : '수업 삭제';
+  $('delete-confirm').textContent = deletingLecture ? '옮기는 중…' : '휴지통으로 이동';
   $('lecture-title').disabled = busy || !!current; $('language').disabled = busy || !!current;
   $('language-auto').disabled = clova;
   $('audio-source').disabled = busy || !!current;
@@ -4769,14 +5333,14 @@ $('download').onclick = () => {
   const type = format === 'text' ? 'text/plain;charset=utf-8' : 'text/markdown;charset=utf-8';
   const displayed = selectedTranscriptLecture();
   const url = URL.createObjectURL(new Blob(['\uFEFF',exportText(displayed,format)],{type}));
-  const suffix = displayed.transcript_version === 'corrected' ? '_AI후보정' : '';
-  const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(current.title)}${suffix}.${extension}`;
+  const suffix = displayed.transcript_version === 'manual' ? '_직접수정' : displayed.transcript_version === 'corrected' ? '_AI후보정' : '';
+  const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(lectureTitle(current))}${suffix}.${extension}`;
   link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
 };
 async function downloadRecording() {
   if (isBusy() || importIsActive() || importStarting || !current
       || (!current.recording_available && !localPcmSnapshots.has(current.id))) return;
-  const lectureId = current.id, title = current.title, owner = user, sessionToken = token, server = apiUrl;
+  const lectureId = current.id, title = lectureTitle(current), owner = user, sessionToken = token, server = apiUrl;
   const generation = requestGeneration, sequence = ++noteActionSequence;
   const operationIsCurrent = () => sequence === noteActionSequence && generation === requestGeneration
     && owner === user && sessionToken === token && server === apiUrl && current?.id === lectureId;
@@ -4844,9 +5408,9 @@ function closeDeleteDialog() {
   if ($('delete-dialog').open) $('delete-dialog').close();
 }
 $('delete-lecture').onclick = () => {
-  if (isBusy() || importIsActive() || importStarting || !current) return;
-  deleteTarget = {id:current.id,title:current.title,owner:user,sessionToken:token,server:apiUrl};
-  $('delete-lecture-title').textContent = current.title;
+  if (isBusy() || importIsActive() || importStarting || !current?.recording_finalized) return;
+  deleteTarget = {id:current.id,title:lectureTitle(current),owner:user,sessionToken:token,server:apiUrl};
+  $('delete-lecture-title').textContent = lectureTitle(current);
   $('delete-dialog').showModal(); $('delete-confirm').focus();
 };
 $('delete-close').onclick = closeDeleteDialog;
@@ -4879,7 +5443,7 @@ function finishDeletedLecture(target) {
   if ($('delete-dialog').open) $('delete-dialog').close();
   if (current?.id === target.id) resetNewNote();
   else { renderCurrent(); renderHistory(); }
-  notice('수업 기록을 삭제했어요. Google Drive 녹음이 있었다면 Drive 휴지통으로 옮겼어요.');
+  notice('수업을 휴지통으로 옮겼어요. 원문과 녹음은 보관되며 휴지통에서 복원할 수 있어요.');
 }
 $('delete-confirm').onclick = async () => {
   const target = deleteTarget;

@@ -246,8 +246,11 @@ class ImportApiTests(unittest.TestCase):
             ).status_code,
             404,
         )
+        trashed = self.client.post(f"/lectures/{completed['lecture_id']}/trash",headers=self.headers())
+        self.assertEqual(trashed.status_code,200,trashed.text)
+        self.assertTrue(recording.exists(), "reversible trash retains the recording")
         deleted = self.client.delete(
-            f"/lectures/{completed['lecture_id']}",
+            f"/lectures/{completed['lecture_id']}/permanent",
             headers=self.headers(),
         )
         self.assertEqual(deleted.status_code, 200, deleted.text)

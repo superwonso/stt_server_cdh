@@ -1835,7 +1835,7 @@ class DriveArchiveApiTests(unittest.TestCase):
         lecture_id, _, file_id = self.add_remote_recording()
 
         hidden = self.client.delete(
-            f"/lectures/{lecture_id}", headers=self.headers("user-beta")
+            f"/lectures/{lecture_id}/permanent", headers=self.headers("user-beta")
         )
         self.assertEqual(hidden.status_code, 200, hidden.text)
         self.assertEqual(self.drive.trash_calls, [])
@@ -1847,8 +1847,12 @@ class DriveArchiveApiTests(unittest.TestCase):
         self.drive.trash_error = DriveTransportError(
             "trash_temporarily_unavailable", "redacted", retryable=True
         )
+        trashed = self.client.post(f"/lectures/{lecture_id}/trash", headers=self.headers())
+        self.assertEqual(trashed.status_code, 200, trashed.text)
+        self.assertEqual(self.drive.trash_calls, [], "app trash must not contact Drive")
+        self.assertFalse(self.drive.get_metadata(file_id).trashed)
         failed = self.client.delete(
-            f"/lectures/{lecture_id}", headers=self.headers()
+            f"/lectures/{lecture_id}/permanent", headers=self.headers()
         )
         self.assertEqual(failed.status_code, 503, failed.text)
         self.assertNotIn(file_id, failed.text)
@@ -1865,7 +1869,7 @@ class DriveArchiveApiTests(unittest.TestCase):
 
         self.drive.trash_error = None
         retried = self.client.delete(
-            f"/lectures/{lecture_id}", headers=self.headers()
+            f"/lectures/{lecture_id}/permanent", headers=self.headers()
         )
         self.assertEqual(retried.status_code, 200, retried.text)
         self.assertTrue(self.drive.get_metadata(file_id).trashed)
@@ -1905,9 +1909,11 @@ class DriveArchiveApiTests(unittest.TestCase):
                 self.app.state.archive_manager.run_once, delete_local=True
             )
             self.assertTrue(self.drive.upload_entered.wait(timeout=3))
+            trashed = self.client.post(f"/lectures/{lecture_id}/trash", headers=self.headers())
+            self.assertEqual(trashed.status_code, 200, trashed.text)
             deletion = executor.submit(
                 self.client.delete,
-                f"/lectures/{lecture_id}",
+                f"/lectures/{lecture_id}/permanent",
                 headers=self.headers(),
             )
             deadline = time.monotonic() + 3

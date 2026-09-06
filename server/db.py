@@ -130,12 +130,27 @@ class Database:
                     language TEXT CHECK (language IS NULL OR language IN ('ko', 'en')),
                     created_at TEXT NOT NULL,
                     deleting INTEGER NOT NULL DEFAULT 0 CHECK (deleting IN (0, 1)),
+                    trashed_at TEXT,
                     recording_finalized INTEGER NOT NULL DEFAULT 0
                         CHECK (recording_finalized IN (0, 1)),
                     asr_provider TEXT NOT NULL DEFAULT 'qwen'
                         CHECK (asr_provider IN ('qwen', 'clova'))
                 );
                 CREATE INDEX IF NOT EXISTS lectures_user ON lectures(username, created_at);
+                CREATE TABLE IF NOT EXISTS lecture_metadata (
+                    lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
+                    display_title TEXT CHECK (
+                        display_title IS NULL OR length(display_title) BETWEEN 1 AND 120
+                    ),
+                    course TEXT NOT NULL DEFAULT '' CHECK (length(course) <= 80),
+                    semester TEXT NOT NULL DEFAULT '' CHECK (length(semester) <= 40),
+                    revision INTEGER NOT NULL CHECK (
+                        typeof(revision) = 'integer' AND revision BETWEEN 1 AND 2147483647
+                    ),
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS lecture_metadata_classification
+                    ON lecture_metadata(semester, course, lecture_id);
                 CREATE TABLE IF NOT EXISTS chunks (
                     lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
                     chunk_id TEXT NOT NULL,
@@ -161,6 +176,54 @@ class Database:
                         REFERENCES chunks(lecture_id, chunk_id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS segments_lecture ON segments(lecture_id, start);
+                CREATE TABLE IF NOT EXISTS lecture_manual_state (
+                    lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
+                    raw_revision TEXT NOT NULL CHECK (length(raw_revision) = 64),
+                    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision BETWEEN 1 AND 2147483647)
+                );
+                CREATE TABLE IF NOT EXISTS lecture_manual_notes (
+                    id TEXT PRIMARY KEY CHECK (length(id) = 36),
+                    lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
+                    segment_id TEXT REFERENCES segments(id) ON DELETE CASCADE,
+                    start_seconds REAL NOT NULL CHECK (start_seconds BETWEEN 0 AND 14400),
+                    text TEXT NOT NULL CHECK (length(text) BETWEEN 1 AND 5000),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS lecture_manual_notes_time
+                    ON lecture_manual_notes(lecture_id, start_seconds, created_at, id);
+                CREATE TABLE IF NOT EXISTS lecture_manual_edits (
+                    segment_id TEXT PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,
+                    lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL CHECK (length(text) BETWEEN 1 AND 5000),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS lecture_manual_edits_lecture ON lecture_manual_edits(lecture_id);
+                CREATE TABLE IF NOT EXISTS lecture_manual_history (
+                    lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision BETWEEN 1 AND 2147483647),
+                    request_id TEXT NOT NULL CHECK (length(request_id) = 36),
+                    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+                    raw_revision TEXT NOT NULL CHECK (length(raw_revision) = 64),
+                    action TEXT NOT NULL CHECK (action IN ('note_upsert','note_delete','segment_edit')),
+                    note_id TEXT CHECK (note_id IS NULL OR length(note_id) = 36),
+                    segment_id TEXT,
+                    start_seconds REAL CHECK (start_seconds IS NULL OR start_seconds BETWEEN 0 AND 14400),
+                    text TEXT CHECK (text IS NULL OR length(text) BETWEEN 1 AND 5000),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (lecture_id, revision),
+                    UNIQUE (lecture_id, request_id),
+                    CHECK ((action='segment_edit' AND note_id IS NULL AND segment_id IS NOT NULL)
+                        OR (action='note_upsert' AND note_id IS NOT NULL AND text IS NOT NULL)
+                        OR (action='note_delete' AND note_id IS NOT NULL AND text IS NULL))
+                );
+                CREATE INDEX IF NOT EXISTS lecture_manual_history_segment
+                    ON lecture_manual_history(lecture_id, segment_id, revision DESC);
+                CREATE INDEX IF NOT EXISTS lecture_manual_history_note
+                    ON lecture_manual_history(lecture_id, note_id, revision DESC);
+                CREATE INDEX IF NOT EXISTS lecture_manual_history_note_identity
+                    ON lecture_manual_history(note_id, lecture_id);
                 CREATE TABLE IF NOT EXISTS lecture_bookmarks (
                     id TEXT PRIMARY KEY CHECK (length(id) = 36),
                     lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
@@ -318,6 +381,40 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS lecture_summaries_queue
                     ON lecture_summaries(status, created_at);
+                CREATE TABLE IF NOT EXISTS lecture_questions (
+                    id TEXT PRIMARY KEY CHECK (length(id) = 36),
+                    lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
+                    username TEXT NOT NULL REFERENCES users(username),
+                    question TEXT NOT NULL CHECK (length(question) BETWEEN 1 AND 1000),
+                    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+                    raw_revision TEXT NOT NULL CHECK (length(raw_revision) = 64),
+                    model TEXT NOT NULL,
+                    selected_ids_json TEXT NOT NULL CHECK (length(selected_ids_json) <= 40000),
+                    evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64),
+                    scope TEXT NOT NULL CHECK (scope IN ('full', 'retrieved', 'none')),
+                    total_segments INTEGER NOT NULL CHECK (total_segments BETWEEN 0 AND 50000),
+                    selected_count INTEGER NOT NULL CHECK (selected_count BETWEEN 0 AND 128),
+                    status TEXT NOT NULL CHECK (
+                        status IN ('queued', 'processing', 'completed', 'failed', 'cancelled')
+                    ),
+                    cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0, 1)),
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 1),
+                    document_json TEXT,
+                    error_code TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    CHECK ((status = 'completed' AND document_json IS NOT NULL
+                            AND completed_at IS NOT NULL AND error IS NULL AND error_code IS NULL)
+                        OR (status != 'completed' AND document_json IS NULL AND completed_at IS NULL))
+                );
+                CREATE INDEX IF NOT EXISTS lecture_questions_recent
+                    ON lecture_questions(lecture_id, created_at DESC, id);
+                CREATE INDEX IF NOT EXISTS lecture_questions_queue
+                    ON lecture_questions(status, created_at, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS lecture_questions_processing_owner
+                    ON lecture_questions(username) WHERE status = 'processing';
                 CREATE TABLE IF NOT EXISTS lecture_translations (
                     lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
                     job_id TEXT NOT NULL UNIQUE,
@@ -363,6 +460,15 @@ class Database:
                     "ALTER TABLE lectures ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0 "
                     "CHECK (deleting IN (0, 1))"
                 )
+            if "trashed_at" not in lecture_columns:
+                # Reversible app trash is independent of durable remote
+                # deletion. Existing lessons remain active; never age out or
+                # infer deletion from their original creation timestamps.
+                connection.execute("ALTER TABLE lectures ADD COLUMN trashed_at TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS lectures_user_trash "
+                "ON lectures(username, trashed_at, id)"
+            )
             if "recording_finalized" not in lecture_columns:
                 connection.execute(
                     "ALTER TABLE lectures ADD COLUMN recording_finalized INTEGER NOT NULL DEFAULT 0 "
@@ -457,5 +563,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 14:
-                connection.execute("PRAGMA user_version = 14")
+            if schema_version < 18:
+                connection.execute("PRAGMA user_version = 18")

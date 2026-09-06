@@ -261,7 +261,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(result["server"]["state"], "online")
         self.assertEqual(result["server"]["model"], "fake-model")
         self.assertEqual(result["queues"], {"transcription": 1, "imports": 1, "corrections": 1,
-                                          "summaries": 0, "translations": 0})
+                                          "summaries": 0, "translations": 0, "questions": 0})
         self.assertEqual(result["tunnel"]["state"], "online")
         self.assertEqual(
             set(result["tunnel"]),
@@ -284,7 +284,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(accounts["user-beta"]["activity"], "transcribing")
         self.assertEqual(
             accounts["user-beta"]["jobs"],
-            {"transcription": 1, "imports": 1, "corrections": 1, "summaries": 0, "translations": 0},
+            {"transcription": 1, "imports": 1, "corrections": 1, "summaries": 0, "translations": 0, "questions": 0},
         )
         self.assertNotEqual(accounts["user-beta"]["account_id"], "user-beta")
         self.assertEqual(result["recent_audit"], [])
@@ -325,12 +325,47 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         result = response.json()
         self.assertEqual(result["queues"], {"transcription": 0, "imports": 0, "corrections": 0,
-                                          "summaries": 1, "translations": 1})
+                                          "summaries": 1, "translations": 1, "questions": 0})
         accounts = {account["label"]: account for account in result["accounts"]}
         for username, expected in (("user-alpha", (0, 0)), ("user-beta", (1, 0)), ("user-gamma", (0, 1))):
             self.assertEqual((accounts[username]["jobs"]["summaries"], accounts[username]["jobs"]["translations"]), expected)
         for secret in (*private_ids, "PRIVATE-JOB-TITLE", "PRIVATE-JOB-MODEL", "PRIVATE-JOB-CONTENT"):
             self.assertNotIn(secret, response.text)
+
+    def test_question_counts_separate_three_owners_and_exclude_terminal_private_results(self):
+        private_ids = []
+        rows = (("user-alpha", "queued"), ("user-alpha", "processing"), ("user-beta", "queued"),
+                ("user-gamma", "completed"), ("user-gamma", "failed"), ("user-gamma", "cancelled"))
+        with self.app.state.database.connect() as connection:
+            for username, status in rows:
+                lecture_id, question_id = str(uuid.uuid4()), str(uuid.uuid4())
+                private_ids.extend((lecture_id, question_id))
+                connection.execute("INSERT INTO lectures(id,username,title,created_at,recording_finalized) "
+                                   "VALUES (?,?,'PRIVATE-QUESTION-TITLE','now',1)", (lecture_id, username))
+                connection.execute(
+                    "INSERT INTO lecture_questions(id,lecture_id,username,question,request_hash,raw_revision,model,"
+                    "selected_ids_json,evidence_sha256,scope,total_segments,selected_count,status,attempts,document_json,"
+                    "created_at,updated_at,completed_at) VALUES(?,?,?,'PRIVATE-QUESTION-TEXT',?,?,'PRIVATE-QUESTION-MODEL',"
+                    "'[]',?,'none',0,0,?,?,?,'now','now',?)",
+                    (question_id, lecture_id, username, "a" * 64, "b" * 64, "c" * 64, status,
+                     int(status in ("processing", "completed")),
+                     '{"private":"PRIVATE-QUESTION-ANSWER"}' if status == "completed" else None,
+                     "now" if status == "completed" else None),
+                )
+        for username in ("user-beta", "user-gamma"):
+            self.assertEqual(self.client.get("/admin/overview", headers=self.headers(username)).status_code, 403)
+        response = self.client.get("/admin/overview", headers=self.headers())
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["queues"], {"transcription": 0, "imports": 0, "corrections": 0,
+                                          "summaries": 0, "translations": 0, "questions": 3})
+        accounts = {account["label"]: account for account in result["accounts"]}
+        for username, expected in (("user-alpha", 2), ("user-beta", 1), ("user-gamma", 0)):
+            self.assertEqual(accounts[username]["jobs"]["questions"], expected)
+            self.assertEqual(accounts[username]["is_self"], username == "user-alpha")
+        for private in (*private_ids, "PRIVATE-QUESTION-TITLE", "PRIVATE-QUESTION-TEXT",
+                        "PRIVATE-QUESTION-MODEL", "PRIVATE-QUESTION-ANSWER"):
+            self.assertNotIn(private, response.text)
 
     def test_third_account_is_listed_but_remains_data_isolated_and_non_admin(self):
         created = self.client.post(

@@ -106,10 +106,10 @@ def install(app, settings, database, recording_store, archive_manager, *,
 
     def owned_now(connection, lecture_id: str, username: str, *, clip: bool = False):
         row = connection.execute(
-            "SELECT recording_finalized,deleting FROM lectures WHERE id=? AND username=?",
+            "SELECT recording_finalized,deleting,trashed_at FROM lectures WHERE id=? AND username=?",
             (lecture_id, username),
         ).fetchone()
-        if row is None:
+        if row is None or row["trashed_at"] is not None:
             raise HTTPException(404, "수업을 찾을 수 없습니다.")
         if row["deleting"]:
             if clip:

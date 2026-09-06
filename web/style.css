@@ -22,6 +22,31 @@
   font-synthesis: none;
 }
 
+.library-filters { display: grid; gap: 8px; margin-bottom: 12px; }
+.library-filters label { display: grid; grid-template-columns: 36px minmax(0, 1fr); align-items: center; gap: 8px; color: var(--muted); font-size: 0.85rem; }
+.library-filters select { min-width: 0; width: 100%; padding: 7px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.study-dialog { width: min(720px, calc(100% - 24px)); max-height: calc(100dvh - 32px); border: 1px solid var(--line); border-radius: 20px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow); }
+.study-dialog::backdrop { background: rgba(19,37,31,0.45); }
+.study-dialog-content { display: grid; gap: 12px; padding: clamp(12px, 3vw, 24px); }
+.study-dialog-content h2, .study-dialog-content p { margin: 0; }
+.study-dialog-content > p { color: var(--muted); font-size: 0.9rem; }
+.study-dialog-content input, .study-dialog-content select, .study-dialog-content textarea { min-width: 0; max-width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-muted); font: inherit; color: inherit; }
+.library-search-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.library-search-form input { grid-column: 1 / -1; }
+.library-results { display: grid; gap: 8px; }
+.library-result { display: grid; gap: 5px; width: 100%; padding: 12px; text-align: left; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-muted); overflow-wrap: anywhere; }
+.library-result:hover { border-color: var(--forest-600); }
+.library-result small { color: var(--muted); }
+.study-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.manual-note-form { display: grid; gap: 8px; margin: 16px 0; }
+.manual-note-form input, .manual-note-form textarea { padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); font: inherit; color: inherit; min-width: 0; width: 100%; }
+.manual-note-form input { width: 150px; max-width: 100%; }
+.source-quote { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; margin: 0; border-left: 3px solid var(--forest-600); background: var(--surface-muted); }
+.manual-note-text, .manual-history-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.segment .segment-tools { grid-column: 2; display: flex; justify-content: flex-end; gap: 10px; }
+.segment.without-time .segment-tools { grid-column: 1 / -1; }
+.segment-tools button { padding: 2px 6px; font-size: 11px; color: var(--forest-700); border: 0; background: transparent; }
+
 * {
   box-sizing: border-box;
 }

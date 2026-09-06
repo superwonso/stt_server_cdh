@@ -436,15 +436,15 @@ class TranslationApiTests(unittest.TestCase):
         self.assertEqual(self.row(lecture_id)["status"], "completed")
         self.assertEqual(len(self.engine.calls), 2)
 
-    def test_queued_lecture_deletion_cancels_before_any_provider_call(self):
+    def test_queued_lecture_trash_is_blocked_without_cancelling_provider_work(self):
         lecture_id, _ = self.lecture()
         self.assert_queued(lecture_id)
         response = self.client.delete(f"/lectures/{lecture_id}", headers=self.headers())
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertIsNone(self.row(lecture_id))
-        self.assertEqual(self.get(lecture_id).status_code, 404)
-        self.assertFalse(self.service.process_next())
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.row(lecture_id)["status"], "queued")
+        self.assertEqual(self.get(lecture_id).status_code, 200)
         self.assertEqual(self.engine.calls, [])
+        self.assertTrue(self.service.process_next())
 
     def test_processing_translation_blocks_deletion_until_completion(self):
         lecture_id, _ = self.lecture()
@@ -456,6 +456,8 @@ class TranslationApiTests(unittest.TestCase):
         self.assertEqual(deletion[0].status_code, 409)
         self.assertEqual(self.row(lecture_id)["status"], "completed")
         self.assertEqual(self.client.delete(f"/lectures/{lecture_id}", headers=self.headers()).status_code, 200)
+        self.assertEqual(self.row(lecture_id)["status"], "completed", "trash preserves saved AI output")
+        self.assertEqual(self.client.delete(f"/lectures/{lecture_id}/permanent", headers=self.headers()).status_code, 200)
         self.assertIsNone(self.row(lecture_id))
 
     def test_source_change_during_translation_discards_result_and_preserves_changed_raw(self):

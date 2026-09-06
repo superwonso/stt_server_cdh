@@ -292,6 +292,7 @@ nohup setsid env PYTHONNOUSERSITE=1 MODEL_WARMUP="$WARMUP" "$PYTHON" -m uvicorn 
     --host 127.0.0.1 \
     --port "$PORT" \
     --workers 1 \
+    --no-access-log \
     --env-file "$ENV_FILE" \
     >>"$LOG_FILE" 2>&1 </dev/null 9>&- &
 SERVER_PID=$!

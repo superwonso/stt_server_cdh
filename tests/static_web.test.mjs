@@ -70,10 +70,12 @@ test('history, export, recording, and destructive controls are explicit and acce
   assert.match(html, /<option value="text" selected>일반 텍스트 \(\.txt\)<\/option>/);
   assert.match(html, /<div\b[^>]*\bclass="note-actions"[^>]*\brole="group"[^>]*\baria-label="현재 수업 작업"/i);
   assert.match(html, /<dialog\b[^>]*\bid="delete-dialog"[^>]*\baria-labelledby="delete-title"[^>]*\baria-describedby="delete-description"/i);
-  assert.match(html, /받아쓴 원문, AI 후보정본과 저장된 녹음/);
-  assert.match(html, /Google Drive에 저장된 녹음은 Drive 휴지통으로 이동/);
-  assert.match(html, /받아쓴 기록은 앱에서 되돌릴 수 없습니다/);
-  assert.match(html, /CLOVA Object Storage 사본은 이 삭제의 대상이 아닙니다/);
+  assert.match(html, /원문·AI 결과·필기·녹음은 보관되며 휴지통에서 복원/);
+  assert.match(html, /id="purge-dialog"[^>]*aria-labelledby="purge-heading"/);
+  assert.match(html, /앱에서 되돌릴 수 없고/);
+  assert.match(html, /연결된 Drive 녹음은 Drive 휴지통으로 옮깁니다/);
+  assert.match(html, /자동으로 영구 삭제하지 않습니다/);
+  assert.match(html, /기존 백업과 CLOVA 별도 사본은 자동 삭제되지 않습니다/);
   assert.match(html, /<div\b[^>]*\bclass="save-row"[^>]*\brole="status"[^>]*\baria-live="polite"/i);
   assert.match(html, /<div\b[^>]*\bclass="record-actions"[^>]*\brole="group"[^>]*\baria-label="받아쓰기 녹음 제어"/i);
   assert.match(html, /<button\b[^>]*\bid="pause-button"[^>]*\baria-pressed="false"[^>]*\bdisabled[^>]*>Ⅱ 일시정지<\/button>/i);

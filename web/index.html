@@ -115,6 +115,12 @@
           <option value="">전체 날짜</option>
         </select>
       </div>
+      <div class="library-filters">
+        <label for="library-semester">학기 <select id="library-semester"><option value="">전체 학기</option></select></label>
+        <label for="library-course">과목 <select id="library-course"><option value="">전체 과목</option></select></label>
+        <button id="library-search-open" class="secondary-button" type="button" aria-haspopup="dialog">⌕ 모든 수업 검색</button>
+        <button id="trash-open" class="text-button" type="button" aria-haspopup="dialog">휴지통 · 삭제 취소</button>
+      </div>
       <nav id="lecture-list" class="lecture-list" aria-label="지난 수업 목록"></nav>
 
       <div class="sidebar-footer">
@@ -153,7 +159,8 @@
             </select>
             <button id="download" class="secondary-button" type="button" disabled>↓ 내보내기</button>
             <button id="recording-download" class="secondary-button" type="button" disabled>↓ 녹음 WAV</button>
-            <button id="delete-lecture" class="danger-button" type="button" disabled>수업 삭제</button>
+            <button id="metadata-open" class="secondary-button" type="button" aria-haspopup="dialog" disabled>이름 · 과목 정리</button>
+            <button id="delete-lecture" class="danger-button" type="button" disabled>휴지통으로</button>
           </div>
         </header>
 
@@ -279,7 +286,23 @@
           <div id="transcript-versions" class="transcript-versions" role="group" aria-label="표시할 받아쓰기 버전" hidden>
             <button id="transcript-raw" class="active" type="button" aria-pressed="true">받아쓴 원문</button>
             <button id="transcript-corrected" type="button" aria-pressed="false" disabled>AI 후보정본</button>
+            <button id="transcript-manual" type="button" aria-pressed="false" disabled>직접 수정본</button>
           </div>
+          <section id="manual-panel" class="lesson-summary" aria-label="내 필기와 직접 수정" hidden>
+            <details id="manual-details">
+              <summary>내 필기 · 직접 수정</summary>
+              <p class="summary-privacy">원문·AI 후보정본은 그대로 보존합니다. 필기와 직접 수정본은 이 서버에만 저장되며 AI 요약·번역·수업 질문은 받아쓴 원문을 기준으로 합니다. 각 문장의 직접 수정 버튼으로 내용을 고칠 수 있어요.</p>
+              <div class="summary-actions"><button id="manual-refresh" class="secondary-button" type="button">필기 · 수정본 불러오기</button><button id="manual-history-all" class="secondary-button" type="button" disabled>수정 이력</button><button id="manual-download" class="secondary-button" type="button" disabled>↓ 필기 Markdown</button></div>
+              <p id="manual-state" role="status" aria-live="polite"></p>
+              <form id="manual-note-form" class="manual-note-form">
+                <label for="manual-note-time">녹음 위치 (초)</label><input id="manual-note-time" type="number" min="0" max="14400" step="0.001" value="0" required>
+                <label for="manual-note-text">내 필기 · 최대 5,000자</label><textarea id="manual-note-text" rows="4" maxlength="5000" placeholder="강의 중 따로 적은 설명, 기억할 내용…" required></textarea>
+                <p id="manual-note-target" class="summary-privacy">새 필기</p>
+                <div class="study-actions"><button id="manual-note-new" class="secondary-button" type="button">새 필기</button><button id="manual-note-save" class="secondary-button" type="submit" disabled>필기 저장</button></div>
+              </form>
+              <div id="manual-note-list" class="library-results"></div>
+            </details>
+          </section>
           <div id="correction-panel" class="correction-panel" data-state="idle" hidden>
             <div class="correction-copy">
               <span class="correction-symbol" aria-hidden="true">✦</span>
@@ -315,6 +338,19 @@
             </div>
             <div id="translation-content"></div>
           </section>
+          <section id="question-panel" class="lesson-summary" aria-label="수업 내용에 질문하기" hidden>
+            <details id="question-details">
+              <summary>수업 내용에 질문하기</summary>
+              <p class="summary-privacy">선택한 내 수업의 받아쓴 원문만 참고합니다. 질문과 선택한 원문을 NOVA(Mindlogic)에 보내며, 음성·수업 제목·계정 ID·개인 필기는 보내지 않습니다. 숫자와 일부 개인정보는 가리지만 이름 등은 포함될 수 있습니다. AI 답변은 틀릴 수 있으니 근거 문장과 녹음을 확인하세요.</p>
+              <form id="question-form" class="manual-note-form">
+                <label for="question-text">이 수업에서 궁금한 점 · 최대 1,000자</label><textarea id="question-text" rows="3" maxlength="1000" required placeholder="오늘 설명한 두 개념은 어떻게 다른가요?"></textarea>
+                <div class="study-actions"><button id="question-refresh" class="secondary-button" type="button">요청 상태 확인</button><button id="question-submit" class="secondary-button" type="submit" disabled>원문을 참고해 답변 만들기</button></div>
+              </form>
+              <p id="question-state" role="status" aria-live="polite"></p>
+              <div id="question-list" class="library-results"></div>
+              <div class="study-actions"><button id="question-prev" class="secondary-button" type="button" disabled>이전 질문</button><button id="question-next" class="secondary-button" type="button" disabled>다음 질문</button></div>
+            </details>
+          </section>
           <div id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text"></div>
         </section>
       </div>
@@ -343,20 +379,85 @@
     </form>
   </dialog>
 
+  <dialog id="metadata-dialog" class="study-dialog" aria-labelledby="metadata-heading">
+    <form id="metadata-form" class="study-dialog-content">
+      <div class="dialog-heading"><h2 id="metadata-heading">수업 이름 · 과목 정리</h2><button id="metadata-close" class="dialog-close" type="button" aria-label="수업 정리 닫기">×</button></div>
+      <p>완료된 수업의 표시 이름과 분류를 바꿉니다. 받아쓴 원문과 녹음은 바뀌지 않습니다.</p>
+      <label for="metadata-title">수업 이름</label><input id="metadata-title" type="text" required maxlength="120" autocomplete="off">
+      <label for="metadata-semester">학기</label><input id="metadata-semester" type="text" maxlength="40" list="semester-options" placeholder="예: 2026년 2학기" autocomplete="off">
+      <datalist id="semester-options"></datalist>
+      <label for="metadata-course">과목</label><input id="metadata-course" type="text" maxlength="80" list="course-options" placeholder="예: 통계학" autocomplete="off">
+      <datalist id="course-options"></datalist>
+      <p id="metadata-state" role="status" aria-live="polite"></p>
+      <button id="metadata-save" class="primary-button" type="submit" disabled>저장</button>
+    </form>
+  </dialog>
+
+  <dialog id="library-search-dialog" class="study-dialog" aria-labelledby="library-search-heading">
+    <div class="study-dialog-content">
+      <div class="dialog-heading"><h2 id="library-search-heading">내 모든 수업 검색</h2><button id="library-search-close" class="dialog-close" type="button" aria-label="전체 수업 검색 닫기">×</button></div>
+      <p id="library-search-filter"></p>
+      <form id="library-search-form" class="library-search-form">
+        <label class="visually-hidden" for="library-query">검색할 내용</label><input id="library-query" type="search" maxlength="120" placeholder="기억나는 표현이나 수업 이름" autocomplete="off">
+        <label class="visually-hidden" for="library-source">검색할 기록</label><select id="library-source"><option value="all">원문 + AI 후보정본</option><option value="raw">원문</option><option value="corrected">AI 후보정본</option></select>
+        <button id="library-search-submit" class="primary-button" type="submit">검색</button>
+      </form>
+      <p id="library-search-state" role="status" aria-live="polite"></p>
+      <div id="library-search-results" class="library-results"></div>
+      <div class="study-actions"><button id="library-search-prev" class="secondary-button" type="button" disabled>이전 결과</button><button id="library-search-next" class="secondary-button" type="button" disabled>다음 결과</button></div>
+    </div>
+  </dialog>
+
   <dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description">
     <div class="delete-dialog-content">
       <div class="dialog-heading">
         <div>
           <p class="eyebrow">DELETE CLASS</p>
-          <h2 id="delete-title">이 수업을 삭제할까요?</h2>
+          <h2 id="delete-title">이 수업을 휴지통으로 옮길까요?</h2>
         </div>
         <button id="delete-close" class="dialog-close" type="button" aria-label="삭제 확인 닫기">×</button>
       </div>
-      <p id="delete-description"><strong id="delete-lecture-title">선택한 수업</strong>의 받아쓴 원문, AI 후보정본과 저장된 녹음을 앱에서 삭제합니다. Google Drive에 저장된 녹음은 Drive 휴지통으로 이동하며, 받아쓴 기록은 앱에서 되돌릴 수 없습니다. CLOVA Object Storage 사본은 이 삭제의 대상이 아닙니다.</p>
+      <p id="delete-description"><strong id="delete-lecture-title">선택한 수업</strong>을 지난 수업과 검색에서 숨깁니다. 원문·AI 결과·필기·녹음은 보관되며 휴지통에서 복원할 수 있습니다. 자동으로 영구 삭제하지 않습니다. 진행 중인 작업은 먼저 마쳐 주세요.</p>
       <div class="delete-dialog-actions">
         <button id="delete-cancel" class="secondary-button" type="button">취소</button>
-        <button id="delete-confirm" class="danger-button solid" type="button">수업 삭제</button>
+        <button id="delete-confirm" class="danger-button solid" type="button">휴지통으로 이동</button>
       </div>
+    </div>
+  </dialog>
+
+  <dialog id="manual-edit-dialog" class="study-dialog" aria-labelledby="manual-edit-heading">
+    <form id="manual-edit-form" class="study-dialog-content">
+      <div class="dialog-heading"><h2 id="manual-edit-heading">문장 직접 수정</h2><button id="manual-edit-close" class="dialog-close" type="button" aria-label="문장 수정 닫기">×</button></div>
+      <p>받아쓴 원문과 문장 시각은 바뀌지 않습니다. 수정 내용은 별도 버전으로 보관됩니다.</p>
+      <p id="manual-edit-time"></p><blockquote id="manual-edit-raw" class="source-quote"></blockquote>
+      <label for="manual-edit-text">수정한 문장</label><textarea id="manual-edit-text" rows="5" maxlength="5000" required></textarea>
+      <p id="manual-edit-state" role="status" aria-live="polite"></p>
+      <div class="study-actions"><button id="manual-edit-history" class="secondary-button" type="button">이 문장 수정 이력</button><button id="manual-edit-original" class="secondary-button" type="button">원문으로 되돌리기</button><button id="manual-edit-save" class="primary-button" type="submit">수정본 저장</button></div>
+    </form>
+  </dialog>
+  <dialog id="manual-history-dialog" class="study-dialog" aria-labelledby="manual-history-heading">
+    <div class="study-dialog-content">
+      <div class="dialog-heading"><h2 id="manual-history-heading">필기 · 문장 수정 이력</h2><button id="manual-history-close" class="dialog-close" type="button" aria-label="수정 이력 닫기">×</button></div>
+      <p>이전 내용으로 복원해도 기존 이력은 지우지 않고 새 수정으로 기록합니다.</p>
+      <p id="manual-history-state" role="status" aria-live="polite"></p><div id="manual-history-list" class="library-results"></div>
+      <div class="study-actions"><button id="manual-history-prev" class="secondary-button" type="button" disabled>이전 이력</button><button id="manual-history-next" class="secondary-button" type="button" disabled>다음 이력</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="trash-dialog" class="study-dialog" aria-labelledby="trash-heading">
+    <div class="study-dialog-content">
+      <div class="dialog-heading"><h2 id="trash-heading">휴지통</h2><button id="trash-close" class="dialog-close" type="button" aria-label="휴지통 닫기">×</button></div>
+      <p>복원하면 원래 날짜·과목과 함께 지난 수업으로 돌아갑니다. 자동 영구 삭제는 없으며, 보관 중인 녹음은 Drive 용량을 사용합니다.</p>
+      <button id="trash-refresh" class="secondary-button" type="button">목록 새로고침</button>
+      <p id="trash-state" role="status" aria-live="polite"></p>
+      <div id="trash-list" class="library-results"></div>
+    </div>
+  </dialog>
+  <dialog id="purge-dialog" class="study-dialog" aria-labelledby="purge-heading">
+    <div class="study-dialog-content">
+      <div class="dialog-heading"><h2 id="purge-heading">정말 영구 삭제할까요?</h2></div>
+      <p><strong id="purge-title"></strong>의 원문·AI 결과·필기·복원 정보를 앱에서 지웁니다. 앱에서 되돌릴 수 없고, 연결된 Drive 녹음은 Drive 휴지통으로 옮깁니다. 기존 백업과 CLOVA 별도 사본은 자동 삭제되지 않습니다.</p>
+      <div class="study-actions"><button id="purge-cancel" class="secondary-button" type="button">취소</button><button id="purge-confirm" class="danger-button" type="button">영구 삭제</button></div>
     </div>
   </dialog>
 
@@ -511,6 +612,7 @@
           <article><span>AI 후보정</span><strong id="admin-correction-queue">0</strong><small>대기·처리</small></article>
           <article><span>수업 요약</span><strong id="admin-summary-queue">0</strong><small>대기·처리</small></article>
           <article><span>수업 번역</span><strong id="admin-translation-queue">0</strong><small>대기·처리</small></article>
+          <article><span>수업 질문</span><strong id="admin-question-queue">0</strong><small>대기·처리</small></article>
         </div>
       </section>
 

@@ -7,6 +7,9 @@ import { encodeWav } from '../web/audio.js';
 import { renderDriveStatus } from '../web/admin-storage.js';
 import { renderMaintenanceStatus } from '../web/admin-maintenance.js';
 import { readRecordingClip, RecordingClipPlayer, filterTranscript } from '../web/recording-review.js';
+import * as TestLectureLibrary from '../web/lecture-library.js';
+import * as TestManualNotes from '../web/manual-notes.js';
+import * as TestLectureQuestions from '../web/lecture-questions.js';
 import { AUTH_SESSION_STORAGE_KEY, TabAuthSessionStore } from '../web/auth-session.js';
 
 const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'))
@@ -14,6 +17,9 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
   .replace("import { renderDriveStatus } from './admin-storage.js';", 'const renderDriveStatus = TestRenderDriveStatus;')
   .replace("import { renderMaintenanceStatus } from './admin-maintenance.js';", 'const renderMaintenanceStatus = TestRenderMaintenanceStatus;')
   .replace("import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';", 'const { readRecordingClip, RecordingClipPlayer, filterTranscript } = TestRecordingReview;')
+  .replace("import { lectureTitle, filterLibrary, libraryOptions, validMetadata, validLibrarySearch } from './lecture-library.js';", 'const { lectureTitle, filterLibrary, libraryOptions, validMetadata, validLibrarySearch } = TestLectureLibrary;')
+  .replace("import { validManualState, manualSegments, validManualHistory } from './manual-notes.js';", 'const { validManualState, manualSegments, validManualHistory } = TestManualNotes;')
+  .replace("import { validQuestionJob, validQuestionPage } from './lecture-questions.js';", 'const { validQuestionJob, validQuestionPage } = TestLectureQuestions;')
   .replace("import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';", `
     const FileImportCancelledError = class extends Error {};
     const RecordingFileUploader = TestFileUploader;
@@ -215,6 +221,9 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     TestRenderDriveStatus:renderDriveStatus,
     TestRenderMaintenanceStatus:renderMaintenanceStatus,
     TestRecordingReview:{readRecordingClip,RecordingClipPlayer,filterTranscript},
+    TestLectureLibrary,
+    TestManualNotes,
+    TestLectureQuestions,
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },
     clearTimeout:value => timeouts.delete(value),
     setInterval:(callback,delay = 0) => { const value = ++id; intervals.set(value,{callback,delay}); return value; },clearInterval:value => intervals.delete(value),
@@ -462,6 +471,54 @@ function openReviewFixture(app) {
     recording_available:true,recording_finalized:true,recording_seconds:10,
     segments:[{id:'s1',start:0,end:5,text:'첫 문장 Alpha'},{id:'s2',start:5,end:10,text:'둘째 문장 Beta'}]}; renderCurrent();`);
 }
+test('library metadata saves display title separately and combines date/course/semester filters',async () => {
+  const posted = [];
+  const app = reviewApp((url,options) => {
+    if (url.endsWith('/metadata')) {
+      if (options.method === 'PATCH') { posted.push(JSON.parse(options.body)); return response({lecture_id:'review-lesson',display_title:'정리한 수업',course:'통계',semester:'2026-1',revision:1}); }
+      return response({lecture_id:'review-lesson',display_title:'Synthetic review',course:'',semester:'',revision:0});
+    }
+    return response({});
+  });
+  openReviewFixture(app); app.run('lectures=[current]; renderHistory();');
+  await app.element('metadata-open').onclick();
+  app.element('metadata-title').value='정리한 수업'; app.element('metadata-course').value='통계'; app.element('metadata-semester').value='2026-1';
+  await app.element('metadata-form').onsubmit({preventDefault(){}});
+  assert.equal(posted[0].revision,0); assert.equal(app.run('current.title'),'Synthetic review');
+  assert.equal(app.run('current.display_title'),'정리한 수업');
+  assert.match(app.run("exportText(current,'markdown')"),/정리한 수업/);
+  app.element('library-course').value='통계'; app.element('library-course').onchange();
+  app.element('library-semester').value='2026-1'; app.element('library-semester').onchange();
+  assert.equal(app.element('lecture-count').textContent,'1/1');
+});
+test('late metadata and global search results are discarded after an account change',async () => {
+  for (const action of ['metadata','search']) {
+    const gate = deferred(); const app = reviewApp(() => gate.promise); openReviewFixture(app);
+    const task = action === 'metadata' ? app.element('metadata-open').onclick()
+      : (app.element('library-search-open').onclick(),app.run('searchLibrary()'));
+    app.run("user='user-beta'; token='new-token'; resetLibraryWorkspace();");
+    gate.resolve(response(action === 'metadata'
+      ? {lecture_id:'review-lesson',display_title:'PRIVATE',course:'PRIVATE',semester:'',revision:1}
+      : {items:[],offset:0,limit:20,has_more:false}));
+    await task;
+    assert.equal(app.element('metadata-title').value,'');
+    assert.equal(app.element('library-search-results').children.length,0);
+    assert.equal(app.run('metadataRevision'),null);
+  }
+});
+test('library search uses safe text nodes and does not stop an ongoing capture',async () => {
+  const id = '11111111-1111-4111-8111-111111111111'; let request;
+  const app = reviewApp((url,options) => {
+    request = {url,options}; return response({items:[{lecture_id:id,display_title:'<img src=x>',snippet:'<script>private</script>',created_at:'2026-01-01T00:00:00Z',source:'raw',segment_id:'s1',start:0,end:1}],offset:0,limit:20,has_more:false});
+  });
+  openReviewFixture(app);
+  app.run("capture={capturedSeconds:12}; captureSession={id:'live-lesson',lecture:{id:'live-lesson'}}; recording=true;");
+  app.element('library-search-open').onclick(); app.element('library-query').value='50%_'; await app.run('searchLibrary()');
+  assert.equal(new URL(request.url).searchParams.get('q'),'50%_');
+  assert.equal(app.run('recording'),true);
+  const row = app.element('library-search-results').children[0];
+  assert.equal(row.children[0].textContent,'<img src=x>'); assert.equal(row.children[2].textContent,'<script>private</script>');
+});
 test('review search filters the display only and bookmark loading is explicit',async () => {
   const requests=[];
   const app=reviewApp((url,options)=>{ requests.push([url,options]); return response({bookmarks:[]}); });
@@ -473,6 +530,385 @@ test('review search filters the display only and bookmark loading is explicit',a
   assert.ok(app.run("exportText(current,'text')").includes('Alpha'));
   await app.run('loadBookmarks()');
   assert.equal(requests.length,1); assert.match(requests[0][0],/\/bookmarks$/);
+});
+test('trash can restore a class without changing the current recording or its original metadata',async () => {
+  const id = '11111111-1111-4111-8111-111111111111'; const requests = [];
+  const item = {lecture_id:id,display_title:'복원 수업',course:'통계',semester:'2026-1',created_at:'2026-01-01T00:00:00Z',trashed_at:'2026-01-02T00:00:00Z',deleting:false};
+  const app = reviewApp((url,options) => {
+    requests.push({url,method:options.method});
+    if (url.endsWith('/library/trash')) return response([item]);
+    if (url.endsWith('/restore')) return response({status:'restored',lecture_id:id});
+    if (url.endsWith('/lectures')) return response([{...item,id,title:'생성 이름'}]);
+    return response({});
+  });
+  openReviewFixture(app); app.run("capture={capturedSeconds:12}; captureSession={id:'live-lesson',lecture:{id:'live-lesson'}}; recording=true;");
+  app.element('trash-open').onclick(); await until(()=>app.run('trashRows.length') === 1);
+  await app.run("changeTrash(trashRows[0],'restore')");
+  assert.equal(app.run('recording'),true); assert.equal(app.run('captureSession.id'),'live-lesson');
+  assert.equal(app.run('lectures[0].course'),'통계'); assert.equal(app.run('trashRows.length'),0);
+  assert.ok(requests.some(item=>item.method === 'POST' && item.url.endsWith('/restore')));
+});
+test('permanent deletion needs a second confirmation and deleting rows cannot restore',async () => {
+  const id = '11111111-1111-4111-8111-111111111111'; let deleted=0;
+  const app = reviewApp((url,options) => {
+    if (url.endsWith('/permanent')) { deleted++; return response({status:'deleted'}); }
+    if (url.endsWith('/lectures')) return response([]);
+    return response([{lecture_id:id,display_title:'영구 삭제 대기',created_at:'2026-01-01T00:00:00Z',trashed_at:'2026-01-02T00:00:00Z',deleting:true}]);
+  });
+  app.element('trash-open').onclick(); await until(()=>app.run('trashRows.length') === 1);
+  const actions = app.element('trash-list').children[0].children[2];
+  assert.equal(actions.children[0].disabled,true);
+  actions.children[1].onclick(); assert.equal(deleted,0); assert.equal(app.element('purge-dialog').open,true);
+  app.element('purge-cancel').onclick(); assert.equal(deleted,0);
+  actions.children[1].onclick(); app.element('purge-confirm').onclick(); await until(()=>!app.run('trashBusy'));
+  assert.equal(deleted,1); assert.equal(app.run('trashRows.length'),0);
+});
+test('old trash responses cannot restore personal titles into a new account',async () => {
+  const gate=deferred(); const app=reviewApp(()=>gate.promise);
+  app.element('trash-open').onclick();
+  app.run("showLogin(); user='user-beta'; token='beta-token';");
+  gate.resolve(response([{lecture_id:'11111111-1111-4111-8111-111111111111',display_title:'PRIVATE',created_at:'2026-01-01T00:00:00Z',deleting:false}]));
+  await tick(); await tick();
+  assert.equal(app.run('trashRows.length'),0); assert.equal(app.element('trash-list').children.length,0);
+  assert.equal(app.element('purge-title').textContent,'');
+});
+function manualFixture({loseFirst = false} = {}) {
+  const state={lecture_id:'review-lesson',raw_revision:'a'.repeat(64),revision:0,notes:[],edits:[]};
+  const history=[],requests=[],acks=new Map(); let lost=false,app;
+  const copy=value=>JSON.parse(JSON.stringify(value));
+  app=reviewApp((url,options)=>{
+    if (url.includes('/manual/history')) return response({lecture_id:state.lecture_id,raw_revision:state.raw_revision,revision:state.revision,at_revision:state.revision,items:copy(history).reverse(),offset:0,limit:20,has_more:false});
+    if (url.endsWith('/manual') && options.method === 'POST') {
+      const body=JSON.parse(options.body); requests.push(body);
+      if (!acks.has(body.id)) {
+        if (body.revision !== state.revision) return response({detail:'revision conflict'},409);
+        state.revision++;
+        if (body.action === 'segment_edit') { state.edits=state.edits.filter(item=>item.segment_id !== body.segment_id); if (body.text !== null) state.edits.push({segment_id:body.segment_id,text:body.text}); }
+        else { state.notes=state.notes.filter(item=>item.id !== body.note_id); if (body.action === 'note_upsert') state.notes.push({id:body.note_id,segment_id:body.segment_id || null,start_seconds:body.start_seconds,text:body.text}); }
+        history.push({...body,note_id:body.note_id || null,segment_id:body.segment_id || null,text:body.text ?? null,
+          start_seconds:body.start_seconds ?? (body.segment_id === 's2' || body.action === 'note_delete' ? 5 : 0),
+          revision:state.revision,created_at:'2026-01-01T00:00:00Z'});
+        acks.set(body.id,{id:body.id,revision:state.revision,action:body.action});
+      }
+      if (loseFirst && !lost) { lost=true; throw app.run("new TypeError('response lost')"); }
+      return response(copy(acks.get(body.id)));
+    }
+    if (url.endsWith('/manual')) return response(copy(state));
+    return response({});
+  });
+  openReviewFixture(app); return {app,state,history,requests};
+}
+test('manual editing, note revisions and original restoration preserve the raw transcript and timestamps',async()=>{
+  const {app,state,history}=manualFixture(); const raw=app.run('JSON.stringify(current.segments)');
+  await app.run("openManualEditor('s1')");
+  assert.equal(app.element('manual-edit-raw').textContent,'첫 문장 Alpha');
+  await app.run("writeManual({action:'segment_edit',segment_id:'s1',text:'직접 바로잡은 내용'})");
+  assert.equal(app.run('JSON.stringify(current.segments)'),raw);
+  assert.equal(app.element('transcript-title').textContent,'직접 수정본');
+  assert.equal(app.run('displayedTranscriptSegments()[0].start'),0);
+  assert.match(app.run("exportText(selectedTranscriptLecture(),'markdown')"),/직접 수정본/);
+  await app.run("writeManual({action:'segment_edit',segment_id:'s1',text:null})");
+  assert.equal(app.run('displayedTranscriptSegments()[0].text'),'첫 문장 Alpha');
+  const noteId='11111111-1111-4111-8111-111111111111';
+  await app.run(`writeManual({action:'note_upsert',note_id:'${noteId}',start_seconds:5,segment_id:'s2',text:${JSON.stringify('필기\n두 번째 줄')}})`);
+  assert.equal(state.notes.length,1); assert.equal(app.element('manual-note-list').children.length,1);
+  await app.run(`writeManual({action:'note_delete',note_id:'${noteId}'})`);
+  assert.equal(state.notes.length,0); assert.equal(history.length,4);
+  await app.run('openManualHistory()'); assert.equal(app.element('manual-history-list').children.length,4);
+  assert.equal(app.run('JSON.stringify(current.segments)'),raw);
+});
+test('an ambiguous manual save retries the same UUID, while original/other-version restoration cannot replay it',async()=>{
+  const {app,state,history,requests}=manualFixture({loseFirst:true});
+  await app.run("openManualEditor('s1')");
+  await app.run("writeManual({action:'segment_edit',segment_id:'s1',text:'정정한 표현'})");
+  assert.equal(history.length,1); assert.equal(app.run('manualView.pending !== null'),true);
+  assert.equal(app.element('manual-edit-original').disabled,true);
+  await app.run("writeManual({action:'segment_edit',segment_id:'s1',text:null})");
+  assert.equal(requests.length,1,'a different intent must not silently resend the earlier save');
+  app.element('manual-edit-form').onsubmit({preventDefault(){}}); await until(()=>!app.run('manualView.busy'));
+  assert.equal(requests.length,2); assert.deepEqual(requests[0],requests[1]);
+  assert.equal(history.length,1); assert.equal(state.revision,1); assert.equal(app.run('manualView.pending'),null);
+});
+test('manual reads are scrubbed on owner change and editing another class does not stop capture',async()=>{
+  const {app}=manualFixture();
+  app.run("capture={capturedSeconds:12}; captureSession={id:'live-lesson',lecture:{id:'live-lesson'}}; recording=true;");
+  await app.run('loadManual()'); await app.run("writeManual({action:'segment_edit',segment_id:'s2',text:'복습하며 수정'})");
+  assert.equal(app.run('recording'),true); assert.equal(app.run('captureSession.id'),'live-lesson');
+  const gate=deferred(); const late=reviewApp(()=>gate.promise); openReviewFixture(late);
+  const task=late.run('loadManual()'); late.run("showLogin(); user='user-beta'; token='beta-token';");
+  gate.resolve(response({lecture_id:'review-lesson',raw_revision:'a'.repeat(64),revision:1,notes:[],edits:[{segment_id:'s1',text:'PRIVATE'}]}));
+  await task; assert.equal(late.run('manualView.row'),null); assert.equal(late.element('manual-edit-raw').textContent,'');
+});
+function questionFixture({loseFirst=false,notStored=false,invalid=false}={}) {
+  const jobs=[],requests=[];
+  const app=reviewApp((url,options)=>{
+    if (!url.includes('/questions')) return response({});
+    if (options.method === 'POST') {
+      const body=JSON.parse(options.body); requests.push(body);
+      const job={...body,lecture_id:'review-lesson',status:'completed',created_at:'2026-01-01T00:00:00Z',scope:'full',total_segments:2,selected_count:2,
+        document:{answerability:'answered',paragraphs:[{text:'수업에서 설명한 합성 답변',source_ids:[invalid ? 'foreign-source' : 's1']}]}};
+      if (!(notStored && requests.length===1)) jobs.unshift(job);
+      if (loseFirst && requests.length===1) throw new TypeError('lost acknowledgment');
+      return response({question:job});
+    }
+    // A real JSON response is a snapshot, not an alias of mutable server rows.
+    if (url.includes('/questions?')) return response({configured:true,model:'fixture',offset:0,limit:20,total:jobs.length,has_more:false,questions:JSON.parse(JSON.stringify(jobs))});
+    const job=jobs.find(value=>url.endsWith(value.id));
+    if (!job) return response({detail:'missing'},404);
+    return response({question:job});
+  });
+  openReviewFixture(app); return {app,jobs,requests};
+}
+test('lecture questions use explicit POST and render validated raw citations without stopping another capture',async()=>{
+  const {app,requests}=questionFixture();
+  app.run("capture={capturedSeconds:12}; captureSession={id:'live-lesson',lecture:{id:'live-lesson'}}; recording=true;");
+  await app.run('loadQuestions()'); assert.equal(requests.length,0);
+  app.element('question-text').value='첫 문장의 뜻은?'; await app.run('submitQuestion()');
+  assert.equal(requests.length,1); assert.equal(app.element('question-list').children.length,1);
+  assert.equal(app.run('recording'),true); assert.equal(app.run('captureSession.id'),'live-lesson');
+  assert.equal(app.run('questionView.pending'),null);
+});
+test('lost question acknowledgment is recovered by GET without another POST',async()=>{
+  const {app,requests}=questionFixture({loseFirst:true}); await app.run('loadQuestions()');
+  app.element('question-text').value='첫 문장의 뜻은?'; await app.run('submitQuestion()');
+  assert.equal(app.element('question-submit').textContent,'요청 상태 확인');
+  await app.run('submitQuestion()');
+  assert.equal(requests.length,1); assert.equal(app.run('questionView.pending'),null);
+  assert.equal(app.element('question-list').children.length,1);
+});
+test('a question not found after an ambiguous POST needs an explicit identical UUID retry',async()=>{
+  const {app,requests}=questionFixture({loseFirst:true,notStored:true}); await app.run('loadQuestions()');
+  app.element('question-text').value='첫 문장의 뜻은?'; await app.run('submitQuestion()');
+  await app.run('submitQuestion()'); assert.equal(requests.length,1);
+  assert.equal(app.element('question-submit').textContent,'같은 질문 요청 다시 전송');
+  app.element('question-text').value='몰래 바뀐 질문'; await app.run('submitQuestion()');
+  assert.equal(requests.length,2); assert.deepEqual(requests[0],requests[1]);
+  assert.equal(app.run('questionView.pending'),null);
+});
+test('questions reject foreign citations and scrub a delayed history after logout',async()=>{
+  const {app}=questionFixture({invalid:true}); await app.run('loadQuestions()');
+  app.element('question-text').value='질문'; await app.run('submitQuestion()');
+  assert.equal(app.element('question-list').children.length,0); assert.notEqual(app.run('questionView.pending'),null);
+  const gate=deferred(), late=reviewApp(()=>gate.promise); openReviewFixture(late);
+  const task=late.run('loadQuestions()'); late.run("showLogin(); user='user-beta'; token='new-token';");
+  gate.resolve(response({configured:true,model:'fixture',offset:0,total:0,has_more:false,questions:[]})); await task;
+  assert.equal(late.run('questionView.page'),null); assert.equal(late.element('question-text').value,'');
+});
+function questionTestJob(index=1, updates={}) {
+  return {id:`00000000-0000-4000-8000-${String(index).padStart(12,'0')}`,lecture_id:'review-lesson',
+    question:`합성 질문 ${index}`,status:'completed',created_at:'2026-01-01T00:00:00Z',cancel_requested:false,
+    scope:'full',total_segments:2,selected_count:2,
+    document:{answerability:'answered',paragraphs:[{text:'원문에 근거한 합성 답변',source_ids:['s1']}]},...updates};
+}
+function questionWorkflowFixture({initial=[],onPost,onDelete,onGet,onList}={}) {
+  const state={jobs:JSON.parse(JSON.stringify(initial)),calls:[]};
+  const snapshot=value=>response(JSON.parse(JSON.stringify(value)));
+  const app=reviewApp(async(url,options)=>{
+    if (!url.includes('/questions')) return response({});
+    const method=options.method || 'GET', body=options.body ? JSON.parse(options.body) : null;
+    state.calls.push({url,method,body,signal:options.signal});
+    if (method==='POST') {
+      if(onPost) return onPost(body,state,snapshot);
+      const job=questionTestJob(state.jobs.length+1,{...body,status:'queued',document:null});
+      state.jobs.unshift(job); return snapshot({question:job});
+    }
+    if (method==='DELETE') {
+      const job=state.jobs.find(item=>url.endsWith(item.id));
+      if(onDelete) return onDelete(job,state,snapshot);
+      job.cancel_requested=true;
+      if(job.status==='queued') job.status='cancelled';
+      return snapshot({question:job});
+    }
+    if (url.includes('/questions?')) {
+      const offset=Number(new URL(url).searchParams.get('offset'));
+      if(onList) return onList(offset,state,snapshot);
+      return snapshot({configured:true,model:'fixture',offset,limit:20,total:state.jobs.length,
+        has_more:offset+20<state.jobs.length,questions:state.jobs.slice(offset,offset+20)});
+    }
+    const id=url.split('/').at(-1);
+    if(onGet) return onGet(id,state,snapshot);
+    const job=state.jobs.find(item=>item.id===id);
+    return job ? snapshot({question:job}) : response({detail:'missing'},404);
+  });
+  openReviewFixture(app);
+  return {app,state};
+}
+const questionTextTree=node=>[node.textContent || '',...(node.children || []).map(questionTextTree)].join('\n');
+test('processing question cancellation remains pending until confirmed and never stops another microphone',async()=>{
+  const {app,state}=questionWorkflowFixture({initial:[questionTestJob(1,{status:'processing',document:null})]});
+  app.run("capture={capturedSeconds:12,stopCalls:0,pauseCalls:0,async stop(){this.stopCalls++},async pause(){this.pauseCalls++}}; captureSession={id:'live-lesson',lecture:{id:'live-lesson'}}; recording=true;");
+  app.element('question-details').open=true;
+  await app.run('loadQuestions()');
+  assert.equal([...app.timeouts.values()].filter(timer=>timer.delay===3000).length,1);
+  await app.run(`cancelQuestion('${state.jobs[0].id}')`);
+  assert.equal(state.calls.filter(call=>call.method==='DELETE').length,1);
+  assert.match(questionTextTree(app.element('question-list')),/취소 요청됨 · 처리 정리 중/);
+  const cancel=app.element('question-list').querySelectorAll('button').find(button=>button.textContent==='요청 취소');
+  assert.equal(cancel.disabled,true);
+  state.jobs[0].status='cancelled';
+  await app.runTimeout(3000); await until(()=>!app.run('questionView.busy'));
+  assert.match(questionTextTree(app.element('question-list')),/취소됨/);
+  assert.equal(app.element('question-list').querySelectorAll('button').length,0);
+  assert.equal(state.calls.filter(call=>call.method==='POST').length,0);
+  assert.equal(app.run('recording'),true); assert.equal(app.run('captureSession.id'),'live-lesson');
+  assert.equal(app.run('capture.stopCalls + capture.pauseCalls'),0);
+  assert.equal([...app.timeouts.values()].filter(timer=>timer.delay===3000).length,0);
+});
+test('failed and cancelled questions do not retry automatically but a new explicit question gets a new UUID',async()=>{
+  const {app,state}=questionWorkflowFixture({initial:[questionTestJob(1,{status:'failed',document:null,error:'확인하지 못해 저장하지 않았습니다.'}),
+    questionTestJob(2,{status:'cancelled',document:null})]});
+  app.element('question-details').open=true;
+  await app.run('loadQuestions()'); await app.run('loadQuestions()');
+  assert.match(questionTextTree(app.element('question-list')),/답변 생성 실패 · 자동 재시도하지 않음/);
+  assert.equal([...app.timeouts.values()].filter(timer=>timer.delay===3000).length,0);
+  assert.equal(app.element('question-submit').disabled,false);
+  app.element('question-text').value='새로운 합성 질문';
+  await app.run('submitQuestion()');
+  const posts=state.calls.filter(call=>call.method==='POST');
+  assert.equal(posts.length,1); assert.ok(UUID.test(posts[0].body.id));
+  assert.notEqual(posts[0].body.id,questionTestJob(1).id); assert.notEqual(posts[0].body.id,questionTestJob(2).id);
+  assert.equal(posts[0].body.question,'새로운 합성 질문');
+  assert.equal(app.run('questionView.pending'),null);
+});
+test('question history reaches entries after twenty and returns without a model POST',async()=>{
+  const {app,state}=questionWorkflowFixture({initial:Array.from({length:45},(_,index)=>questionTestJob(index+1))});
+  await app.run('loadQuestions()');
+  assert.equal(app.element('question-list').children.length,20);
+  assert.equal(app.element('question-prev').disabled,true); assert.equal(app.element('question-next').disabled,false);
+  app.element('question-next').onclick(); await until(()=>!app.run('questionView.busy'));
+  assert.equal(app.run('questionView.page.offset'),20);
+  assert.equal(app.element('question-list').children[0].children[0].textContent,'합성 질문 21');
+  app.element('question-next').onclick(); await until(()=>!app.run('questionView.busy'));
+  assert.equal(app.run('questionView.page.offset'),40); assert.equal(app.element('question-list').children.length,5);
+  assert.equal(app.element('question-next').disabled,true);
+  app.element('question-prev').onclick(); await until(()=>!app.run('questionView.busy'));
+  assert.equal(app.run('questionView.page.offset'),20); assert.equal(app.element('question-list').children.length,20);
+  assert.equal(state.calls.filter(call=>call.method!=='GET').length,0);
+  assert.deepEqual(state.calls.map(call=>new URL(call.url).searchParams.get('offset')),['0','20','40','20']);
+});
+test('an ambiguous question POST freezes paging and repeated GET 404 never sends a new request automatically',async()=>{
+  const {app,state}=questionWorkflowFixture({initial:Array.from({length:25},(_,index)=>questionTestJob(index+1)),
+    onPost(body,state,snapshot){
+      if(state.calls.filter(call=>call.method==='POST').length===1) throw new TypeError('synthetic lost response');
+      const job=questionTestJob(30,{...body,status:'queued',document:null}); state.jobs.unshift(job);
+      return snapshot({question:job});
+    }});
+  await app.run('loadQuestions()'); app.element('question-details').open=true;
+  app.element('question-text').value='확인이 필요한 합성 질문'; await app.run('submitQuestion()');
+  assert.equal(app.element('question-text').disabled,true);
+  assert.equal(app.element('question-next').disabled,true);
+  assert.equal([...app.timeouts.values()].filter(timer=>timer.delay===3000).length,0);
+  await app.run('loadQuestions()'); await app.run('loadQuestions()');
+  assert.equal(state.calls.filter(call=>call.method==='POST').length,1);
+  assert.equal(app.run('questionView.pending.notFound'),true);
+  assert.equal(app.element('question-submit').textContent,'같은 질문 요청 다시 전송');
+  app.element('question-text').value='입력을 몰래 바꿔도 사용하지 않음';
+  await app.run('submitQuestion()');
+  const posts=state.calls.filter(call=>call.method==='POST');
+  assert.equal(posts.length,2); assert.deepEqual(posts[0].body,posts[1].body);
+  assert.equal(app.run('questionView.pending'),null); assert.equal(app.element('question-text').value,'');
+});
+test('normal none and full insufficient answers show local evidence guidance without creating another question',async()=>{
+  const insufficient={answerability:'insufficient_evidence',paragraphs:[]};
+  const {app,state}=questionWorkflowFixture({initial:[questionTestJob(1,{scope:'none',selected_count:0,document:insufficient}),
+    questionTestJob(2,{scope:'full',document:insufficient}),questionTestJob(3,{scope:'retrieved',selected_count:1,document:insufficient})]});
+  await app.run('loadQuestions()');
+  const rows=app.element('question-list').children;
+  assert.equal(rows.length,3); assert.match(questionTextTree(rows[0]),/AI에 요청하지 않았어요/);
+  assert.match(questionTextTree(rows[1]),/전체 원문 2개 구간 참고/);
+  assert.match(questionTextTree(rows[2]),/일부 원문만 참고/);
+  for(const row of rows) {
+    assert.match(questionTextTree(row),/답할 근거가 부족해요/);
+    assert.equal(row.querySelectorAll('button').length,0);
+  }
+  assert.equal(app.run('questionView.error'),'');
+  assert.equal(state.calls.filter(call=>call.method==='POST').length,0);
+});
+test('late question pages cannot cross owner token origin or selected lecture boundaries',async()=>{
+  for(const boundary of ["user='user-beta'", "token='new-token'", "apiUrl='https://different.example'", "current={...current,id:'different-lesson'}"]) {
+    const gate=deferred();
+    const {app,state}=questionWorkflowFixture({onList:()=>gate.promise});
+    const pending=app.run('loadQuestions()'); await until(()=>state.calls.length===1);
+    app.run(`${boundary}; renderQuestions();`);
+    assert.equal(state.calls[0].signal.aborted,true);
+    gate.resolve(response({configured:true,model:'fixture',offset:0,limit:20,total:1,has_more:false,questions:[questionTestJob()]}));
+    await pending;
+    assert.equal(app.run('questionView.page'),null);
+    assert.equal(app.element('question-list').children.length,0);
+    assert.equal(app.element('question-text').value,'');
+  }
+});
+test('late question POST and cancellation ACK cannot restore old question data after a lecture switch',async()=>{
+  for(const method of ['POST','DELETE']) {
+    const gate=deferred();
+    const {app,state}=questionWorkflowFixture({initial:[questionTestJob(1,{status:'processing',document:null})],
+      onPost:()=>gate.promise,onDelete:()=>gate.promise});
+    await app.run('loadQuestions()');
+    app.element('question-text').value='이전 수업의 합성 질문';
+    const pending=app.run(method==='POST' ? 'submitQuestion()' : `cancelQuestion('${state.jobs[0].id}')`);
+    await until(()=>state.calls.some(call=>call.method===method));
+    const call=state.calls.find(call=>call.method===method);
+    app.run("current={...current,id:'different-lesson'}; renderQuestions();");
+    assert.equal(call.signal.aborted,true);
+    gate.resolve(response({question:questionTestJob(1,{...(call.body || {}),status:'queued',document:null})}));
+    await pending;
+    assert.equal(app.run('questionView.page'),null); assert.equal(app.run('questionView.pending'),null);
+    assert.equal(app.element('question-list').children.length,0);
+    assert.equal(state.calls.filter(item=>item.method===method).length,1);
+  }
+});
+test('question citations return to immutable raw text and stale citation buttons cannot affect another lecture',async()=>{
+  const {app,state}=questionWorkflowFixture({initial:[questionTestJob(1,{document:{answerability:'answered',paragraphs:[
+    {text:'<img src=x onerror=alert(1)> 합성 답변',source_ids:['s2']}]}})]});
+  app.run("current.recording_available=false; capture={capturedSeconds:12}; captureSession={id:'live-lesson',lecture:{id:'live-lesson'}}; recording=true;");
+  await app.run('loadQuestions()');
+  const link=app.element('question-list').querySelectorAll('button')[0];
+  const row=app.run("transcriptRenderState.rows.get(JSON.stringify(['id:s2',0])).row");
+  let scrolled=0; row.scrollIntoView=()=>scrolled++;
+  app.run("correctionView='manual'; reviewView.query='hidden';");
+  link.onclick();
+  assert.equal(app.run('correctionView'),'raw'); assert.equal(app.run('reviewView.query'),''); assert.equal(scrolled,1);
+  assert.equal(app.run('recording'),true); assert.equal(app.run('captureSession.id'),'live-lesson');
+  assert.match(questionTextTree(app.element('question-list')),/<img src=x onerror=alert\(1\)>/);
+  assert.equal(app.createdAll('img').length,0);
+  app.run("current={...current,id:'different-lesson'}; renderQuestions(); correctionView='manual'; reviewView.query='keep';");
+  link.onclick();
+  assert.equal(app.run('correctionView'),'manual'); assert.equal(app.run('reviewView.query'),'keep'); assert.equal(scrolled,1);
+  assert.equal(state.calls.filter(call=>call.method!=='GET').length,0);
+});
+test('lost cancellation acknowledgment requires a status read and never repeats a provider request',async()=>{
+  const {app,state}=questionWorkflowFixture({initial:[questionTestJob(1,{status:'processing',document:null})],
+    onDelete(job){job.cancel_requested=true;job.status='cancelled';throw new TypeError('synthetic lost cancellation response');}});
+  app.element('question-details').open=true; await app.run('loadQuestions()');
+  await app.run(`cancelQuestion('${state.jobs[0].id}')`);
+  assert.match(app.element('question-state').textContent,/요청 상태 확인으로 취소 여부/);
+  await app.run('loadQuestions()');
+  assert.match(questionTextTree(app.element('question-list')),/취소됨/);
+  assert.equal(app.run('questionView.error'),'');
+  assert.equal(state.calls.filter(call=>call.method==='DELETE').length,1);
+  assert.equal(state.calls.filter(call=>call.method==='POST').length,0);
+  assert.equal([...app.timeouts.values()].filter(timer=>timer.delay===3000).length,0);
+});
+test('pending question lookup rejects a foreign lecture or different question without clearing its frozen UUID',async()=>{
+  for(const change of [{lecture_id:'foreign-lesson'},{question:'다른 질문'}]) {
+    const {app,state}=questionWorkflowFixture({
+      onPost(){throw new TypeError('synthetic ambiguous POST');},
+      onGet(id,state,snapshot){
+        const submitted=state.calls.find(call=>call.method==='POST').body;
+        return snapshot({question:questionTestJob(1,{...submitted,id,...change,status:'queued',document:null})});
+      }});
+    await app.run('loadQuestions()'); app.element('question-text').value='원래의 합성 질문';
+    await app.run('submitQuestion()');
+    const originalId=app.run('questionView.pending.id');
+    await app.run('submitQuestion()');
+    assert.equal(state.calls.filter(call=>call.method==='POST').length,1);
+    assert.equal(app.run('questionView.pending.id'),originalId);
+    assert.equal(app.run('questionView.pending.question'),'원래의 합성 질문');
+    assert.equal(app.run('questionView.pending.notFound'),false);
+    assert.equal(app.element('question-submit').textContent,'요청 상태 확인');
+    assert.equal(app.element('question-list').children.length,0);
+    assert.match(app.element('question-state').textContent,/같은 질문의 저장 상태/);
+  }
 });
 test('an ambiguous bookmark POST retry keeps its UUID, label and original live audio position',async () => {
   const submitted=[];
@@ -1473,7 +1909,8 @@ test('transcript keys are isolated by lecture, account, provider, origin, and ra
   app.run(`correctionView='corrected'; renderCurrent()`);
   let next = app.element('transcript').children[0];
   assert.notEqual(next,previous);
-  assert.equal(next.children.length,1);
+  assert.equal(next.children.length,2); // Text plus the explicit manual-edit/note actions.
+  assert.equal(next.children[1].className,'segment-tools');
   assert.equal(next.children[0].textContent,'후보정본');
   previous = next;
   app.run(`correctionView='raw'; renderCurrent()`);
@@ -2447,7 +2884,7 @@ test('deletion requires confirmation and invalidates an older lecture response',
       {id:${JSON.stringify(targetId)},title:'지울 수업',created_at:'2026-01-02T00:00:00Z'},
       {id:${JSON.stringify(remainingId)},title:'늦은 수업',created_at:'2026-01-01T00:00:00Z'},
     ];
-    current={id:${JSON.stringify(targetId)},title:'지울 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
+    current={id:${JSON.stringify(targetId)},title:'지울 수업',created_at:'2026-01-02T00:00:00Z',segments:[],recording_finalized:true};
     renderCurrent(); renderHistory();
   `);
   const groups = app.element('lecture-list').children;
@@ -2487,7 +2924,7 @@ test('deletion safely retries once after a lost response', async () => {
     return response({status:'deleted'});
   });
   app.run(`
-    current={id:${JSON.stringify(lectureId)},title:'응답이 끊긴 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
+    current={id:${JSON.stringify(lectureId)},title:'응답이 끊긴 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_finalized:true};
     lectures=[current]; renderCurrent(); renderHistory();
   `);
   app.element('delete-lecture').onclick();
@@ -2495,10 +2932,10 @@ test('deletion safely retries once after a lost response', async () => {
   assert.equal(deleteCalls, 2);
   assert.equal(app.run('current'), null);
   assert.equal(app.run('lectures.length'), 0);
-  assert.match(app.element('notice').textContent, /삭제했어요/);
+  assert.match(app.element('notice').textContent, /휴지통으로 옮겼어요/);
 });
 
-test('deleting an unfinished recovered lesson clears its local correction reservation', async () => {
+test('unfinished recovered lessons cannot be trashed and keep their recovery reservation', async () => {
   const lectureId = webcrypto.randomUUID();
   const app = setup((url, options = {}) => options.method === 'DELETE'
     ? response(null,204) : response({}));
@@ -2511,11 +2948,12 @@ test('deleting an unfinished recovered lesson clears its local correction reserv
     updateControls();
   `);
   assert.equal(app.run('isBusy()'),false);
+  assert.equal(app.element('delete-lecture').disabled,true);
   app.element('delete-lecture').onclick();
   await app.element('delete-confirm').onclick();
-  assert.equal(app.run('scheduledCorrections.size'),0);
-  assert.equal(app.run('captureSession'),null);
-  assert.equal(app.run('hasOwnerLockedWork()'),false);
+  assert.equal(app.run('scheduledCorrections.size'),1);
+  assert.equal(app.run('captureSession.id'),lectureId);
+  assert.equal(app.run('hasOwnerLockedWork()'),true);
 });
 
 test('an explicit deletion failure keeps the lecture available for a later retry', async () => {
@@ -2529,7 +2967,7 @@ test('an explicit deletion failure keeps the lecture available for a later retry
     return response({});
   });
   app.run(`
-    current={id:${JSON.stringify(lectureId)},title:'남겨 둘 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
+    current={id:${JSON.stringify(lectureId)},title:'남겨 둘 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_finalized:true};
     lectures=[current]; renderCurrent(); renderHistory();
   `);
   app.element('delete-lecture').onclick();
@@ -2549,7 +2987,7 @@ test('closing deletion confirmation makes no request and an old account response
     if (options.method === 'DELETE') { deleteCalls += 1; return deletion.promise; }
     return response({});
   });
-  app.run(`current={id:${JSON.stringify(oldLectureId)},title:'기존 수업',created_at:'2026-01-01T00:00:00Z',segments:[]}; lectures=[current]; renderCurrent(); renderHistory()`);
+  app.run(`current={id:${JSON.stringify(oldLectureId)},title:'기존 수업',created_at:'2026-01-01T00:00:00Z',segments:[],recording_finalized:true}; lectures=[current]; renderCurrent(); renderHistory()`);
   app.element('delete-lecture').onclick();
   app.element('delete-cancel').onclick();
   assert.equal(app.element('delete-dialog').open, false);

@@ -31,7 +31,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .db import Database
 from .drive_archive import DriveArchiveManager
 from .drive_storage import DriveStorageError
-from . import lecture_tools
+from . import lecture_tools, lecture_library, lecture_trash, manual_notes
 from .lease_renewal import create_lease_renewer
 from .recovery_backup import BackupScheduler, RecoveryBackupManager
 from .clova_transcriber import ClovaStreamingTranscriber, ClovaTranscriptionError
@@ -48,6 +48,8 @@ from .recordings import (
 from .postprocessor import MindlogicPostprocessor, PostprocessingError
 from .summarizer import MindlogicSummarizer
 from .summary_service import SummaryService
+from .question_service import QuestionService
+from .question_answerer import QuestionAnswerer
 from .translator import MindlogicTranslator
 from .translation_service import TranslationService
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
@@ -327,6 +329,7 @@ def create_app(
     clova_transcriber=None,
     summarizer=None,
     translator=None,
+    question_answerer=None,
     drive_storage=None,
     tunnel_status=None,
     tunnel_restart=None,
@@ -351,6 +354,7 @@ def create_app(
     limiter = RateLimiter()
     summary_service = SummaryService(settings, database, summarizer or MindlogicSummarizer(settings), limiter)
     translation_service = TranslationService(settings, database, translator or MindlogicTranslator(settings), limiter)
+    question_service = QuestionService(settings, database, question_answerer or QuestionAnswerer(settings), limiter)
     inference_lock = threading.Lock()
     capacity = threading.BoundedSemaphore(settings.max_pending_chunks)
     chunk_admission_lock = threading.Lock()
@@ -421,6 +425,7 @@ def create_app(
         recover_correction_jobs()
         summary_service.recover()
         translation_service.recover()
+        question_service.recover()
         if settings.model_warmup and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
         try:
@@ -429,6 +434,7 @@ def create_app(
             ensure_correction_worker()
             summary_service.start()
             translation_service.start()
+            question_service.start()
             archive_manager.start()
             lease_renewer.start()
             if backup_scheduler is not None:
@@ -441,6 +447,7 @@ def create_app(
             request_import_worker_shutdown()
             summary_service.request_shutdown()
             translation_service.request_shutdown()
+            question_service.request_shutdown()
             archive_manager.request_shutdown()
             lease_renewer.request_shutdown()
             if backup_scheduler is not None:
@@ -449,6 +456,7 @@ def create_app(
             correction_stopped = stop_correction_worker(timeout=8)
             summary_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             translation_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
+            question_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
             archive_stopped = archive_manager.stop(
                 timeout=max(0.0, shutdown_deadline - time.monotonic())
@@ -471,6 +479,7 @@ def create_app(
     app.state.postprocessor = correction_engine
     app.state.summary_service = summary_service
     app.state.translation_service = translation_service
+    app.state.question_service = question_service
     app.state.recording_store = recording_store
     app.state.archive_manager = archive_manager
     app.state.lease_renewer = lease_renewer
@@ -496,7 +505,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(settings.site_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=[
             "Authorization",
             "Content-Type",
@@ -870,7 +879,9 @@ def create_app(
                     " WHERE l3.username = u.username AND ls.status IN ('queued', 'processing')) AS summary_jobs, "
                     "(SELECT COUNT(*) FROM lecture_translations lt "
                     " JOIN lectures l4 ON l4.id = lt.lecture_id "
-                    " WHERE l4.username = u.username AND lt.status IN ('queued', 'processing')) AS translation_jobs "
+                    " WHERE l4.username = u.username AND lt.status IN ('queued', 'processing')) AS translation_jobs, "
+                    "(SELECT COUNT(*) FROM lecture_questions lq WHERE lq.username=u.username "
+                    " AND lq.status IN ('queued','processing')) AS question_jobs "
                     "FROM users u",
                     (current_time,),
                 ).fetchall()
@@ -892,6 +903,9 @@ def create_app(
                 ).fetchone()[0],
                 "translations": connection.execute(
                     "SELECT COUNT(*) FROM lecture_translations WHERE status IN ('queued', 'processing')"
+                ).fetchone()[0],
+                "questions": connection.execute(
+                    "SELECT COUNT(*) FROM lecture_questions WHERE status IN ('queued','processing')"
                 ).fetchone()[0],
             }
             recent_audit = [
@@ -938,6 +952,7 @@ def create_app(
                         "corrections": row["correction_jobs"],
                         "summaries": row["summary_jobs"],
                         "translations": row["translation_jobs"],
+                        "questions": row["question_jobs"],
                     },
                 }
             )
@@ -1041,12 +1056,14 @@ def create_app(
             audit(connection, "tunnel_restarted", "accepted", "tunnel")
         return {"accepted": True, **sanitized_tunnel_status(raw_result)}
 
-    def owned_lecture(lecture_id: str, username: str, *, include_deleting: bool = False) -> dict:
+    def owned_lecture(lecture_id: str, username: str, *, include_deleting: bool = False,
+                      include_trashed: bool = False) -> dict:
         deleting_clause = "" if include_deleting else " AND deleting = 0"
+        trash_clause = "" if include_trashed else " AND trashed_at IS NULL"
         with database.connect() as connection:
             lecture = connection.execute(
-                "SELECT id, username, title, language, created_at, deleting, recording_finalized, asr_provider "
-                f"FROM lectures WHERE id = ? AND username = ?{deleting_clause}",
+                "SELECT id, username, title, language, created_at, deleting, trashed_at, recording_finalized, asr_provider "
+                f"FROM lectures WHERE id = ? AND username = ?{deleting_clause}{trash_clause}",
                 (lecture_id, username),
             ).fetchone()
         if lecture is None:
@@ -1063,6 +1080,8 @@ def create_app(
             key: lecture[key]
             for key in ("id", "title", "language", "created_at", "asr_provider")
         }
+        with database.connect() as connection:
+            result.update(lecture_library.metadata_for(connection, lecture))
         result.update(
             recording_flags(
                 lecture["username"], lecture["id"], bool(lecture["recording_finalized"])
@@ -1153,6 +1172,7 @@ def create_app(
             "configured": translation_service.configured,
             "model": settings.translation_model,
         }
+        result["question_answering"] = {"configured": question_service.configured, "model": question_service.model}
         return result
 
     @app.get("/lectures")
@@ -1160,7 +1180,7 @@ def create_app(
         with database.connect() as connection:
             rows = connection.execute(
                 "SELECT id, username, title, language, created_at, deleting, recording_finalized, asr_provider "
-                "FROM lectures WHERE username = ? AND deleting = 0 ORDER BY created_at DESC, id DESC",
+                "FROM lectures WHERE username = ? AND deleting = 0 AND trashed_at IS NULL ORDER BY created_at DESC, id DESC",
                 (user["username"],),
             ).fetchall()
         return [lecture_result(dict(row)) for row in rows]
@@ -1178,7 +1198,7 @@ def create_app(
 
         def replay_or_conflict(connection):
             existing = connection.execute(
-                "SELECT id, username, title, language, created_at, deleting, recording_finalized, asr_provider "
+                "SELECT id, username, title, language, created_at, deleting, trashed_at, recording_finalized, asr_provider "
                 "FROM lectures WHERE id = ?",
                 (lecture_id,),
             ).fetchone()
@@ -1191,8 +1211,8 @@ def create_app(
                 or existing["asr_provider"] != body.asr_provider
             ):
                 raise HTTPException(409, "같은 수업 ID로 다른 내용을 만들 수 없습니다.")
-            if existing["deleting"]:
-                raise HTTPException(409, "삭제 중인 수업 ID는 다시 사용할 수 없습니다.")
+            if existing["deleting"] or existing["trashed_at"] is not None:
+                raise HTTPException(409, "휴지통에 있거나 삭제 중인 수업 ID는 다시 사용할 수 없습니다.")
             return dict(existing)
 
         with database.connect() as connection:
@@ -1240,8 +1260,11 @@ def create_app(
         lecture = owned_lecture(lecture_id, user["username"])
         with database.connect() as connection:
             segments = [dict(row) for row in connection.execute(
-                "SELECT id, start, end, text FROM segments WHERE lecture_id = ? ORDER BY start, end, id", (lecture_id,)
+                "SELECT s.id,s.start,s.end,s.text FROM segments s JOIN lectures l ON l.id=s.lecture_id "
+                "WHERE s.lecture_id=? AND l.username=? AND l.deleting=0 AND l.trashed_at IS NULL "
+                "ORDER BY s.start,s.end,s.id", (lecture_id,user["username"])
             ).fetchall()]
+        owned_lecture(lecture_id, user["username"])
         return lecture_result(lecture, segments=segments)
 
     def correction_configured() -> bool:
@@ -1302,18 +1325,19 @@ def create_app(
             result.update({"error_code": row["error_code"], "error": row["error"]})
         return result
 
-    def get_correction_row(lecture_id: str) -> dict | None:
+    def get_correction_row(lecture_id: str, username: str) -> dict | None:
         with database.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM transcript_corrections WHERE lecture_id = ?",
-                (lecture_id,),
+                "SELECT c.* FROM transcript_corrections c JOIN lectures l ON l.id=c.lecture_id "
+                "WHERE c.lecture_id=? AND l.username=? AND l.deleting=0 AND l.trashed_at IS NULL",
+                (lecture_id,username),
             ).fetchone()
         return dict(row) if row is not None else None
 
     @app.get("/lectures/{lecture_id}/correction")
     def get_correction(lecture_id: str, user: dict = Depends(data_identity)):
         lecture = owned_lecture(lecture_id, user["username"])
-        row = get_correction_row(lecture["id"])
+        row = get_correction_row(lecture["id"], user["username"])
         if row is None:
             raise HTTPException(404, "이 수업에는 후보정 작업이 없습니다.")
         return correction_result(row)
@@ -1334,7 +1358,7 @@ def create_app(
             connection.execute("BEGIN IMMEDIATE")
             current_lecture = connection.execute(
                 "SELECT id FROM lectures WHERE id = ? AND username = ? "
-                "AND deleting = 0 AND recording_finalized = 1",
+                "AND deleting = 0 AND trashed_at IS NULL AND recording_finalized = 1",
                 (lecture["id"], user["username"]),
             ).fetchone()
             if current_lecture is None:
@@ -1456,6 +1480,10 @@ def create_app(
         ticket = secrets.token_urlsafe(32)
         expires_at = time.monotonic() + 60
         with download_ticket_lock:
+            # Trash commits before invalidating tickets. Recheck visibility
+            # while holding this lock so a slow pre-trash request cannot mint
+            # a fresh grant after that invalidation has completed.
+            owned_lecture(lecture_id, user["username"])
             clear_expired_download_tickets(time.monotonic())
             for token_hash, granted in tuple(download_tickets.items()):
                 if granted[1:3] == (user["username"], lecture["id"]):
@@ -1487,13 +1515,13 @@ def create_app(
             "SELECT c.chunk_id FROM chunks AS c "
             "JOIN lectures AS l ON l.id = c.lecture_id "
             "WHERE c.lecture_id = ? AND c.final_chunk = 1 AND c.status = 'done' "
-            "AND l.username = ? AND l.deleting = 0 "
+            "AND l.username = ? AND l.deleting = 0 AND l.trashed_at IS NULL "
             "ORDER BY (c.chunk_id = ?) DESC, c.start_seconds DESC, c.chunk_id DESC LIMIT 1",
             (lecture_id, username, guard_chunk_id),
         ).fetchone()
         if chunk is None:
             owner = connection.execute(
-                "SELECT 1 FROM lectures WHERE id = ? AND username = ? AND deleting = 0",
+                "SELECT 1 FROM lectures WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                 (lecture_id, username),
             ).fetchone()
             if owner is None:
@@ -1504,7 +1532,7 @@ def create_app(
             "JOIN chunks AS c ON c.lecture_id = s.lecture_id AND c.chunk_id = s.chunk_id "
             "JOIN lectures AS l ON l.id = s.lecture_id "
             "WHERE s.lecture_id = ? AND s.chunk_id = ? AND c.status = 'done' "
-            "AND l.username = ? AND l.deleting = 0 ORDER BY s.start, s.end, s.id",
+            "AND l.username = ? AND l.deleting = 0 AND l.trashed_at IS NULL ORDER BY s.start, s.end, s.id",
             (lecture_id, chunk["chunk_id"], username),
         ).fetchall()]
 
@@ -1605,7 +1633,7 @@ def create_app(
             previous = connection.execute(
                 "SELECT c.qwen_boundary_json FROM chunks c "
                 "JOIN lectures l ON l.id = c.lecture_id "
-                "WHERE c.lecture_id = ? AND l.username = ? AND l.deleting = 0 "
+                "WHERE c.lecture_id = ? AND l.username = ? AND l.deleting = 0 AND l.trashed_at IS NULL "
                 "AND c.status = 'done' ORDER BY c.start_seconds DESC, c.rowid DESC LIMIT 1",
                 (lecture["id"], lecture["username"]),
             ).fetchone()
@@ -1642,7 +1670,7 @@ def create_app(
                     connection.execute("BEGIN IMMEDIATE")
                     current = connection.execute(
                         "SELECT recording_finalized FROM lectures "
-                        "WHERE id = ? AND username = ? AND deleting = 0",
+                        "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                         (lecture_id, user["username"]),
                     ).fetchone()
                     if current is None:
@@ -1699,7 +1727,7 @@ def create_app(
                 connection.execute("BEGIN IMMEDIATE")
                 current = connection.execute(
                     "SELECT recording_finalized FROM lectures "
-                    "WHERE id = ? AND username = ? AND deleting = 0",
+                    "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                     (lecture_id, user["username"]),
                 ).fetchone()
                 if current is None:
@@ -1779,7 +1807,7 @@ def create_app(
                     connection.execute("BEGIN IMMEDIATE")
                     current = connection.execute(
                         "SELECT recording_finalized FROM lectures "
-                        "WHERE id = ? AND username = ? AND deleting = 0",
+                        "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                         (lecture_id, user["username"]),
                     ).fetchone()
                     if current is None:
@@ -1833,7 +1861,7 @@ def create_app(
                                 )
                         connection.execute(
                             "UPDATE lectures SET recording_finalized = 1 "
-                            "WHERE id = ? AND username = ? AND deleting = 0",
+                            "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                             (lecture_id, user["username"]),
                         )
             queue_completed_recording(user["username"], lecture_id)
@@ -1951,6 +1979,7 @@ def create_app(
             if stream.content_range:
                 headers["Content-Range"] = stream.content_range
             try:
+                owned_lecture(lecture_id, username)
                 return CloseableStreamingResponse(
                     stream.iter_bytes(),
                     close=stream.close,
@@ -1963,6 +1992,7 @@ def create_app(
                 raise
         descriptor = recording["descriptor"]
         try:
+            owned_lecture(lecture_id, username)
             return DescriptorFileResponse(
                 descriptor,
                 media_type="audio/wav",
@@ -1987,12 +2017,12 @@ def create_app(
         previous = connection.execute(
             "SELECT c.* FROM chunks AS c JOIN lectures AS l ON l.id = c.lecture_id "
             "WHERE c.lecture_id = ? AND c.chunk_id = ? "
-            "AND l.username = ? AND l.deleting = 0",
+            "AND l.username = ? AND l.deleting = 0 AND l.trashed_at IS NULL",
             (lecture_id, chunk_id, expected_username),
         ).fetchone()
         if previous is None:
             owner = connection.execute(
-                "SELECT 1 FROM lectures WHERE id = ? AND username = ? AND deleting = 0",
+                "SELECT 1 FROM lectures WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                 (lecture_id, expected_username),
             ).fetchone()
             if owner is None:
@@ -2011,12 +2041,12 @@ def create_app(
             "SELECT s.id, s.start, s.end, s.text FROM segments AS s "
             "JOIN lectures AS l ON l.id = s.lecture_id "
             "WHERE s.lecture_id = ? AND s.chunk_id = ? "
-            "AND l.username = ? AND l.deleting = 0 ORDER BY s.start, s.end, s.id",
+            "AND l.username = ? AND l.deleting = 0 AND l.trashed_at IS NULL ORDER BY s.start, s.end, s.id",
             (lecture_id, chunk_id, expected_username),
         ).fetchall()]
         lecture = connection.execute(
             "SELECT username, recording_finalized FROM lectures "
-            "WHERE id = ? AND username = ? AND deleting = 0",
+            "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
             (lecture_id, expected_username),
         ).fetchone()
         if lecture is None:
@@ -2150,7 +2180,7 @@ def create_app(
                 if replay is None:
                     still_owned = connection.execute(
                         "SELECT recording_finalized FROM lectures "
-                        "WHERE id = ? AND username = ? AND deleting = 0",
+                        "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                         (lecture_id, lecture["username"]),
                     ).fetchone()
                     if still_owned is None:
@@ -2208,7 +2238,7 @@ def create_app(
                     connection.execute("BEGIN IMMEDIATE")
                     still_owned = connection.execute(
                         "SELECT recording_finalized FROM lectures "
-                        "WHERE id = ? AND username = ? AND deleting = 0",
+                        "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                         (lecture_id, lecture["username"]),
                     ).fetchone()
                     if still_owned is None:
@@ -2350,7 +2380,16 @@ def create_app(
         job = fetch_import(normalized, username)
         if job is None:
             raise HTTPException(404, "파일 변환 작업을 찾을 수 없습니다.")
+        with database.connect() as connection:
+            require_visible_import_lecture(connection, job)
         return job
+
+    def require_visible_import_lecture(connection, job) -> None:
+        if job["lecture_id"] is not None and connection.execute(
+            "SELECT 1 FROM lectures WHERE id=? AND username=? AND trashed_at IS NULL",
+            (job["lecture_id"], job["username"]),
+        ).fetchone() is None:
+            raise HTTPException(404, "파일 변환 작업을 찾을 수 없습니다.")
 
     def import_result(job: dict) -> dict:
         return {
@@ -2445,6 +2484,16 @@ def create_app(
     def finalize_lecture_deletion(lecture_id: str, username: str) -> bool:
         """Trash remote audio, remove staging audio, then delete metadata."""
 
+        with database.connect() as connection:
+            current = connection.execute(
+                "SELECT username,deleting FROM lectures WHERE id=?", (lecture_id,),
+            ).fetchone()
+        if current is None:
+            return True
+        if current["username"] != username or not current["deleting"]:
+            # Internal import cleanup must not turn a reversible trash row
+            # into a remote deletion, even if stale job metadata resurfaces.
+            return False
         try:
             clova_engine.close_session(username, lecture_id)
         except Exception:
@@ -2482,10 +2531,10 @@ def create_app(
             except (OSError, RecordingCorruptError):
                 log.exception("Could not remove an orphaned private recording")
 
-    @app.delete("/lectures/{lecture_id}")
+    @app.delete("/lectures/{lecture_id}/permanent")
     def delete_lecture(lecture_id: str, user: dict = Depends(data_identity)):
         try:
-            lecture = owned_lecture(lecture_id, user["username"], include_deleting=True)
+            lecture = owned_lecture(lecture_id, user["username"], include_deleting=True, include_trashed=True)
         except HTTPException as error:
             if error.status_code == 404:
                 # DELETE is idempotent across a lost Quick Tunnel response.
@@ -2493,16 +2542,20 @@ def create_app(
                 # another account's lesson existence private.
                 return {"status": "deleted"}
             raise
+        if not lecture["deleting"] and lecture["trashed_at"] is None:
+            raise HTTPException(409, "먼저 휴지통으로 옮긴 뒤 영구 삭제를 확인하세요.")
         if not lecture["deleting"]:
             with import_fs_lock, recording_store.lock:
                 try:
                     lecture = owned_lecture(
-                        lecture_id, user["username"], include_deleting=True
+                        lecture_id, user["username"], include_deleting=True, include_trashed=True
                     )
                 except HTTPException as error:
                     if error.status_code == 404:
                         return {"status": "deleted"}
                     raise
+                if not lecture["deleting"] and lecture["trashed_at"] is None:
+                    raise HTTPException(409, "복원된 수업은 영구 삭제하지 않았어요. 먼저 휴지통으로 옮기세요.")
                 if lecture["deleting"]:
                     terminal_jobs = []
                 else:
@@ -2537,8 +2590,12 @@ def create_app(
                             "SELECT 1 FROM lecture_translations WHERE lecture_id=? AND status='processing'",
                             (lecture["id"],),
                         ).fetchone()
-                    if any(job is not None for job in (active, pending, correcting, summarizing, translating)):
-                        raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역이 끝난 뒤 수업을 삭제하세요.")
+                        questioning = connection.execute(
+                            "SELECT 1 FROM lecture_questions WHERE lecture_id=? AND status='processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                    if any(job is not None for job in (active, pending, correcting, summarizing, translating, questioning)):
+                        raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역·수업 질문이 끝난 뒤 수업을 삭제하세요.")
                 for job in terminal_jobs:
                     if not remove_private_upload(job):
                         raise HTTPException(503, "업로드 원본 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
@@ -2546,11 +2603,13 @@ def create_app(
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     current = connection.execute(
-                        "SELECT deleting FROM lectures WHERE id = ? AND username = ?",
+                        "SELECT deleting,trashed_at FROM lectures WHERE id = ? AND username = ?",
                         (lecture["id"], user["username"]),
                     ).fetchone()
                     if current is None:
                         return {"status": "deleted"}
+                    if not current["deleting"] and current["trashed_at"] is None:
+                        raise HTTPException(409, "복원된 수업은 영구 삭제하지 않았어요. 먼저 휴지통으로 옮기세요.")
                     if not current["deleting"]:
                         active = connection.execute(
                             "SELECT 1 FROM imports WHERE lecture_id = ? "
@@ -2574,8 +2633,12 @@ def create_app(
                             "SELECT 1 FROM lecture_translations WHERE lecture_id=? AND status='processing'",
                             (lecture["id"],),
                         ).fetchone()
-                        if any(job is not None for job in (active, pending, correcting, summarizing, translating)):
-                            raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역이 끝난 뒤 수업을 삭제하세요.")
+                        questioning = connection.execute(
+                            "SELECT 1 FROM lecture_questions WHERE lecture_id=? AND status='processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        if any(job is not None for job in (active, pending, correcting, summarizing, translating, questioning)):
+                            raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역·수업 질문이 끝난 뒤 수업을 삭제하세요.")
                         # A queued correction has not sent anything yet. Removing
                         # it in this same transaction wins atomically against the
                         # worker's queued->processing claim.
@@ -2588,6 +2651,8 @@ def create_app(
                         connection.execute("DELETE FROM lecture_summaries WHERE lecture_id=? AND status='queued'",
                                            (lecture["id"],))
                         connection.execute("DELETE FROM lecture_translations WHERE lecture_id=? AND status='queued'",
+                                           (lecture["id"],))
+                        connection.execute("DELETE FROM lecture_questions WHERE lecture_id=? AND status='queued'",
                                            (lecture["id"],))
                         connection.execute("UPDATE lectures SET deleting = 1 WHERE id = ?", (lecture["id"],))
         purge_download_tickets(lecture["id"])
@@ -2621,7 +2686,7 @@ def create_app(
                 if current["lecture_id"]:
                     lecture_id = current["lecture_id"]
                     connection.execute(
-                        "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ?",
+                        "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ? AND trashed_at IS NULL",
                         (lecture_id, current["username"]),
                     )
             if lecture_id:
@@ -2683,7 +2748,7 @@ def create_app(
                     )
                     if row["lecture_id"]:
                         connection.execute(
-                            "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ?",
+                            "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ? AND trashed_at IS NULL",
                             (row["lecture_id"], row["username"]),
                         )
                         cancelled_lectures.append((row["lecture_id"], row["username"]))
@@ -2872,7 +2937,9 @@ def create_app(
                     with database.connect() as connection:
                         connection.execute("BEGIN IMMEDIATE")
                         row = connection.execute(
-                            "SELECT * FROM imports WHERE status = 'queued' ORDER BY created_at, id LIMIT 1"
+                            "SELECT * FROM imports WHERE status = 'queued' AND EXISTS "
+                            "(SELECT 1 FROM lectures l WHERE l.id=imports.lecture_id AND l.username=imports.username "
+                            "AND l.deleting=0 AND l.trashed_at IS NULL) ORDER BY created_at, id LIMIT 1"
                         ).fetchone()
                         if row is not None:
                             claimed = connection.execute(
@@ -2954,14 +3021,16 @@ def create_app(
             if correction_configured():
                 connection.execute(
                     "UPDATE transcript_corrections SET status = 'queued', error_code = NULL, error = NULL, "
-                    "model = ?, updated_at = ? WHERE status IN ('queued', 'processing')",
+                    "model = ?, updated_at = ? WHERE status IN ('queued', 'processing') "
+                    "AND lecture_id IN (SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)",
                     (getattr(correction_engine, "model", settings.mindlogic_model), now_text()),
                 )
             else:
                 connection.execute(
                     "UPDATE transcript_corrections SET status = 'failed', "
                     "error_code = 'not_configured', error = ?, updated_at = ? "
-                    "WHERE status IN ('queued', 'processing')",
+                    "WHERE status IN ('queued', 'processing') "
+                    "AND lecture_id IN (SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)",
                     ("후보정 API 키가 서버에 설정되지 않았습니다.", now_text()),
                 )
 
@@ -2996,7 +3065,8 @@ def create_app(
         with database.connect() as connection:
             connection.execute(
                 "UPDATE transcript_corrections SET status = 'failed', error_code = ?, error = ?, "
-                "updated_at = ? WHERE lecture_id = ? AND status = 'processing' AND attempts = ?",
+                "updated_at = ? WHERE lecture_id = ? AND status = 'processing' AND attempts = ? "
+                "AND lecture_id IN (SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)",
                 (code, messages[code], now_text(), lecture_id, attempt),
             )
 
@@ -3005,14 +3075,14 @@ def create_app(
         try:
             with database.connect() as connection:
                 lecture = connection.execute(
-                    "SELECT id, username, title, language, recording_finalized, deleting "
+                    "SELECT id, username, title, language, recording_finalized, deleting, trashed_at "
                     "FROM lectures WHERE id = ?",
                     (lecture_id,),
                 ).fetchone()
                 segments = raw_segments(connection, lecture_id) if lecture is not None else []
             if lecture is None:
                 return
-            if lecture["deleting"] or not lecture["recording_finalized"] or not segments:
+            if lecture["deleting"] or lecture["trashed_at"] is not None or not lecture["recording_finalized"] or not segments:
                 raise PostprocessingError(
                     "invalid_source",
                     "원문 구간을 후보정할 수 없는 상태입니다.",
@@ -3079,7 +3149,9 @@ def create_app(
                     "UPDATE transcript_corrections SET status = 'completed', corrected_text = ?, "
                     "corrected_segments = ?, uncertain_terms = ?, error_code = NULL, error = NULL, "
                     "updated_at = ?, completed_at = ? "
-                    "WHERE lecture_id = ? AND raw_revision = ? AND status = 'processing' AND attempts = ?",
+                    "WHERE lecture_id = ? AND raw_revision = ? AND status = 'processing' AND attempts = ? "
+                    "AND EXISTS (SELECT 1 FROM lectures l WHERE l.id=transcript_corrections.lecture_id "
+                    "AND l.username=? AND l.deleting=0 AND l.trashed_at IS NULL)",
                     (
                         corrected_text,
                         json.dumps(clean_segments, ensure_ascii=False, separators=(",", ":")),
@@ -3089,6 +3161,7 @@ def create_app(
                         lecture_id,
                         job["raw_revision"],
                         job["attempts"],
+                        lecture["username"],
                     ),
                 ).rowcount
             if changed != 1:
@@ -3098,7 +3171,8 @@ def create_app(
                 with database.connect() as connection:
                     connection.execute(
                         "UPDATE transcript_corrections SET status = 'queued', updated_at = ? "
-                        "WHERE lecture_id = ? AND status = 'processing' AND attempts = ?",
+                        "WHERE lecture_id = ? AND status = 'processing' AND attempts = ? "
+                        "AND lecture_id IN (SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)",
                         (now_text(), lecture_id, job["attempts"]),
                     )
             else:
@@ -3127,7 +3201,7 @@ def create_app(
                     candidate = connection.execute(
                         "SELECT c.* FROM transcript_corrections c "
                         "JOIN lectures l ON l.id = c.lecture_id "
-                        "WHERE c.status = 'queued' AND l.deleting = 0 "
+                        "WHERE c.status = 'queued' AND l.deleting = 0 AND l.trashed_at IS NULL "
                         "ORDER BY c.created_at, c.lecture_id LIMIT 1"
                     ).fetchone()
                     if candidate is not None:
@@ -3152,7 +3226,8 @@ def create_app(
                         with database.connect() as connection:
                             connection.execute(
                                 "UPDATE transcript_corrections SET status = 'queued', updated_at = ? "
-                                "WHERE lecture_id = ? AND status = 'processing' AND attempts = ?",
+                                "WHERE lecture_id = ? AND status = 'processing' AND attempts = ? "
+                                "AND lecture_id IN (SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)",
                                 (now_text(), row["lecture_id"], row["attempts"]),
                             )
                     except Exception:
@@ -3227,6 +3302,7 @@ def create_app(
                         or existing["total_bytes"] != body.size
                     ):
                         raise HTTPException(409, "같은 파일 변환 ID로 다른 작업을 만들 수 없습니다.")
+                    require_visible_import_lecture(connection, existing)
                     return import_result(dict(existing))
                 active = connection.execute(
                     "SELECT id FROM imports WHERE username = ? AND status IN ('uploading', 'queued', 'processing')",
@@ -3285,7 +3361,9 @@ def create_app(
         maintain_import_jobs()
         with database.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM imports WHERE username = ? "
+                "SELECT * FROM imports WHERE username = ? AND (lecture_id IS NULL OR EXISTS "
+                "(SELECT 1 FROM lectures l WHERE l.id=imports.lecture_id AND l.username=imports.username "
+                "AND l.trashed_at IS NULL)) "
                 "ORDER BY CASE status WHEN 'uploading' THEN 0 WHEN 'queued' THEN 0 WHEN 'processing' THEN 0 ELSE 1 END, "
                 "created_at DESC, id DESC LIMIT 20",
                 (user["username"],),
@@ -3443,7 +3521,7 @@ def create_app(
                     if current and current["lecture_id"]:
                         lecture_id = current["lecture_id"]
                         connection.execute(
-                            "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ?",
+                            "UPDATE lectures SET deleting = 1 WHERE id = ? AND username = ? AND trashed_at IS NULL",
                             (lecture_id, current["username"]),
                         )
                 if lecture_id:
@@ -3457,6 +3535,16 @@ def create_app(
                             raw_segments=raw_segments, transcript_revision=transcript_revision)
     translation_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
                                 raw_segments=raw_segments, transcript_revision=transcript_revision)
+    question_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
+                             raw_segments=raw_segments, transcript_revision=transcript_revision)
     lecture_tools.install(app, settings, database, recording_store, archive_manager,
                           identity=data_identity, owned_lecture=owned_lecture, limiter=limiter)
+    lecture_library.install(app, settings, database, identity=data_identity,
+                            owned_lecture=owned_lecture, limiter=limiter,
+                            raw_segments=raw_segments, transcript_revision=transcript_revision)
+    lecture_trash.install(app, database, identity=data_identity, import_fs_lock=import_fs_lock,
+                          recording_lock=recording_store.lock, purge_tickets=purge_download_tickets,
+                          limiter=limiter)
+    manual_notes.install(app, settings, database, identity=data_identity, owned_lecture=owned_lecture,
+                         limiter=limiter, raw_segments=raw_segments, transcript_revision=transcript_revision)
     return app

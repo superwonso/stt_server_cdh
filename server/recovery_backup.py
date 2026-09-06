@@ -202,7 +202,7 @@ def _database_info(path: Path, cancel=None, deadline=float("inf")) -> dict:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         jobs = 0
-        for table in ("imports", "transcript_corrections", "lecture_summaries", "lecture_translations"):
+        for table in ("imports", "transcript_corrections", "lecture_summaries", "lecture_translations", "lecture_questions"):
             if table in tables:
                 jobs += connection.execute(f"SELECT COUNT(*) FROM {table} WHERE status IN ('uploading','queued','processing')").fetchone()[0]
         if "chunks" in tables:

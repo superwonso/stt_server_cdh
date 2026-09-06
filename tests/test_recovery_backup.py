@@ -14,13 +14,14 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
 from server.db import Database
 from server.recovery_backup import (
     AGE_RELATIVE, MAX_DATABASE_BYTES, BackupError, BackupScheduler, RecoveryBackupManager,
-    _hash_file, _run, verify_recovery_archive,
+    _database_info, _hash_file, _run, verify_recovery_archive,
 )
 from server.settings import PROJECT_DIR, Settings
 
@@ -32,6 +33,50 @@ def private_write(path: Path, content: bytes):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_bytes(content)
     path.chmod(0o600)
+
+
+def seed_question_jobs(database):
+    lecture_id = str(uuid.uuid4())
+    with database.connect() as connection:
+        connection.execute("INSERT INTO lectures(id,username,title,created_at,recording_finalized) "
+                           "VALUES (?,?,'Synthetic questions','2026-09-06',1)", (lecture_id, ACCOUNTS[0]))
+        for status in ("queued", "processing", "completed", "failed", "cancelled"):
+            connection.execute(
+                "INSERT INTO lecture_questions(id,lecture_id,username,question,request_hash,raw_revision,model,"
+                "selected_ids_json,evidence_sha256,scope,total_segments,selected_count,status,attempts,document_json,"
+                "created_at,updated_at,completed_at) VALUES(?,?,?,'synthetic private question',?,?,'synthetic-model',"
+                "'[]',?,'none',0,0,?,?,?,'2026-09-06','2026-09-06',?)",
+                (str(uuid.uuid4()), lecture_id, ACCOUNTS[0], "a" * 64, "b" * 64, "c" * 64, status,
+                 int(status in ("processing", "completed")),
+                 '{"answerability":"insufficient_evidence","paragraphs":[]}' if status == "completed" else None,
+                 "2026-09-06" if status == "completed" else None),
+            )
+
+
+class RecoveryQuestionInfoTests(unittest.TestCase):
+    def test_unfinished_question_warning_counts_only_queued_and_processing_without_changes(self):
+        with tempfile.TemporaryDirectory(prefix="stt-question-backup-test-") as temporary:
+            database = Database(Path(temporary) / "private" / "database.sqlite3", ACCOUNTS)
+            database.initialize()
+            seed_question_jobs(database)
+            with database.connect() as connection:
+                before = [tuple(row) for row in connection.execute("SELECT * FROM lecture_questions ORDER BY id")]
+            result = _database_info(database.path)
+            self.assertEqual(result["unfinished_jobs"], 2)
+            self.assertEqual(result["unfinalized_lectures"], 0)
+            with database.connect() as connection:
+                self.assertEqual([tuple(row) for row in connection.execute("SELECT * FROM lecture_questions ORDER BY id")], before)
+
+    def test_legacy_backup_without_question_table_is_still_readable(self):
+        with tempfile.TemporaryDirectory(prefix="stt-question-backup-test-") as temporary:
+            database = Database(Path(temporary) / "private" / "database.sqlite3", ACCOUNTS)
+            database.initialize()
+            with database.connect() as connection:
+                connection.execute("DROP TABLE lecture_questions")
+                connection.execute("PRAGMA user_version=17")
+            result = _database_info(database.path)
+            self.assertEqual(result["schema_version"], 17)
+            self.assertEqual(result["unfinished_jobs"], 0)
 
 
 @unittest.skipUnless(AGE.is_file(), "The pinned age CLI is required for encrypted backup integration tests")
@@ -130,6 +175,18 @@ class RecoveryBackupTests(unittest.TestCase):
         key.rename(outside)
         result = self.verify(self.exported(), outside)
         self.assertTrue(result["verified"], "encryption only reads the public recipient")
+
+    def test_question_jobs_survive_encrypted_roundtrip_with_unfinished_warning(self):
+        seed_question_jobs(self.database)
+        with self.database.connect() as connection:
+            before = [tuple(row) for row in connection.execute("SELECT * FROM lecture_questions ORDER BY id")]
+        result = self.verify(self.exported())
+        self.assertEqual(result["warnings"]["unfinished_jobs"], 2)
+        directory = Path(result["directory"])
+        manifest_text = (directory / "manifest.json").read_text()
+        self.assertNotIn("synthetic private question", manifest_text)
+        with sqlite3.connect(directory / "database.sqlite3") as connection:
+            self.assertEqual(connection.execute("SELECT * FROM lecture_questions ORDER BY id").fetchall(), before)
 
     def test_wrong_key_and_tamper_never_expose_a_partially_decrypted_restore(self):
         archive = self.exported()
