@@ -17,7 +17,7 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
   .replace("import { renderDriveStatus } from './admin-storage.js';", 'const renderDriveStatus = TestRenderDriveStatus;')
   .replace("import { renderMaintenanceStatus } from './admin-maintenance.js';", 'const renderMaintenanceStatus = TestRenderMaintenanceStatus;')
   .replace("import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';", 'const { readRecordingClip, RecordingClipPlayer, filterTranscript } = TestRecordingReview;')
-  .replace("import { lectureTitle, filterLibrary, libraryOptions, validMetadata, validLibrarySearch } from './lecture-library.js';", 'const { lectureTitle, filterLibrary, libraryOptions, validMetadata, validLibrarySearch } = TestLectureLibrary;')
+  .replace("import { lectureTitle, libraryOptions, validMetadata, validLibrarySearch } from './lecture-library.js';", 'const { lectureTitle, libraryOptions, validMetadata, validLibrarySearch } = TestLectureLibrary;')
   .replace("import { validManualState, manualSegments, validManualHistory } from './manual-notes.js';", 'const { validManualState, manualSegments, validManualHistory } = TestManualNotes;')
   .replace("import { validQuestionJob, validQuestionPage } from './lecture-questions.js';", 'const { validQuestionJob, validQuestionPage } = TestLectureQuestions;')
   .replace("import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';", `
@@ -471,7 +471,7 @@ function openReviewFixture(app) {
     recording_available:true,recording_finalized:true,recording_seconds:10,
     segments:[{id:'s1',start:0,end:5,text:'첫 문장 Alpha'},{id:'s2',start:5,end:10,text:'둘째 문장 Beta'}]}; renderCurrent();`);
 }
-test('library metadata saves display title separately and combines date/course/semester filters',async () => {
+test('library metadata stays editable while history filters only by date across classifications',async () => {
   const posted = [];
   const app = reviewApp((url,options) => {
     if (url.endsWith('/metadata')) {
@@ -480,16 +480,24 @@ test('library metadata saves display title separately and combines date/course/s
     }
     return response({});
   });
-  openReviewFixture(app); app.run('lectures=[current]; renderHistory();');
+  openReviewFixture(app); app.run(`lectures=[current,
+    {id:'other-course',title:'다른 과목',course:'물리',semester:'2025-2',created_at:current.created_at},
+    {id:'another-day',title:'다른 날짜',created_at:'2026-01-02T00:00:00Z'}]; renderHistory();`);
   await app.element('metadata-open').onclick();
   app.element('metadata-title').value='정리한 수업'; app.element('metadata-course').value='통계'; app.element('metadata-semester').value='2026-1';
   await app.element('metadata-form').onsubmit({preventDefault(){}});
   assert.equal(posted[0].revision,0); assert.equal(app.run('current.title'),'Synthetic review');
   assert.equal(app.run('current.display_title'),'정리한 수업');
   assert.match(app.run("exportText(current,'markdown')"),/정리한 수업/);
-  app.element('library-course').value='통계'; app.element('library-course').onchange();
-  app.element('library-semester').value='2026-1'; app.element('library-semester').onchange();
-  assert.equal(app.element('lecture-count').textContent,'1/1');
+  assert.equal(app.run('current.course'),'통계'); assert.equal(app.run('current.semester'),'2026-1');
+  assert.deepEqual(posted[0],{revision:0,display_title:'정리한 수업',course:'통계',semester:'2026-1'});
+  assert.equal(app.element('lecture-count').textContent,3);
+  app.element('lecture-date').value=app.run('dateKey(current.created_at)'); app.element('lecture-date').onchange();
+  assert.equal(app.element('lecture-count').textContent,'2/3');
+  const visible=app.element('lecture-list').children.flatMap(group=>group.children[1].children);
+  assert.deepEqual(visible.map(button=>button.children[0].textContent),['정리한 수업','다른 과목']);
+  assert.ok(app.element('course-options').children.some(option=>option.value==='통계'));
+  assert.ok(app.element('semester-options').children.some(option=>option.value==='2026-1'));
 });
 test('late metadata and global search results are discarded after an account change',async () => {
   for (const action of ['metadata','search']) {
@@ -504,6 +512,34 @@ test('late metadata and global search results are discarded after an account cha
     assert.equal(app.element('metadata-title').value,'');
     assert.equal(app.element('library-search-results').children.length,0);
     assert.equal(app.run('metadataRevision'),null);
+    assert.equal(app.element('course-options').children.length,0);
+    assert.equal(app.element('semester-options').children.length,0);
+  }
+});
+test('global search and its paged retries never send hidden course semester or date filters',async () => {
+  for (const source of ['all','raw','corrected']) {
+    const requests=[];
+    const app=reviewApp((url,options)=>{
+      requests.push(new URL(url));
+      return response({items:[],offset:Number(new URL(url).searchParams.get('offset')),limit:20,has_more:false});
+    });
+    openReviewFixture(app);
+    app.run("current.course='PRIVATE COURSE'; current.semester='PRIVATE SEMESTER'; lectures=[current]; lectureDateFilter=dateKey(current.created_at); renderHistory();");
+    app.element('library-search-open').onclick();
+    assert.equal(app.element('library-search-filter').textContent,'내 모든 수업 · 날짜 제한 없이 검색');
+    app.element('library-query').value='  50%_ 조건  '; app.element('library-source').value=source;
+    await app.run('searchLibrary()');
+    // A cached/legacy object cannot silently add removed filter keys to a retry.
+    app.run("Object.assign(librarySearchQuery,{course:'HIDDEN',semester:'HIDDEN',date:'2026-01-01'});");
+    app.element('library-query').value='화면에서 바뀐 검색어'; app.element('library-source').value='title';
+    await app.run('searchLibrary(20,true)');
+    assert.equal(requests.length,2);
+    for (const [index,url] of requests.entries()) {
+      assert.deepEqual([...url.searchParams.keys()].sort(),['limit','offset','q','source']);
+      assert.equal(url.searchParams.get('q'),'50%_ 조건'); assert.equal(url.searchParams.get('source'),source);
+      assert.equal(url.searchParams.get('offset'),String(index*20));
+      assert.equal(url.searchParams.get('limit'),'20');
+    }
   }
 });
 test('library search uses safe text nodes and does not stop an ongoing capture',async () => {
@@ -518,6 +554,27 @@ test('library search uses safe text nodes and does not stop an ongoing capture',
   assert.equal(app.run('recording'),true);
   const row = app.element('library-search-results').children[0];
   assert.equal(row.children[0].textContent,'<img src=x>'); assert.equal(row.children[2].textContent,'<script>private</script>');
+});
+test('unclassified global search results retain the exact raw timestamp and account guard when opening',async () => {
+  const id='11111111-1111-4111-8111-111111111111';
+  const note={id,title:'결과 수업',created_at:'2026-01-02T00:00:00Z',recording_finalized:true,
+    recording_available:true,recording_seconds:10,segments:[{id:'result-segment',start:5.125,end:8,text:'원문 결과'}]};
+  const requests=[];
+  const app=reviewApp((url)=>{
+    requests.push(url);
+    return response(url.endsWith(`/lectures/${id}`) ? note : {configured:false,correction:null});
+  });
+  openReviewFixture(app);
+  app.run("globalThis.libraryClipStart=null; playRecordingClip=async start=>{globalThis.libraryClipStart=start;};");
+  const item={lecture_id:id,segment_id:'result-segment',source:'raw',start:5.125};
+  const scope=app.run('libraryAuthScope()');
+  await app.run(`openLibraryResult(${JSON.stringify(item)},${JSON.stringify(scope)})`);
+  assert.equal(app.run('current.id'),id); assert.equal(app.run('libraryClipStart'),5.125);
+  assert.equal(app.run('correctionView'),'raw');
+  const count=requests.length;
+  app.run("user='user-beta'; token='new-token'; resetLibraryWorkspace(); globalThis.libraryClipStart=null;");
+  await app.run(`openLibraryResult(${JSON.stringify(item)},${JSON.stringify(scope)})`);
+  assert.equal(requests.length,count); assert.equal(app.run('libraryClipStart'),null);
 });
 test('review search filters the display only and bookmark loading is explicit',async () => {
   const requests=[];

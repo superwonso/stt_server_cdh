@@ -13,6 +13,14 @@ test('course and semester filters compose without modifying owner-scoped input',
   assert.deepEqual(libraryOptions(lectures,'course'),['통계']);
   assert.deepEqual(libraryOptions(lectures,'title'),[]); assert.equal(lectures.length,3);
 });
+test('unfiltered library data keeps all classes and classification suggestions without changing stored metadata', () => {
+  const lectures=[{id:1,course:'통계',semester:'2026-2'},{id:2,course:'물리',semester:'2025-1'},{id:3}];
+  const before=structuredClone(lectures);
+  assert.deepEqual(filterLibrary(lectures),lectures);
+  assert.deepEqual(filterLibrary(lectures,{course:'',semester:''}),lectures);
+  assert.deepEqual(libraryOptions(lectures,'semester'),['2025-1','2026-2']);
+  assert.deepEqual(lectures,before);
+});
 test('metadata and search responses are bounded and require matching identities', () => {
   const id = '11111111-1111-4111-8111-111111111111';
   const metadata = {lecture_id:id,display_title:'수업',course:'',semester:'',revision:0};

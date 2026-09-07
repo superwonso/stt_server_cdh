@@ -35,9 +35,31 @@ class UrlValidationTests(unittest.TestCase):
         ):
             settings = Settings.from_env()
         self.assertEqual((settings.translation_model, settings.translation_chunk_chars,
-                          settings.translation_max_source_chars), ("solar-pro4", 6000, 250000))
+                          settings.translation_max_source_chars), ("gpt-5.6-luna", 6000, 250000))
         self.assertEqual(settings.mindlogic_api_key, "test-only-gateway-key")
         self.assertNotIn("test-only-gateway-key", repr(settings))
+
+    def test_all_llm_defaults_use_evaluated_model_and_keep_explicit_independent_overrides(self):
+        def models(settings):
+            return settings.mindlogic_model, settings.summary_model, settings.translation_model
+
+        self.assertEqual(models(Settings(data_dir=Path("/tmp/unused-llm-settings-data"),
+                                         model_cache_dir=Path("/tmp/unused-llm-settings-models"))),
+                         ("gpt-5.6-luna",) * 3)
+        # Questions intentionally share SUMMARY_MODEL; saved historical models
+        # and an operator's explicit per-feature settings must not be migrated.
+        for overrides, expected in (
+            ({}, ("gpt-5.6-luna",) * 3),
+            ({key: "  " for key in ("MINDLOGIC_MODEL", "SUMMARY_MODEL", "TRANSLATION_MODEL")},
+             ("gpt-5.6-luna",) * 3),
+            ({"MINDLOGIC_MODEL": "solar-pro4", "SUMMARY_MODEL": "deepseek-v4-flash",
+              "TRANSLATION_MODEL": "glm-5.3-flash"},
+             ("solar-pro4", "deepseek-v4-flash", "glm-5.3-flash")),
+        ):
+            with self.subTest(overrides=overrides), mock.patch("server.settings.load_dotenv"), mock.patch.dict(
+                "os.environ", {"ACCOUNT_USERNAMES": "user-alpha,user-beta", **overrides}, clear=True,
+            ):
+                self.assertEqual(models(Settings.from_env()), expected)
 
     def test_translation_environment_clamps_work_bounds_without_loading_private_configuration(self):
         for value, expected in (("-1", (1000, 1000)), ("999999999", (24000, 250000))):

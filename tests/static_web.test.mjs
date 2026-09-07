@@ -85,6 +85,18 @@ test('history, export, recording, and destructive controls are explicit and acce
   assert.match(html, /<button\b[^>]*\bid="return-live-capture"[^>]*>현재 녹음으로 돌아가기<\/button>/i);
 });
 
+test('library search has no classification filters while metadata editing remains available', () => {
+  assert.doesNotMatch(html, /\bid="library-(?:course|semester)"/);
+  assert.doesNotMatch(app, /\$\(['"]library-(?:course|semester)['"]\)|libraryCourse|librarySemester|renderLibraryFilters/);
+  assert.match(html, /\bid="lecture-date"/);
+  assert.match(html, /\bid="library-query"/);
+  assert.match(html, /\bid="library-source"/);
+  for (const id of ['metadata-title','metadata-course','metadata-semester','course-options','semester-options']) {
+    assert.ok(html.includes(`id="${id}"`), `stored metadata editing still needs ${id}`);
+  }
+  assert.match(app, /내 모든 수업 · 날짜 제한 없이 검색/);
+});
+
 test('AI correction controls keep raw and corrected transcripts explicit without exposing credentials', () => {
   assert.match(html, /<div\b[^>]*\bid="transcript-versions"[^>]*\brole="group"[^>]*\baria-label="표시할 받아쓰기 버전"[^>]*\bhidden/i);
   assert.match(html, /<button\b[^>]*\bid="transcript-raw"[^>]*\baria-pressed="true"/i);

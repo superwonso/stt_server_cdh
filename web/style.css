@@ -22,9 +22,7 @@
   font-synthesis: none;
 }
 
-.library-filters { display: grid; gap: 8px; margin-bottom: 12px; }
-.library-filters label { display: grid; grid-template-columns: 36px minmax(0, 1fr); align-items: center; gap: 8px; color: var(--muted); font-size: 0.85rem; }
-.library-filters select { min-width: 0; width: 100%; padding: 7px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.library-actions { display: grid; gap: 8px; margin-bottom: 12px; }
 .study-dialog { width: min(720px, calc(100% - 24px)); max-height: calc(100dvh - 32px); border: 1px solid var(--line); border-radius: 20px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow); }
 .study-dialog::backdrop { background: rgba(19,37,31,0.45); }
 .study-dialog-content { display: grid; gap: 12px; padding: clamp(12px, 3vw, 24px); }

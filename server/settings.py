@@ -149,11 +149,11 @@ class Settings:
     clova_epd_duration_ms: int = 15000
     mindlogic_api_key: str | None = field(default=None, repr=False)
     mindlogic_base_url: str = f"https://{MINDLOGIC_GATEWAY_HOST}{MINDLOGIC_GATEWAY_PATH}"
-    mindlogic_model: str = "solar-pro4"
-    summary_model: str = "solar-pro4"
+    mindlogic_model: str = "gpt-5.6-luna"
+    summary_model: str = "gpt-5.6-luna"
     summary_chunk_chars: int = 6000
     summary_max_source_chars: int = 250000
-    translation_model: str = "solar-pro4"
+    translation_model: str = "gpt-5.6-luna"
     translation_chunk_chars: int = 6000
     translation_max_source_chars: int = 250000
     correction_chunk_chars: int = 6000
@@ -279,13 +279,13 @@ class Settings:
                     f"https://{MINDLOGIC_GATEWAY_HOST}{MINDLOGIC_GATEWAY_PATH}",
                 )
             ),
-            mindlogic_model=(os.getenv("MINDLOGIC_MODEL", "solar-pro4").strip() or "solar-pro4"),
-            summary_model=(os.getenv("SUMMARY_MODEL", "solar-pro4").strip() or "solar-pro4"),
+            mindlogic_model=(os.getenv("MINDLOGIC_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"),
+            summary_model=(os.getenv("SUMMARY_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"),
             summary_chunk_chars=max(1000, min(int(os.getenv("SUMMARY_CHUNK_CHARS", "6000")), 24000)),
             summary_max_source_chars=max(
                 1000, min(int(os.getenv("SUMMARY_MAX_SOURCE_CHARS", "250000")), 250000)
             ),
-            translation_model=(os.getenv("TRANSLATION_MODEL", "solar-pro4").strip() or "solar-pro4"),
+            translation_model=(os.getenv("TRANSLATION_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"),
             translation_chunk_chars=max(1000, min(int(os.getenv("TRANSLATION_CHUNK_CHARS", "6000")), 24000)),
             translation_max_source_chars=max(
                 1000, min(int(os.getenv("TRANSLATION_MAX_SOURCE_CHARS", "250000")), 250000)

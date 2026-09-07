@@ -1,0 +1,2632 @@
+{
+  "scope": "Public synthetic data only; application pipeline compatibility, not a general model or ASR accuracy benchmark. Semantic review by Codex, not human expert grading.",
+  "dataset": "scripts/llm_eval_cases.py",
+  "dataset_version": 1,
+  "runs": [
+    {
+      "label": "comparison",
+      "metadata": {
+        "type": "metadata",
+        "created_at": "2026-09-07T13:16:48.380445+00:00",
+        "dataset_version": 1,
+        "models": [
+          "solar-pro4",
+          "gpt-5.6-luna",
+          "deepseek-v4-flash",
+          "glm-5.3-flash",
+          "glm-5.3"
+        ],
+        "repeats": 1,
+        "max_calls": 80,
+        "workers": 2,
+        "automatic_retries": 0,
+        "price_unit": "credits per 1000 tokens; general tariff, NOT verified school debit",
+        "price_source": "https://docs.mindlogic.ai/docs/general/factchat/product/model-credits",
+        "prices": {
+          "solar-pro4": [
+            0.3,
+            1.2
+          ],
+          "gpt-5.6-luna": [
+            0.2,
+            1.2
+          ],
+          "deepseek-v4-flash": [
+            0.2,
+            0.4
+          ],
+          "glm-5.3-flash": [
+            0.15,
+            0.5
+          ],
+          "glm-5.3": [
+            1.4,
+            4.4
+          ]
+        },
+        "rubric": {
+          "priority": [
+            "형식·출처·구간·숫자 검사에 실패한 결과는 품질 비교에서 먼저 제외한다.",
+            "원문의 부정, 조건, 원인과 상관의 구별을 보존하는지 사람이 확인한다.",
+            "뒤쪽 문맥의 반영과 근거가 없는 질문의 답변 유보를 확인한다.",
+            "위 항목을 통과한 모델끼리 한국어 가독성, 지연, 실제 호출 수와 비용을 비교한다."
+          ],
+          "semantic_ratings": {
+            "pass": "필수 의미를 보존하며 원문에 없는 사실을 덧붙이지 않는다.",
+            "partial": "틀린 사실은 없으나 질문에 필요한 설명이나 핵심 조건을 일부 빠뜨린다.",
+            "fail": "부정·조건을 뒤집거나, 문맥을 오역하거나, 근거 없는 사실을 답한다."
+          },
+          "limitations": [
+            "단어 검출 신호만으로 의미 정확도를 판정하거나 합산 점수를 만들지 않는다.",
+            "한 번의 성공이나 짧은 합성 예문의 결과로 모든 전공·긴 수업의 품질을 보장하지 않는다.",
+            "원문에 없는 수치를 추론·계산해 보충하거나 평가용 AI 심판을 추가하지 않는다.",
+            "모든 후보에 같은 입력과 파이프라인 설정을 쓰고 형식 실패·호출 실패도 결과에 남긴다."
+          ]
+        }
+      },
+      "complete": {
+        "type": "complete",
+        "http_requests": 45,
+        "wall_seconds": 409.367
+      },
+      "cases": [
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "ko_correction_constraints",
+          "feature": "correction",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 3.33,
+          "estimated_general_uncached_credits": 0.4342,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-korean-0",
+                "start": 0,
+                "end": 10,
+                "text": "오늘은 통제 변수를 살펴봅니다. 온도는 25도로 일정하게 유지했어요."
+              },
+              {
+                "id": "eval-korean-1",
+                "start": 10,
+                "end": 20,
+                "text": "빛의 세기만 바꿨지, 온도를 바꾼 건 아닙니다."
+              },
+              {
+                "id": "eval-korean-2",
+                "start": 20,
+                "end": 30,
+                "text": "빛을 더 세게 했을 때 기포 수가 늘었다고 해도, 그것만으로 원인이 증명되는 건 아니에요."
+              },
+              {
+                "id": "eval-korean-3",
+                "start": 30,
+                "end": 40,
+                "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있어요."
+              },
+              {
+                "id": "eval-korean-4",
+                "start": 40,
+                "end": 50,
+                "text": "다음 시간에는 같은 방법으로 다시 측정할 수 있지만, 과제로 제출하라는 뜻은 아닙니다."
+              }
+            ],
+            "uncertain_terms": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 533,
+                "completion_tokens": 273,
+                "total_tokens": 806,
+                "cached_tokens": 0,
+                "reasoning_tokens": 64
+              },
+              "elapsed_seconds": 3.329,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "segment_identity_time_order",
+              "passed": true
+            },
+            {
+              "name": "per_segment_protected_values",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "solar-pro4",
+          "case_id": "ko_correction_constraints",
+          "feature": "correction",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 3.909,
+          "estimated_general_uncached_credits": 0.3078,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-korean-0",
+                "start": 0,
+                "end": 10,
+                "text": "오늘은 통제 변수를 살펴봅니다. 온도는 25도로 일정하게 유지했어요."
+              },
+              {
+                "id": "eval-korean-1",
+                "start": 10,
+                "end": 20,
+                "text": "빛의 세기만 바꿨지, 온도를 바꾼 건 아닙니다."
+              },
+              {
+                "id": "eval-korean-2",
+                "start": 20,
+                "end": 30,
+                "text": "빛을 더 세게 했을 때 기포 수가 늘었다고 해도, 그것만으로 원인이 증명되는 건 아니에요."
+              },
+              {
+                "id": "eval-korean-3",
+                "start": 30,
+                "end": 40,
+                "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있어요."
+              },
+              {
+                "id": "eval-korean-4",
+                "start": 40,
+                "end": 50,
+                "text": "다음 시간에는 같은 방법으로 다시 측정할 수 있지만, 과제로 제출하라는 뜻은 아닙니다."
+              }
+            ],
+            "uncertain_terms": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 394,
+                "completion_tokens": 158,
+                "total_tokens": 552,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 3.908
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "segment_identity_time_order",
+              "passed": true
+            },
+            {
+              "name": "per_segment_protected_values",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "ko_summary_conditions_not_homework",
+          "feature": "summary",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 4.213,
+          "estimated_general_uncached_credits": 0.5954,
+          "output": {
+            "overview": "실험에서는 빛의 세기만 변화시키고 온도, 센서 위치, 물의 양 등 다른 조건을 통제해야 결과를 비교하고 원인을 판단할 수 있습니다.",
+            "overview_source_ids": [
+              "eval-lesson-0",
+              "eval-lesson-1",
+              "eval-lesson-2"
+            ],
+            "sections": [
+              {
+                "heading": "실험 조건 통제",
+                "bullets": [
+                  {
+                    "text": "빛의 세기만 바꾸고 온도는 25도로 일정하게 유지했습니다.",
+                    "source_ids": [
+                      "eval-lesson-0"
+                    ]
+                  },
+                  {
+                    "text": "센서의 위치와 물의 양이 같을 때 두 결과를 비교할 수 있습니다.",
+                    "source_ids": [
+                      "eval-lesson-2"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "결과 해석",
+                "bullets": [
+                  {
+                    "text": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수는 없습니다.",
+                    "source_ids": [
+                      "eval-lesson-1"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "반복 측정",
+                "bullets": [
+                  {
+                    "text": "다음 시간에 같은 방법으로 다시 측정할 수 있지만, 과제로 제출하라는 뜻은 아닙니다.",
+                    "source_ids": [
+                      "eval-lesson-3"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "review_questions": [
+              {
+                "question": "실험에서 일정하게 유지한 조건은 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "question": "두 결과를 비교하려면 어떤 조건이 같아야 하나요?",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              },
+              {
+                "question": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수 없는 이유는 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-1"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 673,
+                "completion_tokens": 384,
+                "total_tokens": 1057,
+                "cached_tokens": 0,
+                "reasoning_tokens": 44
+              },
+              "elapsed_seconds": 4.211,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_summary_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "solar-pro4",
+          "case_id": "ko_summary_conditions_not_homework",
+          "feature": "summary",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 15.368,
+          "estimated_general_uncached_credits": 0.7281,
+          "output": {
+            "overview": "빛의 세기만 바꾸고 온도는 25도로 일정하게 유지한 실험에서, 기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수 없다고 설명한다. 센서를 같은 위치에 두고 물의 양도 같을 때만 두 결과를 비교할 수 있으며, 다음 시간에 같은 방법으로 다시 측정할 수 있지만 과제로 제출하라는 뜻은 아니다.",
+            "overview_source_ids": [
+              "eval-lesson-0",
+              "eval-lesson-1",
+              "eval-lesson-2",
+              "eval-lesson-3"
+            ],
+            "sections": [
+              {
+                "heading": "실험 조건",
+                "bullets": [
+                  {
+                    "text": "실험에서는 빛의 세기만 바꾸고 온도를 25도로 일정하게 유지했다.",
+                    "source_ids": [
+                      "eval-lesson-0"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "관찰과 원인 단정",
+                "bullets": [
+                  {
+                    "text": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수는 없다.",
+                    "source_ids": [
+                      "eval-lesson-1"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "결과 비교 조건",
+                "bullets": [
+                  {
+                    "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있다.",
+                    "source_ids": [
+                      "eval-lesson-2"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "재측정과 과제 여부",
+                "bullets": [
+                  {
+                    "text": "다음 시간에 같은 방법으로 다시 측정할 수 있지만 과제로 제출하라는 뜻은 아니다.",
+                    "source_ids": [
+                      "eval-lesson-3"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "review_questions": [
+              {
+                "question": "실험에서 일정하게 유지한 조건은 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "question": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수 없는 이유는 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-1"
+                ]
+              },
+              {
+                "question": "두 결과를 비교할 수 있는 조건은 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 515,
+                "completion_tokens": 478,
+                "total_tokens": 993,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 15.367
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_summary_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "en_translation_late_bank_context",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 14.929,
+          "estimated_general_uncached_credits": 1.7272,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-bank-0",
+                "start": 0,
+                "end": 10,
+                "text": "폭풍 뒤 강둑이 불안정해졌고, 위쪽 부분이 수로 쪽으로 이동했다."
+              },
+              {
+                "id": "eval-bank-1",
+                "start": 10,
+                "end": 20,
+                "text": "폭우는 흙 입자 사이의 공극을 채웠고 지반 내부의 힘을 변화시켰다."
+              },
+              {
+                "id": "eval-bank-2",
+                "start": 20,
+                "end": 30,
+                "text": "물이 경사면 기저부 근처의 물질을 제거하여, 그 위의 흙을 지지하는 힘이 줄어들었다."
+              },
+              {
+                "id": "eval-bank-3",
+                "start": 30,
+                "end": 40,
+                "text": "물이 벽 뒤에 갇혀 빠져나가지 못한다면 벽만으로는 이 문제를 해결할 수 없습니다."
+              },
+              {
+                "id": "eval-bank-4",
+                "start": 40,
+                "end": 50,
+                "text": "우리는 강을 따라 발생하는 침식에 대해, 강의 수로 모양과 sediment의 이동을 포함하여 논의하고 있습니다."
+              },
+              {
+                "id": "eval-bank-5",
+                "start": 50,
+                "end": 60,
+                "text": "첫 번째 문장에서 bank는 강의 가장자리를 의미하며, 돈을 빌려주는 사업체를 의미하지 않습니다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 363,
+                "completion_tokens": 166,
+                "total_tokens": 529,
+                "cached_tokens": 0,
+                "reasoning_tokens": 46
+              },
+              "elapsed_seconds": 2.72,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 369,
+                "completion_tokens": 132,
+                "total_tokens": 501,
+                "cached_tokens": 0,
+                "reasoning_tokens": 31
+              },
+              "elapsed_seconds": 2.468,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 489,
+                "completion_tokens": 276,
+                "total_tokens": 765,
+                "cached_tokens": 0,
+                "reasoning_tokens": 46
+              },
+              "elapsed_seconds": 3.522,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 841,
+                "completion_tokens": 170,
+                "total_tokens": 1011,
+                "cached_tokens": 0,
+                "reasoning_tokens": 40
+              },
+              "elapsed_seconds": 3.077,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 844,
+                "completion_tokens": 211,
+                "total_tokens": 1055,
+                "cached_tokens": 0,
+                "reasoning_tokens": 81
+              },
+              "elapsed_seconds": 3.14,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "solar-pro4",
+          "case_id": "en_translation_late_bank_context",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "TranslationError",
+          "error_code": "evaluation_failed",
+          "elapsed_seconds": 5.513,
+          "estimated_general_uncached_credits": 0.579,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 326,
+                "completion_tokens": 221,
+                "total_tokens": 547,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 3.107
+            },
+            {
+              "usage": {
+                "prompt_tokens": 332,
+                "completion_tokens": 97,
+                "total_tokens": 429,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 2.406
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "en_translation_numeric_negation",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 5.427,
+          "estimated_general_uncached_credits": 0.5824,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-conditions-0",
+                "start": 0,
+                "end": 10,
+                "text": "온도를 25도로 유지하고 15분 후 측정값을 기록한다."
+              },
+              {
+                "id": "eval-conditions-1",
+                "start": 10,
+                "end": 20,
+                "text": "센서가 보정되지 않은 경우에는 두 실험의 측정값을 비교하지 않는다."
+              },
+              {
+                "id": "eval-conditions-2",
+                "start": 20,
+                "end": 30,
+                "text": "더 큰 측정값만으로 빛이 변화를 일으켰다고 증명할 수 없으며, 물의 높이는 동일하게 유지되어야 한다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 368,
+                "completion_tokens": 187,
+                "total_tokens": 555,
+                "cached_tokens": 0,
+                "reasoning_tokens": 68
+              },
+              "elapsed_seconds": 3.047,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 696,
+                "completion_tokens": 121,
+                "total_tokens": 817,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 2.379,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "qa_grounded_temperature_and_conditions",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 2.137,
+          "estimated_general_uncached_credits": 0.2124,
+          "output": {
+            "answerability": "answered",
+            "paragraphs": [
+              {
+                "text": "실험에서는 빛의 세기만 바꾸고 온도는 25도로 일정하게 유지했습니다. 두 결과를 비교하려면 센서의 위치와 물의 양이 같아야 합니다.",
+                "source_ids": [
+                  "eval-lesson-0",
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 588,
+                "completion_tokens": 79,
+                "total_tokens": 667,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 2.136,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "qa_related_but_missing_student_count",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 1.441,
+          "estimated_general_uncached_credits": 0.1402,
+          "output": {
+            "answerability": "insufficient_evidence",
+            "paragraphs": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 581,
+                "completion_tokens": 20,
+                "total_tokens": 601,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 1.44,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "nonempty_evidence_for_model_abstention",
+              "passed": true
+            },
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "solar-pro4",
+          "case_id": "en_translation_numeric_negation",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 8.517,
+          "estimated_general_uncached_credits": 0.5325,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-conditions-0",
+                "start": 0,
+                "end": 10,
+                "text": "온도를 25도로 유지하고 15분 후에 측정값을 기록하세요."
+              },
+              {
+                "id": "eval-conditions-1",
+                "start": 10,
+                "end": 20,
+                "text": "센서가 보정되지 않았다면 두 시행을 비교하지 마세요."
+              },
+              {
+                "id": "eval-conditions-2",
+                "start": 20,
+                "end": 30,
+                "text": "더 큰 측정값이 빛이 변화를 일으켰다는 것을 입증하지는 않습니다. 수위를 일정하게 유지해야 합니다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 339,
+                "completion_tokens": 79,
+                "total_tokens": 418,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 7.038
+            },
+            {
+              "usage": {
+                "prompt_tokens": 576,
+                "completion_tokens": 136,
+                "total_tokens": 712,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 1.478
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "solar-pro4",
+          "case_id": "qa_grounded_temperature_and_conditions",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 6.574,
+          "estimated_general_uncached_credits": 0.252,
+          "output": {
+            "answerability": "answered",
+            "paragraphs": [
+              {
+                "text": "실험에서는 빛의 세기만 바꾸고 온도를 25도로 일정하게 유지했습니다.",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "text": "두 결과를 비교하려면 센서가 같은 위치에 있고 물의 양도 같을 때만 비교할 수 있습니다.",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 424,
+                "completion_tokens": 104,
+                "total_tokens": 528,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 6.573
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "solar-pro4",
+          "case_id": "qa_related_but_missing_student_count",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 0.935,
+          "estimated_general_uncached_credits": 0.144,
+          "output": {
+            "answerability": "insufficient_evidence",
+            "paragraphs": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 420,
+                "completion_tokens": 15,
+                "total_tokens": 435,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 0.934
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "nonempty_evidence_for_model_abstention",
+              "passed": true
+            },
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "ko_correction_constraints",
+          "feature": "correction",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 11.297,
+          "estimated_general_uncached_credits": 0.6438,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-korean-0",
+                "start": 0,
+                "end": 10,
+                "text": "오늘은 통제 변수를 살펴봅니다. 온도는 25도로 일정하게 유지했어요."
+              },
+              {
+                "id": "eval-korean-1",
+                "start": 10,
+                "end": 20,
+                "text": "빛의 세기만 바꿨지, 온도를 바꾼 건 아닙니다."
+              },
+              {
+                "id": "eval-korean-2",
+                "start": 20,
+                "end": 30,
+                "text": "빛을 더 세게 했을 때 기포 수가 늘었다고 해도, 그것만으로 원인이 증명되는 건 아니에요."
+              },
+              {
+                "id": "eval-korean-3",
+                "start": 30,
+                "end": 40,
+                "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있어요."
+              },
+              {
+                "id": "eval-korean-4",
+                "start": 40,
+                "end": 50,
+                "text": "다음 시간에는 같은 방법으로 다시 측정할 수 있지만, 과제로 제출하라는 뜻은 아닙니다."
+              }
+            ],
+            "uncertain_terms": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 519,
+                "completion_tokens": 1350,
+                "total_tokens": 1869,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1122
+              },
+              "elapsed_seconds": 11.296,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "segment_identity_time_order",
+              "passed": true
+            },
+            {
+              "name": "per_segment_protected_values",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "ko_summary_conditions_not_homework",
+          "feature": "summary",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 8.891,
+          "estimated_general_uncached_credits": 0.4276,
+          "output": {
+            "overview": "실험 조건과 결과 비교에 관한 주의사항을 다룹니다.",
+            "overview_source_ids": [
+              "eval-lesson-0",
+              "eval-lesson-1",
+              "eval-lesson-2",
+              "eval-lesson-3"
+            ],
+            "sections": [
+              {
+                "heading": "실험 조건과 관찰 해석",
+                "bullets": [
+                  {
+                    "text": "실험에서는 빛의 세기만 바꾸고 온도를 25도로 일정하게 유지했습니다.",
+                    "source_ids": [
+                      "eval-lesson-0"
+                    ]
+                  },
+                  {
+                    "text": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수는 없습니다.",
+                    "source_ids": [
+                      "eval-lesson-1"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "결과 비교와 추가 측정",
+                "bullets": [
+                  {
+                    "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있습니다.",
+                    "source_ids": [
+                      "eval-lesson-2"
+                    ]
+                  },
+                  {
+                    "text": "다음 시간에 같은 방법으로 다시 측정할 수 있지만 과제로 제출하라는 뜻은 아닙니다.",
+                    "source_ids": [
+                      "eval-lesson-3"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "review_questions": [
+              {
+                "question": "실험에서 빛의 세기만 바꾸고 일정하게 유지한 다른 조건은 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "question": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수 없는 이유는 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-1"
+                ]
+              },
+              {
+                "question": "두 결과를 비교할 수 있는 조건은 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 584,
+                "completion_tokens": 777,
+                "total_tokens": 1361,
+                "cached_tokens": 0,
+                "reasoning_tokens": 340
+              },
+              "elapsed_seconds": 8.89,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_summary_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "glm-5.3-flash",
+          "case_id": "ko_correction_constraints",
+          "feature": "correction",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "PostprocessingError",
+          "error_code": "invalid_response",
+          "elapsed_seconds": 30.195,
+          "estimated_general_uncached_credits": 0.70705,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 577,
+                "completion_tokens": 1241,
+                "total_tokens": 1818,
+                "cached_tokens": 0,
+                "reasoning_tokens": 911
+              },
+              "elapsed_seconds": 30.195,
+              "returned_model": "glm-5.3-flash"
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "glm-5.3-flash",
+          "case_id": "ko_summary_conditions_not_homework",
+          "feature": "summary",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "SummarizationError",
+          "error_code": "invalid_response",
+          "elapsed_seconds": 19.66,
+          "estimated_general_uncached_credits": 1.08565,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 671,
+                "completion_tokens": 1970,
+                "total_tokens": 2641,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1342
+              },
+              "elapsed_seconds": 19.66,
+              "returned_model": "glm-5.3-flash"
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "en_translation_late_bank_context",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 40.159,
+          "estimated_general_uncached_credits": 2.1502,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-bank-0",
+                "start": 0,
+                "end": 10,
+                "text": "강둑이 폭풍 후에 불안정해졌고, 상부가 수로 쪽으로 움직였다."
+              },
+              {
+                "id": "eval-bank-1",
+                "start": 10,
+                "end": 20,
+                "text": "폭우가 토양 입자 사이의 공극을 채우고 지반 내부의 힘을 변화시켰다."
+              },
+              {
+                "id": "eval-bank-2",
+                "start": 20,
+                "end": 30,
+                "text": "물이 사면 기저부 근처의 물질을 제거하여 위쪽 토양을 지지하는 힘을 줄였다."
+              },
+              {
+                "id": "eval-bank-3",
+                "start": 30,
+                "end": 40,
+                "text": "벽만으로는 이 문제를 해결할 수 없습니다. 물이 벽 뒤에 갇혀 배수되지 못하면."
+              },
+              {
+                "id": "eval-bank-4",
+                "start": 40,
+                "end": 50,
+                "text": "우리는 강을 따라 발생하는 침식에 대해 논의하고 있으며, 여기에는 수로의 형태와 퇴적물의 이동이 포함됩니다."
+              },
+              {
+                "id": "eval-bank-5",
+                "start": 50,
+                "end": 60,
+                "text": "첫 문장에서 bank는 돈을 빌려주는 금융 기관이 아니라 강가를 의미합니다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 359,
+                "completion_tokens": 344,
+                "total_tokens": 703,
+                "cached_tokens": 0,
+                "reasoning_tokens": 263
+              },
+              "elapsed_seconds": 5.217,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 364,
+                "completion_tokens": 338,
+                "total_tokens": 702,
+                "cached_tokens": 0,
+                "reasoning_tokens": 236
+              },
+              "elapsed_seconds": 4.833,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 465,
+                "completion_tokens": 2539,
+                "total_tokens": 3004,
+                "cached_tokens": 0,
+                "reasoning_tokens": 2450
+              },
+              "elapsed_seconds": 21.903,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 695,
+                "completion_tokens": 430,
+                "total_tokens": 1125,
+                "cached_tokens": 0,
+                "reasoning_tokens": 274
+              },
+              "elapsed_seconds": 3.911,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 698,
+                "completion_tokens": 434,
+                "total_tokens": 1132,
+                "cached_tokens": 0,
+                "reasoning_tokens": 273
+              },
+              "elapsed_seconds": 4.293,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "en_translation_numeric_negation",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 20.71,
+          "estimated_general_uncached_credits": 1.1714,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-conditions-0",
+                "start": 0,
+                "end": 10,
+                "text": "온도를 25 도로 유지하고 15 분 후 측정값을 기록하십시오."
+              },
+              {
+                "id": "eval-conditions-1",
+                "start": 10,
+                "end": 20,
+                "text": "센서가 보정되지 않은 경우, 두 시행을 비교하지 마십시오."
+              },
+              {
+                "id": "eval-conditions-2",
+                "start": 20,
+                "end": 30,
+                "text": "더 큰 측정값이 빛이 변화를 일으켰다는 것을 증명하지 않습니다. 수위는 동일해야 합니다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 365,
+                "completion_tokens": 1369,
+                "total_tokens": 1734,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1287
+              },
+              "elapsed_seconds": 12.309,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 654,
+                "completion_tokens": 1050,
+                "total_tokens": 1704,
+                "cached_tokens": 0,
+                "reasoning_tokens": 902
+              },
+              "elapsed_seconds": 8.4,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "glm-5.3-flash",
+          "case_id": "en_translation_late_bank_context",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "TranslationError",
+          "error_code": "invalid_response",
+          "elapsed_seconds": 24.905,
+          "estimated_general_uncached_credits": 0.99295,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 403,
+                "completion_tokens": 1865,
+                "total_tokens": 2268,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1243
+              },
+              "elapsed_seconds": 24.905,
+              "returned_model": "glm-5.3-flash"
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "qa_grounded_temperature_and_conditions",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 6.205,
+          "estimated_general_uncached_credits": 0.3618,
+          "output": {
+            "answerability": "answered",
+            "paragraphs": [
+              {
+                "text": "실험에서는 온도를 25도로 일정하게 유지했습니다.",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "text": "두 결과를 비교하려면 센서가 같은 위치에 있고 물의 양이 같아야 합니다.",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 539,
+                "completion_tokens": 635,
+                "total_tokens": 1174,
+                "cached_tokens": 0,
+                "reasoning_tokens": 533
+              },
+              "elapsed_seconds": 6.204,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "qa_related_but_missing_student_count",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 2.352,
+          "estimated_general_uncached_credits": 0.1672,
+          "output": {
+            "answerability": "insufficient_evidence",
+            "paragraphs": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 532,
+                "completion_tokens": 152,
+                "total_tokens": 684,
+                "cached_tokens": 0,
+                "reasoning_tokens": 131
+              },
+              "elapsed_seconds": 2.351,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "nonempty_evidence_for_model_abstention",
+              "passed": true
+            },
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "glm-5.3-flash",
+          "case_id": "en_translation_numeric_negation",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "TranslationError",
+          "error_code": "invalid_response",
+          "elapsed_seconds": 26.663,
+          "estimated_general_uncached_credits": 1.0457,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 408,
+                "completion_tokens": 1969,
+                "total_tokens": 2377,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1457
+              },
+              "elapsed_seconds": 26.663,
+              "returned_model": "glm-5.3-flash"
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "glm-5.3-flash",
+          "case_id": "qa_grounded_temperature_and_conditions",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "QuestionAnsweringError",
+          "error_code": "invalid_response",
+          "evidence_segments": 4,
+          "elapsed_seconds": 6.369,
+          "estimated_general_uncached_credits": 0.35015,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 631,
+                "completion_tokens": 511,
+                "total_tokens": 1142,
+                "cached_tokens": 0,
+                "reasoning_tokens": 355
+              },
+              "elapsed_seconds": 6.368,
+              "returned_model": "glm-5.3-flash"
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "glm-5.3-flash",
+          "case_id": "qa_related_but_missing_student_count",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 4.322,
+          "estimated_general_uncached_credits": 0.17285,
+          "output": {
+            "answerability": "insufficient_evidence",
+            "paragraphs": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 619,
+                "completion_tokens": 160,
+                "total_tokens": 779,
+                "cached_tokens": 0,
+                "reasoning_tokens": 143
+              },
+              "elapsed_seconds": 4.321,
+              "returned_model": "glm-5.3-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "nonempty_evidence_for_model_abstention",
+              "passed": true
+            },
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "glm-5.3",
+          "case_id": "ko_correction_constraints",
+          "feature": "correction",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "PostprocessingError",
+          "error_code": "invalid_response",
+          "elapsed_seconds": 51.768,
+          "estimated_general_uncached_credits": 12.899,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 577,
+                "completion_tokens": 2748,
+                "total_tokens": 3325,
+                "cached_tokens": 0,
+                "reasoning_tokens": 2358
+              },
+              "elapsed_seconds": 51.768,
+              "returned_model": "glm-5.3"
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "glm-5.3",
+          "case_id": "ko_summary_conditions_not_homework",
+          "feature": "summary",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "SummarizationError",
+          "error_code": "invalid_response",
+          "elapsed_seconds": 40.286,
+          "estimated_general_uncached_credits": 12.551,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 671,
+                "completion_tokens": 2639,
+                "total_tokens": 3310,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1924
+              },
+              "elapsed_seconds": 40.285,
+              "returned_model": "glm-5.3"
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "glm-5.3",
+          "case_id": "en_translation_late_bank_context",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "TranslationError",
+          "error_code": "gateway_unavailable",
+          "elapsed_seconds": 115.046,
+          "estimated_general_uncached_credits": null,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 403,
+                "completion_tokens": 1265,
+                "total_tokens": 1668,
+                "cached_tokens": 0,
+                "reasoning_tokens": 730
+              },
+              "elapsed_seconds": 28.734,
+              "returned_model": "glm-5.3"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 409,
+                "completion_tokens": 1222,
+                "total_tokens": 1631,
+                "cached_tokens": 320,
+                "reasoning_tokens": 778
+              },
+              "elapsed_seconds": 26.253,
+              "returned_model": "glm-5.3"
+            },
+            {
+              "usage": {},
+              "elapsed_seconds": 60.058
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "glm-5.3",
+          "case_id": "en_translation_numeric_negation",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "failed",
+          "error_type": "TranslationError",
+          "error_code": "invalid_response",
+          "elapsed_seconds": 61.977,
+          "estimated_general_uncached_credits": 17.603,
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 408,
+                "completion_tokens": 2242,
+                "total_tokens": 2650,
+                "cached_tokens": 320,
+                "reasoning_tokens": 1605
+              },
+              "elapsed_seconds": 41.587,
+              "returned_model": "glm-5.3"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 1197,
+                "completion_tokens": 1248,
+                "total_tokens": 2445,
+                "cached_tokens": 128,
+                "reasoning_tokens": 1091
+              },
+              "elapsed_seconds": 20.389,
+              "returned_model": "glm-5.3"
+            }
+          ],
+          "hard_checks": [],
+          "hard_pass": false
+        },
+        {
+          "model": "glm-5.3",
+          "case_id": "qa_grounded_temperature_and_conditions",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 11.606,
+          "estimated_general_uncached_credits": 3.8182,
+          "output": {
+            "answerability": "answered",
+            "paragraphs": [
+              {
+                "text": "실험에서는 온도를 25도로 일정하게 유지했습니다. 그리고 빛의 세기만 바꾸었으므로, 온도는 고정된 조건으로 두고 빛의 세기 변화에 따른 결과만 관찰한 것입니다.",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "text": "두 결과를 비교하려면 센서가 같은 위치에 있어야 하고 물의 양도 같아야 합니다. 이 두 조건이 같을 때만 두 결과를 비교할 수 있다고 되어 있습니다.",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 631,
+                "completion_tokens": 667,
+                "total_tokens": 1298,
+                "cached_tokens": 0,
+                "reasoning_tokens": 495
+              },
+              "elapsed_seconds": 11.605,
+              "returned_model": "glm-5.3"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "glm-5.3",
+          "case_id": "qa_related_but_missing_student_count",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 7.479,
+          "estimated_general_uncached_credits": 2.3802,
+          "output": {
+            "answerability": "insufficient_evidence",
+            "paragraphs": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 619,
+                "completion_tokens": 344,
+                "total_tokens": 963,
+                "cached_tokens": 384,
+                "reasoning_tokens": 327
+              },
+              "elapsed_seconds": 7.478,
+              "returned_model": "glm-5.3"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "nonempty_evidence_for_model_abstention",
+              "passed": true
+            },
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        }
+      ]
+    },
+    {
+      "label": "repeat_with_hardened_correction_parser",
+      "metadata": {
+        "type": "metadata",
+        "created_at": "2026-09-07T13:20:33.909207+00:00",
+        "dataset_version": 1,
+        "models": [
+          "gpt-5.6-luna",
+          "deepseek-v4-flash"
+        ],
+        "repeats": 1,
+        "max_calls": 24,
+        "workers": 2,
+        "automatic_retries": 0,
+        "price_unit": "credits per 1000 tokens; general tariff, NOT verified school debit",
+        "price_source": "https://docs.mindlogic.ai/docs/general/factchat/product/model-credits",
+        "prices": {
+          "solar-pro4": [
+            0.3,
+            1.2
+          ],
+          "gpt-5.6-luna": [
+            0.2,
+            1.2
+          ],
+          "deepseek-v4-flash": [
+            0.2,
+            0.4
+          ],
+          "glm-5.3-flash": [
+            0.15,
+            0.5
+          ],
+          "glm-5.3": [
+            1.4,
+            4.4
+          ]
+        },
+        "rubric": {
+          "priority": [
+            "형식·출처·구간·숫자 검사에 실패한 결과는 품질 비교에서 먼저 제외한다.",
+            "원문의 부정, 조건, 원인과 상관의 구별을 보존하는지 사람이 확인한다.",
+            "뒤쪽 문맥의 반영과 근거가 없는 질문의 답변 유보를 확인한다.",
+            "위 항목을 통과한 모델끼리 한국어 가독성, 지연, 실제 호출 수와 비용을 비교한다."
+          ],
+          "semantic_ratings": {
+            "pass": "필수 의미를 보존하며 원문에 없는 사실을 덧붙이지 않는다.",
+            "partial": "틀린 사실은 없으나 질문에 필요한 설명이나 핵심 조건을 일부 빠뜨린다.",
+            "fail": "부정·조건을 뒤집거나, 문맥을 오역하거나, 근거 없는 사실을 답한다."
+          },
+          "limitations": [
+            "단어 검출 신호만으로 의미 정확도를 판정하거나 합산 점수를 만들지 않는다.",
+            "한 번의 성공이나 짧은 합성 예문의 결과로 모든 전공·긴 수업의 품질을 보장하지 않는다.",
+            "원문에 없는 수치를 추론·계산해 보충하거나 평가용 AI 심판을 추가하지 않는다.",
+            "모든 후보에 같은 입력과 파이프라인 설정을 쓰고 형식 실패·호출 실패도 결과에 남긴다."
+          ]
+        }
+      },
+      "complete": {
+        "type": "complete",
+        "http_requests": 22,
+        "wall_seconds": 102.282
+      },
+      "cases": [
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "ko_correction_constraints",
+          "feature": "correction",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 4.493,
+          "estimated_general_uncached_credits": 0.4294,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-korean-0",
+                "start": 0,
+                "end": 10,
+                "text": "오늘은 통제 변수를 살펴봅니다. 온도는 25도로 일정하게 유지했어요."
+              },
+              {
+                "id": "eval-korean-1",
+                "start": 10,
+                "end": 20,
+                "text": "빛의 세기만 바꿨지, 온도를 바꾼 건 아닙니다."
+              },
+              {
+                "id": "eval-korean-2",
+                "start": 20,
+                "end": 30,
+                "text": "빛을 더 세게 했을 때 기포 수가 늘었다고 해도, 그것만으로 원인이 증명되는 건 아니에요."
+              },
+              {
+                "id": "eval-korean-3",
+                "start": 30,
+                "end": 40,
+                "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있어요."
+              },
+              {
+                "id": "eval-korean-4",
+                "start": 40,
+                "end": 50,
+                "text": "다음 시간에는 같은 방법으로 다시 측정할 수 있지만, 과제로 제출하라는 뜻은 아닙니다."
+              }
+            ],
+            "uncertain_terms": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 533,
+                "completion_tokens": 269,
+                "total_tokens": 802,
+                "cached_tokens": 0,
+                "reasoning_tokens": 60
+              },
+              "elapsed_seconds": 4.492,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "segment_identity_time_order",
+              "passed": true
+            },
+            {
+              "name": "per_segment_protected_values",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "ko_summary_conditions_not_homework",
+          "feature": "summary",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 4.785,
+          "estimated_general_uncached_credits": 0.635,
+          "output": {
+            "overview": "실험에서 빛의 세기만 변화시키고 온도는 일정하게 유지했으며, 관찰 결과를 해석할 때 원인 단정과 비교 조건에 주의해야 합니다.",
+            "overview_source_ids": [
+              "eval-lesson-0",
+              "eval-lesson-1",
+              "eval-lesson-2"
+            ],
+            "sections": [
+              {
+                "heading": "실험 조건",
+                "bullets": [
+                  {
+                    "text": "실험에서는 빛의 세기만 바꾸고 온도를 25도로 일정하게 유지했습니다.",
+                    "source_ids": [
+                      "eval-lesson-0"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "관찰과 해석",
+                "bullets": [
+                  {
+                    "text": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수는 없습니다.",
+                    "source_ids": [
+                      "eval-lesson-1"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "결과 비교",
+                "bullets": [
+                  {
+                    "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있습니다.",
+                    "source_ids": [
+                      "eval-lesson-2"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "반복 측정",
+                "bullets": [
+                  {
+                    "text": "다음 시간에 같은 방법으로 다시 측정할 수 있지만, 과제로 제출하라는 뜻은 아닙니다.",
+                    "source_ids": [
+                      "eval-lesson-3"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "review_questions": [
+              {
+                "question": "실험에서 바꾼 조건과 일정하게 유지한 조건은 무엇인가요?",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "question": "두 결과를 비교하려면 어떤 조건이 같아야 하나요?",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              },
+              {
+                "question": "기포 수가 늘었다는 관찰만으로 무엇을 단정할 수 없나요?",
+                "source_ids": [
+                  "eval-lesson-1"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 673,
+                "completion_tokens": 417,
+                "total_tokens": 1090,
+                "cached_tokens": 0,
+                "reasoning_tokens": 61
+              },
+              "elapsed_seconds": 4.782,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_summary_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "ko_correction_constraints",
+          "feature": "correction",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 15.891,
+          "estimated_general_uncached_credits": 0.869,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-korean-0",
+                "start": 0,
+                "end": 10,
+                "text": "오늘은 통제 변수를 살펴봅니다. 온도는 25도로 일정하게 유지했어요.✅"
+              },
+              {
+                "id": "eval-korean-1",
+                "start": 10,
+                "end": 20,
+                "text": "빛의 세기만 바꿨지, 온도를 바꾼 건 아닙니다.✅"
+              },
+              {
+                "id": "eval-korean-2",
+                "start": 20,
+                "end": 30,
+                "text": "빛을 더 세게 했을 때 기포 수가 늘었다고 해도, 그것만으로 원인이 증명되는 건 아니에요.✅"
+              },
+              {
+                "id": "eval-korean-3",
+                "start": 30,
+                "end": 40,
+                "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있어요.✅"
+              },
+              {
+                "id": "eval-korean-4",
+                "start": 40,
+                "end": 50,
+                "text": "다음 시간에는 같은 방법으로 다시 측정할 수 있지만, 과제로 제출하라는 뜻은 아닙니다.✅"
+              }
+            ],
+            "uncertain_terms": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 519,
+                "completion_tokens": 1913,
+                "total_tokens": 2432,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1686
+              },
+              "elapsed_seconds": 15.89,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "segment_identity_time_order",
+              "passed": true
+            },
+            {
+              "name": "per_segment_protected_values",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "en_translation_late_bank_context",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 15.644,
+          "estimated_general_uncached_credits": 1.8512,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-bank-0",
+                "start": 0,
+                "end": 10,
+                "text": "폭풍 뒤 물길 가장자리의 지반이 불안정해졌고, 위쪽 부분이 수로 쪽으로 이동했다."
+              },
+              {
+                "id": "eval-bank-1",
+                "start": 10,
+                "end": 20,
+                "text": "많은 비가 토양 입자 사이의 공극을 물로 채우고 지반 내부의 힘을 변화시켰다."
+              },
+              {
+                "id": "eval-bank-2",
+                "start": 20,
+                "end": 30,
+                "text": "물이 경사면의 바닥 근처에서 물질을 제거하여, 그 위의 토양을 지지하는 부분이 줄어들었다."
+              },
+              {
+                "id": "eval-bank-3",
+                "start": 30,
+                "end": 40,
+                "text": "물이 벽 뒤에 갇혀 빠져나가지 못한다면 벽만으로는 이 문제를 해결할 수 없습니다."
+              },
+              {
+                "id": "eval-bank-4",
+                "start": 40,
+                "end": 50,
+                "text": "우리는 강을 따라 발생하는 침식에 대해 논의하고 있으며, 여기에는 강의 수로 형태와 퇴적물의 이동이 포함됩니다."
+              },
+              {
+                "id": "eval-bank-5",
+                "start": 50,
+                "end": 60,
+                "text": "첫 문장에서 bank는 돈을 빌려주는 금융기관이 아니라 강의 가장자리를 의미합니다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 363,
+                "completion_tokens": 248,
+                "total_tokens": 611,
+                "cached_tokens": 0,
+                "reasoning_tokens": 60
+              },
+              "elapsed_seconds": 3.572,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 369,
+                "completion_tokens": 157,
+                "total_tokens": 526,
+                "cached_tokens": 0,
+                "reasoning_tokens": 30
+              },
+              "elapsed_seconds": 2.685,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 583,
+                "completion_tokens": 323,
+                "total_tokens": 906,
+                "cached_tokens": 0,
+                "reasoning_tokens": 61
+              },
+              "elapsed_seconds": 3.073,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 873,
+                "completion_tokens": 131,
+                "total_tokens": 1004,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 3.016,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 876,
+                "completion_tokens": 173,
+                "total_tokens": 1049,
+                "cached_tokens": 0,
+                "reasoning_tokens": 43
+              },
+              "elapsed_seconds": 3.294,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "en_translation_numeric_negation",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 5.115,
+          "estimated_general_uncached_credits": 0.5842,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-conditions-0",
+                "start": 0,
+                "end": 10,
+                "text": "온도를 25도로 유지하고 15분 후 측정값을 기록한다."
+              },
+              {
+                "id": "eval-conditions-1",
+                "start": 10,
+                "end": 20,
+                "text": "센서가 보정되지 않은 경우에는 두 실험의 측정값을 비교하지 않는다."
+              },
+              {
+                "id": "eval-conditions-2",
+                "start": 20,
+                "end": 30,
+                "text": "더 큰 측정값만으로 빛이 변화를 일으켰다고 입증할 수 없으며, 물의 수위는 동일하게 유지해야 한다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 368,
+                "completion_tokens": 190,
+                "total_tokens": 558,
+                "cached_tokens": 0,
+                "reasoning_tokens": 80
+              },
+              "elapsed_seconds": 2.882,
+              "returned_model": "gpt-5.6-luna"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 687,
+                "completion_tokens": 121,
+                "total_tokens": 808,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 2.231,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "ko_summary_conditions_not_homework",
+          "feature": "summary",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 15.105,
+          "estimated_general_uncached_credits": 0.7868,
+          "output": {
+            "overview": "실험 조건과 관찰 해석의 주의점, 비교 가능 조건, 재측정에 관한 내용.",
+            "overview_source_ids": [
+              "eval-lesson-0",
+              "eval-lesson-1",
+              "eval-lesson-2",
+              "eval-lesson-3"
+            ],
+            "sections": [
+              {
+                "heading": "실험 조건 설정",
+                "bullets": [
+                  {
+                    "text": "실험에서는 빛의 세기만 바꾸고 온도를 25도로 일정하게 유지했습니다.",
+                    "source_ids": [
+                      "eval-lesson-0"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "인과 추론의 한계",
+                "bullets": [
+                  {
+                    "text": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수는 없습니다.",
+                    "source_ids": [
+                      "eval-lesson-1"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "비교 가능 조건",
+                "bullets": [
+                  {
+                    "text": "센서가 같은 위치에 있고 물의 양도 같을 때만 두 결과를 비교할 수 있습니다.",
+                    "source_ids": [
+                      "eval-lesson-2"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "재측정 가능성과 과제 제출 의미",
+                "bullets": [
+                  {
+                    "text": "다음 시간에 같은 방법으로 다시 측정할 수 있지만 과제로 제출하라는 뜻은 아닙니다.",
+                    "source_ids": [
+                      "eval-lesson-3"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "review_questions": [
+              {
+                "question": "실험에서 빛의 세기 외에 일정하게 유지한 조건은 무엇인가?",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "question": "기포 수가 늘었다는 관찰만으로 빛이 원인이라고 단정할 수 없는 이유는 무엇인가?",
+                "source_ids": [
+                  "eval-lesson-1"
+                ]
+              },
+              {
+                "question": "두 결과를 비교하기 위해 필요한 조건은 무엇인가?",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 584,
+                "completion_tokens": 1675,
+                "total_tokens": 2259,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1192
+              },
+              "elapsed_seconds": 15.103,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_summary_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "qa_grounded_temperature_and_conditions",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 2.151,
+          "estimated_general_uncached_credits": 0.2208,
+          "output": {
+            "answerability": "answered",
+            "paragraphs": [
+              {
+                "text": "실험에서는 빛의 세기만 바꾸고 온도를 25도로 일정하게 유지했습니다.",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "text": "두 결과를 비교하려면 센서가 같은 위치에 있고 물의 양도 같아야 합니다.",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 588,
+                "completion_tokens": 86,
+                "total_tokens": 674,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 2.15,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "case_id": "qa_related_but_missing_student_count",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 1.398,
+          "estimated_general_uncached_credits": 0.1402,
+          "output": {
+            "answerability": "insufficient_evidence",
+            "paragraphs": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 581,
+                "completion_tokens": 20,
+                "total_tokens": 601,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "elapsed_seconds": 1.397,
+              "returned_model": "gpt-5.6-luna"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "nonempty_evidence_for_model_abstention",
+              "passed": true
+            },
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "en_translation_late_bank_context",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 46.152,
+          "estimated_general_uncached_credits": 2.4052,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-bank-0",
+                "start": 0,
+                "end": 10,
+                "text": "폭풍 후 제방이 불안정해졌고, 상부가 수로 방향으로 이동했다."
+              },
+              {
+                "id": "eval-bank-1",
+                "start": 10,
+                "end": 20,
+                "text": "폭우가 토양 입자 사이의 공극을 채우고 지반 내부의 힘을 변화시켰다."
+              },
+              {
+                "id": "eval-bank-2",
+                "start": 20,
+                "end": 30,
+                "text": "물이 사면 기저부 근처의 물질을 제거하여, 그 위 토양에 대한 지지가 줄어들었다."
+              },
+              {
+                "id": "eval-bank-3",
+                "start": 30,
+                "end": 40,
+                "text": "벽만으로는 물이 벽 뒤에 갇혀 배수되지 못하는 이 문제를 해결할 수 없습니다."
+              },
+              {
+                "id": "eval-bank-4",
+                "start": 40,
+                "end": 50,
+                "text": "우리는 강을 따라 발생하는 침식에 대해 논의하고 있으며, 여기에는 수로의 형태와 퇴적물의 이동이 포함됩니다."
+              },
+              {
+                "id": "eval-bank-5",
+                "start": 50,
+                "end": 60,
+                "text": "첫 문장에서 bank는 돈을 빌려주는 사업체가 아닌 강둑을 의미합니다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 359,
+                "completion_tokens": 1229,
+                "total_tokens": 1588,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1119
+              },
+              "elapsed_seconds": 12.393,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 364,
+                "completion_tokens": 947,
+                "total_tokens": 1311,
+                "cached_tokens": 0,
+                "reasoning_tokens": 810
+              },
+              "elapsed_seconds": 10.28,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 532,
+                "completion_tokens": 1656,
+                "total_tokens": 2188,
+                "cached_tokens": 0,
+                "reasoning_tokens": 1452
+              },
+              "elapsed_seconds": 14.714,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 810,
+                "completion_tokens": 459,
+                "total_tokens": 1269,
+                "cached_tokens": 0,
+                "reasoning_tokens": 306
+              },
+              "elapsed_seconds": 4.938,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 813,
+                "completion_tokens": 283,
+                "total_tokens": 1096,
+                "cached_tokens": 0,
+                "reasoning_tokens": 154
+              },
+              "elapsed_seconds": 3.824,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "en_translation_numeric_negation",
+          "feature": "translation",
+          "repeat": 1,
+          "status": "completed",
+          "elapsed_seconds": 17.391,
+          "estimated_general_uncached_credits": 0.9446,
+          "output": {
+            "segments": [
+              {
+                "id": "eval-conditions-0",
+                "start": 0,
+                "end": 10,
+                "text": "온도를 25도로 유지하고 15분 후 측정값을 기록한다."
+              },
+              {
+                "id": "eval-conditions-1",
+                "start": 10,
+                "end": 20,
+                "text": "센서가 보정되지 않았으면 두 실험을 비교하지 않는다."
+              },
+              {
+                "id": "eval-conditions-2",
+                "start": 20,
+                "end": 30,
+                "text": "측정값이 더 크다고 해서 빛이 변화를 일으켰다는 증거는 아니며, 수위는 동일해야 한다."
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 365,
+                "completion_tokens": 1030,
+                "total_tokens": 1395,
+                "cached_tokens": 0,
+                "reasoning_tokens": 941
+              },
+              "elapsed_seconds": 10.705,
+              "returned_model": "deepseek-v4-flash"
+            },
+            {
+              "usage": {
+                "prompt_tokens": 660,
+                "completion_tokens": 819,
+                "total_tokens": 1479,
+                "cached_tokens": 0,
+                "reasoning_tokens": 672
+              },
+              "elapsed_seconds": 6.684,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_translation_validator",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "qa_grounded_temperature_and_conditions",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 4.839,
+          "estimated_general_uncached_credits": 0.2958,
+          "output": {
+            "answerability": "answered",
+            "paragraphs": [
+              {
+                "text": "실험에서 온도는 25도로 일정하게 유지했습니다.",
+                "source_ids": [
+                  "eval-lesson-0"
+                ]
+              },
+              {
+                "text": "두 결과를 비교하려면 센서가 같은 위치에 있고 물의 양이 같아야 합니다.",
+                "source_ids": [
+                  "eval-lesson-2"
+                ]
+              }
+            ]
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 539,
+                "completion_tokens": 470,
+                "total_tokens": 1009,
+                "cached_tokens": 0,
+                "reasoning_tokens": 367
+              },
+              "elapsed_seconds": 4.838,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "case_id": "qa_related_but_missing_student_count",
+          "feature": "question_answering",
+          "repeat": 1,
+          "status": "completed",
+          "evidence_segments": 4,
+          "elapsed_seconds": 2.742,
+          "estimated_general_uncached_credits": 0.1684,
+          "output": {
+            "answerability": "insufficient_evidence",
+            "paragraphs": []
+          },
+          "calls": [
+            {
+              "usage": {
+                "prompt_tokens": 532,
+                "completion_tokens": 155,
+                "total_tokens": 687,
+                "cached_tokens": 0,
+                "reasoning_tokens": 139
+              },
+              "elapsed_seconds": 2.741,
+              "returned_model": "deepseek-v4-flash"
+            }
+          ],
+          "hard_checks": [
+            {
+              "name": "nonempty_evidence_for_model_abstention",
+              "passed": true
+            },
+            {
+              "name": "production_answer_validator",
+              "passed": true
+            },
+            {
+              "name": "expected_answerability",
+              "passed": true
+            }
+          ],
+          "hard_pass": true
+        }
+      ]
+    }
+  ]
+}

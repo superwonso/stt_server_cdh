@@ -2,7 +2,7 @@ import { MicrophoneCapture } from './audio.js';
 import { renderDriveStatus } from './admin-storage.js';
 import { renderMaintenanceStatus } from './admin-maintenance.js';
 import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';
-import { lectureTitle, filterLibrary, libraryOptions, validMetadata, validLibrarySearch } from './lecture-library.js';
+import { lectureTitle, libraryOptions, validMetadata, validLibrarySearch } from './lecture-library.js';
 import { validManualState, manualSegments, validManualHistory } from './manual-notes.js';
 import { validQuestionJob, validQuestionPage } from './lecture-questions.js';
 import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';
@@ -44,7 +44,7 @@ let importStarting = false, importCancelling = false, importPromise = null, impo
 let importLectureRequest = null, lastImportLectureRefresh = 0, selectImportLecture = false;
 let lectureRefreshGeneration = 0, importLectureSequence = 0;
 let lectureDateFilter = '', recordingDownloadPending = false, recordingFinalizePending = false;
-let libraryCourse = '', librarySemester = '', librarySearchSequence = 0, librarySearchAbort = null;
+let librarySearchSequence = 0, librarySearchAbort = null;
 let librarySearchPage = null, librarySearchQuery = null, metadataScope = '', metadataRevision = null, metadataAbort = null;
 let trashSequence = 0, trashAbort = null, trashRows = [], trashBusy = false, purgeTarget = null;
 let manualView = {scope:'',row:null,loaded:false,busy:false,error:'',pending:null,noteId:'',noteSegment:null,editSegment:'',rendered:''};
@@ -2030,7 +2030,7 @@ async function selectLecture(lecture) {
   } catch (error) { notice(errorText(error)); }
 }
 function renderHistory() {
-  renderLibraryFilters();
+  renderMetadataSuggestions();
   const dateCounts = new Map();
   for (const lecture of lectures) {
     const key = dateKey(lecture.created_at);
@@ -2046,9 +2046,8 @@ function renderHistory() {
   }
   dateSelect.value = lectureDateFilter;
 
-  const classified = filterLibrary(lectures,{course:libraryCourse,semester:librarySemester});
-  const visible = lectureDateFilter ? classified.filter(lecture => dateKey(lecture.created_at) === lectureDateFilter) : classified;
-  const filtered = !!(lectureDateFilter || libraryCourse || librarySemester);
+  const visible = lectureDateFilter ? lectures.filter(lecture => dateKey(lecture.created_at) === lectureDateFilter) : lectures;
+  const filtered = !!lectureDateFilter;
   $('lecture-count').textContent = filtered ? `${visible.length}/${lectures.length}` : lectures.length;
   $('lecture-count').ariaLabel = filtered ? `선택한 조건의 수업 ${visible.length}개, 전체 ${lectures.length}개` : `저장된 수업 ${lectures.length}개`;
   const list = $('lecture-list'); list.replaceChildren();
@@ -2103,32 +2102,23 @@ function resetLibraryWorkspace() {
   resetTrashWorkspace();
   ++librarySearchSequence; librarySearchAbort?.abort(); librarySearchAbort = null;
   metadataAbort?.abort(); metadataAbort = null; metadataScope = ''; metadataRevision = null;
-  libraryCourse = ''; librarySemester = ''; librarySearchPage = null; librarySearchQuery = null;
+  librarySearchPage = null; librarySearchQuery = null;
   for (const id of ['library-search-dialog','metadata-dialog']) if ($(id).open) $(id).close();
   for (const id of ['library-query','metadata-title','metadata-course','metadata-semester']) $(id).value = '';
+  for (const id of ['course-options','semester-options']) $(id).replaceChildren();
   $('library-search-results').replaceChildren(); $('library-search-state').textContent = '';
   $('library-search-filter').textContent = ''; $('metadata-state').textContent = '';
   $('metadata-save').disabled = true;
 }
-function renderLibraryFilters() {
+function renderMetadataSuggestions() {
   for (const field of ['course','semester']) {
-    const options = libraryOptions(lectures,field), selected = field === 'course' ? libraryCourse : librarySemester;
-    const select = $(`library-${field}`), suggestions = $(`${field}-options`);
-    select.replaceChildren(); suggestions.replaceChildren();
-    const all = document.createElement('option'); all.value = ''; all.textContent = field === 'course' ? '전체 과목' : '전체 학기'; select.append(all);
-    for (const value of options) {
-      const option = document.createElement('option'); option.value = value; option.textContent = value; select.append(option);
+    const suggestions = $(`${field}-options`);
+    suggestions.replaceChildren();
+    for (const value of libraryOptions(lectures,field)) {
       const suggestion = document.createElement('option'); suggestion.value = value; suggestions.append(suggestion);
     }
-    select.value = options.includes(selected) ? selected : '';
-    if (field === 'course') libraryCourse = select.value; else librarySemester = select.value;
-    select.disabled = historyNavigationBusy();
   }
 }
-for (const field of ['course','semester']) $(`library-${field}`).onchange = () => {
-  if (field === 'course') libraryCourse = $('library-course').value; else librarySemester = $('library-semester').value;
-  renderHistory();
-};
 function metadataIsCurrent(scope, id, controller = null) { return metadataScope === scope && scope === libraryAuthScope() && !!token && current?.id === id && $('metadata-dialog').open && (!controller || metadataAbort === controller); }
 $('metadata-open').onclick = async () => {
   if (!token || !current?.recording_finalized || historyNavigationBusy()) return;
@@ -2174,7 +2164,7 @@ $('library-search-open').onclick = () => {
   librarySearchPage = null; librarySearchQuery = null;
   $('library-search-results').replaceChildren(); $('library-search-state').textContent = '검색어를 입력하거나 빈 검색으로 수업 이름을 찾아보세요.';
   $('library-search-prev').disabled = true; $('library-search-next').disabled = true;
-  $('library-search-filter').textContent = [librarySemester || '전체 학기',libraryCourse || '전체 과목','날짜 제한 없이 검색'].join(' · ');
+  $('library-search-filter').textContent = '내 모든 수업 · 날짜 제한 없이 검색';
   $('library-search-dialog').showModal(); $('library-query').focus();
 };
 function closeLibrarySearch() { ++librarySearchSequence; librarySearchAbort?.abort(); librarySearchAbort = null; $('library-search-dialog').close(); }
@@ -2185,8 +2175,10 @@ async function searchLibrary(offset = 0, reuse = false) {
   librarySearchAbort?.abort(); const controller = new AbortController(); librarySearchAbort = controller;
   const sequence = ++librarySearchSequence, scope = libraryAuthScope();
   const isCurrent = () => sequence === librarySearchSequence && scope === libraryAuthScope() && !!token && $('library-search-dialog').open;
-  if (!reuse || !librarySearchQuery) librarySearchQuery = {q:$('library-query').value.trim().slice(0,120),source:$('library-source').value || 'all',course:libraryCourse,semester:librarySemester};
-  const params = new URLSearchParams({...librarySearchQuery,offset:String(offset),limit:'20'});
+  if (!reuse || !librarySearchQuery) librarySearchQuery = {q:$('library-query').value.trim().slice(0,120),source:$('library-source').value || 'all'};
+  // Only explicit search controls may reach the API, including paged retries.
+  // Stored classification metadata must never become an invisible filter.
+  const params = new URLSearchParams({q:librarySearchQuery.q,source:librarySearchQuery.source,offset:String(offset),limit:'20'});
   librarySearchPage = null; $('library-search-results').replaceChildren();
   $('library-search-state').textContent = '내 수업에서 검색하고 있어요…';
   $('library-search-next').disabled = true; $('library-search-prev').disabled = true;
@@ -4122,7 +4114,6 @@ function updateControls() {
     : '음성과 받아쓰기 결과는 현재 녹음 수업에만 저장되며, 이 PC의 Qwen으로 계속 처리됩니다.';
   $('return-live-capture').disabled = !stableLiveCapture();
   $('lecture-date').disabled = historyNavigationBusy();
-  $('library-course').disabled = historyNavigationBusy(); $('library-semester').disabled = historyNavigationBusy();
   $('library-search-open').disabled = historyNavigationBusy();
   $('trash-open').disabled = historyNavigationBusy();
   $('metadata-open').disabled = historyNavigationBusy() || !current?.recording_finalized;

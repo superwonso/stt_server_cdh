@@ -98,7 +98,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
             self.assertFalse(request.url.params)
             body = json.loads(request.content)
             requests.append(body)
-            self.assertEqual(body["model"], "solar-pro4")
+            self.assertEqual(body["model"], "gpt-5.6-luna")
             self.assertEqual(body["response_format"]["type"], "json_schema")
             user_data = json.loads(body["messages"][1]["content"])
             self.assertNotIn("lecture_title", user_data)
@@ -287,6 +287,80 @@ class MindlogicPostprocessorTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "protected_content_changed")
         client.close()
+
+    def test_incomplete_refused_and_multiple_choice_responses_fail_closed(self):
+        content = json.dumps({"segments": [{"id": "s1", "text": "정상 문장입니다."}], "uncertain_terms": []})
+        valid = {"finish_reason": "stop", "message": {"content": content}}
+        cases = {
+            "length": {"choices": [{**valid, "finish_reason": "length"}]},
+            "content_filter": {"choices": [{**valid, "finish_reason": "content_filter"}]},
+            "tool_calls": {"choices": [{**valid, "finish_reason": "tool_calls"}]},
+            "refusal": {"choices": [{**valid, "message": {"content": content, "refusal": "provider-private-refusal"}}]},
+            "multiple_choices": {"choices": [valid, valid]},
+            "empty_choices": {"choices": []},
+            "non_list_choices": {"choices": {"0": valid}},
+            "non_object_choice": {"choices": [None]},
+            "non_object_message": {"choices": [{"message": [content]}]},
+        }
+        for name, envelope in cases.items():
+            with self.subTest(case=name):
+                calls = []
+
+                def handler(request):
+                    calls.append(request)
+                    return httpx.Response(200, json=envelope)
+
+                source = [{"id": "s1", "start": 0, "end": 1, "text": "정상 문장입니다."}]
+                with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                    processor = MindlogicPostprocessor(self.settings(correction_max_retries=3), client)
+                    with self.assertRaises(PostprocessingError) as raised:
+                        processor.correct(title="", language="ko", segments=source)
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertNotIn("provider-private", str(raised.exception))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(source[0]["text"], "정상 문장입니다.")
+
+    def test_duplicate_json_keys_and_nonstandard_constants_fail_closed(self):
+        # Each duplicate has a valid last value, so ordinary json.loads would
+        # silently discard the earlier value and accept the correction.
+        item = '{"id":"s1","text":"정상 문장입니다."}'
+        contents = {
+            "root": '{"segments":[],"segments":[' + item + '],"uncertain_terms":[]}',
+            "id": '{"segments":[{"id":"wrong","id":"s1","text":"정상 문장입니다."}],"uncertain_terms":[]}',
+            "text": '{"segments":[{"id":"s1","text":"provider-private-text","text":"정상 문장입니다."}],"uncertain_terms":[]}',
+            "uncertain_terms": '{"segments":[' + item + '],"uncertain_terms":["provider-private-text"],"uncertain_terms":[]}',
+        }
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            contents[constant] = '{"segments":[' + item + '],"uncertain_terms":[' + constant + ']}'
+        for name, content in contents.items():
+            with self.subTest(case=name):
+                calls = []
+
+                def handler(request):
+                    calls.append(request)
+                    return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
+
+                with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                    processor = MindlogicPostprocessor(self.settings(), client)
+                    with self.assertRaises(PostprocessingError) as raised:
+                        processor.correct(title="", language="ko", segments=[{
+                            "id": "s1", "start": 0, "end": 1, "text": "정상 문장입니다."}])
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertNotIn("provider-private", str(raised.exception))
+                self.assertEqual(len(calls), 1)
+
+    def test_stop_and_legacy_missing_finish_reason_preserve_valid_corrections(self):
+        content = json.dumps({"segments": [{"id": "s1", "text": "정상 문장입니다."}], "uncertain_terms": []})
+        for fields in ({}, {"finish_reason": None}, {"finish_reason": "stop"}):
+            with self.subTest(fields=fields):
+                def handler(request):
+                    return httpx.Response(200, json={"choices": [{**fields, "message": {"content": content, "refusal": None}}]})
+
+                with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                    result = MindlogicPostprocessor(self.settings(), client).correct(
+                        title="", language="ko", segments=[{"id": "s1", "start": 0, "end": 1, "text": "정상 문장입니다."}])
+                self.assertEqual(result.segments, [{"id": "s1", "start": 0, "end": 1, "text": "정상 문장입니다."}])
+                self.assertEqual(result.uncertain_terms, [])
 
 
 if __name__ == "__main__":

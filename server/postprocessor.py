@@ -532,18 +532,31 @@ class MindlogicPostprocessor:
 
     @staticmethod
     def _parse_response(response: dict[str, Any]) -> dict[str, Any]:
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        def reject_constant(value):
+            raise ValueError("invalid JSON constant")
+
         try:
             choices = response["choices"]
-            message = choices[0]["message"]
+            if not isinstance(choices, list) or len(choices) != 1:
+                raise ValueError("invalid choices")
+            choice = choices[0]
+            if choice.get("finish_reason") not in (None, "stop"):
+                raise ValueError("incomplete output")
+            message = choice["message"]
             content = message["content"]
-        except (KeyError, IndexError, TypeError) as error:
-            raise MindlogicPostprocessor._invalid_response() from error
-        if not isinstance(content, str) or len(content) > 2_000_000:
-            raise MindlogicPostprocessor._invalid_response()
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as error:
-            raise MindlogicPostprocessor._invalid_response() from error
+            if message.get("refusal") or not isinstance(content, str) or len(content) > 2_000_000:
+                raise ValueError("invalid message")
+            parsed = json.loads(content, object_pairs_hook=unique_object, parse_constant=reject_constant)
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError, RecursionError):
+            raise MindlogicPostprocessor._invalid_response() from None
         if not isinstance(parsed, dict) or set(parsed) != {"segments", "uncertain_terms"}:
             raise MindlogicPostprocessor._invalid_response()
         return parsed
