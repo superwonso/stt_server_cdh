@@ -628,9 +628,20 @@ CLOVA 수업은 외부 gRPC 응답을 기다리므로 로컬 GPU 대기와 별�
 
 ## 테스트와 로컬 벤치마크
 
+### 사용자별 보관 현황·복구 통합 배포 검증
+
+2026-09-08 Python749개·Node346개(총1,095개), 실제 격리 Chromium 사용량5개·복구5개 묶음을 통과했다. 공개 Chromium의1365px/390px 확인과 자산16개 소스 일치, 외부 인증/CORS, schema18→19 이전 및 기존22개 테이블 보존도 확인했다. 구현 커밋 `7813e4b`의 Pages 게시와 API 재시작은 사용자가 지정한13:30 전에 완료했다. 최신 상세 결과와 미검증 범위는 HANDOFF를 따른다.
+
+```bash
+node scripts/validate_usage_browser.mjs --sandbox /tmp/stt-browser-check.EXAMPLE
+node scripts/validate_recovery_browser.mjs --sandbox /tmp/stt-browser-check.EXAMPLE
+```
+
+두 검증기는 지정한 전용 `/tmp` 환경의 Playwright·Chromium을 사용한다. 임시 합성 계정·DB·가짜 ASR/AI만 사용하고 운영 설정을 읽지 않는다.
+
 ### 관리자 발급형 복구 격리 검증
 
-2026-09-08 Python729개·Node336개 및 실제 Chromium의 복구5개 묶음을 통과했다. 실제 계정·운영 DB·유료 API를 사용하지 않았으며 서버 재시작·Pages 배포는 보류했다. 상세 범위와 초기 검증기 보완은 HANDOFF 최신 절을 따른다. 다음 명령은 지정한 `/tmp/stt-browser-check.*`에 Playwright·Chromium이 준비된 경우 별도 임시 포트·합성 계정으로 실행하고 종료한다. 운영 설정을 읽지 않는다.
+같은 날 앞선 복구 단독 검증에서는 Python729개·Node336개 및 실제 Chromium의 복구5개 묶음을 통과했다. 당시에는 실제 계정·운영 DB·유료 API를 사용하지 않고 서버 재시작·Pages 배포를 보류했으며, 이후 위 통합 배포에서 반영했다. 상세 범위와 초기 검증기 보완은 HANDOFF를 따른다. 다음 명령은 지정한 `/tmp/stt-browser-check.*`에 Playwright·Chromium이 준비된 경우 별도 임시 포트·합성 계정으로 실행하고 종료한다. 운영 설정을 읽지 않는다.
 
 ```bash
 node scripts/validate_recovery_browser.mjs --sandbox /tmp/stt-browser-check.EXAMPLE
