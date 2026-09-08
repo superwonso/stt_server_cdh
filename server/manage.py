@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -313,6 +314,12 @@ def main():
         "add-account",
         help="Privately add one inactive account (the ID is entered with echo disabled)",
     )
+    recovery = subcommands.add_parser(
+        "issue-password-reset",
+        help="Privately issue a 30-minute reset for an activated account; no schema migration",
+    )
+    recovery.add_argument("--position", help="Private configured account position (1-10 or first-tenth)")
+    recovery.add_argument("--site-url", required=True, help="Full existing HTTPS website URL")
     subcommands.add_parser(
         "configure-clova",
         help="Privately save a CLOVA Speech domain Secret Key (entered with echo disabled)",
@@ -337,6 +344,22 @@ def main():
             return
         settings = Settings.from_env()
         database = Database(settings.database_path, settings.accounts)
+        if arguments.command == "issue-password-reset":
+            from .recovery_management import create_password_reset_file
+            if arguments.position:
+                selected = account_at_position(settings.accounts, arguments.position)
+            else:
+                if not sys.stdin.isatty():
+                    raise ValueError("Use an interactive terminal or a private account position")
+                selected = getpass.getpass("복구할 활성 계정 ID (입력 내용은 보이지 않음): ")
+            output = settings.data_dir / f"password-reset-{int(time.time())}-{secrets.token_hex(6)}.txt"
+            create_password_reset_file(
+                database, selected_username=selected, site_url=arguments.site_url,
+                allowed_origins=settings.site_origins, output_path=output,
+            )
+            print(f"Created one private 30-minute reset file: {output}")
+            print("Open locally and send only to the verified account owner. No password or session was changed.")
+            return
         database.initialize()
         if arguments.command == "add-account":
             if not sys.stdin.isatty():

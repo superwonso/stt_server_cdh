@@ -4,6 +4,7 @@ import { test } from 'node:test';
 
 const html = await readFile(new URL('../web/index.html', import.meta.url), 'utf8');
 const app = await readFile(new URL('../web/app.js', import.meta.url), 'utf8');
+const css = await readFile(new URL('../web/style.css', import.meta.url), 'utf8');
 
 test('static page provides every element required by the app exactly once', () => {
   const required = new Set([...app.matchAll(/\$\('([^']+)'\)/g)].map(([, id]) => id));
@@ -63,6 +64,31 @@ test('automatic server discovery has a locked login and an accessible manual fal
   assert.match(html, /<dialog\b[^>]*\bid="connection-dialog"[^>]*\baria-describedby="connection-description connection-status"/i);
   assert.match(html, /<p\b[^>]*\bid="connection-status"[^>]*\brole="status"[^>]*\baria-live="polite"/i);
   assert.match(html, /<input\b[^>]*\bid="api-url"[^>]*\baria-describedby="connection-description connection-privacy connection-error"/i);
+});
+
+test('account recovery uses private administrator contact and explicit single-use secret controls', () => {
+  assert.match(html,/아이디나 비밀번호를 잊었나요\? 관리자에게 개인적으로 문의/);
+  assert.match(html,/<dialog\b[^>]*id="admin-recovery-dialog"[^>]*aria-describedby="admin-recovery-description"/);
+  assert.match(html,/<input\b[^>]*id="admin-recovery-password"[^>]*type="password"[^>]*maxlength="128"[^>]*autocomplete="off"/);
+  assert.match(html,/<textarea\b[^>]*id="admin-recovery-link"[^>]*readonly[^>]*autocomplete="off"/);
+  assert.match(html,/요청자와 개인적으로 연락해 본인임을 확인/);
+  assert.match(html,/기존 복구 링크 취소/);
+  assert.match(html,/이 창을 닫으면 링크는 지워지고 다시 표시할 수 없습니다/);
+  assert.match(html,/자동으로 재발급하지 않습니다/);
+  assert.doesNotMatch(html,/type="email"|id="reset-code"/);
+});
+
+test('retained usage declares cohort coverage unavailable billing and responsive administrator-only controls', () => {
+  assert.match(html,/<select\b[^>]*id="admin-usage-period"[^>]*aria-describedby="admin-usage-definition"/);
+  assert.match(html,/<option value="month" selected>이번 달/);
+  assert.match(html,/<p\b[^>]*id="admin-usage-updated"[^>]*role="status"/);
+  assert.match(html,/수업 생성일\(KST\) 기준 현재 보관 기록/);
+  assert.match(html,/휴지통 수업은 포함하고 삭제 중·영구 삭제된 수업은 제외/);
+  assert.match(html,/확인할 수 없는 시간과 과거 누락은 0으로 추정하지/);
+  assert.match(html,/보관된 완료 결과 수이며 API 요청 수·토큰 수가 아닙니다/);
+  assert.match(html,/실제 과금액은 기록하지 않아/);
+  assert.match(css,/\.admin-usage-summary, \.admin-usage-account dl \{ grid-template-columns: minmax\(0,1fr\)/);
+  assert.match(css,/\.admin-usage-account dd[^}]*overflow-wrap: anywhere/);
 });
 
 test('history, export, recording, and destructive controls are explicit and accessible', () => {

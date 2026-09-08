@@ -89,6 +89,7 @@
 
       <button id="auth-capture-stop" class="danger-button auth-capture-stop" type="button" hidden>■ 이 기기의 녹음 종료</button>
       <button id="auth-toggle" class="text-button" type="button">처음이라면 · 비밀번호 설정하기</button>
+      <p class="account-recovery-help">아이디나 비밀번호를 잊었나요? 관리자에게 개인적으로 문의해 주세요. 본인 확인 후 아이디 안내 또는 일회용 비밀번호 복구 링크를 받을 수 있어요.</p>
       <p class="session-note"><span aria-hidden="true">○</span> 로그인 정보는 이 탭을 닫으면 사라집니다.</p>
     </section>
   </main>
@@ -639,6 +640,39 @@
         <div id="admin-accounts" class="admin-accounts" aria-label="계정별 접속 상태"></div>
       </section>
 
+      <section class="admin-section" aria-labelledby="admin-usage-title" aria-describedby="admin-usage-definition">
+        <div class="admin-section-heading admin-usage-heading">
+          <div>
+            <p class="eyebrow">RETAINED USAGE</p>
+            <h3 id="admin-usage-title">사용자별 보관 현황</h3>
+          </div>
+          <div class="admin-usage-controls">
+            <label for="admin-usage-period">집계 기간</label>
+            <select id="admin-usage-period" aria-describedby="admin-usage-definition">
+              <option value="today">오늘</option>
+              <option value="month" selected>이번 달</option>
+              <option value="all">전체</option>
+            </select>
+            <button id="admin-usage-refresh" class="secondary-button" type="button">사용량 새로고침</button>
+          </div>
+        </div>
+        <p class="admin-section-detail">수업 생성일(KST) 기준 현재 보관 기록 · 휴지통 포함 · 실제 과금이나 누적 API 사용량이 아닙니다.</p>
+        <p id="admin-usage-updated" class="admin-section-detail" role="status" aria-live="polite">관리자 화면을 열면 현황을 확인합니다.</p>
+        <p id="admin-usage-error" class="form-error" role="alert" hidden></p>
+        <div class="admin-usage-summary" aria-label="선택 기간 전체 보관 현황">
+          <article class="admin-metric"><span>보관 수업</span><strong id="admin-usage-lectures">—</strong><small id="admin-usage-lecture-detail">휴지통 포함</small></article>
+          <article class="admin-metric"><span>확인된 녹음 시간</span><strong id="admin-usage-recording">—</strong><small id="admin-usage-recording-detail">확인 가능한 기록만 합산</small></article>
+          <article class="admin-metric"><span>완료된 AI 결과</span><strong id="admin-usage-ai">—</strong><small>후보정 · 요약 · 번역 · 질문</small></article>
+        </div>
+        <div id="admin-usage-accounts" class="admin-usage-accounts" aria-label="사용자별 보관 수업과 처리 결과"></div>
+        <details class="admin-usage-source">
+          <summary>집계 기준과 한계</summary>
+          <p id="admin-usage-definition">이 서버 DB에 현재 보관된 기록입니다. 기간은 수업 생성일을 한국 표준시(KST)로 구분하며, 휴지통 수업은 포함하고 삭제 중·영구 삭제된 수업은 제외합니다. 해당 기간에 실제 사용한 시각이나 누적 이용 이력과는 다릅니다.</p>
+          <p>녹음 시간은 확인 가능한 녹음·파일 처리 기록만 합산하며, 화면에는 분 단위로 내림해 표시합니다. 확인할 수 없는 시간과 과거 누락은 0으로 추정하지 않습니다. 미확인에는 아직 확정되지 않은 수업과 길이 정보가 없는 수업도 포함됩니다. 수업 내용·음성·질문 내용은 이 현황에서 조회하지 않습니다.</p>
+          <p>AI 수치는 보관된 완료 결과 수이며 API 요청 수·토큰 수가 아닙니다. 실패·재시도·삭제된 결과 등의 과거 사용은 모두 포함되지 않을 수 있습니다. 실제 과금액은 기록하지 않아 이 화면에서 확인할 수 없습니다.</p>
+        </details>
+      </section>
+
       <section class="admin-section" aria-labelledby="admin-audit-title">
         <div class="admin-section-heading">
           <div>
@@ -648,6 +682,40 @@
         </div>
         <div id="admin-audit" class="admin-audit" aria-label="최근 관리자 조작 내역"></div>
       </section>
+    </div>
+  </dialog>
+
+  <dialog id="admin-recovery-dialog" class="delete-dialog" aria-labelledby="admin-recovery-title" aria-describedby="admin-recovery-description">
+    <div class="delete-dialog-content">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">ACCOUNT RECOVERY</p>
+          <h2 id="admin-recovery-title">비밀번호 복구</h2>
+        </div>
+        <button id="admin-recovery-close" class="dialog-close" type="button" aria-label="비밀번호 복구 닫기">×</button>
+      </div>
+      <p id="admin-recovery-target"></p>
+      <p id="admin-recovery-description">요청자와 개인적으로 연락해 본인임을 확인한 뒤 발급해 주세요. 링크는 30분 동안 한 번만 사용할 수 있으며, 사용하면 해당 계정의 기존 로그인이 모두 해제됩니다.</p>
+      <form id="admin-recovery-form" class="auth-form" autocomplete="off">
+        <div class="field">
+          <label for="admin-recovery-password">관리자의 현재 비밀번호</label>
+          <input id="admin-recovery-password" name="admin-current-password" type="password" required maxlength="128" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="admin-recovery-description">
+        </div>
+        <p id="admin-recovery-error" class="form-error" role="alert" hidden></p>
+        <div class="account-recovery-actions">
+          <button id="admin-recovery-issue" class="primary-button" type="submit">새 복구 링크 발급</button>
+          <button id="admin-recovery-revoke" class="danger-button" type="button">기존 복구 링크 취소</button>
+        </div>
+      </form>
+      <p class="account-recovery-help">새로 발급하면 이전 링크는 무효가 됩니다. 응답을 받지 못해도 자동으로 재발급하지 않습니다. 취소하려면 관리자 비밀번호를 다시 입력해 주세요.</p>
+      <div id="admin-recovery-result" class="field account-recovery-result" hidden>
+        <label for="admin-recovery-link">개인적으로 전달할 일회용 링크</label>
+        <textarea id="admin-recovery-link" readonly rows="4" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="admin-recovery-expires"></textarea>
+        <small id="admin-recovery-expires"></small>
+        <button id="admin-recovery-copy" class="secondary-button" type="button">링크 복사</button>
+      </div>
+      <p id="admin-recovery-status" class="account-recovery-help" role="status" aria-live="polite"></p>
+      <p class="account-recovery-help">이 창을 닫으면 링크는 지워지고 다시 표시할 수 없습니다. 링크는 취소하거나 만료되기 전까지 유효합니다. 복사한 링크도 안전하게 관리해 주세요.</p>
     </div>
   </dialog>
 

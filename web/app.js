@@ -17,6 +17,11 @@ import {
 
 const $ = id => document.getElementById(id);
 let apiUrl = '', token = '', user = '', activation = false, lectures = [], current = null;
+let passwordReset = null, passwordResetSequence = 0, passwordResetController = null, authFormSequence = 0;
+let suppressSavedAuthRestore = false;
+let adminRecovery = null, adminRecoverySequence = 0, adminRecoveryController = null, adminRecoveryExpiryTimer = null;
+const PASSWORD_RECOVERY_PAGE = 'https://superwonso.github.io/stt_server_cdh/';
+const RECOVERY_USERNAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,30}[a-z0-9])?$/;
 const authSessionStore = new TabAuthSessionStore();
 let authSessionExpiresAt = 0, authSessionExpiryTimer = null;
 let authRestoreSequence = 0, authRestoreController = null, authRestorePromise = null;
@@ -58,6 +63,12 @@ let correctionLoading = false, correctionStarting = false, correctionError = '',
 let correctionSequence = 0, correctionPollTimer = null;
 const scheduledCorrections = new Map();
 let adminAuthorized = false, adminOverview = null, adminLoading = false, adminError = '', adminAction = '';
+let adminUsagePeriod = 'month', adminUsageSnapshot = null, adminUsageLoading = false, adminUsageError = '';
+let adminUsageSequence = 0, adminUsageController = null, adminUsageRefreshTimer = null;
+const ADMIN_USAGE_PERIODS = Object.freeze({today:'오늘',month:'이번 달',all:'전체'});
+const ADMIN_USAGE_SCOPE = Object.freeze({basis:'retained_lectures',date_field:'lecture_created_at',includes_trashed:true,
+  excludes_permanently_deleted:true,excludes_deleting:true,ai_counts:'latest_saved_state_except_question_rows',
+  imports:'linked_retained_lectures',duration:'finalized_archive_or_completed_import_metadata'});
 let adminSequence = 0, adminRefreshTimer = null, adminProbeTimer = null, adminConfirmation = null;
 let tunnelRecoveryTimer = null, tunnelRecoveryDeadline = 0, tunnelRecoveryContext = null;
 let presenceSequence = 0, presenceTimer = null, presenceIdleTimer = null, presenceSending = false;
@@ -982,7 +993,18 @@ function nativeDownloadUrl(value, server = apiUrl) {
   }
   return url.href;
 }
-function setServer(value) { const next = normalizeUrl(value); if (next !== apiUrl) { resetRecordingReview(); resetLibraryWorkspace(); } apiUrl = next; storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl; }
+function setServer(value) {
+  const next = normalizeUrl(value);
+  if (next !== apiUrl) {
+    closeAdminRecovery();
+    resetAdminUsage();
+    // The first anonymously verified origin may bind an incoming link. A
+    // later origin change must never carry its recovery credentials across.
+    if (apiUrl && passwordReset) setActivation(false);
+    resetRecordingReview(); resetLibraryWorkspace();
+  }
+  apiUrl = next; storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl;
+}
 function clearActiveAuthExpiry() {
   if (authSessionExpiryTimer !== null) clearTimeout(authSessionExpiryTimer);
   authSessionExpiryTimer = null;
@@ -1421,7 +1443,11 @@ async function ensureTrustedApiRequest({uploaderAlreadyLocked = false} = {}) {
   throw connectionChangedBeforeRequestError();
 }
 function setActivation(value) {
+  ++authFormSequence;
+  cancelSavedSessionRestore(); authenticating = false;
+  clearPasswordReset();
   activation = value;
+  $('username').readOnly = false;
   $('auth-title').textContent = value ? '내 비밀번호를 정해 주세요.' : '다시 만나 반가워요.';
   $('auth-description').textContent = value ? '초대 코드로 처음 한 번만 설정하면 돼요.' : '내 계정으로 로그인해 수업을 기록하세요.';
   $('setup-code-field').hidden = !value; $('confirm-field').hidden = !value;
@@ -1433,6 +1459,59 @@ function setActivation(value) {
   $('auth-toggle').textContent = value ? '이미 비밀번호가 있어요 · 로그인' : '처음이라면 · 비밀번호 설정하기';
   $('auth-error').hidden = true;
   updateAuthControls();
+}
+function clearPasswordReset() {
+  ++passwordResetSequence;
+  if (passwordResetController) authenticating = false;
+  passwordResetController?.abort(); passwordResetController = null;
+  passwordReset = null;
+  $('password').value = ''; $('password-confirm').value = '';
+}
+function consumeAccountLink() {
+  const fragment = location.hash;
+  // Do this synchronously, before opening IndexedDB or discovering a server.
+  if (fragment) history.replaceState(null,'',location.pathname + location.search);
+  const fields = new URLSearchParams(fragment.slice(1));
+  const hasReset = fields.has('reset_code'), hasSetup = fields.has('setup_code');
+  if (!hasReset && !hasSetup) return;
+  suppressSavedAuthRestore = true;
+  cancelSavedSessionRestore();
+  if (hasReset) {
+    // Even a malformed/ambiguous reset link must not revive a saved login.
+    authSessionStore.clear();
+    $('setup-code').value = '';
+    const username = fields.get('username'), code = fields.get('reset_code');
+    const invalid = hasSetup || fields.getAll('reset_code').length !== 1 || fields.getAll('username').length !== 1
+      || typeof username !== 'string' || !RECOVERY_USERNAME_PATTERN.test(username)
+      || typeof code !== 'string' || !/^[A-Za-z0-9_-]{20,128}$/.test(code);
+    if (invalid || (user && hasOwnerLockedWork() && username !== user)) {
+      setActivation(false);
+      const message = invalid ? '초대·복구 링크를 확인할 수 없어요. 관리자에게 새 링크를 요청해 주세요.'
+        : '다른 계정의 녹음이나 전송이 남아 있어 복구 링크를 열지 않았어요. 해당 계정의 작업을 먼저 마무리해 주세요.';
+      $('auth-error').textContent = message; $('auth-error').hidden = false;
+      if (token) notice(message);
+      return;
+    }
+    token = ''; clearActiveAuthExpiry();
+    showLogin(!hasOwnerLockedWork());
+    passwordReset = {username,code};
+    $('username').value = username; $('username').readOnly = true;
+    $('confirm-field').hidden = false; $('password-confirm').required = true;
+    $('password').minLength = 4; $('password').autocomplete = 'new-password';
+    $('password-label').textContent = '새 비밀번호 · 4–128자';
+    $('auth-title').textContent = '새 비밀번호를 정해 주세요.';
+    $('auth-description').textContent = '관리자가 발급한 일회용 링크입니다. 설정 후 새 비밀번호로 다시 로그인해 주세요.';
+    $('login-button').textContent = '새 비밀번호 저장';
+    $('auth-toggle').textContent = '복구 취소 · 로그인으로 돌아가기';
+    updateAuthControls();
+    return;
+  }
+  // An invitation cannot select an API origin either; existing setup behavior
+  // is intentionally kept separate from administrator-issued recovery.
+  if (fields.get('setup_code')) {
+    setActivation(true); $('setup-code').value = fields.get('setup_code');
+    if (fields.get('username')) $('username').value = fields.get('username');
+  }
 }
 function importIsActive() { return !!importJob && !isTerminalImportState(importJob); }
 function importTransportBusy() {
@@ -1505,7 +1584,7 @@ function showLogin(clear = true) {
       : '전송 대기 중인 음성이 이 기기에 보관되어 있습니다. 같은 계정으로 다시 로그인해 주세요.';
   }
 }
-$('auth-toggle').onclick = () => setActivation(!activation);
+$('auth-toggle').onclick = () => setActivation(passwordReset ? false : !activation);
 function openConnectionDialog() {
   if (connectionState === 'discovering') {
     cancelConnectionAttempt();
@@ -1572,7 +1651,7 @@ $('connection-form').onsubmit = async event => {
       return;
     }
     $('connection-dialog').close(); notice('서버에 연결했어요.');
-    if (!token && !activation) await restoreStoredSession();
+    if (!token && !activation && !passwordReset) await restoreStoredSession();
   } catch (error) {
     if (sequence !== null && (sequence !== connectionGeneration || connectionController !== controller)) return;
     setConnectionState(hasTrustedApiOrigin() ? 'connected' : 'manual-needed',hasTrustedApiOrigin()
@@ -1638,7 +1717,7 @@ async function enterAuthenticatedWorkspace(response, authServer, {notAfter = Inf
 }
 function restoreStoredSession() {
   if (authRestorePromise) return authRestorePromise;
-  if (token || activation || authenticating || !hasVerifiedServer()) return Promise.resolve(false);
+  if (token || activation || passwordReset || suppressSavedAuthRestore || authenticating || !hasVerifiedServer()) return Promise.resolve(false);
   const saved = authSessionStore.read();
   if (!saved) return Promise.resolve(false);
   if (saved.apiOrigin !== apiUrl || (user && hasOwnerLockedWork() && saved.username !== user)) {
@@ -1690,6 +1769,7 @@ function restoreStoredSession() {
 }
 $('auth-form').onsubmit = async event => {
   event.preventDefault(); $('auth-error').hidden = true;
+  if (passwordReset) { await submitPasswordReset(); return; }
   if (authenticating && !authRestoreController) return;
   cancelSavedSessionRestore();
   expireActiveAuthSession();
@@ -1700,23 +1780,59 @@ $('auth-form').onsubmit = async event => {
   }
   if (!refreshingExpiredLease) cancelConnectionAttempt();
   authenticating = true; updateAuthControls();
-  const authServer = apiUrl, generation = requestGeneration;
+  const authServer = apiUrl, generation = requestGeneration, attempt = ++authFormSequence, activating = activation;
   try {
     const username = $('username').value, password = $('password').value;
     const ownerLocked = hasOwnerLockedWork();
     if (ownerLocked && user && username !== user) throw new Error('전송 대기 중인 음성이 있어요. 이전 계정으로 다시 로그인해 주세요.');
     if (stopPromise) await stopPromise;
-    if (activation && password !== $('password-confirm').value) throw new Error('입력한 두 비밀번호가 일치하지 않아요.');
-    const body = {username,password}; if (activation) body.setup_code = $('setup-code').value.trim();
-    const response = await api(activation ? '/auth/activate' : '/auth/login', {method:'POST',body:JSON.stringify(body)});
+    if (attempt !== authFormSequence || passwordReset) return;
+    if (activating && password !== $('password-confirm').value) throw new Error('입력한 두 비밀번호가 일치하지 않아요.');
+    const body = {username,password}; if (activating) body.setup_code = $('setup-code').value.trim();
+    const response = await api(activating ? '/auth/activate' : '/auth/login', {method:'POST',body:JSON.stringify(body)});
+    if (attempt !== authFormSequence || passwordReset) return;
     if (apiUrl !== authServer || requestGeneration !== generation) throw new Error('서버 연결 상태가 바뀌어 로그인 응답을 적용하지 않았어요. 다시 로그인해 주세요.');
     await enterAuthenticatedWorkspace(response,authServer);
   } catch (error) {
+    if (attempt !== authFormSequence || passwordReset) return;
     $('password').value = ''; $('password-confirm').value = '';
     $('auth-error').textContent = errorText(error); $('auth-error').hidden = false;
   }
-  finally { authenticating = false; updateAuthControls(); updateControls(); }
+  finally { if (attempt === authFormSequence) { authenticating = false; updateAuthControls(); updateControls(); } }
 };
+async function submitPasswordReset() {
+  if (!passwordReset || authenticating) return;
+  const reset = passwordReset, sequence = passwordResetSequence;
+  const server = apiUrl, owner = user, sessionToken = token;
+  const controller = new AbortController(); passwordResetController = controller;
+  const isCurrent = () => passwordReset === reset && passwordResetSequence === sequence
+    && passwordResetController === controller && apiUrl === server && user === owner
+    && token === sessionToken;
+  authenticating = true; updateAuthControls();
+  try {
+    if (!hasVerifiedServer()) throw new Error('서버 연결을 먼저 확인해 주세요.');
+    if (hasOwnerLockedWork() && user && reset.username !== user) throw new Error('이전 계정의 녹음이나 전송을 먼저 마무리해 주세요.');
+    const password = $('password').value, confirm = $('password-confirm').value;
+    if (password.length < 4 || password.length > 128) throw new Error('새 비밀번호는 4–128자로 입력해 주세요.');
+    if (password !== confirm) throw new Error('입력한 두 비밀번호가 일치하지 않아요.');
+    const body = JSON.stringify({username:reset.username,reset_code:reset.code,password,password_confirm:confirm});
+    $('password').value = ''; $('password-confirm').value = '';
+    const result = await api('/auth/reset-password',{method:'POST',body,anonymous:true,signal:controller.signal},15000,server);
+    if (!isCurrent()) return;
+    if (result?.status !== 'password_reset') throw new Error('비밀번호 설정 결과를 확인하지 못했어요. 새 비밀번호로 로그인해 보거나 관리자에게 새 링크를 요청해 주세요.');
+    authSessionStore.clear();
+    setActivation(false); $('username').value = reset.username;
+    $('auth-description').textContent = '비밀번호를 변경했어요. 새 비밀번호로 로그인해 주세요.';
+  } catch (error) {
+    if (!isCurrent()) return;
+    $('password').value = ''; $('password-confirm').value = '';
+    $('auth-error').textContent = errorText(error); $('auth-error').hidden = false;
+  } finally {
+    if (passwordResetController === controller) {
+      passwordResetController = null; authenticating = false; updateAuthControls(); updateControls();
+    }
+  }
+}
 async function updateStatus() {
   if (!token) return;
   const sequence = ++statusSequence, statusToken = token, statusUser = user, statusServer = apiUrl;
@@ -2790,6 +2906,8 @@ function scrubAdminDom() {
   $('admin-confirm-accept').textContent = '확인';
 }
 function resetAdminState() {
+  closeAdminRecovery();
+  resetAdminUsage();
   ++adminSequence;
   clearAdminRefresh(); clearAdminProbe(); clearTunnelRecovery();
   adminAuthorized = false; adminOverview = null; adminLoading = false; adminError = ''; adminAction = ''; adminConfirmation = null;
@@ -2810,6 +2928,165 @@ function adminDateTime(value) {
     timeZone:'Asia/Seoul',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,
   }).format(date);
 }
+function validateAdminUsageSnapshot(value, period) {
+  const invalid = () => { throw new Error('사용량 응답의 기준이나 합계를 확인하지 못했어요.'); };
+  const record = item => !!item && typeof item === 'object' && !Array.isArray(item);
+  const count = item => Number.isSafeInteger(item) && item >= 0 ? item : invalid();
+  const seconds = item => typeof item === 'number' && Number.isFinite(item) && item >= 0
+    && item <= Number.MAX_SAFE_INTEGER ? item : invalid();
+  const sameSeconds = (a,b) => Math.abs(a-b) <= 0.0011;
+  const states = item => {
+    if (!record(item)) return invalid();
+    return Object.fromEntries(['completed','failed','pending','cancelled'].map(key => [key,count(item[key])]));
+  };
+  const metrics = item => {
+    if (!record(item) || !record(item.lectures) || !record(item.recording) || !record(item.ai)) return invalid();
+    const lectures = Object.fromEntries(['total','active','trashed'].map(key => [key,count(item.lectures[key])]));
+    const recording = Object.fromEntries(['known_seconds','qwen_seconds','clova_seconds'].map(key => [key,seconds(item.recording[key])]));
+    for (const key of ['known_lectures','unknown_lectures']) recording[key] = count(item.recording[key]);
+    if (lectures.active + lectures.trashed !== lectures.total
+        || recording.known_lectures + recording.unknown_lectures !== lectures.total
+        || !sameSeconds(recording.qwen_seconds + recording.clova_seconds,recording.known_seconds)) return invalid();
+    return {lectures,recording,imports:states(item.imports),ai:Object.fromEntries(
+      ['correction','summary','translation','question'].map(key => [key,states(item.ai[key])]))};
+  };
+  const timestamp = item => typeof item === 'string' && item.length <= 40
+    && /^\d{4}-\d{2}-\d{2}T/.test(item) && Number.isFinite(Date.parse(item));
+  if (!record(value) || value.period !== period || !Object.hasOwn(ADMIN_USAGE_PERIODS,period)
+      || value.timezone !== 'Asia/Seoul' || !timestamp(value.end_at) || !timestamp(value.generated_at)
+      || (period === 'all' ? value.start_at !== null : !timestamp(value.start_at))
+      || (value.start_at !== null && Date.parse(value.start_at) > Date.parse(value.end_at))
+      || !record(value.scope) || !Object.entries(ADMIN_USAGE_SCOPE).every(([key,expected]) => value.scope[key] === expected)
+      || value.billing?.available !== false || value.billing?.reason !== 'not_recorded'
+      || !Array.isArray(value.accounts) || value.accounts.length > 50) return invalid();
+  const ids = new Set(), labels = new Set();
+  const accounts = value.accounts.map(account => {
+    if (!record(account) || typeof account.account_id !== 'string' || !account.account_id
+        || account.account_id.length > 128 || /[\u0000-\u001f\u007f]/.test(account.account_id)
+        || typeof account.label !== 'string' || !RECOVERY_USERNAME_PATTERN.test(account.label)
+        || ids.has(account.account_id) || labels.has(account.label)) return invalid();
+    ids.add(account.account_id); labels.add(account.label);
+    return {account_id:account.account_id,label:account.label,...metrics(account)};
+  });
+  const totals = metrics(value.totals);
+  const compare = (total,rows) => {
+    for (const [key,item] of Object.entries(total)) {
+      if (record(item)) compare(item,rows.map(row => row[key]));
+      else {
+        const sum = rows.reduce((n,row) => n + row[key],0);
+        if (!Number.isFinite(sum) || (key.endsWith('_seconds') ? !sameSeconds(sum,item) : sum !== item)) invalid();
+      }
+    }
+  };
+  compare(totals,accounts);
+  return {period,timezone:'Asia/Seoul',start_at:value.start_at,end_at:value.end_at,generated_at:value.generated_at,
+    accounts,totals};
+}
+function adminUsageSeconds(value) {
+  if (value === 0) return '0분';
+  if (value < 60) return '1분 미만';
+  const minutes = Math.floor(value / 60), hours = Math.floor(minutes / 60);
+  return hours ? `${hours.toLocaleString('ko-KR')}시간 ${minutes % 60}분` : `${minutes.toLocaleString('ko-KR')}분`;
+}
+function adminUsageCount(value) { return `${value.toLocaleString('ko-KR')}개`; }
+function adminUsageAiCompleted(metrics) {
+  return Object.values(metrics.ai).reduce((sum,states) => sum + states.completed,0);
+}
+function clearAdminUsageTimer() {
+  if (adminUsageRefreshTimer !== null) clearTimeout(adminUsageRefreshTimer);
+  adminUsageRefreshTimer = null;
+}
+function resetAdminUsage() {
+  ++adminUsageSequence; adminUsageController?.abort(); adminUsageController = null; clearAdminUsageTimer();
+  adminUsagePeriod = 'month'; adminUsageSnapshot = null; adminUsageLoading = false; adminUsageError = '';
+  renderAdminUsage();
+}
+function renderAdminUsage() {
+  $('admin-usage-period').value = adminUsagePeriod;
+  $('admin-usage-refresh').disabled = adminUsageLoading;
+  $('admin-usage-refresh').textContent = adminUsageLoading ? '불러오는 중…' : '사용량 새로고침';
+  $('admin-usage-error').textContent = adminUsageError; $('admin-usage-error').hidden = !adminUsageError;
+  const data = adminUsageSnapshot, totals = data?.totals;
+  $('admin-usage-lectures').textContent = totals ? adminUsageCount(totals.lectures.total) : '—';
+  $('admin-usage-recording').textContent = totals ? adminUsageSeconds(totals.recording.known_seconds) : '—';
+  $('admin-usage-ai').textContent = totals ? adminUsageCount(adminUsageAiCompleted(totals)) : '—';
+  $('admin-usage-lecture-detail').textContent = totals ? `일반 ${adminUsageCount(totals.lectures.active)} · 휴지통 ${adminUsageCount(totals.lectures.trashed)}` : '휴지통 포함';
+  $('admin-usage-recording-detail').textContent = totals
+    ? `시간 확인 ${adminUsageCount(totals.recording.known_lectures)} · 미확인 ${adminUsageCount(totals.recording.unknown_lectures)} 수업`
+    : '확인 가능한 기록만 합산';
+  $('admin-usage-updated').textContent = data
+    ? `${ADMIN_USAGE_PERIODS[data.period]} 생성 수업 · KST · 기준 ${adminDateTime(data.generated_at)}${adminUsageLoading ? ' · 갱신 중' : adminUsageError ? ' · 마지막 확인값' : ' · 20초마다 확인'}`
+    : adminUsageLoading ? `${ADMIN_USAGE_PERIODS[adminUsagePeriod]} 현황을 확인하고 있어요.`
+      : adminUsageError ? '현황을 확인할 수 없습니다. 0건으로 집계한 것이 아닙니다.' : '관리자 화면을 열면 현황을 확인합니다.';
+  const container = $('admin-usage-accounts'); container.replaceChildren();
+  if (!data) return;
+  if (!data.accounts.length) {
+    const empty = document.createElement('p'); empty.className = 'admin-empty'; empty.textContent = '표시할 계정이 없습니다.'; container.append(empty);
+  }
+  const stateText = states => `완료 ${states.completed} · 대기/처리 ${states.pending} · 실패 ${states.failed} · 취소 ${states.cancelled}`;
+  for (const account of data.accounts) {
+    const row = document.createElement('article'); row.className = 'admin-usage-account';
+    const heading = document.createElement('h4'); heading.textContent = account.label;
+    const metrics = document.createElement('dl');
+    for (const [label,value] of [['보관 수업',adminUsageCount(account.lectures.total)],
+      ['확인된 녹음 시간',adminUsageSeconds(account.recording.known_seconds)],['완료된 AI 결과',adminUsageCount(adminUsageAiCompleted(account))]]) {
+      const pair = document.createElement('div'), term = document.createElement('dt'), number = document.createElement('dd');
+      term.textContent = label; number.textContent = value; pair.append(term,number); metrics.append(pair);
+    }
+    const recordingDetail = document.createElement('p');
+    recordingDetail.textContent = `일반 ${account.lectures.active} · 휴지통 ${account.lectures.trashed} · 시간 미확인 ${account.recording.unknown_lectures} 수업 · Qwen ${adminUsageSeconds(account.recording.qwen_seconds)} · CLOVA ${adminUsageSeconds(account.recording.clova_seconds)}`;
+    const imports = document.createElement('p'); imports.textContent = `파일 변환: ${stateText(account.imports)}`;
+    row.append(heading,metrics,recordingDetail,imports);
+    for (const [key,label] of [['correction','후보정'],['summary','요약'],['translation','번역'],['question','질문']]) {
+      const detail = document.createElement('p'); detail.textContent = `${label}: ${stateText(account.ai[key])}`; row.append(detail);
+    }
+    container.append(row);
+  }
+}
+function scheduleAdminUsageRefresh() {
+  clearAdminUsageTimer();
+  if (!adminAuthorized || !token || !$('admin-dialog').open) return;
+  const sequence = adminUsageSequence, owner = user, sessionToken = token, server = apiUrl, period = adminUsagePeriod;
+  adminUsageRefreshTimer = setTimeout(() => {
+    adminUsageRefreshTimer = null;
+    if (sequence !== adminUsageSequence || !adminAuthorized || !$('admin-dialog').open
+        || owner !== user || sessionToken !== token || server !== apiUrl || period !== adminUsagePeriod) return;
+    if (document.hidden || adminAction) scheduleAdminUsageRefresh();
+    else void loadAdminUsage();
+  },20000);
+}
+async function loadAdminUsage() {
+  if (!adminAuthorized || !token || !$('admin-dialog').open) return;
+  clearAdminUsageTimer(); adminUsageController?.abort();
+  const sequence = ++adminUsageSequence, owner = user, sessionToken = token, server = apiUrl, period = adminUsagePeriod;
+  const controller = new AbortController(); adminUsageController = controller;
+  const isCurrent = () => sequence === adminUsageSequence && adminUsageController === controller
+    && adminAuthorized && $('admin-dialog').open && user === owner && token === sessionToken
+    && apiUrl === server && adminUsagePeriod === period;
+  adminUsageLoading = true; adminUsageError = ''; renderAdminUsage();
+  try {
+    const result = await api(`/admin/usage?period=${period}`,{signal:controller.signal});
+    if (!isCurrent()) return;
+    adminUsageSnapshot = validateAdminUsageSnapshot(result,period);
+  } catch (error) {
+    if (!isCurrent()) return;
+    if (error?.status === 403) { resetAdminState(); return; }
+    adminUsageError = error?.status === 404 ? '이 서버는 보관 현황 조회를 아직 지원하지 않습니다.' : errorText(error);
+  } finally {
+    if (isCurrent()) {
+      adminUsageController = null; adminUsageLoading = false; renderAdminUsage(); scheduleAdminUsageRefresh();
+    }
+  }
+}
+$('admin-usage-period').onchange = () => {
+  const period = $('admin-usage-period').value;
+  if (!adminAuthorized || !token || !$('admin-dialog').open) { $('admin-usage-period').value = adminUsagePeriod; return; }
+  if (!Object.hasOwn(ADMIN_USAGE_PERIODS,period)) { $('admin-usage-period').value = adminUsagePeriod; return; }
+  if (period === adminUsagePeriod) return;
+  adminUsagePeriod = period; adminUsageSnapshot = null; adminUsageError = '';
+  renderAdminUsage(); void loadAdminUsage();
+};
+$('admin-usage-refresh').onclick = () => { if (!adminUsageLoading) return loadAdminUsage(); };
 function durationLabel(value) {
   const total = Math.max(0,Math.floor(Number(value) || 0));
   const days = Math.floor(total / 86400);
@@ -2902,6 +3179,13 @@ function renderAdminAccounts(accounts) {
       action.onclick = () => openAdminConfirmation('session-revoke',{...account,is_self:self});
     }
     row.append(identity,activity,action); container.append(row);
+    if (!self && account?.activated === true && typeof account?.account_id === 'string' && account.account_id) {
+      const recovery = document.createElement('button'); recovery.type = 'button';
+      recovery.className = 'secondary-button admin-account-recovery'; recovery.textContent = '비밀번호 복구';
+      recovery.disabled = !!adminAction;
+      recovery.onclick = () => openAdminRecovery(account);
+      row.append(recovery);
+    }
   }
 }
 function renderAdminAudit(entries) {
@@ -3099,16 +3383,130 @@ async function loadAdminOverview({probe = false} = {}) {
   }
 }
 function closeAdminDialog() {
+  resetAdminUsage();
+  closeAdminRecovery();
   clearAdminRefresh();
   if ($('admin-dialog').open) $('admin-dialog').close();
 }
 $('admin-open').onclick = () => {
   if (!adminAuthorized || !token) return;
-  renderAdminOverview(); $('admin-dialog').showModal(); $('admin-close').focus(); void loadAdminOverview();
+  renderAdminOverview(); $('admin-dialog').showModal(); $('admin-close').focus(); void loadAdminOverview(); void loadAdminUsage();
 };
 $('admin-close').onclick = closeAdminDialog;
-$('admin-dialog').oncancel = () => { clearAdminRefresh(); };
+$('admin-dialog').oncancel = () => { resetAdminUsage(); closeAdminRecovery(); clearAdminRefresh(); };
 $('admin-refresh').onclick = () => { if (!adminLoading && !adminAction) void loadAdminOverview(); };
+function clearAdminRecoveryLink() {
+  if (adminRecoveryExpiryTimer !== null) clearTimeout(adminRecoveryExpiryTimer);
+  adminRecoveryExpiryTimer = null;
+  if (adminRecovery) { adminRecovery.link = ''; adminRecovery.expiresAt = 0; }
+  $('admin-recovery-link').value = '';
+  $('admin-recovery-result').hidden = true;
+  $('admin-recovery-expires').textContent = '';
+}
+function closeAdminRecovery() {
+  ++adminRecoverySequence;
+  adminRecoveryController?.abort(); adminRecoveryController = null;
+  clearAdminRecoveryLink(); adminRecovery = null;
+  if (adminAction === 'password-reset') adminAction = '';
+  $('admin-recovery-password').value = ''; $('admin-recovery-password').disabled = false;
+  $('admin-recovery-target').textContent = '';
+  $('admin-recovery-error').textContent = ''; $('admin-recovery-error').hidden = true;
+  $('admin-recovery-status').textContent = '';
+  $('admin-recovery-issue').disabled = false; $('admin-recovery-revoke').disabled = false;
+  if ($('admin-recovery-dialog').open) $('admin-recovery-dialog').close();
+}
+function openAdminRecovery(account) {
+  if (!adminAuthorized || !token || adminAction || account?.activated !== true
+      || account?.is_self === true || account?.label === user
+      || typeof account?.account_id !== 'string' || !account.account_id
+      || typeof account?.label !== 'string' || !RECOVERY_USERNAME_PATTERN.test(account.label)) return;
+  closeAdminRecovery();
+  adminRecovery = {accountId:account.account_id,username:account.label,owner:user,token,server:apiUrl,
+    link:'',expiresAt:0};
+  $('admin-recovery-target').textContent = `${account.label} 계정`;
+  $('admin-recovery-dialog').showModal(); $('admin-recovery-password').focus();
+}
+function adminRecoveryIsCurrent(target,sequence) {
+  return adminRecovery === target && sequence === adminRecoverySequence && adminAuthorized
+    && $('admin-recovery-dialog').open && user === target.owner && token === target.token
+    && apiUrl === target.server;
+}
+async function runAdminRecovery(revoke = false) {
+  const target = adminRecovery;
+  if (!target || adminRecoveryController || adminAction
+      || !adminRecoveryIsCurrent(target,adminRecoverySequence)) return;
+  clearAdminRecoveryLink();
+  $('admin-recovery-error').hidden = true; $('admin-recovery-status').textContent = '';
+  const password = $('admin-recovery-password').value;
+  $('admin-recovery-password').value = '';
+  if (!password || password.length > 128) {
+    $('admin-recovery-error').textContent = '관리자의 현재 비밀번호를 입력해 주세요.';
+    $('admin-recovery-error').hidden = false; return;
+  }
+  const sequence = ++adminRecoverySequence, controller = new AbortController();
+  adminRecoveryController = controller; adminAction = 'password-reset'; clearAdminRefresh();
+  $('admin-recovery-password').disabled = true;
+  $('admin-recovery-issue').disabled = true; $('admin-recovery-revoke').disabled = true;
+  const isCurrent = () => adminRecoveryIsCurrent(target,sequence) && adminRecoveryController === controller;
+  try {
+    const result = await api(revoke ? '/admin/password-resets/revoke' : '/admin/password-resets',{
+      method:'POST',signal:controller.signal,
+      body:JSON.stringify({account_id:target.accountId,current_password:password}),
+    });
+    if (!isCurrent()) return;
+    if (revoke) {
+      if (result?.status !== 'revoked') throw new Error('복구 링크 취소 결과를 확인하지 못했어요.');
+      $('admin-recovery-status').textContent = '이 계정의 사용하지 않은 복구 링크를 취소했어요.';
+    } else {
+      if (result?.username !== target.username || typeof result?.reset_code !== 'string'
+          || !/^[A-Za-z0-9_-]{43}$/.test(result.reset_code) || typeof result?.expires_at !== 'number'
+          || !Number.isFinite(result.expires_at) || result.expires_at * 1000 <= Date.now()
+          || result.expires_at * 1000 > Date.now() + 31 * 60 * 1000) {
+        throw new Error('복구 링크 응답을 확인하지 못했어요.');
+      }
+      const link = new URL(PASSWORD_RECOVERY_PAGE);
+      link.hash = new URLSearchParams({username:target.username,reset_code:result.reset_code}).toString();
+      target.link = link.href; target.expiresAt = result.expires_at * 1000;
+      $('admin-recovery-link').value = target.link; $('admin-recovery-result').hidden = false;
+      $('admin-recovery-expires').textContent = `${adminDateTime(target.expiresAt)}까지 한 번 사용할 수 있어요.`;
+      $('admin-recovery-status').textContent = '이 창에서만 링크를 확인할 수 있어요. 본인 확인한 사용자에게 개인적으로 전달해 주세요.';
+      adminRecoveryExpiryTimer = setTimeout(() => {
+        if (!adminRecoveryIsCurrent(target,sequence)) return;
+        clearAdminRecoveryLink(); $('admin-recovery-status').textContent = '복구 링크가 만료되어 화면에서 지웠어요.';
+      },Math.max(0,target.expiresAt - Date.now()));
+    }
+  } catch (error) {
+    if (!isCurrent()) return;
+    $('admin-recovery-error').textContent = `${errorText(error)} ${revoke
+      ? '결과가 불확실하면 비밀번호를 다시 입력해 취소를 요청해 주세요.'
+      : '자동으로 다시 발급하지 않습니다. 새로 발급하면 이전 복구 링크는 무효가 됩니다.'}`;
+    $('admin-recovery-error').hidden = false;
+  } finally {
+    if (isCurrent()) {
+      adminRecoveryController = null; adminAction = '';
+      $('admin-recovery-password').value = ''; $('admin-recovery-password').disabled = false;
+      $('admin-recovery-issue').disabled = false; $('admin-recovery-revoke').disabled = false;
+      renderAdminOverview(); scheduleAdminRefresh();
+    }
+  }
+}
+$('admin-recovery-form').onsubmit = event => { event.preventDefault(); return runAdminRecovery(false); };
+$('admin-recovery-revoke').onclick = () => runAdminRecovery(true);
+$('admin-recovery-close').onclick = closeAdminRecovery;
+$('admin-recovery-dialog').oncancel = closeAdminRecovery;
+$('admin-recovery-dialog').onclose = () => { if (!$('admin-recovery-dialog').open) closeAdminRecovery(); };
+$('admin-recovery-copy').onclick = async () => {
+  const target = adminRecovery, sequence = adminRecoverySequence;
+  if (!target || !adminRecoveryIsCurrent(target,sequence) || !target.link) return;
+  if (target.expiresAt <= Date.now()) { clearAdminRecoveryLink(); return; }
+  try {
+    if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+    await navigator.clipboard.writeText(target.link);
+    if (adminRecoveryIsCurrent(target,sequence)) $('admin-recovery-status').textContent = '링크를 복사했어요. 본인 확인한 사용자에게만 개인적으로 전달해 주세요.';
+  } catch {
+    if (adminRecoveryIsCurrent(target,sequence)) $('admin-recovery-status').textContent = '자동 복사를 사용할 수 없어요. 위 링크를 직접 선택해 복사해 주세요.';
+  }
+};
 function closeAdminConfirmation() {
   adminConfirmation = null;
   if ($('admin-confirm-dialog').open) $('admin-confirm-dialog').close();
@@ -5475,6 +5873,7 @@ $('delete-confirm').onclick = async () => {
 };
 $('logout').onclick = async () => {
   if (isBusy()) return;
+  closeAdminRecovery(); clearPasswordReset();
   cancelSavedSessionRestore();
   authSessionStore.clear();
   clearActiveAuthExpiry();
@@ -5495,28 +5894,19 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) nudgeQueuedUpload();
   if (!document.hidden) nudgeStorageRecovery();
   if (!document.hidden && adminAuthorized && $('admin-dialog').open && !adminLoading && !adminAction) void loadAdminOverview();
+  if (!document.hidden && adminAuthorized && $('admin-dialog').open && !adminUsageLoading && !adminAction) void loadAdminUsage();
 });
 window.addEventListener('online',nudgeQueuedUpload);
 window.addEventListener('online',nudgeStorageRecovery);
 
 async function init() {
+  consumeAccountLink();
   void openLiveQueue();
   authSessionStore.read();
-  // Keep invitation codes out of the URL as soon as the document runs.
-  const invite = new URLSearchParams(location.hash.slice(1));
-  if (location.hash) history.replaceState(null,'',location.pathname + location.search);
-  // Invitation fragments are easy to forge. Never let one choose the server
-  // that receives a setup code and new password; users set that origin apart.
-  if (invite.get('setup_code')) {
-    setActivation(true);
-    $('setup-code').value = invite.get('setup_code');
-    // The server owns the account allow-list and validates the single-use code.
-    // The client only restores the opaque invitation fields into the form.
-    if (invite.get('username')) $('username').value = invite.get('username');
-  }
   updateSourceGuidance();
   renderCurrent();
   await discoverServer();
-  if (!activation) await restoreStoredSession();
+  if (!activation && !passwordReset) await restoreStoredSession();
 }
+window.addEventListener('hashchange',consumeAccountLink);
 void init();

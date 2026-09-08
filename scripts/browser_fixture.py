@@ -15,6 +15,7 @@ import socket
 import sys
 import threading
 import wave
+from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -106,9 +107,51 @@ class QuietWebHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
 
+def seed_usage(database, accounts):
+    """Synthetic metadata only: never create/download long recordings or use an API."""
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month = today.replace(day=1)
+    # Month/day ranges remain valid even when QA is run on the first day.
+    earlier = month if today > month else today
+    rows = [
+        ("00000000-0000-4000-8000-000000000001", accounts[0], today, "qwen", 600, False),
+        ("00000000-0000-4000-8000-000000000002", accounts[1], today, "clova", 3600, True),
+        ("00000000-0000-4000-8000-000000000003", accounts[1], month-timedelta(days=1), "qwen", None, False),
+        ("00000000-0000-4000-8000-000000000004", accounts[0], earlier, "qwen", 300, False),
+    ]
+    with database.connect() as connection:
+        for index, (identifier, owner, created, provider, seconds, trashed) in enumerate(rows):
+            timestamp = created.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            connection.execute(
+                "INSERT INTO lectures(id,username,title,language,created_at,recording_finalized,asr_provider,trashed_at) "
+                "VALUES (?,?,?,'en',?,1,?,?)",
+                (identifier, owner, "Synthetic usage fixture", timestamp, provider, timestamp if trashed else None),
+            )
+            if seconds is not None:
+                connection.execute(
+                    "INSERT INTO recording_archives(lecture_id,state,object_key,drive_file_id,source_bytes,"
+                    "source_sha256,source_md5,local_deleted,updated_at) VALUES (?,'ready',?,?,?,?,?,1,?)",
+                    (identifier, f"{index+1:064x}", f"synthetic-file-{index}", 44+32000*seconds,
+                     "a"*64, "b"*32, timestamp),
+                )
+        timestamp = today.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        connection.execute(
+            "INSERT INTO lecture_summaries(lecture_id,job_id,raw_revision,status,model,summary_json,"
+            "created_at,updated_at,completed_at) VALUES (?,?,?,'completed','synthetic','{}',?,?,?)",
+            (rows[0][0], "00000000-0000-4000-8000-000000000010", "a"*64, timestamp, timestamp, timestamp),
+        )
+    return {"today_lectures": 3 if today == month else 2,
+            "month_lectures": 3, "all_lectures": 4, "month_seconds": 4500,
+            "all_unknown_lectures": 1}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", required=True, type=Path)
+    parser.add_argument("--admin", action="store_true", help="Enable the first synthetic account as administrator")
+    parser.add_argument("--usage-seed", action="store_true", help="Seed synthetic usage metadata only")
     args = parser.parse_args()
     directory = args.directory.resolve()
     if (directory.parent.parent != Path("/tmp")
@@ -125,7 +168,8 @@ def main():
     site_origin = f"http://127.0.0.1:{web.server_port}"
     settings = Settings(
         data_dir=directory / "data", model_cache_dir=directory / "unused-models",
-        accounts=accounts, site_origins=(site_origin,), model_warmup=False,
+        accounts=accounts, admin_username=accounts[0] if args.admin else None,
+        site_origins=(site_origin,), model_warmup=False,
         device="cpu", google_drive_enabled=False, recording_free_reserve_bytes=0,
     )
     asr, summary, translation = SyntheticASR(), SyntheticSummary(), SyntheticTranslation()
@@ -133,6 +177,7 @@ def main():
                      summarizer=summary, translator=translation)
     with app.state.database.connect() as connection:
         connection.execute("UPDATE users SET password_hash=?", (PASSWORD_HASHER.hash(password),))
+    usage_expected = seed_usage(app.state.database, accounts) if args.usage_seed else None
 
     @app.get("/__validation__/state")
     def state():
@@ -163,7 +208,8 @@ def main():
     listener.bind(("127.0.0.1", 0))
     api_origin = f"http://127.0.0.1:{listener.getsockname()[1]}"
     metadata = {"api_origin": api_origin, "site_origin": site_origin, "accounts": accounts,
-                "password": password, "fake_audio": str(fake_audio), "directory": str(directory)}
+                "password": password, "fake_audio": str(fake_audio), "directory": str(directory),
+                "usage_expected": usage_expected}
     metadata_path = directory / "fixture.json"
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     metadata_path.chmod(0o600)

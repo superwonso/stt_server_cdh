@@ -123,6 +123,13 @@ class Database:
                     created_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(username);
+                CREATE TABLE IF NOT EXISTS account_password_resets (
+                    username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+                    token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+                    password_fingerprint TEXT NOT NULL CHECK (length(password_fingerprint) = 64),
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL CHECK (expires_at > created_at)
+                );
                 CREATE TABLE IF NOT EXISTS lectures (
                     id TEXT PRIMARY KEY,
                     username TEXT NOT NULL REFERENCES users(username),
@@ -445,7 +452,8 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
                     action TEXT NOT NULL CHECK (
-                        action IN ('access_changed', 'sessions_revoked', 'tunnel_restarted')
+                        action IN ('access_changed', 'sessions_revoked', 'tunnel_restarted',
+                                   'password_reset_issued', 'password_reset_revoked', 'password_reset_completed')
                     ),
                     result TEXT NOT NULL CHECK (result IN ('success', 'failed', 'accepted')),
                     target TEXT NOT NULL CHECK (length(target) BETWEEN 1 AND 64)
@@ -453,6 +461,33 @@ class Database:
                 CREATE INDEX IF NOT EXISTS admin_audit_recent
                     ON admin_audit(timestamp DESC, id DESC);
             """)
+            audit_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='admin_audit'"
+            ).fetchone()[0]
+            if "password_reset_issued" not in audit_sql:
+                # SQLite cannot extend a CHECK in place. Rebuild only this
+                # bounded metadata table, preserving every row and its IDs.
+                connection.execute("BEGIN IMMEDIATE")
+                sequence = connection.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name='admin_audit'"
+                ).fetchone()
+                connection.execute("""
+                    CREATE TABLE admin_audit_v19 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        action TEXT NOT NULL CHECK (action IN (
+                            'access_changed','sessions_revoked','tunnel_restarted',
+                            'password_reset_issued','password_reset_revoked','password_reset_completed')),
+                        result TEXT NOT NULL CHECK (result IN ('success','failed','accepted')),
+                        target TEXT NOT NULL CHECK (length(target) BETWEEN 1 AND 64)
+                    )
+                """)
+                connection.execute("INSERT INTO admin_audit_v19 SELECT * FROM admin_audit")
+                connection.execute("DROP TABLE admin_audit")
+                connection.execute("ALTER TABLE admin_audit_v19 RENAME TO admin_audit")
+                connection.execute("CREATE INDEX admin_audit_recent ON admin_audit(timestamp DESC,id DESC)")
+                if sequence is not None:
+                    connection.execute("UPDATE sqlite_sequence SET seq=max(seq,?) WHERE name='admin_audit'", (sequence[0],))
             chunk_columns = {row[1] for row in connection.execute("PRAGMA table_info(chunks)")}
             lecture_columns = {row[1] for row in connection.execute("PRAGMA table_info(lectures)")}
             if "deleting" not in lecture_columns:
@@ -563,5 +598,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 18:
-                connection.execute("PRAGMA user_version = 18")
+            if schema_version < 19:
+                connection.execute("PRAGMA user_version = 19")

@@ -1885,6 +1885,110 @@ button {
   font-weight: 700;
 }
 
+.admin-account-recovery {
+  grid-column: 3;
+}
+
+.admin-usage-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.admin-usage-controls label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.admin-usage-controls select {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+}
+
+.admin-usage-summary {
+  display: grid;
+  grid-template-columns: repeat(3,minmax(0,1fr));
+  gap: 10px;
+}
+
+.admin-usage-summary strong {
+  font-size: clamp(17px,2.2vw,24px);
+  overflow-wrap: anywhere;
+}
+
+.admin-usage-accounts {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.admin-usage-account {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-muted);
+}
+
+.admin-usage-account h4 {
+  margin: 0 0 10px;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.admin-usage-account dl {
+  display: grid;
+  grid-template-columns: repeat(3,minmax(0,1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.admin-usage-account dl > div { min-width: 0; }
+.admin-usage-account dt { color: var(--muted); font-size: 11px; }
+.admin-usage-account dd { margin: 4px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+.admin-usage-account p, .admin-usage-source p { color: var(--muted); font-size: 11px; line-height: 1.7; }
+.admin-usage-account p { margin: 10px 0 0; }
+.admin-usage-source { margin-top: 16px; }
+.admin-usage-source summary { cursor: pointer; font-size: 12px; }
+
+.account-recovery-help {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.account-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.account-recovery-actions button {
+  flex: 1 1 160px;
+}
+
+.account-recovery-result {
+  margin-top: 16px;
+}
+
+.account-recovery-result textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
+  overflow-wrap: anywhere;
+  resize: vertical;
+}
+
 .admin-empty {
   margin: 0;
   padding: 16px;
@@ -2381,6 +2485,14 @@ button {
   .admin-account button {
     width: 100%;
   }
+
+  .admin-account-recovery {
+    grid-column: 1;
+  }
+
+  .admin-usage-heading { align-items: flex-start; flex-direction: column; }
+  .admin-usage-controls { width: 100%; }
+  .admin-usage-summary, .admin-usage-account dl { grid-template-columns: minmax(0,1fr); }
 
   .delete-dialog-actions {
     align-items: stretch;

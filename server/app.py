@@ -31,7 +31,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .db import Database
 from .drive_archive import DriveArchiveManager
 from .drive_storage import DriveStorageError
-from . import lecture_tools, lecture_library, lecture_trash, manual_notes
+from . import lecture_tools, lecture_library, lecture_trash, manual_notes, account_recovery, admin_usage
 from .lease_renewal import create_lease_renewer
 from .recovery_backup import BackupScheduler, RecoveryBackupManager
 from .clova_transcriber import ClovaStreamingTranscriber, ClovaTranscriptionError
@@ -536,13 +536,18 @@ def create_app(
         if not limiter.allow((operation, "all-addresses", account), 50, 1800):
             raise HTTPException(429, "로그인 시도가 많습니다. 30분 후 다시 시도하세요.", headers={"Retry-After": "1800"})
 
-    def issue_session(username: str) -> dict:
+    def issue_session(username: str, *, expected_password_hash: str) -> dict:
         if username not in accounts:
             raise RuntimeError("Cannot issue a session for an unknown account")
         token = new_secret()
         now = time.time()
         expires_at = now + settings.session_hours * 3600
         with database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute("SELECT password_hash FROM users WHERE username=?", (username,)).fetchone()
+            if (current is None or not current["password_hash"]
+                    or not secrets.compare_digest(current["password_hash"], expected_password_hash)):
+                raise HTTPException(401, "아이디 또는 비밀번호를 확인하세요.")
             connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
             connection.execute(
                 "INSERT INTO sessions(token_hash, username, expires_at, created_at) VALUES (?, ?, ?, ?)",
@@ -608,7 +613,8 @@ def create_app(
         return user
 
     def audit(connection, action: str, result: str, target: str) -> None:
-        allowed_actions = {"access_changed", "sessions_revoked", "tunnel_restarted"}
+        allowed_actions = {"access_changed", "sessions_revoked", "tunnel_restarted",
+                           "password_reset_issued", "password_reset_revoked", "password_reset_completed"}
         allowed_results = {"success", "failed", "accepted"}
         allowed_targets = {"service", "tunnel", *settings.accounts}
         if action not in allowed_actions or result not in allowed_results or target not in allowed_targets:
@@ -1113,7 +1119,7 @@ def create_app(
             )
             if result.rowcount != 1:
                 raise HTTPException(400, "초대가 만료되었거나 이미 사용되었습니다.")
-        return issue_session(body.username)
+        return issue_session(body.username, expected_password_hash=encoded)
 
     @app.post("/auth/login")
     def login(body: LoginBody, request: Request):
@@ -1124,7 +1130,7 @@ def create_app(
         valid_password = password_matches(encoded, body.password)
         if body.username not in accounts or not valid_password or user is None or not user["password_hash"]:
             raise HTTPException(401, "아이디 또는 비밀번호를 확인하세요.")
-        return issue_session(body.username)
+        return issue_session(body.username, expected_password_hash=encoded)
 
     @app.get("/auth/me")
     def me(user: dict = Depends(identity)):
@@ -1484,6 +1490,14 @@ def create_app(
             # while holding this lock so a slow pre-trash request cannot mint
             # a fresh grant after that invalidation has completed.
             owned_lecture(lecture_id, user["username"])
+            with database.connect() as connection:
+                live = connection.execute(
+                    "SELECT 1 FROM sessions WHERE token_hash=? AND username=? AND expires_at>?",
+                    (user["token_hash"], user["username"], time.time()),
+                ).fetchone()
+            if live is None:
+                raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인하세요.",
+                                    headers={"WWW-Authenticate": "Bearer"})
             clear_expired_download_tickets(time.monotonic())
             for token_hash, granted in tuple(download_tickets.items()):
                 if granted[1:3] == (user["username"], lecture["id"]):
@@ -3547,4 +3561,13 @@ def create_app(
                           limiter=limiter)
     manual_notes.install(app, settings, database, identity=data_identity, owned_lecture=owned_lecture,
                          limiter=limiter, raw_segments=raw_segments, transcript_revision=transcript_revision)
+    def purge_account_presence(username):
+        with presence_lock:
+            presence.pop(username, None)
+
+    account_recovery.install(app, database, admin_identity=admin_identity, account_ids=account_ids,
+                             administrator=settings.admin_username, auth_limit=auth_limit,
+                             purge_tickets=purge_account_download_tickets,
+                             purge_presence=purge_account_presence, audit=audit)
+    admin_usage.install(app, database, admin_identity=admin_identity, account_ids=account_ids, limiter=limiter)
     return app

@@ -73,10 +73,10 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
   const elements = new Map(), createdElements = new Map(), intervals = new Map(), timeouts = new Map(), objectUrls = new Map();
   const documentListeners = new Map();
   const location = {hash:'',hostname:'student.github.io',pathname:'/classroom/',search:''};
-  const historyCalls = [];
+  const historyCalls = [], clipboardWrites = [], storageWrites = [];
   let storedServerValue = storedServer;
   const tabStorage = {getItem:key => sessionItems.get(key) ?? null,
-    setItem:(key,value) => sessionItems.set(key,String(value)),removeItem:key => sessionItems.delete(key)};
+    setItem:(key,value) => { storageWrites.push([key,String(value)]); sessionItems.set(key,String(value)); },removeItem:key => sessionItems.delete(key)};
   let id = 0, mic;
   const makeElement = (name, value = '') => {
     const node = {
@@ -210,9 +210,10 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     document,
     window:{addEventListener(){}}, performance:{now:() => 0},
     location,history:{replaceState(...args){historyCalls.push(args);}},
+    navigator:{clipboard:{writeText:async value => { clipboardWrites.push(value); }}},
     localStorage:{
       getItem(key){ return key === 'yeobaek-server' ? storedServerValue : ''; },
-      setItem(key,value){ if (key === 'yeobaek-server') storedServerValue = String(value); },
+      setItem(key,value){ storageWrites.push([key,String(value)]); if (key === 'yeobaek-server') storedServerValue = String(value); },
     },
     sessionStorage:tabStorage,
     TestAuthSessionStore:class extends TabAuthSessionStore {
@@ -460,7 +461,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     }
     return chunkId;
   };
-  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,runInterval,dispatchDocument,document,location,historyCalls,storedServer:() => storedServerValue,microphone:() => mic,coordination,seedDurableFailedFinal};
+  return {run,element,created,createdAll,objectUrlBlob,intervals,timeouts,runTimeout,runInterval,dispatchDocument,document,location,historyCalls,clipboardWrites,storageWrites,storedServer:() => storedServerValue,microphone:() => mic,coordination,seedDurableFailedFinal};
 }
 
 function reviewApp(fetch) {
@@ -5453,4 +5454,487 @@ test('a late durable skip commit never clears a different account or server uplo
     assert.equal(app.element('notice').textContent,'new scope notice');
     assert.equal(uploads.length,0);
   }
+});
+
+const recoveryCode = 'r'.repeat(43);
+const recoveryAccount = {account_id:'opaque-peer',label:'member-beta',is_self:false,activated:true};
+function recoveryResponse(overrides = {}) {
+  return {username:recoveryAccount.label,reset_code:recoveryCode,expires_at:Math.floor(Date.now()/1000)+1800,...overrides};
+}
+function openRecoveryFixture(app) {
+  app.run(`adminAuthorized=true; adminOverview={accounts:[${JSON.stringify(recoveryAccount)}]};
+    openAdminRecovery(${JSON.stringify(recoveryAccount)});`);
+}
+function readResetLink(app,username = 'user-alpha',extra = '') {
+  app.location.hash = `#username=${encodeURIComponent(username)}&reset_code=${recoveryCode}${extra}`;
+  app.run('consumeAccountLink()');
+}
+
+test('recovery supports dotted account names while enforcing the server account format', () => {
+  const app = setup(() => response({}));
+  app.run(`adminAuthorized=true; openAdminRecovery({account_id:'opaque-dot',label:'member.beta',activated:true})`);
+  assert.equal(app.run('adminRecovery.username'),'member.beta');
+  app.run('closeAdminRecovery()');
+  readResetLink(app,'member.beta');
+  assert.equal(app.run('passwordReset.username'),'member.beta');
+  assert.equal(app.element('username').value,'member.beta');
+  for (const username of ['.user','user.','UPPER','user name','a'.repeat(33)]) {
+    readResetLink(app,username);
+    assert.equal(app.run('passwordReset'),null,username);
+  }
+});
+
+test('password recovery is available only for activated non-self admin targets', () => {
+  const app = setup(() => response({}));
+  app.run(`adminAuthorized=true; renderAdminAccounts([
+    {account_id:'opaque-self',label:user,is_self:true,activated:true},
+    ${JSON.stringify(recoveryAccount)},
+    {account_id:'opaque-invite',label:'invited-user',activated:false},
+    {account_id:'opaque-unknown',label:'unknown-user'}]);`);
+  const rows = app.element('admin-accounts').children;
+  assert.equal(rows[0].children.length,3);
+  assert.equal(rows[1].children[3].textContent,'비밀번호 복구');
+  assert.equal(rows[2].children.length,3); assert.equal(rows[3].children.length,3);
+  rows[1].children[3].onclick();
+  assert.equal(app.element('admin-recovery-dialog').open,true);
+  assert.equal(app.element('admin-recovery-target').textContent,'member-beta 계정');
+  app.run(`closeAdminRecovery(); openAdminRecovery({account_id:'self',label:user,activated:true})`);
+  assert.equal(app.element('admin-recovery-dialog').open,false);
+  app.run(`adminAuthorized=false; openAdminRecovery(${JSON.stringify(recoveryAccount)})`);
+  assert.equal(app.element('admin-recovery-dialog').open,false);
+});
+
+test('admin recovery explicitly issues a fixed Pages fragment without persisting or automatically copying secrets', async () => {
+  const issued = deferred(), calls = [];
+  const app = setup((url,options) => { calls.push({url,options}); return issued.promise; });
+  openRecoveryFixture(app);
+  app.element('admin-recovery-password').value = 'synthetic-admin-password';
+  const issuing = app.element('admin-recovery-form').onsubmit({preventDefault(){}});
+  assert.equal(app.element('admin-recovery-password').value,'');
+  assert.equal(app.element('admin-recovery-password').disabled,true);
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].url,'https://classroom.example/admin/password-resets');
+  assert.deepEqual(JSON.parse(calls[0].options.body),{account_id:'opaque-peer',current_password:'synthetic-admin-password'});
+  issued.resolve(response(recoveryResponse())); await issuing;
+  const link = new URL(app.element('admin-recovery-link').value);
+  assert.equal(link.origin + link.pathname,'https://superwonso.github.io/stt_server_cdh/');
+  assert.equal(link.search,'');
+  assert.deepEqual([...new URLSearchParams(link.hash.slice(1))],[['username','member-beta'],['reset_code',recoveryCode]]);
+  assert.equal(app.element('admin-recovery-result').hidden,false);
+  assert.equal(app.clipboardWrites.length,0);
+  assert.equal(app.storageWrites.length,0);
+  await app.element('admin-recovery-copy').onclick();
+  assert.deepEqual(app.clipboardWrites,[link.href]);
+  app.element('admin-recovery-close').onclick();
+  assert.equal(app.run('adminRecovery'),null);
+  assert.equal(app.element('admin-recovery-link').value,'');
+  assert.equal(app.element('admin-recovery-target').textContent,'');
+  assert.equal(app.element('admin-recovery-dialog').open,false);
+  openRecoveryFixture(app);
+  assert.equal(app.element('admin-recovery-link').value,'');
+  assert.equal(app.element('admin-recovery-result').hidden,true);
+});
+
+test('admin reauthentication errors preserve the login and require explicit fresh credentials for issue or revoke', async () => {
+  const calls = [];
+  const app = setup((url,options) => {
+    calls.push({url,options});
+    return response(calls.length === 1 ? {detail:'현재 비밀번호를 확인해 주세요.',code:'reauth_invalid'} : {status:'revoked'},calls.length === 1 ? 403 : 200);
+  });
+  openRecoveryFixture(app); app.element('admin-recovery-password').value = 'wrong-fixture';
+  await app.run('runAdminRecovery()');
+  assert.equal(app.run('adminAuthorized'),true); assert.equal(app.run('token'),'old-token');
+  assert.equal(app.element('admin-recovery-password').value,'');
+  assert.match(app.element('admin-recovery-error').textContent,/자동으로 다시 발급하지/);
+  assert.equal(calls.length,1);
+  await app.element('admin-recovery-revoke').onclick();
+  assert.equal(calls.length,1,'a new explicit password is mandatory');
+  app.element('admin-recovery-password').value = 'new-fixture';
+  await app.element('admin-recovery-revoke').onclick();
+  assert.equal(calls[1].url,'https://classroom.example/admin/password-resets/revoke');
+  assert.deepEqual(JSON.parse(calls[1].options.body),{account_id:'opaque-peer',current_password:'new-fixture'});
+  assert.match(app.element('admin-recovery-status').textContent,/취소했어요/);
+  assert.equal(app.element('admin-recovery-link').value,'');
+});
+
+test('admin issuance does not retry ambiguous failures and rejects cross-target malformed or expired links', async () => {
+  for (const result of [null,{username:'another-owner'},{reset_code:'short'},
+    {expires_at:Date.now()/1000-1},{expires_at:Date.now()/1000+7200}]) {
+    let posts = 0;
+    const app = setup(() => { posts += 1; if (result === null) throw new TypeError('synthetic lost response'); return response(recoveryResponse(result)); });
+    openRecoveryFixture(app); app.element('admin-recovery-password').value='fixture';
+    await app.run('runAdminRecovery()'); await tick();
+    assert.equal(posts,1); assert.equal(app.element('admin-recovery-link').value,'');
+    assert.equal(app.element('admin-recovery-password').value,'');
+    assert.match(app.element('admin-recovery-error').textContent,/이전 복구 링크는 무효/);
+    assert.doesNotMatch(app.element('admin-recovery-error').textContent,new RegExp(recoveryCode));
+  }
+});
+
+test('admin link results and secrets are discarded on close logout identity session or origin changes', async () => {
+  for (const change of ["closeAdminRecovery()", "token=''; showLogin()", "user='other-user'; token='other-token'; showLogin()",
+    "setServer('https://replacement.trycloudflare.com')", "token='replacement-token'; resetAdminState()"] ) {
+    const issued = deferred(); const app = setup(() => issued.promise);
+    openRecoveryFixture(app); app.element('admin-recovery-password').value='fixture';
+    const request = app.run('runAdminRecovery()');
+    app.run(change);
+    issued.resolve(response(recoveryResponse())); await request;
+    assert.equal(app.element('admin-recovery-link').value,'',change);
+    assert.equal(app.element('admin-recovery-password').value,'',change);
+    assert.equal(app.run('adminRecovery'),null,change);
+    assert.equal(app.storageWrites.some(([,value]) => value.includes(recoveryCode)),false);
+  }
+});
+
+test('closing and immediately reopening a recovery dialog cannot resurrect an old response or old close event', async () => {
+  const issued = deferred(); const app = setup(() => issued.promise);
+  openRecoveryFixture(app); app.element('admin-recovery-password').value='fixture';
+  const request = app.run('runAdminRecovery()');
+  app.run('closeAdminRecovery()');
+  openRecoveryFixture(app);
+  app.element('admin-recovery-dialog').onclose();
+  assert.equal(app.element('admin-recovery-dialog').open,true);
+  issued.resolve(response(recoveryResponse())); await request;
+  assert.equal(app.element('admin-recovery-link').value,'');
+  assert.equal(app.run('adminRecovery.username'),'member-beta');
+});
+
+test('displayed recovery links expire out of memory and DOM without a server request', async () => {
+  let calls = 0;
+  const app = setup(() => { calls += 1; return response(recoveryResponse()); });
+  openRecoveryFixture(app); app.element('admin-recovery-password').value='fixture';
+  await app.run('runAdminRecovery()');
+  const expiryTimer = app.run('adminRecoveryExpiryTimer');
+  app.timeouts.get(expiryTimer).callback();
+  assert.equal(app.run('adminRecovery.link'),'');
+  assert.equal(app.element('admin-recovery-link').value,'');
+  assert.match(app.element('admin-recovery-status').textContent,/만료/);
+  assert.equal(calls,1);
+});
+
+test('reset fragments are removed before discovery and cannot select an API or restore a saved login', async () => {
+  const sessionItems = new Map(), saved = storedAuthFixture(sessionItems), calls = [];
+  const app = setup((url,options) => {
+    assert.deepEqual(app.historyCalls[0],[null,'','/classroom/']);
+    calls.push({url,options});
+    return response(url.startsWith('./config.json') ? runtimeConfig({apiUrl:saved.apiOrigin}) : {status:'ok'});
+  },{sessionItems});
+  blankAuthentication(app);
+  app.location.hash = `#username=user-alpha&reset_code=${recoveryCode}&api=https%3A%2F%2Fevil.trycloudflare.com&origin=http%3A%2F%2Flocalhost%3A8765`;
+  await app.run('init()');
+  assert.equal(sessionItems.size,0); assert.equal(app.run('token'),'');
+  assert.equal(app.run('apiUrl'),saved.apiOrigin); assert.equal(app.run('passwordReset.code'),recoveryCode);
+  assert.equal(app.element('username').readOnly,true);
+  assert.equal(app.element('password').minLength,4);
+  assert.equal(app.element('password-confirm').required,true);
+  assert.equal(app.element('password').autocomplete,'new-password');
+  assert.equal(calls.some(call => call.url.includes('/auth/') || call.url.includes('evil.')),false);
+  assert.equal(app.storageWrites.some(([,value]) => value.includes(recoveryCode)),false);
+});
+
+test('ambiguous duplicate incomplete and malformed reset links fail closed without session restoration', async () => {
+  for (const hash of [`#username=user-alpha&reset_code=${recoveryCode}&setup_code=invitation`,
+    `#username=user-alpha&reset_code=${recoveryCode}&reset_code=${recoveryCode}`,
+    `#username=user-alpha&username=other&reset_code=${recoveryCode}`,
+    '#username=user-alpha&reset_code=',`#reset_code=${recoveryCode}`,'#username=user-alpha&reset_code=bad']) {
+    const sessionItems = new Map(), saved = storedAuthFixture(sessionItems); let authCalls=0;
+    const app = setup(url => { if (url.includes('/auth/')) authCalls+=1;
+      return response(url.startsWith('./config.json') ? runtimeConfig({apiUrl:saved.apiOrigin}) : {status:'ok'});
+    },{sessionItems});
+    blankAuthentication(app); app.location.hash=hash;
+    await app.run('init()');
+    assert.equal(app.run('passwordReset'),null); assert.equal(app.run('activation'),false);
+    assert.equal(authCalls,0); assert.equal(sessionItems.size,0);
+    assert.match(app.element('auth-error').textContent,/관리자에게 새 링크/);
+    assert.equal(app.historyCalls.length,1);
+  }
+});
+
+test('reset success is anonymous and returns to manual login while preserving same-owner microphone and class', async () => {
+  const calls = [];
+  const app = setup((url,options) => { calls.push({url,options}); return response({status:'password_reset'}); });
+  app.run(`recording=true; capture={stop(){throw new Error('must not stop capture')}};
+    current={id:'in-progress',title:'Synthetic ongoing class',segments:[],recording_finalized:false}; lectures=[current];`);
+  readResetLink(app);
+  assert.equal(app.run('recording'),true); assert.equal(app.run('current.id'),'in-progress');
+  app.element('password').value='abcd'; app.element('password-confirm').value='abcd';
+  await app.element('auth-form').onsubmit({preventDefault(){}});
+  assert.equal(calls.length,1); assert.equal(calls[0].url,'https://classroom.example/auth/reset-password');
+  assert.equal(calls[0].options.headers.has('Authorization'),false);
+  assert.deepEqual(JSON.parse(calls[0].options.body),{username:'user-alpha',reset_code:recoveryCode,password:'abcd',password_confirm:'abcd'});
+  assert.equal(app.run('token'),''); assert.equal(app.run('passwordReset'),null);
+  assert.equal(app.run('authenticating'),false); assert.equal(await app.run('restoreStoredSession()'),false);
+  assert.equal(app.run('recording'),true); assert.equal(app.run('current.id'),'in-progress');
+  assert.equal(app.element('username').value,'user-alpha'); assert.equal(app.element('username').readOnly,false);
+  assert.equal(app.element('password').value,''); assert.equal(app.element('password-confirm').value,'');
+  assert.match(app.element('auth-description').textContent,/새 비밀번호로 로그인/);
+});
+
+test('a reset link for another account cannot interrupt or reassign existing owner audio', async () => {
+  let calls = 0;
+  const app = setup(() => { calls += 1; return response({}); });
+  app.run(`recording=true; capture={stop(){throw new Error('must not stop capture')}};`);
+  readResetLink(app,'member-beta');
+  assert.equal(app.run('passwordReset'),null); assert.equal(app.run('user'),'user-alpha');
+  assert.equal(app.run('token'),'old-token'); assert.equal(app.run('recording'),true);
+  assert.equal(calls,0); assert.match(app.element('auth-error').textContent,/다른 계정의 녹음/);
+});
+
+test('reset password bounds confirmation and server verification are checked before any POST', async () => {
+  for (const [password,confirm,verified] of [['abc','abc',true],['x'.repeat(129),'x'.repeat(129),true],
+    ['abcd','abce',true],['abcd','abcd',false]]) {
+    let calls=0; const app = setup(() => {calls+=1; return response({});});
+    readResetLink(app); if (!verified) app.run("connectionState='unverified'");
+    app.element('password').value=password; app.element('password-confirm').value=confirm;
+    await app.element('auth-form').onsubmit({preventDefault(){}});
+    assert.equal(calls,0); assert.equal(app.element('password').value,'');
+    assert.equal(app.element('password-confirm').value,''); assert.equal(app.element('auth-error').hidden,false);
+    assert.equal(app.run('passwordReset.code'),recoveryCode);
+  }
+});
+
+test('reset errors clear passwords but never retry or revive a prior authenticated session', async () => {
+  for (const value of [null,{status:'unexpected'}]) {
+    let calls=0; const app = setup(() => { calls+=1; if (value === null) throw new TypeError('synthetic network loss'); return response(value); });
+    readResetLink(app); app.element('password').value='abcd'; app.element('password-confirm').value='abcd';
+    await app.element('auth-form').onsubmit({preventDefault(){}}); await tick();
+    assert.equal(calls,1); assert.equal(app.run('token'),'');
+    assert.equal(app.element('password').value,''); assert.equal(app.element('password-confirm').value,'');
+    assert.equal(app.element('auth-error').hidden,false);
+    assert.equal(await app.run('restoreStoredSession()'),false);
+  }
+});
+
+test('late reset responses cannot alter a closed form new account session or changed API origin', async () => {
+  for (const change of ["$('auth-toggle').onclick()", "setServer('https://new.trycloudflare.com')",
+    "setActivation(false); user='new-owner'; token='new-session'; ++requestGeneration;",
+    "token=''; showLogin()"] ) {
+    const gate = deferred(); const app = setup(() => gate.promise);
+    readResetLink(app); app.element('password').value='abcd'; app.element('password-confirm').value='abcd';
+    const saving = app.element('auth-form').onsubmit({preventDefault(){}});
+    app.run(change); app.element('auth-description').textContent='new scope';
+    gate.resolve(response({status:'password_reset'})); await saving;
+    assert.equal(app.run('passwordReset'),null); assert.equal(app.element('auth-description').textContent,'new scope');
+    assert.equal(app.element('password').value,''); assert.equal(app.element('password-confirm').value,'');
+    assert.equal(app.run('authenticating'),false);
+  }
+});
+
+test('an older login response cannot log in or clear a newly submitted reset form', async () => {
+  const login = deferred(), reset = deferred(), calls = [];
+  const app = setup((url,options) => {
+    calls.push({url,options}); return url.endsWith('/auth/login') ? login.promise : reset.promise;
+  });
+  app.run("token=''; user=''");
+  app.element('username').value='user-alpha'; app.element('password').value='prior-login-password';
+  const loggingIn = app.element('auth-form').onsubmit({preventDefault(){}});
+  assert.equal(app.run('authenticating'),true);
+  readResetLink(app);
+  assert.equal(app.run('authenticating'),false);
+  app.element('password').value='abcd'; app.element('password-confirm').value='abcd';
+  const resetting = app.element('auth-form').onsubmit({preventDefault(){}});
+  assert.equal(app.run('authenticating'),true);
+  login.resolve(response({token:'must-not-activate',user:{username:'user-alpha'}})); await loggingIn;
+  assert.equal(app.run('token'),''); assert.equal(app.run('authenticating'),true);
+  assert.equal(app.run('passwordReset.code'),recoveryCode);
+  reset.resolve(response({status:'password_reset'})); await resetting;
+  assert.equal(app.run('authenticating'),false); assert.equal(app.run('token'),'');
+  assert.equal(calls.length,2); assert.equal(app.element('auth-error').hidden,true);
+});
+
+test('unrelated lesson rendering generations do not strand an account recovery operation', async () => {
+  const issued = deferred(), app = setup(() => issued.promise);
+  openRecoveryFixture(app); app.element('admin-recovery-password').value='fixture';
+  const issuance = app.run('runAdminRecovery()');
+  app.run('++requestGeneration');
+  issued.resolve(response(recoveryResponse())); await issuance;
+  assert.equal(app.run('adminAction'),''); assert.notEqual(app.element('admin-recovery-link').value,'');
+  app.run('closeAdminRecovery()');
+  const changed = deferred(), resetting = setup(() => changed.promise);
+  readResetLink(resetting); resetting.element('password').value='abcd'; resetting.element('password-confirm').value='abcd';
+  const saving = resetting.element('auth-form').onsubmit({preventDefault(){}});
+  resetting.run('++requestGeneration');
+  changed.resolve(response({status:'password_reset'})); await saving;
+  assert.equal(resetting.run('passwordReset'),null); assert.equal(resetting.run('authenticating'),false);
+});
+
+const usageStates = (overrides = {}) => ({completed:0,failed:0,pending:0,cancelled:0,...overrides});
+function usageAccount(label,overrides = {}) {
+  return {account_id:`opaque-${label}`,label,lectures:{total:0,active:0,trashed:0},
+    recording:{known_seconds:0,qwen_seconds:0,clova_seconds:0,known_lectures:0,unknown_lectures:0},
+    imports:usageStates(),ai:{correction:usageStates(),summary:usageStates(),translation:usageStates(),question:usageStates()},...overrides};
+}
+function usageFixture(period = 'month',accounts = null) {
+  const rows = accounts || [usageAccount('user-alpha',{
+    lectures:{total:2,active:1,trashed:1},recording:{known_seconds:600,qwen_seconds:600,clova_seconds:0,known_lectures:1,unknown_lectures:1},
+    imports:usageStates({completed:1,pending:1}),
+    ai:{correction:usageStates({completed:1}),summary:usageStates({completed:2}),translation:usageStates({failed:1}),question:usageStates({completed:3})},
+  }),usageAccount('member.beta',{
+    lectures:{total:1,active:1,trashed:0},recording:{known_seconds:3600,qwen_seconds:0,clova_seconds:3600,known_lectures:1,unknown_lectures:0},
+    imports:usageStates({failed:1}),
+    ai:{correction:usageStates(),summary:usageStates({completed:1}),translation:usageStates(),question:usageStates({pending:1})},
+  })];
+  const {account_id,label,...totals} = usageAccount('total');
+  const add = (sum,item) => { for (const key of Object.keys(sum)) {
+    if (typeof sum[key] === 'object') add(sum[key],item[key]); else sum[key] += item[key];
+  }};
+  for (const row of rows) add(totals,row);
+  return {period,timezone:'Asia/Seoul',start_at:period === 'all' ? null : period === 'today' ? '2026-09-07T15:00:00Z' : '2026-08-31T15:00:00Z',
+    end_at:'2026-09-08T04:00:00Z',generated_at:'2026-09-08T04:00:00Z',accounts:rows,totals,
+    scope:{basis:'retained_lectures',date_field:'lecture_created_at',includes_trashed:true,excludes_permanently_deleted:true,
+      excludes_deleting:true,ai_counts:'latest_saved_state_except_question_rows',imports:'linked_retained_lectures',duration:'finalized_archive_or_completed_import_metadata'},
+    billing:{available:false,reason:'not_recorded'}};
+}
+function openUsageFixture(app) { app.run("adminAuthorized=true; $('admin-dialog').showModal()"); }
+
+test('admin retained usage reconciles whole and per-account class time and AI-result counts', async () => {
+  const calls = [], snapshot = usageFixture();
+  snapshot.accounts[0].lecture_title = 'must not retain source content';
+  snapshot.billing.secret = 'must not retain billing detail';
+  const app = setup((url,options) => { calls.push({url,options}); return response(snapshot); });
+  openUsageFixture(app); await app.run('loadAdminUsage()');
+  assert.equal(calls.length,1); assert.equal(calls[0].url,'https://classroom.example/admin/usage?period=month');
+  assert.equal(calls[0].options.method,undefined,'usage is read-only');
+  assert.equal(app.element('admin-usage-period').value,'month');
+  assert.equal(app.element('admin-usage-lectures').textContent,'3개');
+  assert.equal(app.element('admin-usage-recording').textContent,'1시간 10분');
+  assert.equal(app.element('admin-usage-ai').textContent,'7개');
+  assert.match(app.element('admin-usage-lecture-detail').textContent,/일반 2개 · 휴지통 1개/);
+  assert.match(app.element('admin-usage-recording-detail').textContent,/미확인 1개 수업/);
+  const rows = app.element('admin-usage-accounts').children;
+  assert.equal(rows.length,2); assert.equal(rows[1].children[0].textContent,'member.beta');
+  assert.equal(rows[0].children[1].children[0].children[1].textContent,'2개');
+  assert.equal(rows[0].children[1].children[1].children[1].textContent,'10분');
+  assert.equal(rows[1].children[1].children[1].children[1].textContent,'1시간 0분');
+  assert.equal(rows[0].children[1].children[2].children[1].textContent,'6개');
+  assert.match(rows[0].children[3].textContent,/파일 변환: 완료 1 · 대기\/처리 1/);
+  assert.match(rows[0].children.at(-1).textContent,/질문: 완료 3/);
+  assert.doesNotMatch(app.run('JSON.stringify(adminUsageSnapshot)'),/must not retain|billing|lecture_title/);
+  assert.match(app.element('admin-usage-updated').textContent,/이번 달 생성 수업 · KST/);
+  assert.ok([...app.timeouts.values()].some(item => item.delay === 20000));
+});
+
+test('zero retained usage and unknown durations remain distinct from unavailable data', async () => {
+  const zero = setup(() => response(usageFixture('month',[usageAccount('zero-user')])));
+  openUsageFixture(zero); await zero.run('loadAdminUsage()');
+  assert.equal(zero.element('admin-usage-lectures').textContent,'0개');
+  assert.equal(zero.element('admin-usage-recording').textContent,'0분');
+  assert.equal(zero.element('admin-usage-ai').textContent,'0개');
+  const unknown = usageAccount('unknown-user',{lectures:{total:1,active:1,trashed:0},
+    recording:{known_seconds:0,qwen_seconds:0,clova_seconds:0,known_lectures:0,unknown_lectures:1}});
+  const app = setup(() => response(usageFixture('month',[unknown])));
+  openUsageFixture(app); await app.run('loadAdminUsage()');
+  assert.equal(app.element('admin-usage-recording').textContent,'0분');
+  assert.match(app.element('admin-usage-recording-detail').textContent,/시간 확인 0개 · 미확인 1개/);
+  for (const status of [404,500]) {
+    const unavailable = setup(() => response({detail:'synthetic unavailable'},status));
+    openUsageFixture(unavailable); await unavailable.run('loadAdminUsage()');
+    assert.equal(unavailable.element('admin-usage-lectures').textContent,'—');
+    assert.equal(unavailable.element('admin-usage-recording').textContent,'—');
+    assert.equal(unavailable.element('admin-usage-error').hidden,false);
+    assert.match(unavailable.element('admin-usage-updated').textContent,/0건으로 집계한 것이 아닙니다/);
+  }
+});
+
+test('retained usage rejects invalid shape scope totals duplicate accounts and non-finite metrics', async () => {
+  const mutations = [data => {data.totals.lectures.total+=1;},data => {data.totals.ai.question.completed+=1;},
+    data => {data.accounts[0].recording.known_seconds=NaN;},data => {data.accounts[0].recording.qwen_seconds=-1;},
+    data => {data.accounts[0].imports.completed='1';},data => {data.accounts[0].ai.summary.pending=0.5;},
+    data => {data.accounts.push(data.accounts[0]);},data => {data.scope.includes_trashed=false;},
+    data => {data.timezone='UTC';},data => {data.period='today';},data => {data.generated_at='not a date';},
+    data => {data.billing.available=true;},data => {data.accounts[0].label='<script>';},
+    data => {data.accounts[0].recording.unknown_lectures=0;},data => {delete data.totals;},
+    data => {data.accounts[0].recording.qwen_seconds=0;}];
+  for (const mutate of mutations) {
+    const data = usageFixture(); mutate(data);
+    const app = setup(() => response(data)); openUsageFixture(app); await app.run('loadAdminUsage()');
+    assert.equal(app.run('adminUsageSnapshot'),null);
+    assert.equal(app.element('admin-usage-accounts').children.length,0);
+    assert.equal(app.element('admin-usage-lectures').textContent,'—');
+    assert.match(app.element('admin-usage-error').textContent,/합계를 확인하지 못/);
+  }
+});
+
+test('a failed usage refresh preserves a clearly stale last-known value but a period change immediately clears it', async () => {
+  let calls=0; const pending = deferred();
+  const app = setup(() => { calls+=1; return calls===1 ? response(usageFixture()) : calls===2
+    ? response({detail:'synthetic connection failure'},503) : pending.promise; });
+  openUsageFixture(app); await app.run('loadAdminUsage()'); await app.run('loadAdminUsage()');
+  assert.equal(app.element('admin-usage-lectures').textContent,'3개');
+  assert.match(app.element('admin-usage-updated').textContent,/마지막 확인값/);
+  app.element('admin-usage-period').value='today'; app.element('admin-usage-period').onchange();
+  assert.equal(app.element('admin-usage-lectures').textContent,'—');
+  assert.equal(app.element('admin-usage-accounts').children.length,0);
+  assert.match(app.element('admin-usage-updated').textContent,/오늘 현황/);
+  pending.resolve(response(usageFixture('today',[usageAccount('zero-user')]))); await tick(); await tick();
+  assert.equal(app.element('admin-usage-lectures').textContent,'0개');
+  assert.equal(app.element('admin-usage-error').hidden,true);
+});
+
+test('rapid usage period changes abort and discard older results with a strict request allowlist', async () => {
+  const requests = [];
+  const app = setup((url,options) => { const gate=deferred(); requests.push({url,options,gate}); return gate.promise; });
+  openUsageFixture(app); const month = app.run('loadAdminUsage()');
+  app.element('admin-usage-period').value='today'; app.element('admin-usage-period').onchange();
+  app.element('admin-usage-period').value='all'; app.element('admin-usage-period').onchange();
+  assert.deepEqual(requests.map(item=>item.url.split('?')[1]),['period=month','period=today','period=all']);
+  assert.equal(requests[0].options.signal.aborted,true); assert.equal(requests[1].options.signal.aborted,true);
+  requests[2].gate.resolve(response(usageFixture('all',[usageAccount('latest-user')]))); await tick(); await tick();
+  requests[1].gate.resolve(response(usageFixture('today'))); requests[0].gate.resolve(response(usageFixture())); await month; await tick();
+  assert.equal(app.run('adminUsageSnapshot.period'),'all');
+  assert.equal(app.element('admin-usage-lectures').textContent,'0개');
+  assert.equal(app.element('admin-usage-accounts').children[0].children[0].textContent,'latest-user');
+  app.element('admin-usage-period').value='today&account_id=someone'; app.element('admin-usage-period').onchange();
+  assert.equal(requests.length,3); assert.equal(app.element('admin-usage-period').value,'all');
+});
+
+test('usage rows controllers and timers are scrubbed on close logout and API identity changes', async () => {
+  for (const change of ["closeAdminDialog()", "token=''; showLogin()", "user='other'; token='other-token'; resetAdminState()",
+    "setServer('https://other.trycloudflare.com')"]) {
+    let calls=0; const late=deferred();
+    const app=setup(() => ++calls===1 ? response(usageFixture()) : late.promise);
+    openUsageFixture(app); await app.run('loadAdminUsage()');
+    const oldTimer=app.timeouts.get(app.run('adminUsageRefreshTimer')).callback;
+    const refreshing=app.run('loadAdminUsage()'); app.run(change);
+    late.resolve(response(usageFixture())); await refreshing; oldTimer(); await tick();
+    assert.equal(app.run('adminUsageSnapshot'),null,change);
+    assert.equal(app.element('admin-usage-accounts').children.length,0,change);
+    assert.equal(app.element('admin-usage-lectures').textContent,'—',change);
+    assert.equal(app.run('adminUsageController'),null,change); assert.equal(calls,2,change);
+  }
+});
+
+test('usage requires administrator access and a 403 never exposes or retains account totals', async () => {
+  let calls=0; const app=setup(() => {calls+=1;return response({detail:'administrator required'},403);});
+  await app.run('loadAdminUsage()'); assert.equal(calls,0);
+  openUsageFixture(app); await app.run('loadAdminUsage()');
+  assert.equal(calls,1); assert.equal(app.run('adminAuthorized'),false);
+  assert.equal(app.element('admin-open').hidden,true); assert.equal(app.run('adminUsageSnapshot'),null);
+  assert.equal(app.element('admin-usage-accounts').children.length,0);
+});
+
+test('usage refresh is independent from active recording and recovery password entry', async () => {
+  const app=setup(url => response(url.includes('/admin/usage?') ? usageFixture() : recoveryResponse()));
+  openUsageFixture(app); openRecoveryFixture(app);
+  app.run("recording=true; capture={stop(){throw new Error('do not stop microphone')}}");
+  app.element('admin-recovery-password').value='unsent-admin-password';
+  await app.run('loadAdminUsage()');
+  assert.equal(app.run('recording'),true); assert.equal(app.element('admin-recovery-dialog').open,true);
+  assert.equal(app.element('admin-recovery-password').value,'unsent-admin-password');
+  assert.equal(app.run('adminAction'),'');
+  await app.run('runAdminRecovery()');
+  const link=app.element('admin-recovery-link').value;
+  await app.run('loadAdminUsage()');
+  assert.equal(app.element('admin-recovery-link').value,link);
+  assert.equal(app.run('recording'),true); assert.equal(app.run('adminUsageSnapshot.totals.lectures.total'),3);
+});
+
+test('usage polls only while the administrator dialog is visible and avoids polling during recovery writes', async () => {
+  let calls=0; const app=setup(() => {calls+=1;return response(usageFixture());});
+  openUsageFixture(app); await app.run('loadAdminUsage()');
+  app.document.hidden=true; await app.runTimeout(20000); assert.equal(calls,1);
+  app.document.hidden=false; app.run("adminAction='password-reset'"); await app.runTimeout(20000); assert.equal(calls,1);
+  app.run("adminAction=''"); await app.runTimeout(20000); assert.equal(calls,2);
+  const timer=app.timeouts.get(app.run('adminUsageRefreshTimer')).callback;
+  app.run('closeAdminDialog()'); timer(); await tick(); assert.equal(calls,2);
 });
