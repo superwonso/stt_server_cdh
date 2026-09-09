@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
+import { performance as hostPerformance } from 'node:perf_hooks';
+import { setTimeout as hostDelay } from 'node:timers/promises';
 import { encodeWav } from '../web/audio.js';
 import * as TestLocalAudioExport from '../web/local-audio-export.js';
 import * as TestRecordingFileSelection from '../web/recording-file-selection.js';
@@ -46,10 +48,14 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
   `)
   .replace('void init();', '');
 const tick = () => new Promise(resolve => setImmediate(resolve));
-async function until(predicate, label = 'asynchronous operation') {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+async function until(predicate, label = 'asynchronous operation', {timeoutMs = 5000} = {}) {
+  // WebCrypto/Blob work may finish on another thread. Two hundred immediate
+  // turns can elapse in under 10 ms on CI without that work completing. Use a
+  // host monotonic deadline, separate from the intentionally frozen VM clock.
+  const deadline = hostPerformance.now() + timeoutMs;
+  while (hostPerformance.now() < deadline) {
     if (predicate()) return;
-    await tick();
+    await hostDelay(1);
   }
   assert.ok(predicate(),`${label} did not settle`);
 }
@@ -75,7 +81,7 @@ function runtimeConfig({state = 'online', apiUrl = 'https://fresh-tunnel.tryclou
   return {version:1,state,apiUrl,publishedAt:isoSeconds(publishedMs),expiresAt:isoSeconds(expiresMs)};
 }
 function deferred() { let resolve, reject; const promise = new Promise((yes,no) => { resolve = yes; reject = no; }); return {promise,resolve,reject}; }
-function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '', sessionItems = new Map(), translationApi = false } = {}) {
+function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '', sessionItems = new Map(), translationApi = false, cryptoImplementation = webcrypto } = {}) {
   const elements = new Map(), createdElements = new Map(), intervals = new Map(), timeouts = new Map(), objectUrls = new Map();
   const documentListeners = new Map();
   const location = {hash:'',hostname:'student.github.io',pathname:'/classroom/',search:''};
@@ -212,7 +218,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     },
   };
   const context = vm.createContext({
-    Blob, Headers, URL:TestURL, URLSearchParams, AbortController, console, crypto:webcrypto,
+    Blob, Headers, URL:TestURL, URLSearchParams, AbortController, console, crypto:cryptoImplementation,
     document,
     window:{addEventListener(){}}, performance:{now:() => 0},
     location,history:{replaceState(...args){historyCalls.push(args);}},
@@ -4409,12 +4415,12 @@ test('a late CLOVA lookup and a pending lookup timer cannot affect another accou
 });
 
 test('an ambiguous CLOVA chunk failure never auto-retries or silently switches to Qwen', async () => {
-  let uploads = 0;
+  let uploads = 0, lookups = 0;
   const app = setup(async (url,options = {}) => {
     if (url.endsWith('/lectures')) return response({
       id:options.headers.get('X-Lecture-Id'),title:'클로바 수업',language:'ko',asr_provider:'clova',created_at:new Date().toISOString(),segments:[],
     },201);
-    if (url.endsWith('/result')) return response({state:'unknown'});
+    if (url.endsWith('/result')) { lookups += 1; return response({state:'unknown'}); }
     if (url.endsWith('/chunks')) {
       uploads += 1;
       throw new TypeError('connection lost after upload');
@@ -4426,9 +4432,11 @@ test('an ambiguous CLOVA chunk failure never auto-retries or silently switches t
   await app.run('startRecording()');
   app.microphone().tail = chunk(6,2.2,2,true);
   app.microphone().callbacks.onChunk(chunk(0));
-  await until(() => app.run('!!sendError'),'unknown CLOVA result');
+  await until(() => app.run('!!sendError && !sending'),'unknown CLOVA result and durable blocked state');
 
   assert.equal(uploads,1);
+  assert.equal(lookups,1);
+  assert.equal(app.run('liveQueue.chunks.values().next().value.state'),'blocked');
   assert.equal(app.run('liveQueue.markInflightCalls'),1,
     'CLOVA ambiguity is persisted before the request leaves the browser');
   assert.equal(app.run('retryTimer'),null);
@@ -4447,6 +4455,77 @@ test('an ambiguous CLOVA chunk failure never auto-retries or silently switches t
   await tick(); await tick();
   assert.equal(app.microphone().stopCalls,1);
   assert.equal(app.run('pending.length'),2,'an explicit stop appends the final tail behind the blocked chunk');
+});
+
+test('ambiguous CLOVA failure retains one WAV across delayed durable writes and real SHA-256 completion', async () => {
+  for (const phase of ['inflight-write','digest','blocked-write']) {
+    const entered = deferred(), release = deferred();
+    let uploads = 0, lookups = 0, digestCalls = 0, enteredGate = false, settled = false;
+    const gate = async () => { enteredGate = true; entered.resolve(); await release.promise; };
+    const cryptoImplementation = {
+      randomUUID:() => webcrypto.randomUUID(),
+      getRandomValues:array => webcrypto.getRandomValues(array),
+      subtle:{digest:async (...args) => {
+        digestCalls += 1;
+        if (phase === 'digest') await gate();
+        return webcrypto.subtle.digest(...args);
+      }},
+    };
+    const app = setup(async (url,options = {}) => {
+      if (url.endsWith('/lectures')) return response({id:options.headers.get('X-Lecture-Id'),
+        title:'합성 클로바 수업',language:'ko',asr_provider:'clova',created_at:new Date().toISOString(),segments:[]},201);
+      if (url.endsWith('/chunks')) { uploads += 1; throw new TypeError('synthetic response lost'); }
+      if (url.endsWith('/result')) {
+        lookups += 1;
+        assert.match(options.headers.get('X-Chunk-Payload-SHA256'),/^[a-f0-9]{64}$/);
+        assert.notEqual(options.method,'POST');
+        return response({state:'unknown'});
+      }
+      return response({});
+    },{cryptoImplementation});
+    app.run('transcriptionProviders.clova.configured=true');app.element('asr-provider').value='clova';
+    await app.run('startRecording()');
+    const queue=app.run('liveQueue');
+    if (phase !== 'digest') {
+      const method=phase==='inflight-write'?'markChunkInflight':'markChunkBlocked';
+      const original=queue[method].bind(queue);
+      queue[method]=async (...args)=>{await gate();return original(...args);};
+    }
+    const audio=chunk(0);
+    app.microphone().callbacks.onChunk(audio);
+    const complete=until(()=>app.run('!!sendError && !sending'),`${phase}: durable unknown-result completion`).then(()=>{settled=true;});
+    // Observe early rejections as well as successful completion; finally still
+    // releases the external operation if an assertion fails.
+    void complete.catch(()=>{});
+    try {
+      await until(()=>enteredGate,`${phase}: external operation entered`);
+      await entered.promise;
+      for(let turns=0;turns<250;turns+=1) await tick();
+      assert.equal(settled,false,'the old 200-turn budget can be exhausted while legitimate work is pending');
+      assert.equal(app.run('recording'),true);assert.equal(queue.chunks.size,1);
+      assert.equal(uploads,phase==='inflight-write'?0:1);
+      assert.equal(lookups,phase==='blocked-write'?1:0);
+      assert.equal(app.run('retryTimer'),null);
+    } finally { release.resolve(); }
+    await complete;
+    assert.equal(uploads,1);assert.equal(lookups,1);assert.equal(digestCalls,1);
+    assert.equal(queue.markInflightCalls,1);assert.equal(queue.chunks.size,1);
+    const stored=[...queue.chunks.values()][0];assert.equal(stored.state,'blocked');
+    assert.deepEqual(new Uint8Array(await stored.blob.arrayBuffer()),new Uint8Array(await audio.blob.arrayBuffer()));
+    assert.equal(app.run('pending.length'),1);assert.equal(app.run('current.segments.length'),0);
+    assert.equal(app.run('pending[0].asrProvider'),'clova');assert.equal(app.run('retryTimer'),null);
+    assert.equal(app.run('recording'),true);assert.equal(app.microphone().stopCalls,undefined);
+    assert.match(app.run('sendError'),/자동 재전송하지 않았/);
+    assert.match(app.element('retry').textContent,/위험 이해.*수동 재전송/);
+    await app.run('drain()');assert.equal(uploads,1,'even another drain cannot replay an ambiguous chunk');
+    await app.run('stopRecording()');
+  }
+});
+
+test('asynchronous test waits retain a bounded monotonic deadline for work that never settles', async () => {
+  const started=hostPerformance.now();
+  await assert.rejects(until(()=>false,'synthetic stalled operation',{timeoutMs:20}),/synthetic stalled operation did not settle/);
+  assert.ok(hostPerformance.now()-started>=20);
 });
 
 test('re-login preserves the manual CLOVA retry gate until the user explicitly resubmits', async () => {
