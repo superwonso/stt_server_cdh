@@ -4,7 +4,7 @@
 
 ## 중단 복구·내보내기·원문 문맥 정리본 통합 릴리스 (2026-09-09~10)
 
-사용자가 미반영된 변경 전체의 수정·테스트·커밋·푸시·Pages 배포·API 재시작을 요청했다. 이전 보류 지시는 해제됐다. 코드 통합 검증·API 재시작·DB 이전은 완료했고 Pages 게시를 진행 중이다. 아래의 미배포·재시작 금지 문구들은 **당시의 과거 체크포인트**다. 로그인 구조 변경 철회는 유지하고 기존 계정·키·모델·터널을 바꾸지 않는다.
+사용자가 미반영된 변경 전체의 수정·테스트·커밋·푸시·Pages 배포·API 재시작을 요청했다. 이전 보류 지시는 해제됐고, **코드 수정·검증·커밋/푸시·API 재시작·DB 이전·Pages 게시·공개 확인을 완료했다.** [성공한 배포 실행](https://github.com/superwonso/stt_server_cdh/actions/runs/34368338292)은 `3e4e619` 기준이다. 아래의 미배포·재시작 금지 문구들은 **당시의 과거 체크포인트**다. 로그인 구조 변경 철회는 유지하고 기존 계정·키·모델·터널은 바꾸지 않았다.
 
 - 기존 원문 대조용 후보정·번역은 유지한다. 별도 정리본은 **후보정·번역·직접 수정을 거치지 않은 확정 ASR 원문** 전체를 하나의 Markdown 입력으로 구성한다. 사용자 요청의 전체 문맥 기반 영문→한국어 번역·한글 음차 복원 문구를 상위 프롬프트에 그대로 포함하고, 단순 요약이나 영어 나열을 목표로 하지 않는다. 모델에는 파일 내용이 전달되며 임의 Markdown 파일의 추가 업로드 UI나 파일 저장 API를 신설하지 않는다. 출력은 검증용 JSON에 Markdown 본문·출처를 담고 최종 `.md` 하나로 제공한다. 기존32회/무재시도/보호 정보·출처 검증 한도는 유지한다.
 - TXT·Markdown은 현재 표시한 버전의 읽기 전용 시점 복사본을 내려받는다. 전송 대기·오류·일시정지·다른 수업 녹음만으로 막지 않고, 미완료본의 부분 기록·시점을 표시한다. 다운로드를 위해 녹음을 끝내거나 원문·대기열을 수정하지 않는다.
@@ -20,7 +20,7 @@
 
 ### 최종 코드 검증
 
-- Python 전체 **879개/176.738초**, Node 개별 **460개/16파일**, Actions와 동일한 파일 격리 방식16파일 모두 통과했다. 합계 **1,339개**이며 집중 테스트나 앞선876개 실행을 중복 합산하지 않는다. Python 로그의 `simulated local file lock`은 기존 실패 주입 테스트다. 최종 로그는 `/tmp/stt-sep9-python-release-verified.log`, `/tmp/stt-sep9-node-individual-verified.log`, `/tmp/stt-sep9-node-actions-verified.log`다.
+- Python 전체 **879개/176.738초**, Node 개별 **462개/16파일**, Actions와 동일한 파일 격리 방식도 Node22/24에서16파일 모두 통과했다. 합계 **1,341개**이며 집중 테스트·20회 반복이나 앞선876개 실행을 중복 합산하지 않는다. Python 로그의 `simulated local file lock`은 기존 실패 주입 테스트다. 최종 로그는 `/tmp/stt-sep9-python-release-verified.log`, `/tmp/stt-sep9-node-individual-final.log`, `/tmp/stt-sep9-node22-ci-recheck.log`, `/tmp/stt-sep9-node24-ci-recheck.log`다. 앞선460개 실행 뒤의 CI 하네스2회귀 추가는 아래에 설명한다.
 - 추가 서버 회귀는 부모/자식 소유권·동일 UUID 생성 재시도·부모 삭제 뒤 자식 보존, schema20→21의 기존 행 보존, WAV append 중 고정 prefix/Range·빈파일 거절·symlink/파일 교체·축소 거절·세션 폐기·소켓 취소 자원 반환을 포함한다. 부분 WAV 전용 동시2개 제한에서 초과 FD/티켓회수소비0, 같은 시점 ASR 청크 성공, 중복 close로 슬롯이 늘지 않음을 확인했다.
 - 실제 Chromium153 기기 구조5묶음을 재검증했다. HTTP422 뒤 마이크 유지·단일 실패 요청, 현재 탭 WAV517,176바이트/16.160375초, 별도 구조 창512,044바이트/16초,5초 PCM 중단 안내/수동 복구, 합성 무음→톤22초의 겹침·미완성tail 재조립704,044바이트와 원본/큐 불변을 통과했다. 첫 두 WAV는 합성 무음이며 소리가 있다고 주장하지 않는다. 보고서 `/tmp/stt-browser-check.QQUsBu/local-audio-artifacts-1788965384777/report.json`.
 - 실제 Chromium153 이어 녹음·내보내기5묶음도 통과했다. 전송 실패 중 TXT/MD·수동 pause/resume, 실제 로컬16.684625초/533,952바이트·서버부분15초/480,044바이트·다른 완료 수업1초/32,044바이트 WAV의 RIFF/PCM, 자동 감지 null 부모의 새 child/sequence0, 기존 큐 SHA 불변, 다른 수업 텍스트/WAV 다운로드 중 child 입력 유지,390px 넘침0, 타계정404를 확인했다. 추가 자동 ASR POST는0이었다. 보고서 `/tmp/stt-browser-check.QQUsBu/continuation-export-artifacts-1788965879184/report.json`, 화면도 직접 확인했다. 초기 QA는 제목 부분일치가 부모·자식을 함께 선택한 하네스 문제였고 exact 선택자로 고친 뒤 전체 재실행했다.
@@ -35,8 +35,11 @@
 - 새 서버의 schema21·integrity ok·FK 오류0, 기존23테이블의 모든 행/열 값 동일, 새 정리본/이어 녹음 테이블0행을 시작 뒤 다시 확인했다. 미확정 수업1개·기존청크2687개·Drive ready17개·로컬WAV1개도 보존됐다. 실제 Drive 파일의 전체 바이트를 다시 내려받아 비교한 것은 아니다.
 - 새 schema21과 복구 설정도 D 드라이브에3,267,544바이트 암호문으로 백업·검증했다. 스케줄 enabled·failure0·pending_copy false다. 기존 암호문을 지우거나 녹음을 중복 보관하지 않았으며 실제 복호화 복원은 이번에 반복하지 않았다.
 - 로컬/외부 health200, 무인증 status/me/lectures/admin/study-note401, 잘못된 티켓404, 잘못된 Origin403, Pages preflight200을 확인했다. 공개 runtime config는 online·만료 전·기존 터널 주소와 일치한다. 실제 사용자 로그인·초대·비밀번호는 이 검증에 사용하지 않았다.
-- 최초 Pages 실행 `34367583325`는 게시 전에 기존 CLOVA 비동기 회귀1개가 실패해 멈췄고 기존 공개 웹은 유지됐다. 로그상200회 `setImmediate` 대기를8.6ms 안에 소진한 것이며, 실제 Blob/WebCrypto/영속 저장의 완료 대기가 아니었다. 제품 보호 조건을 완화하거나 CI 테스트를 제외하지 않고, 테스트 하네스에 host monotonic deadline을 적용하고 지연된 inflight 쓰기·실제 SHA-256·blocked 쓰기와 끝나지 않는 작업의 제한 시간 회귀를 추가했다. 제품 소스·실행 API는 이 수정으로 바뀌지 않는다. 최종 Pages 결과는 후속 확인 후 기록한다.
+- 최초 Pages 실행 `34367583325`는 게시 전에 기존 CLOVA 비동기 회귀1개가 실패해 멈췄고 기존 공개 웹은 유지됐다. 로그상200회 `setImmediate` 대기를8.6ms 안에 소진한 것이며, 실제 Blob/WebCrypto/영속 저장의 완료 대기가 아니었다. 제품 보호 조건을 완화하거나 CI 테스트를 제외하지 않고, 테스트 하네스에 host monotonic deadline을 적용하고 지연된 inflight 쓰기·실제 SHA-256·blocked 쓰기와 끝나지 않는 작업의 제한 시간 회귀를 추가했다. 제품 소스·실행 API는 이 수정으로 바뀌지 않는다.
 - 이 수정 후 Node24.18.1 전체 앱264개를20회 연속 실행해 모두 통과했다(집중 반복5,280건은 전체 테스트 수에 합산하지 않음). 구 helper만 메모리의 모듈 소스에 임시 주입하면 새 회귀가 실패함을 확인했고 파일/제품 코드를 되돌리지 않았다. Node22의 앱264개와 Node22/24의 전체16파일도 통과했다. 반복 로그 `/tmp/stt-clova-ci-repeat.evyywo/`, 반증 `/tmp/stt-clova-ci-old-helper-proof.log`, 전체 `/tmp/stt-sep9-node22-ci-recheck.log`, `/tmp/stt-sep9-node24-ci-recheck.log`. 추가2회귀를 포함한 최종 고유 테스트 수는 Python879+Node462=**1,341개**다.
+- CI 수정 커밋 `3e4e619`을 정상 푸시하고 Pages 실행 `34368338292`의 웹 회귀·runtime 검사·게시 전 단계 성공을 확인했다. 공개 자산21개가 로컬 웹 소스와 byte-for-byte 같았으며, 공개/로컬 API health200·인증401·잘못된 Origin403·Pages preflight200도 다시 확인했다. runtime config는 online·만료 전·동일 터널이다. `/tmp/stt-sep9-public-check-result.json`에 URL/비밀값 없는 결과를 보존했다.
+- 공개 Chromium에서 본 화면/구조 창 ×1365px/390px의4개 익명 화면 모두 통과했다. 한글 글꼴을 적용한 실제 화면도 직접 확인했으며 가로 넘침·JS 예외·콘솔 오류·자격정보/POST 요청·자산 불일치0, health4회200이었다. 새 격리 프로필만 사용하고 기존 사용자 탭은 건드리지 않았다. 최종 보고서 `/tmp/stt-sep9-public-browser-Cor9BM/report.json`; 첫 화면 점검의 격리 환경 글꼴 누락은 QA 설정을 고쳐 전체 재실행했으며 사이트 코드를 바꾼 것은 아니다.
+- API·터널은 실행 중이며 이후 검증 기록 갱신은 문서 전용이다. 웹/API 소스가 동일하므로 테스트/문서 수정 뒤 API를 추가 재시작하지 않았다. 기존 음성부터 확보한 뒤 새 화면을 사용하며, 실제 운영 계정 로그인·장시간 수업 확인은 위 미검증 범위와 구분한다.
 
 ## 과거 체크포인트: 드롭·LLM 안정화·별도 수업 정리본 — 당시 운영 미배포 (2026-09-09)
 
