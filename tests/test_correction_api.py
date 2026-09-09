@@ -237,6 +237,21 @@ class CorrectionApiTests(unittest.TestCase):
         self.wait_for(lecture_id, "completed")
         self.assertEqual(self.processor.calls, 2)
 
+    def test_truncation_and_refusal_codes_are_preserved_with_fixed_safe_messages(self):
+        for code in ("response_truncated", "model_refused"):
+            with self.subTest(code=code):
+                lecture_id, segment_id = self.lecture()
+                self.processor.error = PostprocessingError(code, "private-provider-body secret-key")
+                started = self.client.post(f"/lectures/{lecture_id}/correction", headers=self.headers(), json={})
+                self.assertEqual(started.status_code,200)
+                failed = self.wait_for(lecture_id,"failed").json()
+                self.assertEqual(failed["error_code"],code)
+                self.assertNotIn("private-provider",str(failed))
+                self.assertNotIn("secret-key",str(failed))
+                with self.database.connect() as connection:
+                    self.assertEqual(connection.execute("SELECT text FROM segments WHERE id=?",(segment_id,)).fetchone()[0],
+                                     "첫 번재 문장 15개입니다.")
+
     def test_requires_final_transcript_and_blocks_delete_while_external_call_is_running(self):
         unfinished, _ = self.lecture(finalized=False)
         self.assertEqual(

@@ -29,6 +29,7 @@ from server.security import PASSWORD_HASHER
 from server.settings import Settings
 from server.summarizer import LectureSummary
 from server.translator import LectureTranslation
+from server.study_notes import StudyNoteDocument
 
 
 class SyntheticASR:
@@ -91,6 +92,23 @@ class SyntheticTranslation:
         self.calls += 1
         return LectureTranslation([{**segment, "text": "식물은 빛을 이용해 양분을 만듭니다."}
                                    for segment in segments])
+
+
+class SyntheticStudyNotes:
+    configured = True
+    model = "synthetic-study-note"
+
+    def __init__(self):
+        self.calls = 0
+
+    def create(self, *, language, segments, interrupted):
+        self.calls += 1
+        return StudyNoteDocument([{
+            "heading": "식물의 양분 생성",
+            "source_ids": [segment["id"] for segment in segments],
+            "text": "식물은 **빛**을 이용해 양분을 만듭니다.",
+            "edits": [],
+        }])
 
 
 class QuietWebHandler(SimpleHTTPRequestHandler):
@@ -172,9 +190,9 @@ def main():
         site_origins=(site_origin,), model_warmup=False,
         device="cpu", google_drive_enabled=False, recording_free_reserve_bytes=0,
     )
-    asr, summary, translation = SyntheticASR(), SyntheticSummary(), SyntheticTranslation()
+    asr, summary, translation, study_notes = SyntheticASR(), SyntheticSummary(), SyntheticTranslation(), SyntheticStudyNotes()
     app = create_app(settings, asr, DisabledCorrection(), clova_transcriber=DisabledCloudASR(),
-                     summarizer=summary, translator=translation)
+                     summarizer=summary, translator=translation, study_note_maker=study_notes)
     with app.state.database.connect() as connection:
         connection.execute("UPDATE users SET password_hash=?", (PASSWORD_HASHER.hash(password),))
     usage_expected = seed_usage(app.state.database, accounts) if args.usage_seed else None
@@ -196,7 +214,8 @@ def main():
                     "SELECT count(*) FROM segments WHERE lecture_id=?", (lecture["id"],)).fetchone()[0]
         return {"lectures": lectures, "chunks": chunks, "asr_calls": asr.calls,
                 "worklet_loads": web.validation_worklet_requests,
-                "summary_calls": summary.calls, "translation_calls": translation.calls}
+                "summary_calls": summary.calls, "translation_calls": translation.calls,
+                "study_note_calls": study_notes.calls}
 
     fake_audio = directory / "synthetic-silence.wav"
     with wave.open(str(fake_audio), "wb") as output:

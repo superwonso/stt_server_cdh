@@ -31,7 +31,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .db import Database
 from .drive_archive import DriveArchiveManager
 from .drive_storage import DriveStorageError
-from . import lecture_tools, lecture_library, lecture_trash, manual_notes, account_recovery, admin_usage
+from . import lecture_tools, lecture_library, lecture_trash, manual_notes, account_recovery, admin_usage, lecture_continuations
 from .lease_renewal import create_lease_renewer
 from .recovery_backup import BackupScheduler, RecoveryBackupManager
 from .clova_transcriber import ClovaStreamingTranscriber, ClovaTranscriptionError
@@ -46,12 +46,15 @@ from .recordings import (
     WAV_HEADER_BYTES,
 )
 from .postprocessor import MindlogicPostprocessor, PostprocessingError
+from .recording_snapshot import RecordingSnapshot, SnapshotStream
 from .summarizer import MindlogicSummarizer
 from .summary_service import SummaryService
 from .question_service import QuestionService
 from .question_answerer import QuestionAnswerer
 from .translator import MindlogicTranslator
 from .translation_service import TranslationService
+from .study_notes import MindlogicStudyNotes
+from .study_note_service import StudyNoteService
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
 from .settings import Settings
 from .transcriber import LocalTranscriber
@@ -127,6 +130,7 @@ class LectureBody(BaseModel):
     title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
     language: Literal["ko", "en"] | None = "ko"
     asr_provider: Literal["qwen", "clova"] = "qwen"
+    continuation_of: uuid.UUID | None = None
 
 
 class ImportBody(BaseModel):
@@ -330,6 +334,7 @@ def create_app(
     summarizer=None,
     translator=None,
     question_answerer=None,
+    study_note_maker=None,
     drive_storage=None,
     tunnel_status=None,
     tunnel_restart=None,
@@ -355,6 +360,7 @@ def create_app(
     summary_service = SummaryService(settings, database, summarizer or MindlogicSummarizer(settings), limiter)
     translation_service = TranslationService(settings, database, translator or MindlogicTranslator(settings), limiter)
     question_service = QuestionService(settings, database, question_answerer or QuestionAnswerer(settings), limiter)
+    study_note_service = StudyNoteService(settings, database, study_note_maker or MindlogicStudyNotes(settings), limiter)
     inference_lock = threading.Lock()
     capacity = threading.BoundedSemaphore(settings.max_pending_chunks)
     chunk_admission_lock = threading.Lock()
@@ -388,9 +394,11 @@ def create_app(
     )
     backup_scheduler = BackupScheduler(RecoveryBackupManager(settings)) if production_factory else None
     download_ticket_lock = threading.Lock()
+    # Slow partial-file downloads must never share the ASR admission budget.
+    snapshot_download_capacity = threading.BoundedSemaphore(2)
     # A small reuse budget lets a browser resume a Range download after a
     # Wi-Fi interruption without ever putting the login bearer in a URL.
-    download_tickets: dict[str, tuple[float, str, str, int, str]] = {}
+    download_tickets: dict[str, tuple[float, str, str, int, str] | tuple[float, str, str, int, str, RecordingSnapshot]] = {}
     if settings.max_upload_bytes < settings.import_part_bytes:
         raise RuntimeError("MAX_UPLOAD_BYTES must be at least the fixed import part size")
     import_part_bytes = settings.import_part_bytes
@@ -426,6 +434,7 @@ def create_app(
         summary_service.recover()
         translation_service.recover()
         question_service.recover()
+        study_note_service.recover()
         if settings.model_warmup and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
         try:
@@ -435,6 +444,7 @@ def create_app(
             summary_service.start()
             translation_service.start()
             question_service.start()
+            study_note_service.start()
             archive_manager.start()
             lease_renewer.start()
             if backup_scheduler is not None:
@@ -448,6 +458,7 @@ def create_app(
             summary_service.request_shutdown()
             translation_service.request_shutdown()
             question_service.request_shutdown()
+            study_note_service.request_shutdown()
             archive_manager.request_shutdown()
             lease_renewer.request_shutdown()
             if backup_scheduler is not None:
@@ -457,6 +468,7 @@ def create_app(
             summary_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             translation_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             question_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
+            study_note_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
             archive_stopped = archive_manager.stop(
                 timeout=max(0.0, shutdown_deadline - time.monotonic())
@@ -480,6 +492,7 @@ def create_app(
     app.state.summary_service = summary_service
     app.state.translation_service = translation_service
     app.state.question_service = question_service
+    app.state.study_note_service = study_note_service
     app.state.recording_store = recording_store
     app.state.archive_manager = archive_manager
     app.state.lease_renewer = lease_renewer
@@ -887,7 +900,10 @@ def create_app(
                     " JOIN lectures l4 ON l4.id = lt.lecture_id "
                     " WHERE l4.username = u.username AND lt.status IN ('queued', 'processing')) AS translation_jobs, "
                     "(SELECT COUNT(*) FROM lecture_questions lq WHERE lq.username=u.username "
-                    " AND lq.status IN ('queued','processing')) AS question_jobs "
+                    " AND lq.status IN ('queued','processing')) AS question_jobs, "
+                    "(SELECT COUNT(*) FROM lecture_study_notes sn JOIN lectures l5 ON l5.id=sn.lecture_id "
+                    " WHERE l5.username=u.username AND sn.username=u.username "
+                    " AND sn.status IN ('queued','processing')) AS study_note_jobs "
                     "FROM users u",
                     (current_time,),
                 ).fetchall()
@@ -912,6 +928,9 @@ def create_app(
                 ).fetchone()[0],
                 "questions": connection.execute(
                     "SELECT COUNT(*) FROM lecture_questions WHERE status IN ('queued','processing')"
+                ).fetchone()[0],
+                "study_notes": connection.execute(
+                    "SELECT COUNT(*) FROM lecture_study_notes WHERE status IN ('queued','processing')"
                 ).fetchone()[0],
             }
             recent_audit = [
@@ -959,6 +978,7 @@ def create_app(
                         "summaries": row["summary_jobs"],
                         "translations": row["translation_jobs"],
                         "questions": row["question_jobs"],
+                        "study_notes": row["study_note_jobs"],
                     },
                 }
             )
@@ -1088,6 +1108,7 @@ def create_app(
         }
         with database.connect() as connection:
             result.update(lecture_library.metadata_for(connection, lecture))
+            result.update(lecture_continuations.fields_for(connection, lecture))
         result.update(
             recording_flags(
                 lecture["username"], lecture["id"], bool(lecture["recording_finalized"])
@@ -1179,6 +1200,8 @@ def create_app(
             "model": settings.translation_model,
         }
         result["question_answering"] = {"configured": question_service.configured, "model": question_service.model}
+        result["study_notes"] = {"configured": study_note_service.configured, "model": study_note_service.model}
+        result["capabilities"] = {"lecture_continuations": True, "recording_partial_download": True}
         return result
 
     @app.get("/lectures")
@@ -1201,6 +1224,9 @@ def create_app(
             lecture_id = str(uuid.UUID(x_lecture_id)) if x_lecture_id else str(uuid.uuid4())
         except (ValueError, AttributeError) as error:
             raise HTTPException(422, "수업 ID가 올바르지 않습니다.") from error
+        parent_id = str(body.continuation_of) if body.continuation_of is not None else None
+        if parent_id is not None and not x_lecture_id:
+            raise HTTPException(422, "이어 녹음에는 새 수업 요청 ID가 필요합니다.")
 
         def replay_or_conflict(connection):
             existing = connection.execute(
@@ -1215,16 +1241,25 @@ def create_app(
                 or existing["title"] != body.title
                 or existing["language"] != body.language
                 or existing["asr_provider"] != body.asr_provider
+                or not lecture_continuations.matches_creation(connection, lecture_id, parent_id)
             ):
                 raise HTTPException(409, "같은 수업 ID로 다른 내용을 만들 수 없습니다.")
             if existing["deleting"] or existing["trashed_at"] is not None:
                 raise HTTPException(409, "휴지통에 있거나 삭제 중인 수업 ID는 다시 사용할 수 없습니다.")
             return dict(existing)
 
+        def creation_result(lecture):
+            result = lecture_result(lecture)
+            if parent_id is not None:
+                # This verifies the submitted creation intent, not visibility
+                # of a parent that may have been trashed since the lost ACK.
+                result["continuation_creation_verified"] = True
+            return result
+
         with database.connect() as connection:
             replay = replay_or_conflict(connection)
         if replay is not None:
-            return lecture_result(replay)
+            return creation_result(replay)
         if body.asr_provider == "clova":
             if body.language not in {"ko", "en"}:
                 raise HTTPException(422, "CLOVA Speech에서는 한국어 또는 영어를 직접 선택하세요.")
@@ -1255,9 +1290,12 @@ def create_app(
                         lecture["asr_provider"],
                     ),
                 )
+                lecture_continuations.link_new_lecture(
+                    connection, child_id=lecture_id, parent_id=parent_id, username=user["username"],
+                )
         if replay is not None:
-            return lecture_result(replay)
-        return lecture_result(
+            return creation_result(replay)
+        return creation_result(
             {**lecture, "username": user["username"], "recording_finalized": 0}
         )
 
@@ -1510,6 +1548,49 @@ def create_app(
                 user["token_hash"],
             )
         return {"path": f"/recording-downloads/{ticket}", "expires_in": 60}
+
+    @app.post("/lectures/{lecture_id}/recording-snapshot-ticket")
+    def create_recording_snapshot_ticket(lecture_id: str, user: dict = Depends(data_identity)):
+        lecture = owned_lecture(lecture_id, user["username"])
+        if lecture["recording_finalized"]:
+            raise HTTPException(409, "완료된 수업은 기존 녹음 다운로드를 이용해 주세요.")
+        if not limiter.allow(("recording-download", user["username"]), 30, 60):
+            raise HTTPException(429, "잠시 후 녹음을 다시 내려받아 주세요.", headers={"Retry-After": "60"})
+        try:
+            recording = recording_store.open_info(user["username"], lecture_id)
+            if recording is None:
+                raise HTTPException(404, "서버에 내려받을 녹음이 아직 보관되어 있지 않습니다.")
+            try:
+                snapshot = RecordingSnapshot.capture(recording, recording_store.max_frames)
+            finally:
+                os.close(recording["descriptor"])
+        except (RecordingCorruptError, OSError):
+            raise HTTPException(503, "서버에 보관된 녹음을 안전하게 확인하지 못했습니다.") from None
+        ticket = secrets.token_urlsafe(32)
+        with download_ticket_lock:
+            # Match normal ticket issuance: revoked sessions and trashed rows
+            # cannot race an old authenticated request into a new grant.
+            current = owned_lecture(lecture_id, user["username"])
+            if current["recording_finalized"]:
+                raise HTTPException(409, "완료된 수업은 기존 녹음 다운로드를 이용해 주세요.")
+            with database.connect() as connection:
+                live = connection.execute(
+                    "SELECT 1 FROM sessions WHERE token_hash=? AND username=? AND expires_at>?",
+                    (user["token_hash"], user["username"], time.time()),
+                ).fetchone()
+            if live is None:
+                raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인하세요.",
+                                    headers={"WWW-Authenticate": "Bearer"})
+            clear_expired_download_tickets(time.monotonic())
+            for token_hash, granted in tuple(download_tickets.items()):
+                if granted[1:3] == (user["username"], lecture_id):
+                    download_tickets.pop(token_hash, None)
+            download_tickets[digest(ticket)] = (
+                time.monotonic() + 60, user["username"], lecture_id, 16, user["token_hash"], snapshot,
+            )
+        return {"path": f"/recording-snapshots/{ticket}", "expires_in": 60,
+                "bytes": snapshot.total_bytes, "duration_seconds": snapshot.duration_seconds,
+                "scope": "server_saved_prefix"}
 
     def final_guard_chunk_id() -> str:
         # API clients must submit UUID chunk IDs, so this deterministic internal
@@ -1903,8 +1984,7 @@ def create_app(
                         (lecture_id, guard_chunk_id, payload_hash),
                     )
 
-    @app.get("/recording-downloads/{ticket}")
-    def download_recording(ticket: str, request: Request):
+    def claim_recording_ticket(ticket: str, *, snapshot: bool = False, consume: bool = True):
         if not 32 <= len(ticket) <= 128:
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
         now = time.monotonic()
@@ -1912,7 +1992,7 @@ def create_app(
         with download_ticket_lock:
             clear_expired_download_tickets(now)
             granted = download_tickets.get(token_hash)
-        if granted is None or granted[0] <= now:
+        if granted is None or granted[0] <= now or (len(granted) == 6) != snapshot:
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
         # Validate the unguessable grant before revealing the paused state, but
         # do not consume a retry while the operator has disabled data access.
@@ -1927,6 +2007,8 @@ def create_app(
             with download_ticket_lock:
                 download_tickets.pop(token_hash, None)
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
+        if not consume:
+            return granted
         now = time.monotonic()
         with download_ticket_lock:
             clear_expired_download_tickets(now)
@@ -1938,10 +2020,83 @@ def create_app(
                     download_tickets[token_hash] = (
                         *granted[:3],
                         granted[3] - 1,
-                        granted[4],
+                        *granted[4:],
                     )
         if granted is None or granted[0] <= now:
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
+        return granted
+
+    @app.get("/recording-snapshots/{ticket}")
+    def download_recording_snapshot(ticket: str, request: Request):
+        granted = claim_recording_ticket(ticket, snapshot=True, consume=False)
+        _, username, lecture_id, _, _, snapshot = granted
+        lecture = owned_lecture(lecture_id, username)
+        if not snapshot_download_capacity.acquire(blocking=False):
+            raise HTTPException(429, "부분 녹음 다운로드가 진행 중입니다. 잠시 후 다시 내려받아 주세요.",
+                                headers={"Retry-After": "5"})
+        released = False
+        release_lock = threading.Lock()
+
+        def release_slot():
+            nonlocal released
+            with release_lock:
+                if released:
+                    return
+                released = True
+            snapshot_download_capacity.release()
+
+        # The grant is a previously captured local prefix even if the lecture
+        # completed later. Never fall back to Drive or a replaced local file.
+        recording = None
+        stream = None
+        try:
+            # Check expiry/revocation again after admission, then spend a retry.
+            # A full download pool does not consume the ticket's Range budget.
+            granted = claim_recording_ticket(ticket, snapshot=True)
+            try:
+                recording = recording_store.open_info(username, lecture_id)
+                if recording is None or not snapshot.matches(recording):
+                    raise RecordingCorruptError("recording snapshot identity changed")
+                stream = SnapshotStream(recording["descriptor"], snapshot, on_close=release_slot)
+            except (RecordingCorruptError, OSError):
+                raise HTTPException(503, "보관된 녹음이 바뀌어 이 부분 다운로드를 이어받을 수 없습니다. 다시 요청해 주세요.") from None
+            total = snapshot.total_bytes
+            try:
+                start, end = _single_byte_range(request.headers.get("range"), total)
+            except ValueError:
+                raise HTTPException(416, "요청한 녹음 구간을 내려받을 수 없습니다.",
+                                    headers={"Content-Range": f"bytes */{total}", "Accept-Ranges": "bytes"}) from None
+            partial = start is not None
+            start, end = (0, total) if not partial else (start, end)
+            filename = quote("서버에-저장된-부분.wav", safe="")
+            headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                       "Accept-Ranges": "bytes", "Content-Length": str(end - start),
+                       "Content-Disposition": f"attachment; filename*=utf-8''{filename}"}
+            if partial:
+                headers["Content-Range"] = f"bytes {start}-{end - 1}/{total}"
+            owned_lecture(lecture["id"], username)
+            require_data_access()
+            # Recheck session after potentially waiting for an appending write.
+            with database.connect() as connection:
+                live = connection.execute("SELECT 1 FROM sessions WHERE token_hash=? AND username=? AND expires_at>?",
+                                          (granted[4], username, time.time())).fetchone()
+            if live is None:
+                raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
+            return CloseableStreamingResponse(stream.iter_bytes(start, end), close=stream.close,
+                                              status_code=206 if partial else 200, media_type="audio/wav", headers=headers)
+        except BaseException:
+            try:
+                if stream is not None:
+                    stream.close()
+                elif recording is not None:
+                    os.close(recording["descriptor"])
+            finally:
+                release_slot()
+            raise
+
+    @app.get("/recording-downloads/{ticket}")
+    def download_recording(ticket: str, request: Request):
+        granted = claim_recording_ticket(ticket)
         _, username, lecture_id, _, _ = granted
         lecture = owned_lecture(lecture_id, username)
         if not lecture["recording_finalized"]:
@@ -2608,8 +2763,12 @@ def create_app(
                             "SELECT 1 FROM lecture_questions WHERE lecture_id=? AND status='processing'",
                             (lecture["id"],),
                         ).fetchone()
-                    if any(job is not None for job in (active, pending, correcting, summarizing, translating, questioning)):
-                        raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역·수업 질문이 끝난 뒤 수업을 삭제하세요.")
+                        study_noting = connection.execute(
+                            "SELECT 1 FROM lecture_study_notes WHERE lecture_id=? AND status='processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                    if any(job is not None for job in (active, pending, correcting, summarizing, translating, questioning, study_noting)):
+                        raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역·수업 질문·정리본이 끝난 뒤 수업을 삭제하세요.")
                 for job in terminal_jobs:
                     if not remove_private_upload(job):
                         raise HTTPException(503, "업로드 원본 삭제를 완료하지 못했습니다. 잠시 후 다시 시도하세요.")
@@ -2651,8 +2810,12 @@ def create_app(
                             "SELECT 1 FROM lecture_questions WHERE lecture_id=? AND status='processing'",
                             (lecture["id"],),
                         ).fetchone()
-                        if any(job is not None for job in (active, pending, correcting, summarizing, translating, questioning)):
-                            raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역·수업 질문이 끝난 뒤 수업을 삭제하세요.")
+                        study_noting = connection.execute(
+                            "SELECT 1 FROM lecture_study_notes WHERE lecture_id=? AND status='processing'",
+                            (lecture["id"],),
+                        ).fetchone()
+                        if any(job is not None for job in (active, pending, correcting, summarizing, translating, questioning, study_noting)):
+                            raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역·수업 질문·정리본이 끝난 뒤 수업을 삭제하세요.")
                         # A queued correction has not sent anything yet. Removing
                         # it in this same transaction wins atomically against the
                         # worker's queued->processing claim.
@@ -2667,6 +2830,8 @@ def create_app(
                         connection.execute("DELETE FROM lecture_translations WHERE lecture_id=? AND status='queued'",
                                            (lecture["id"],))
                         connection.execute("DELETE FROM lecture_questions WHERE lecture_id=? AND status='queued'",
+                                           (lecture["id"],))
+                        connection.execute("DELETE FROM lecture_study_notes WHERE lecture_id=? AND status='queued'",
                                            (lecture["id"],))
                         connection.execute("UPDATE lectures SET deleting = 1 WHERE id = ?", (lecture["id"],))
         purge_download_tickets(lecture["id"])
@@ -3055,6 +3220,8 @@ def create_app(
             "empty_transcript",
             "gateway_unavailable",
             "invalid_response",
+            "response_truncated",
+            "model_refused",
             "invalid_source",
             "not_configured",
             "privacy_placeholder_changed",
@@ -3069,6 +3236,8 @@ def create_app(
             "empty_transcript": "후보정할 받아쓰기 내용이 없습니다.",
             "gateway_unavailable": "후보정 서버에 연결하지 못했습니다. 원본 받아쓰기는 그대로 보관되어 있습니다.",
             "invalid_response": "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
+            "response_truncated": "AI 출력이 길이 한도에서 끊겨 후보정을 저장하지 않았습니다. 원문은 그대로 보관됩니다.",
+            "model_refused": "AI가 후보정 결과 생성을 거절했습니다. 원문은 그대로 보관됩니다.",
             "invalid_source": "원문 구간을 후보정할 수 없는 상태입니다.",
             "not_configured": "후보정 API 키가 서버에 설정되지 않았습니다.",
             "privacy_placeholder_changed": "개인정보 보호 표시가 바뀐 후보정 결과는 저장하지 않았습니다.",
@@ -3551,6 +3720,8 @@ def create_app(
                                 raw_segments=raw_segments, transcript_revision=transcript_revision)
     question_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
                              raw_segments=raw_segments, transcript_revision=transcript_revision)
+    study_note_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
+                               raw_segments=raw_segments, transcript_revision=transcript_revision)
     lecture_tools.install(app, settings, database, recording_store, archive_manager,
                           identity=data_identity, owned_lecture=owned_lecture, limiter=limiter)
     lecture_library.install(app, settings, database, identity=data_identity,

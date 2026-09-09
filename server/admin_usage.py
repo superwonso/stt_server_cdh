@@ -34,6 +34,7 @@ SCOPE = {
 FEATURE_TABLES = (
     ("correction", "transcript_corrections"), ("summary", "lecture_summaries"),
     ("translation", "lecture_translations"), ("question", "lecture_questions"),
+    ("study_note", "lecture_study_notes"),
 )
 
 
@@ -182,7 +183,7 @@ class UsageReader:
                     check()
                     branches = []
                     for feature, table in FEATURE_TABLES:
-                        owner = " AND t.username=c.username" if feature == "question" else ""
+                        owner = " AND t.username=c.username" if feature in {"question", "study_note"} else ""
                         branches.append("SELECT c.username,'" + feature + "' AS feature,t.status,COUNT(*) AS amount "
                                         "FROM " + table + " t JOIN cohort c ON c.id=t.lecture_id" + owner +
                                         " GROUP BY c.username,t.status")

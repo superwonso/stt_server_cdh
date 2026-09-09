@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 
-from .question_answerer import select_evidence, validate_answer_document
+from .postprocessor import PostprocessingError
+from .question_answerer import QuestionAnsweringError, select_evidence, validate_answer_document
 
 HISTORY_LIMIT = 100
 OWNER_QUEUE_LIMIT = 3
@@ -267,11 +268,18 @@ class QuestionService:
         return result
 
     def _terminal(self, connection, identifier, code, *, cancelled=False):
+        if code in _ERRORS:
+            message = _ERRORS[code]
+        else:
+            # Known provider codes have fixed feature-specific messages. Never
+            # persist exception strings or a caller-provided unknown code.
+            safe_error = QuestionAnsweringError(code)
+            code, message = safe_error.code, str(safe_error)
         connection.execute(
             "UPDATE lecture_questions SET status=?,document_json=NULL,completed_at=NULL,error_code=?,error=?,updated_at=? "
             "WHERE id=? AND status IN ('queued','processing')",
             ("cancelled" if cancelled else "failed", None if cancelled else code,
-             None if cancelled else _ERRORS[code], _now(), identifier),
+             None if cancelled else message, _now(), identifier),
         )
 
     def recover(self):
@@ -355,11 +363,16 @@ class QuestionService:
             connection.execute("UPDATE lecture_questions SET status='processing',attempts=1,updated_at=? WHERE id=?",
                                (_now(), job["id"]))
             self._unsettled = job
-        document = None
+        document, failure_code = None, "question_failed"
         try:
             if not self._interrupted(job):
                 output = self.engine.answer(job["question"], copy.deepcopy(selected), lambda: self._interrupted(job))
                 document = validate_answer_document(output, selected)
+        except PostprocessingError as error:
+            # The code is normalized now and its message reconstructed at the
+            # terminal write. This never adds a retry of the paid request.
+            failure_code = QuestionAnsweringError(error.code).code
+            document = None
         except Exception:
             # Never retain raw provider errors, bodies, keys or question text.
             document = None
@@ -390,7 +403,7 @@ class QuestionService:
                         self._terminal(connection, job["id"], "source_changed")
                     else:
                         if document is None:
-                            self._terminal(connection, job["id"], "question_failed")
+                            self._terminal(connection, job["id"], failure_code)
                         else:
                             now = _now()
                             connection.execute(

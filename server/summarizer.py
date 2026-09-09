@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 import httpx
 
+from .llm_protocol import ProtocolError, gateway_schema, parse_json_document
 from .postprocessor import (
     MindlogicPostprocessor,
     PostprocessingError,
@@ -54,10 +55,12 @@ _ERROR_MESSAGES = {
     "rate_limited": "수업 요약 요청이 많습니다. 잠시 후 다시 시도해 주세요.",
     "gateway_unavailable": "수업 요약 서버에 연결하지 못했습니다. 원문은 그대로 보관됩니다.",
     "interrupted": "서버 종료로 수업 요약을 잠시 중단했습니다.",
-    "source_too_large": "받아쓰기 내용이 수업 요약 허용 크기를 초과했습니다.",
+    "source_too_large": "원문 분량이나 구간 수가 한 번에 요약할 수 있는 상한을 초과했습니다.",
     "invalid_source": "요약할 원문 구간을 확인할 수 없습니다.",
     "empty_transcript": "요약할 받아쓰기 내용이 없습니다.",
     "invalid_response": "수업 요약 결과의 형식이나 출처를 확인하지 못해 저장하지 않았습니다.",
+    "response_truncated": "수업 요약 응답이 도중에 잘려 저장하지 않았습니다. 원문은 그대로 보관됩니다.",
+    "model_refused": "AI가 수업 요약 요청에 응답하지 않아 저장하지 않았습니다. 원문은 그대로 보관됩니다.",
     "unsupported_claim": "원문에서 확인되지 않는 숫자나 공지가 요약에 포함되어 저장하지 않았습니다.",
 }
 
@@ -66,7 +69,7 @@ class SummarizationError(PostprocessingError):
     """A fixed, provider-redacted summary failure safe for job persistence."""
 
     def __init__(self, code: str, *, retryable: bool = False):
-        if code not in _ERROR_MESSAGES:
+        if not isinstance(code, str) or code not in _ERROR_MESSAGES:
             code = "invalid_response"
         super().__init__(code, _ERROR_MESSAGES[code], retryable=retryable)
 
@@ -112,6 +115,36 @@ def _source_segments(segments: Any, maximum_chars: int = MAX_SOURCE_CHARS) -> li
         result.append({"id": identifier, "text": text})
         seen.add(identifier)
     return result
+
+
+def _batch_ranges(segments: list[dict[str, str]], chunk_chars: int) -> list[tuple[int, int]]:
+    """Plan whole source segments before masking or any billable request."""
+    if type(chunk_chars) is not int or not 1 <= chunk_chars <= MAX_SEGMENT_CHARS:
+        raise ValueError("SUMMARY_CHUNK_CHARS is outside the supported range")
+    ranges, begin, used = [], 0, 0
+    for index, segment in enumerate(segments):
+        size = len(segment["text"])
+        if index > begin and (used + size > chunk_chars or index - begin >= MAX_BATCH_SEGMENTS):
+            ranges.append((begin, index))
+            begin, used = index, 0
+        used += size
+    if segments:
+        ranges.append((begin, len(segments)))
+    if len(ranges) > MAX_MAP_BATCHES:
+        raise SummarizationError("source_too_large")
+    return ranges
+
+
+def validate_summary_source(
+    segments: list[dict[str, Any]], *, chunk_chars: int = 6000,
+    maximum_chars: int = MAX_SOURCE_CHARS,
+) -> None:
+    """Pure enqueue preflight using the engine's unchanged map/call limits.
+
+    No transcript is modified, no partial segments are silently dropped, and
+    no provider client is needed. Existing completed jobs need no new plan.
+    """
+    _batch_ranges(_source_segments(segments, maximum_chars), chunk_chars)
 
 
 def _ids(value: Any, source: dict[str, str], limit: int = 12) -> list[str]:
@@ -258,19 +291,6 @@ def _schema() -> dict[str, Any]:
     }
 
 
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
-
-
-def _reject_constant(value):
-    raise ValueError("invalid JSON constant")
-
-
 class MindlogicSummarizer:
     def __init__(self, settings: Settings, client: httpx.Client | None = None):
         if client is not None and client.follow_redirects:
@@ -310,6 +330,7 @@ class MindlogicSummarizer:
             raise SummarizationError("not_configured")
         self._interrupted(interrupted)
         normalized = _source_segments(segments, self.max_source_chars)
+        batch_ranges = _batch_ranges(normalized, self.chunk_chars)
         aliases, originals, private_values = {}, {}, {}
         masked, counter = [], 0
 
@@ -328,17 +349,7 @@ class MindlogicSummarizer:
             originals[segment["id"]] = segment["text"]
             masked.append({"id": alias, "text": mask(segment["text"])})
         source = {segment["id"]: segment["text"] for segment in masked}
-        batches, batch, used = [], [], 0
-        for raw, segment in zip(normalized, masked, strict=True):
-            if batch and (used + len(raw["text"]) > self.chunk_chars or len(batch) >= MAX_BATCH_SEGMENTS):
-                batches.append(batch)
-                batch, used = [], 0
-            batch.append(segment)
-            used += len(raw["text"])
-        if batch:
-            batches.append(batch)
-        if len(batches) > MAX_MAP_BATCHES:
-            raise SummarizationError("source_too_large")
+        batches = [masked[begin:end] for begin, end in batch_ranges]
         calls = 0
 
         def request(data, allowed, *, intermediate):
@@ -428,7 +439,7 @@ class MindlogicSummarizer:
                              ensure_ascii=False, separators=(",", ":"))}],
             "temperature": 0, "max_tokens": 8192,
             "response_format": {"type": "json_schema", "json_schema": {
-                "name": "lecture_summary", "strict": True, "schema": _schema(),
+                "name": "lecture_summary", "strict": True, "schema": gateway_schema(_schema()),
             }},
         }
         try:
@@ -437,20 +448,12 @@ class MindlogicSummarizer:
             raise SummarizationError(error.code, retryable=error.retryable) from None
         except (httpx.HTTPError, OSError):
             raise SummarizationError("gateway_unavailable", retryable=True) from None
-        try:
-            choices = response["choices"]
-            if not isinstance(choices, list) or len(choices) != 1:
-                raise ValueError("invalid choices")
-            choice = choices[0]
-            if choice.get("finish_reason") not in {None, "stop"}:
-                raise ValueError("incomplete output")
-            message = choice["message"]
-            content = message["content"]
-            if message.get("refusal") or not isinstance(content, str):
-                raise ValueError("invalid message")
-            document = json.loads(content, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
-        except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        except (ValueError, RecursionError):
             raise SummarizationError("invalid_response") from None
+        try:
+            document = parse_json_document(response)
+        except ProtocolError as error:
+            raise SummarizationError(error.code) from None
         result = _validate_document(document, source)
         if intermediate and (
             _document_chars(result) > MAX_INTERMEDIATE_CHARS

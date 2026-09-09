@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 import httpx
 
+from .llm_protocol import ProtocolError, gateway_schema, parse_json_document
 from .postprocessor import (
     MindlogicPostprocessor, PostprocessingError, _MODEL_NAME, _PLACEHOLDER,
     _PROTECTED_VALUE,
@@ -45,6 +46,8 @@ _ERROR_MESSAGES = {
     "source_too_large": "수업 질문 원문 또는 선택된 근거가 허용 크기를 초과했습니다.",
     "invalid_source": "수업 질문의 원문 근거를 확인할 수 없습니다.",
     "invalid_response": "답변 형식이나 출처를 확인하지 못해 저장하지 않았습니다.",
+    "response_truncated": "질문 답변이 도중에 잘려 저장하지 않았습니다. 자동으로 다시 요청하지 않습니다.",
+    "model_refused": "AI가 질문 답변 요청에 응답하지 않아 저장하지 않았습니다. 자동으로 다시 요청하지 않습니다.",
     "unsupported_claim": "인용한 원문에 없는 숫자나 보호 정보가 포함되어 답변을 저장하지 않았습니다.",
 }
 _WORDS = re.compile(r"[a-z]+(?:'[a-z]+)?|[가-힣]+|\d+(?:[.,]\d+)*", re.IGNORECASE)
@@ -62,7 +65,7 @@ class QuestionAnsweringError(PostprocessingError):
     """A fixed, provider-redacted error safe for job persistence and display."""
 
     def __init__(self, code: str, *, retryable: bool = False):
-        if code not in _ERROR_MESSAGES:
+        if not isinstance(code, str) or code not in _ERROR_MESSAGES:
             code = "invalid_response"
         super().__init__(code, _ERROR_MESSAGES[code], retryable=retryable)
 
@@ -230,19 +233,6 @@ def validate_answer_document(document: Any, selected_segments: list[dict[str, An
 validate_question_document = validate_answer_document
 
 
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
-
-
-def _reject_constant(value):
-    raise ValueError("invalid JSON constant")
-
-
 def _schema(aliases: list[str]) -> dict[str, Any]:
     # The gateway's structured-output subset rejects JSON Schema size and
     # uniqueness keywords. Enforce those bounds in _validate, not on the wire.
@@ -342,7 +332,7 @@ class QuestionAnswerer:
             "messages": [{"role": "system", "content": instructions},
                          {"role": "user", "content": json.dumps(data, ensure_ascii=False, separators=(",", ":"))}],
             "response_format": {"type": "json_schema", "json_schema": {
-                "name": "lecture_answer", "strict": True, "schema": _schema(list(aliases)),
+                "name": "lecture_answer", "strict": True, "schema": gateway_schema(_schema(list(aliases))),
             }},
         }
         self._interrupted(interrupted)
@@ -356,18 +346,9 @@ class QuestionAnswerer:
             raise QuestionAnsweringError("invalid_response") from None
         self._interrupted(interrupted)
         try:
-            choices = response["choices"]
-            if not isinstance(choices, list) or len(choices) != 1:
-                raise ValueError("invalid choices")
-            choice = choices[0]
-            if choice.get("finish_reason") not in (None, "stop"):
-                raise ValueError("incomplete output")
-            message = choice["message"]
-            if message.get("refusal") or not isinstance(message["content"], str):
-                raise ValueError("invalid message")
-            result = json.loads(message["content"], object_pairs_hook=_unique_object, parse_constant=_reject_constant)
-        except (KeyError, IndexError, TypeError, ValueError, AttributeError, RecursionError):
-            raise QuestionAnsweringError("invalid_response") from None
+            result = parse_json_document(response)
+        except ProtocolError as error:
+            raise QuestionAnsweringError(error.code) from None
         checked = _validate(result, {item["id"]: item["text"] for item in masked})
         for paragraph in checked["paragraphs"]:
             paragraph["text"] = _PLACEHOLDER.sub(lambda match: private[match.group(0)], paragraph["text"])

@@ -8,6 +8,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 
@@ -177,8 +178,8 @@ class TranslatorTests(unittest.TestCase):
             self.assertTrue(all(isinstance(text, str) for group in readonly.values() for text in group))
             self.assertNotRegex(json.dumps(readonly), r"S[0-9]{6}|private-row-")
             schema = payload["response_format"]["json_schema"]["schema"]["properties"]["segments"]
-            self.assertEqual(schema["minItems"], len(ids))
-            self.assertEqual(schema["maxItems"], len(ids))
+            self.assertNotIn("minItems", schema)
+            self.assertNotIn("maxItems", schema)
             self.assertEqual(schema["items"]["properties"]["id"]["enum"], ids)
             self.assertIn(json.dumps(ids, separators=(",", ":")), payload["messages"][0]["content"])
             self.assertIn("읽기 전용", payload["messages"][0]["content"])
@@ -504,6 +505,98 @@ class TranslatorTests(unittest.TestCase):
                 "segments": [{"id": data["segments"][0]["id"], "text": "가" * 48001}]})
         with self.assertRaises(TranslationError):
             self.engine(handler).translate(language="en", segments=[source()])
+
+    def test_explicit_truncation_splits_whole_rows_with_identical_course_context(self):
+        raw = [source(f"English sentence {letter}.", f"local-{letter}", index) for index, letter in enumerate("ABCD")]
+        original = copy.deepcopy(raw)
+        calls = []
+        def handler(request):
+            kind, data, payload = request_data(request)
+            calls.append((kind,data))
+            self.assertLessEqual(payload["max_tokens"],16384)
+            if kind == "lecture_outline":
+                return response({"context":"수업 전체 문맥"})
+            if len(data["segments"]) == 4:
+                # Even valid-looking JSON must not be accepted after length.
+                return response(translated(data),finish_reason="length")
+            self.assertEqual(data["course_context"],"수업 전체 문맥")
+            self.assertEqual(len(data["segments"]),2)
+            return response(translated(data))
+        result = self.engine(handler).translate(language="en",segments=raw)
+        self.assertEqual(len(calls),4)
+        self.assertEqual([r["id"] for r in result.segments],[r["id"] for r in raw])
+        self.assertEqual(raw,original)
+
+    def test_single_row_and_outline_truncation_are_reported_without_blind_retry(self):
+        for stage in ("lecture_outline","lecture_translation"):
+            calls=[]
+            def handler(request):
+                kind,data,_=request_data(request); calls.append(kind)
+                if kind == stage:
+                    return response({"context":"일부"} if kind == "lecture_outline" else translated(data),finish_reason="length")
+                return standard_handler(request)
+            with self.assertRaises(TranslationError) as error:
+                self.engine(handler).translate(language="en",segments=[source()])
+            self.assertEqual(error.exception.code,"response_truncated")
+            self.assertEqual(len(calls),1 if stage == "lecture_outline" else 2)
+
+    def test_refusal_invalid_rows_and_protected_edits_do_not_trigger_split_retry(self):
+        for mode,code in (("refusal","model_refused"),("wrong-id","invalid_response"),("protected","protected_content_changed")):
+            calls=[]
+            def handler(request):
+                kind,data,_=request_data(request); calls.append(kind)
+                if kind == "lecture_outline": return standard_handler(request)
+                document=translated(data)
+                if mode == "refusal": return response(document,refusal="private-provider-text")
+                if mode == "wrong-id": document["segments"][0]["id"]="wrong"
+                if mode == "protected": document["segments"][0]["text"]="보호된 숫자를 누락했다."
+                return response(document)
+            with self.assertRaises(TranslationError) as error:
+                self.engine(handler).translate(language="en",segments=[source("Value is 15.","one"),source("Value is 20.","two",1)])
+            self.assertEqual(error.exception.code,code)
+            self.assertEqual(len(calls),2)
+            self.assertNotIn("private-provider",str(error.exception))
+
+    def test_adaptive_split_is_bounded_by_extra_calls_and_depth(self):
+        raw=[source("English sentence.",f"local-{i}",i) for i in range(32)]
+        for limits,max_calls in (({"MAX_ADAPTIVE_CALLS":2},3),({"MAX_ADAPTIVE_DEPTH":1},3)):
+            calls=[]
+            def handler(request):
+                kind,data,_=request_data(request); calls.append(kind)
+                if kind == "lecture_outline": return standard_handler(request)
+                return response(translated(data),finish_reason="length")
+            with patch.multiple("server.translator",**limits),self.assertRaises(TranslationError) as error:
+                self.engine(handler).translate(language="en",segments=raw)
+            self.assertEqual(error.exception.code,"response_truncated")
+            self.assertLessEqual(len(calls),max_calls)
+
+    def test_mask_expansion_budget_prevents_large_target_batches(self):
+        raw=[source("Value " + "1 "*80,f"local-{i}",i) for i in range(30)]
+        batches=[]
+        def handler(request):
+            kind,data,payload=request_data(request)
+            if kind == "lecture_translation":
+                batches.append(data["segments"])
+                encoded=json.dumps({"segments":data["segments"]},ensure_ascii=False,separators=(",",":")).encode()
+                self.assertLessEqual(len(encoded),12000)
+                self.assertGreaterEqual(payload["max_tokens"],8192)
+                self.assertLessEqual(payload["max_tokens"],16384)
+            return standard_handler(request)
+        result=self.engine(handler).translate(language="en",segments=raw)
+        self.assertGreater(len(batches),1)
+        self.assertEqual(len(result.segments),30)
+        self.assertTrue(all(len(re.findall(r"\d+",row["text"]))==80 for row in result.segments))
+
+    def test_gateway_wire_subset_does_not_remove_local_size_checks(self):
+        def handler(request):
+            kind,data,payload=request_data(request)
+            self.assertNotRegex(json.dumps(payload["response_format"]),r'"(?:minLength|maxLength|minItems|maxItems|uniqueItems)"')
+            if kind == "lecture_outline":
+                return response({"context":"가"*2401})
+            self.fail("Invalid outline must not start translation")
+        with self.assertRaises(TranslationError) as error:
+            self.engine(handler).translate(language="en",segments=[source()])
+        self.assertEqual(error.exception.code,"invalid_response")
 
     def test_literal_protection_tokens_restore_in_one_pass_and_calls_do_not_share_state(self):
         engine = self.engine()

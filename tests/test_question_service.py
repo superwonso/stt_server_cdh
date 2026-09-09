@@ -9,6 +9,8 @@ import uuid
 from contextlib import contextmanager
 from unittest.mock import patch
 
+from server.postprocessor import PostprocessingError
+from server.question_answerer import QuestionAnsweringError
 from tests.test_question_api import QuestionFixture
 
 
@@ -169,6 +171,25 @@ class QuestionServiceTests(QuestionFixture, unittest.TestCase):
         self.assertIsNone(row["document_json"])
         self.assertFalse(self.service.process_next())
         self.assertEqual(len(self.engine.calls), 1)
+
+    def test_typed_provider_failure_is_fixed_terminal_and_never_replayed(self):
+        for code in ("authentication_failed", "credit_exhausted", "rate_limited",
+                     "response_truncated", "model_refused", "unsupported_claim", "synthetic-private-code"):
+            with self.subTest(code=code):
+                lecture_id, _ = self.lecture()
+                job = self.queued(lecture_id)
+                previous_calls = len(self.engine.calls)
+                self.engine.error = PostprocessingError(code, "synthetic-private-provider-body", retryable=True)
+                self.service.process_next()
+                result = self.get(lecture_id, job["id"]).json()["question"]
+                expected = QuestionAnsweringError(code)
+                self.assertEqual((result["status"], result["error_code"], result["error"], result["document"]),
+                                 ("failed", expected.code, str(expected), None))
+                self.assertNotIn("synthetic-private", json.dumps(self.row(job["id"])))
+                self.assertEqual(self.post(lecture_id, identifier=job["id"]).json()["question"], result)
+                self.service.recover()
+                self.assertFalse(self.service.process_next())
+                self.assertEqual(len(self.engine.calls), previous_calls + 1)
 
     def test_source_change_before_claim_prevents_call_and_during_call_discards_answer(self):
         for during_call in (False, True):

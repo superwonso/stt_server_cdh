@@ -4,22 +4,28 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 import { encodeWav } from '../web/audio.js';
+import * as TestLocalAudioExport from '../web/local-audio-export.js';
+import * as TestRecordingFileSelection from '../web/recording-file-selection.js';
 import { renderDriveStatus } from '../web/admin-storage.js';
 import { renderMaintenanceStatus } from '../web/admin-maintenance.js';
 import { readRecordingClip, RecordingClipPlayer, filterTranscript } from '../web/recording-review.js';
 import * as TestLectureLibrary from '../web/lecture-library.js';
 import * as TestManualNotes from '../web/manual-notes.js';
 import * as TestLectureQuestions from '../web/lecture-questions.js';
+import * as TestStudyNotes from '../web/study-notes.js';
 import { AUTH_SESSION_STORAGE_KEY, TabAuthSessionStore } from '../web/auth-session.js';
 
 const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'))
   .replace("import { MicrophoneCapture } from './audio.js';", 'const MicrophoneCapture = TestCapture;')
+  .replace("import { validateRecordingSelection, isFileDrag, recordingFileFromDrop } from './recording-file-selection.js';", 'const { validateRecordingSelection, isFileDrag, recordingFileFromDrop } = TestRecordingFileSelection;')
+  .replace("import { buildRecoverableLocalAudioExports, validateLocalWav } from './local-audio-export.js';", 'const { buildRecoverableLocalAudioExports, validateLocalWav } = TestLocalAudioExport;')
   .replace("import { renderDriveStatus } from './admin-storage.js';", 'const renderDriveStatus = TestRenderDriveStatus;')
   .replace("import { renderMaintenanceStatus } from './admin-maintenance.js';", 'const renderMaintenanceStatus = TestRenderMaintenanceStatus;')
   .replace("import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';", 'const { readRecordingClip, RecordingClipPlayer, filterTranscript } = TestRecordingReview;')
   .replace("import { lectureTitle, libraryOptions, validMetadata, validLibrarySearch } from './lecture-library.js';", 'const { lectureTitle, libraryOptions, validMetadata, validLibrarySearch } = TestLectureLibrary;')
   .replace("import { validManualState, manualSegments, validManualHistory } from './manual-notes.js';", 'const { validManualState, manualSegments, validManualHistory } = TestManualNotes;')
   .replace("import { validQuestionJob, validQuestionPage } from './lecture-questions.js';", 'const { validQuestionJob, validQuestionPage } = TestLectureQuestions;')
+  .replace("import { studyNoteSourceSnapshot, validateStudyNoteResponse, appendStudyNoteText } from './study-notes.js';", 'const { studyNoteSourceSnapshot, validateStudyNoteResponse, appendStudyNoteText } = TestStudyNotes;')
   .replace("import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';", `
     const FileImportCancelledError = class extends Error {};
     const RecordingFileUploader = TestFileUploader;
@@ -77,7 +83,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
   let storedServerValue = storedServer;
   const tabStorage = {getItem:key => sessionItems.get(key) ?? null,
     setItem:(key,value) => { storageWrites.push([key,String(value)]); sessionItems.set(key,String(value)); },removeItem:key => sessionItems.delete(key)};
-  let id = 0, mic;
+  let id = 0, mic, lastLiveQueue;
   const makeElement = (name, value = '') => {
     const node = {
     name,tagName:name.toUpperCase(),value,style:{},dataset:{},children:[],open:false,
@@ -224,7 +230,8 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     TestRecordingReview:{readRecordingClip,RecordingClipPlayer,filterTranscript},
     TestLectureLibrary,
     TestManualNotes,
-    TestLectureQuestions,
+    TestLectureQuestions, TestStudyNotes,
+    TestLocalAudioExport, TestRecordingFileSelection, TestEncodeWav:encodeWav,
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },
     clearTimeout:value => timeouts.delete(value),
     setInterval:(callback,delay = 0) => { const value = ++id; intervals.set(value,{callback,delay}); return value; },clearInterval:value => intervals.delete(value),
@@ -265,7 +272,14 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       }
     },
     TestDurableLiveQueue:class {
-      constructor() { this.sessions = new Map(); this.chunks = new Map(); this.snapshots = new Map(); }
+      constructor(options = {}) {
+        if (options.readOnlyExisting) return {
+          readExportSnapshot:owner=>lastLiveQueue ? lastLiveQueue.readExportSnapshot(owner)
+            : Promise.reject(new Error('no existing synthetic database')),
+          close:()=>{},
+        };
+        this.sessions = new Map(); this.chunks = new Map(); this.snapshots = new Map();lastLiveQueue=this;
+      }
       async open() { return this; }
       async createSession(value) {
         requireUuid(value.id,'captureId'); requireOwner(value.owner);
@@ -382,6 +396,11 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       }
       async getStats(owner) { const items = [...this.chunks.values()].filter(item => item.owner === owner); return {count:items.length,bytes:items.reduce((sum,item) => sum + item.byteLength,0),queued:items.filter(item => item.state === 'queued').length,inflight:items.filter(item => item.state === 'inflight').length,blocked:items.filter(item => item.state === 'blocked').length}; }
       async recoverOwner() { return {sessions:[],chunks:[],inflightChunks:[],stats:{count:0,bytes:0,queued:0,inflight:0,blocked:0}}; }
+      async readExportSnapshot(owner) {
+        return {owner,sessions:[...this.sessions.values()].filter(row=>row.owner===owner).map(row=>({...row})),
+          chunks:[...this.chunks.values()].filter(row=>row.owner===owner).map(row=>({...row})),
+          snapshots:[...this.snapshots.values()].filter(row=>row.owner===owner).map(row=>({...row}))};
+      }
       async hasWorkForOtherOwner(owner) {
         requireOwner(owner);
         return [...this.chunks.values()].some(item => item.owner !== owner)
@@ -422,8 +441,8 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     assert.ok(entry, `missing ${delay} ms interval`);
     entry[1].callback(); await tick(); await tick();
   };
-  const dispatchDocument = async name => {
-    for (const callback of documentListeners.get(name) || []) callback();
+  const dispatchDocument = async (name,event) => {
+    for (const callback of documentListeners.get(name) || []) callback(event);
     await tick(); await tick();
   };
   const created = tag => createdElements.get(tag)?.at(-1);
@@ -1893,7 +1912,7 @@ test('starting a new file import clears an older date filter without changing re
   assert.equal(app.element('lecture-date').value, '');
 });
 
-test('Markdown and plain-text exports preserve content safely and lock during audio work', async () => {
+test('Markdown and plain-text exports preserve content safely independently of audio work', async () => {
   const app = setup(async () => response({}));
   app.run(`
     current={id:'lesson',title:'# 역사 [1]',language:'ko',created_at:'2026-01-01T16:00:00Z',
@@ -1919,9 +1938,8 @@ test('Markdown and plain-text exports preserve content safely and lock during au
   assert.ok(plain.includes('[00:02] <script> *강조* \\경로 $공식$ ~~삭제~~'));
 
   app.run('recording=true; updateControls()');
-  for (const id of ['export-format','download','recording-download','delete-lecture']) {
-    assert.equal(app.element(id).disabled, true, `${id} must lock while recording`);
-  }
+  for (const id of ['export-format','download','recording-download']) assert.equal(app.element(id).disabled,false,`${id} is read-only during recording`);
+  assert.equal(app.element('delete-lecture').disabled,true);
 });
 
 test('live transcript updates reuse unchanged rows and text nodes without changing the reading position', () => {
@@ -2417,9 +2435,10 @@ test('a finalized past lecture can be corrected while live chunks stay attached 
   assert.equal(app.run('current.id'),'past-finalized');
   assert.equal(app.element('live-capture-banner').hidden,false);
   assert.equal(app.element('return-live-capture').disabled,false);
-  for (const id of ['new-note','logout','recording-file','download','recording-download','delete-lecture']) {
+  for (const id of ['new-note','logout','recording-file','delete-lecture']) {
     assert.equal(app.element(id).disabled,true,`${id} must remain locked during background capture`);
   }
+  assert.equal(app.element('download').disabled,false);assert.equal(app.element('recording-download').disabled,false);
   assert.equal(app.element('correct-transcript').disabled,false);
   app.element('correct-transcript').onclick();
   await tick(); await tick();
@@ -2677,19 +2696,22 @@ test('admin response data and account action closures are scrubbed when the iden
   assert.equal(app.run('adminConfirmation'),null);
 });
 
-test('admin work totals include summary and translation without revealing lesson content', async () => {
+test('admin work totals include summary translation and study notes without revealing lesson content', async () => {
   const overview = adminOverviewFixture();
   overview.queues.summaries = 2;
   overview.queues.translations = 3;
-  overview.accounts[1].jobs = {transcription:0,imports:0,corrections:0,summaries:1,translations:1};
+  overview.queues.study_notes = 4;
+  overview.accounts[1].jobs = {transcription:0,imports:0,corrections:0,summaries:1,translations:1,study_notes:1};
   const app = setup(async () => response(overview));
   await app.run('loadAdminOverview({probe:true})');
   assert.equal(app.element('admin-summary-queue').textContent, '2');
   assert.equal(app.element('admin-translation-queue').textContent, '3');
-  assert.match(app.element('admin-accounts').children[1].children[1].children[1].textContent, /진행 작업 2개/);
+  assert.equal(app.element('admin-study-note-queue').textContent, '4');
+  assert.match(app.element('admin-accounts').children[1].children[1].children[1].textContent, /진행 작업 3개/);
   app.run('adminOverview={...adminOverview,queues:{}}; renderAdminOverview()');
   assert.equal(app.element('admin-summary-queue').textContent, '0 · 0');
   assert.equal(app.element('admin-translation-queue').textContent, '0 · 0');
+  assert.equal(app.element('admin-study-note-queue').textContent, '서버 미지원');
 });
 
 test('admin overview renders safe operational metadata, refreshes while open, and never offers self-revocation', async () => {
@@ -2839,7 +2861,8 @@ test('recording download exchanges bearer auth for a same-origin native ticket l
   assert.equal(app.element('recording-download').disabled, false);
   app.run('current.recording_finalized=false; updateControls()');
   assert.equal(app.element('recording-download').disabled, false, 'saved unfinished audio must be recoverable');
-  assert.match(app.element('recording-download').textContent, /마무리/);
+  assert.match(app.element('recording-download').textContent, /기기에 남은/);
+  assert.equal(app.element('recording-finalize').disabled,false);
   app.run('current.recording_finalized=true; updateControls()');
   const downloading = app.run('downloadRecording()');
   assert.equal(app.run('recordingDownloadPending'), true);
@@ -2895,7 +2918,7 @@ test('recording archive states explain Drive progress without exposing a Drive l
   assert.equal(app.element('save-state').textContent,'Google Drive에 녹음 저장됨');
 });
 
-test('recording download repairs an unfinished saved WAV before requesting its ticket', async () => {
+test('unfinished WAV download never finalizes implicitly and separate explicit finalization precedes a server ticket', async () => {
   const lectureId = webcrypto.randomUUID();
   const ticketPath = `/recording-downloads/${'b'.repeat(43)}`;
   const requests = [];
@@ -2912,7 +2935,12 @@ test('recording download repairs an unfinished saved WAV before requesting its t
     lectures=[{...current}]; renderCurrent(); renderHistory();
   `);
   assert.equal(app.element('recording-download').disabled, false);
-  assert.match(app.element('recording-download').textContent, /마무리/);
+  assert.match(app.element('recording-download').textContent, /기기에 남은/);
+  await app.run('downloadRecording()');
+  assert.deepEqual(requests,[],'local rescue never finalizes or requests server tickets');
+  app.run('clearLocalAudioExports()');
+  await app.run('downloadRecording({finalize:true})');
+  assert.equal(requests.length,1);assert.equal(app.created('a'),undefined);
   await app.run('downloadRecording()');
   assert.deepEqual(requests.map(request => request.url.replace('https://classroom.example','')), [
     `/lectures/${lectureId}/recording-finalize`,
@@ -4645,9 +4673,10 @@ test('skipping the last failed chunk finalizes the saved recording and applies i
   assert.equal(app.run('pending.length'), 0);
   assert.equal(app.run('recordingFinalizePending'), true);
   assert.equal(app.run('isBusy()'), true);
-  for (const id of ['new-note','record-button','recording-file','download','recording-download','delete-lecture']) {
+  for (const id of ['new-note','record-button','recording-file','download','delete-lecture']) {
     assert.equal(app.element(id).disabled, true, `${id} must lock while finalizing the recording`);
   }
+  assert.equal(app.element('recording-download').disabled,false,'read-only local rescue is independent of finalization');
   assert.equal(request.url, `https://classroom.example/lectures/${lectureId}/recording-finalize`);
   assert.equal(request.options.method, 'POST');
   assert.equal(request.options.headers.get('Authorization'), 'Bearer old-token');
@@ -4736,7 +4765,7 @@ test('a failed recording finalization leaves its correction reserved without loc
   assert.equal(app.run(`scheduledCorrections.get(${JSON.stringify(lectureId)}).status`),'scheduled');
   assert.equal(app.run('hasOwnerLockedWork()'),true,'same-owner reauthentication must retain the reservation');
   assert.equal(app.run('isBusy()'),false,'a stored retryable reservation must not deadlock the workspace');
-  assert.equal(app.element('recording-download').disabled,false,'the user can retry finalization from the WAV button');
+  assert.equal(app.element('recording-finalize').disabled,false,'the explicit finalization button retries separately from WAV download');
   assert.equal(app.element('logout').disabled,false);
 
   app.run(`
@@ -4762,7 +4791,8 @@ test('skipping the only failed chunk never claims that a server WAV exists', asy
   await tick(); await tick();
   assert.equal(app.run('current.recording_available'), false);
   assert.equal(app.run('current.recording_finalized'), true);
-  assert.equal(app.element('recording-download').disabled, true);
+  assert.equal(app.element('recording-download').disabled, false);
+  assert.match(app.element('recording-download').textContent,/기기에 남은/);
   assert.match(app.element('notice').textContent, /내려받을 녹음은 없습니다/);
   assert.doesNotMatch(app.element('notice').textContent, /WAV로 마무리/);
 });
@@ -4883,13 +4913,139 @@ test('a failed live chunk uses its own lecture title while a past note is open',
     const live={id:'live-failed',title:'현재 수업',created_at:'2026-01-02T00:00:00Z',segments:[]};
     const past={id:'past-open',title:'지난 수업',created_at:'2026-01-01T00:00:00Z',segments:[]};
     current=past; lectures=[live,past]; captureSession={id:'live-capture',lecture:live};
-    pending=[{blob:new Blob([new Uint8Array(32044)],{type:'audio/wav'}),startSeconds:0,durationSeconds:1,
+    pending=[{blob:TestEncodeWav(new Float32Array(16000)),owner:user,startSeconds:0,durationSeconds:1,
       overlapSeconds:0,final:false,id:'failed-live',lectureId:live.id}];
     sendError='전송 실패';
   `);
   await app.run('saveFailedChunk()');
   assert.match(app.created('a').download,/^현재 수업_/);
   assert.doesNotMatch(app.created('a').download,/지난 수업/);
+});
+
+async function localAudioExportFixture() {
+  const app = setup(async()=>{throw new Error('export must not use the network');});
+  await app.run(`(async()=>{
+    await openLiveQueue();
+    const captureId='71000000-0000-4000-8000-000000000001';
+    const session={id:captureId,owner:user,title:'합성 구조 수업',createdAt:Date.now(),nextRuntimeSequence:2,
+      durable:true,asrProvider:'clova',persistChain:Promise.resolve(),storageFailed:false};
+    liveSessions.set(captureId,session); captureSession=session;
+    const first=TestEncodeWav(new Float32Array(128000));
+    const next=new Float32Array(176000);next.fill(.25,48000);
+    const second=TestEncodeWav(next);
+    liveQueue.sessions.set(captureId,{...session,persistChain:undefined});
+    liveQueue.chunks.set('72000000-0000-4000-8000-000000000001',{
+      id:'72000000-0000-4000-8000-000000000001',captureId,owner:user,sequence:0,
+      startSamples:0,durationSamples:128000,overlapSamples:0,blob:first,state:'blocked'});
+    pending=[{id:'72000000-0000-4000-8000-000000000001',captureId,owner:user,sequence:0,
+      startSeconds:0,durationSeconds:8,overlapSeconds:0,blob:first,durable:true},
+      {id:'72000000-0000-4000-8000-000000000002',captureId,owner:user,sequence:1,
+      startSeconds:5,durationSeconds:11,overlapSeconds:3,blob:second}];
+    capture={recording:true,paused:false,inputHealth:{status:'receiving'},
+      snapshotForExport:()=>({sequence:2,startSamples:208000,durationSamples:80000,overlapSamples:48000,
+        blob:TestEncodeWav(new Float32Array(80000).fill(.25))})};
+    recording=true; sendError='합성 전송 보류';updateControls();
+  })()`);
+  return app;
+}
+
+test('local rescue combines all remaining silence, speech and current PCM without stopping or settling the queue',async()=>{
+  const app=await localAudioExportFixture();
+  await app.run('prepareLocalAudioExport()');
+  const links=app.createdAll('a').filter(link=>link.download?.includes('_기기보관_'));
+  assert.equal(links.length,1);
+  const data=new DataView(await app.objectUrlBlob(links[0].href).arrayBuffer());
+  assert.equal(data.byteLength,44+18*32000,'all remaining unique samples, not only the silent head');
+  assert.equal(data.getInt16(44,true),0);
+  assert.equal(data.getInt16(44+8*32000,true),8192);
+  assert.equal(data.getInt16(data.byteLength-2,true),8192);
+  assert.equal(app.run('pending.length'),2);assert.equal(app.run('liveQueue.chunks.size'),1);
+  assert.equal(app.run('pending.some(row=>row.downloadRequested)'),false);
+  assert.equal(app.run('recording'),true);assert.equal(app.run('capture.recording'),true);
+  assert.equal(app.run('sendError'),'합성 전송 보류');
+  assert.equal(app.element('local-audio-dialog').open,true);
+  assert.equal(app.element('pause-button').disabled,false);
+  assert.match(app.element('local-audio-status').textContent,/1개 파일/);
+  app.run('clearLocalAudioExports()');
+  assert.equal(app.objectUrlBlob(links[0].href),undefined);
+  assert.equal(app.run('pending.length'),2);
+});
+
+test('local export has no sendError requirement and tolerates IDB failure with an explicit RAM-only warning',async()=>{
+  const app=await localAudioExportFixture();
+  app.run("sendError='';liveQueue.readExportSnapshot=async()=>{throw new Error('synthetic storage unavailable')};updateControls();");
+  assert.equal(app.element('save-failed').hidden,true);
+  assert.equal(app.element('local-audio-open').disabled,false);
+  await app.run('prepareLocalAudioExport()');
+  assert.equal(app.createdAll('a').filter(link=>link.download?.includes('_기기보관_')).length,1);
+  assert.match(app.element('local-audio-status').textContent,/메모리에서 읽은 음성만/);
+  assert.equal(app.run('pending.length'),2);
+});
+
+test('expired login can rescue its already authenticated locked audio but no cached or selected identity is accepted',async()=>{
+  const app=await localAudioExportFixture();
+  app.run("token='';showLogin(false);");
+  assert.equal(app.element('auth-local-audio-open').hidden,false);
+  await app.run('prepareLocalAudioExport()');
+  assert.equal(app.createdAll('a').filter(link=>link.download?.includes('_기기보관_')).length,1);
+  app.run("clearLocalAudioExports();user='';updateControls();");
+  await app.run('prepareLocalAudioExport()');
+  assert.equal(app.element('local-audio-dialog').open,false);
+});
+
+test('local export drops a late snapshot after owner change and never offers a foreign owner WAV',async()=>{
+  const app=await localAudioExportFixture(),gate=deferred();
+  const queue=app.run('liveQueue');queue.readExportSnapshot=()=>gate.promise;
+  const work=app.run('prepareLocalAudioExport()');
+  app.run("user='user-beta';token='new-session';clearLocalAudioExports();");
+  gate.resolve({sessions:[],chunks:[],snapshots:[]});await work;
+  assert.equal(app.createdAll('a').filter(link=>link.download?.includes('_기기보관_')).length,0);
+  assert.equal(app.element('local-audio-files').children.length,0);
+  const next=await localAudioExportFixture();
+  next.run("liveQueue.readExportSnapshot=async()=>({sessions:[],chunks:[{owner:'other-owner'}],snapshots:[]});");
+  await next.run('prepareLocalAudioExport()');
+  assert.match(next.element('local-audio-status').textContent,/계정 정보/);
+  assert.equal(next.createdAll('a').filter(link=>link.download?.includes('_기기보관_')).length,0);
+});
+
+test('invalid zero-byte RAM WAV cannot be downloaded or grant skip permission',async()=>{
+  const app=await localAudioExportFixture();
+  app.run("pending[0].blob=new Blob([],{type:'audio/wav'});");
+  await app.run('saveFailedChunk()');
+  assert.equal(app.created('a'),undefined);
+  assert.equal(app.run('pending[0].downloadRequested'),undefined);
+  assert.equal(app.run('pending.length'),2);
+  assert.match(app.element('notice').textContent,/원본은 지우지 않았습니다/);
+});
+
+test('bulk rescue can still save later sound with an explicit missing warning when the first WAV is unreadable',async()=>{
+  const app=await localAudioExportFixture();
+  app.run("pending[0].blob=new Blob([],{type:'audio/wav'});liveQueue.chunks.clear();");
+  await app.run('prepareLocalAudioExport()');
+  const links=app.createdAll('a').filter(link=>link.download?.includes('_기기보관_'));
+  assert.equal(links.length,1);
+  assert.equal(app.objectUrlBlob(links[0].href).size,44+13*32000);
+  assert.match(app.element('local-audio-status').textContent,/읽지 못한 음성 항목 1개/);
+  assert.match(app.element('local-audio-status').textContent,/누락이 있습니다/);
+  const warning=app.element('local-audio-status').textContent;
+  links[0].onclick({preventDefault(){throw new Error('same owner should download');}});
+  assert.equal(app.element('local-audio-status').textContent,warning,'download notice must not erase known missing audio');
+  assert.equal(app.run('pending.length'),2);assert.equal(app.run('pending[0].blob.size'),0);
+  assert.equal(app.run('pending.some(row=>row.downloadRequested)'),false);
+});
+
+test('blocked upload messaging never claims continuing microphone capture when input is gone or stopped',async()=>{
+  const app=await localAudioExportFixture();
+  app.run("inputUnavailable=true;capture.inputHealth={status:'unavailable'};updateControls();");
+  assert.match(app.element('processing-text').textContent,/새 음성을 받지 못하고/);
+  assert.match(app.element('capture-input-status').textContent,/중단 중의 소리는 녹음되지 않습니다/);
+  assert.equal(app.element('record-dot').classList.values.has('live'),false);
+  assert.equal(app.element('pause-button').disabled,false);
+  app.run("inputUnavailable=false;recording=false;capture=null;updateControls();");
+  assert.match(app.element('capture-input-status').textContent,/녹음하고 있지 않습니다/);
+  assert.match(app.element('record-state').textContent,/녹음 중 아님/);
+  assert.doesNotMatch(app.element('processing-text').textContent,/음성은 계속 보관 중/);
+  assert.equal(app.element('local-audio-open').disabled,false);
 });
 
 async function ongoingRecordingFixture(source = 'microphone') {
@@ -4905,6 +5061,45 @@ async function ongoingRecordingFixture(source = 'microphone') {
   await tick(); await tick();
   return app;
 }
+
+test('resumed context alone cannot clear the unavailable warning or start the recording clock',async()=>{
+  const app=await ongoingRecordingFixture();
+  const mic=app.microphone();mic.inputHealth={status:'unavailable'};
+  mic.callbacks.onInputUnavailable(new Error('synthetic input stalled'),{});
+  mic.resumeInput=async()=>{mic.inputHealth={status:'waiting'};return true;};
+  await app.run('resumeRecording()');
+  assert.equal(app.run('inputUnavailable'),true);assert.equal(app.run('timer'),null);
+  mic.callbacks.onInputRecovered({});
+  assert.equal(app.run('inputUnavailable'),true,'a control event without PCM is not recovery');
+  mic.inputHealth={status:'receiving'};mic.callbacks.onLevel(0);
+  assert.equal(app.run('inputUnavailable'),false);assert.notEqual(app.run('timer'),null);
+  assert.equal(app.run('recording'),true);assert.equal(mic.stopCalls,undefined);
+});
+
+test('manual pause remains explicit during suspended input and one resume command restores the intended state',async()=>{
+  const app=await ongoingRecordingFixture(),mic=app.microphone();
+  await app.run('pauseRecording()');mic.inputHealth={status:'paused'};
+  mic.callbacks.onInputUnavailable(new Error('context suspended while manually paused'),{});
+  assert.match(app.element('capture-input-status').textContent,/일시정지 중/);
+  assert.equal(app.element('pause-button').textContent,'▶ 받아쓰기 재개');
+  mic.resume=async()=>{mic.resumeCalls=(mic.resumeCalls || 0)+1;mic.paused=false;mic.recording=true;mic.inputHealth={status:'waiting'};};
+  await app.run('resumeRecording()');
+  assert.equal(mic.resumeCalls,1);assert.equal(mic.resumeInputCalls,undefined);
+  assert.equal(app.run('inputUnavailable'),true);assert.equal(app.run('timer'),null);
+  mic.inputHealth={status:'receiving'};mic.callbacks.onLevel(0);
+  assert.equal(app.run('recording'),true);assert.equal(app.run('paused'),false);
+});
+
+test('RAM rescue never creates or upgrades a missing IndexedDB database',async()=>{
+  const app=setup(async()=>{throw new Error('no network');});
+  app.run(`pending=[{id:'72000000-0000-4000-8000-000000000003',owner:user,
+    captureId:'71000000-0000-4000-8000-000000000003',sequence:0,startSeconds:0,
+    durationSeconds:1,overlapSeconds:0,blob:TestEncodeWav(new Float32Array(16000).fill(.2))}];`);
+  await app.run('prepareLocalAudioExport()');
+  assert.equal(app.createdAll('a').filter(link=>link.download?.includes('_기기보관_')).length,1);
+  assert.equal(app.run('liveQueue'),null);assert.equal(app.run('liveQueueReady'),null);
+  assert.match(app.element('local-audio-status').textContent,/메모리에서 읽은 음성만/);
+});
 
 test('quiet input never pauses the recording UI or its elapsed clock for microphone or system audio', async () => {
   for (const source of ['microphone', 'system']) {
@@ -5762,17 +5957,17 @@ const usageStates = (overrides = {}) => ({completed:0,failed:0,pending:0,cancell
 function usageAccount(label,overrides = {}) {
   return {account_id:`opaque-${label}`,label,lectures:{total:0,active:0,trashed:0},
     recording:{known_seconds:0,qwen_seconds:0,clova_seconds:0,known_lectures:0,unknown_lectures:0},
-    imports:usageStates(),ai:{correction:usageStates(),summary:usageStates(),translation:usageStates(),question:usageStates()},...overrides};
+    imports:usageStates(),ai:{correction:usageStates(),summary:usageStates(),translation:usageStates(),question:usageStates(),study_note:usageStates()},...overrides};
 }
 function usageFixture(period = 'month',accounts = null) {
   const rows = accounts || [usageAccount('user-alpha',{
     lectures:{total:2,active:1,trashed:1},recording:{known_seconds:600,qwen_seconds:600,clova_seconds:0,known_lectures:1,unknown_lectures:1},
     imports:usageStates({completed:1,pending:1}),
-    ai:{correction:usageStates({completed:1}),summary:usageStates({completed:2}),translation:usageStates({failed:1}),question:usageStates({completed:3})},
+    ai:{correction:usageStates({completed:1}),summary:usageStates({completed:2}),translation:usageStates({failed:1}),question:usageStates({completed:3}),study_note:usageStates()},
   }),usageAccount('member.beta',{
     lectures:{total:1,active:1,trashed:0},recording:{known_seconds:3600,qwen_seconds:0,clova_seconds:3600,known_lectures:1,unknown_lectures:0},
     imports:usageStates({failed:1}),
-    ai:{correction:usageStates(),summary:usageStates({completed:1}),translation:usageStates(),question:usageStates({pending:1})},
+    ai:{correction:usageStates(),summary:usageStates({completed:1}),translation:usageStates(),question:usageStates({pending:1}),study_note:usageStates()},
   })];
   const {account_id,label,...totals} = usageAccount('total');
   const add = (sum,item) => { for (const key of Object.keys(sum)) {
@@ -5808,7 +6003,8 @@ test('admin retained usage reconciles whole and per-account class time and AI-re
   assert.equal(rows[1].children[1].children[1].children[1].textContent,'1시간 0분');
   assert.equal(rows[0].children[1].children[2].children[1].textContent,'6개');
   assert.match(rows[0].children[3].textContent,/파일 변환: 완료 1 · 대기\/처리 1/);
-  assert.match(rows[0].children.at(-1).textContent,/질문: 완료 3/);
+  assert.match(rows[0].children.at(-2).textContent,/질문: 완료 3/);
+  assert.match(rows[0].children.at(-1).textContent,/수업 정리본: 완료 0/);
   assert.doesNotMatch(app.run('JSON.stringify(adminUsageSnapshot)'),/must not retain|billing|lecture_title/);
   assert.match(app.element('admin-usage-updated').textContent,/이번 달 생성 수업 · KST/);
   assert.ok([...app.timeouts.values()].some(item => item.delay === 20000));
@@ -5937,4 +6133,519 @@ test('usage polls only while the administrator dialog is visible and avoids poll
   app.run("adminAction=''"); await app.runTimeout(20000); assert.equal(calls,2);
   const timer=app.timeouts.get(app.run('adminUsageRefreshTimer')).callback;
   app.run('closeAdminDialog()'); timer(); await tick(); assert.equal(calls,2);
+});
+
+function importSelectionFile(name='dropped.wav',type='audio/wav',size=100) {
+  const value=new Blob([new Uint8Array(Math.min(size,100))],{type});
+  Object.defineProperties(value,{name:{value:name},size:{value:size}}); return value;
+}
+function recordingDrop(files,{items,types=['Files']}={}) {
+  return {dataTransfer:{files,items:items || files.map(file=>({kind:'file',getAsFile:()=>file})),types,dropEffect:'none'},
+    defaultPrevented:false,stopped:false,preventDefault(){this.defaultPrevented=true;},stopPropagation(){this.stopped=true;}};
+}
+
+test('dragged recording selects one immutable File without FileList assignment or upload until explicit start',async()=>{
+  const starts=[],operation=deferred();let requests=0;
+  const app=setup(()=>{requests++;return response({});},{FileUploader:class{
+    detach(){} start(file,options){this.running=true;starts.push({file,options});return operation.promise;}
+  }});
+  const file=importSelectionFile('새 강의.m4a','');
+  Object.defineProperty(app.element('recording-file'),'files',{configurable:true,get:()=>[],set(){throw new Error('FileList assignment unsupported');}});
+  app.run("current={id:'english-class',language:'en',segments:[]}; renderCurrent()");
+  const event=recordingDrop([file]);await app.element('recording-dropzone').ondrop(event);
+  assert.equal(event.defaultPrevented,true);assert.equal(event.stopped,true);
+  assert.equal(app.run('currentRecordingFile()'),file);assert.equal(app.run('current'),null);
+  assert.equal(app.element('language').value,'ko');assert.equal(app.element('lecture-title').value,'새 강의');
+  assert.match(app.element('recording-file-selection').textContent,/새 강의\.m4a/);
+  assert.equal(app.element('import-button').disabled,false);assert.equal(requests,0);assert.equal(starts.length,0);
+  await app.run('startOrResumeFileImport()');
+  assert.equal(starts.length,1);assert.equal(starts[0].file,file);assert.equal(starts[0].options.title,'새 강의');
+  assert.equal(app.element('recording-file').disabled,true);
+});
+
+test('picker and drop reject empty unsupported oversized multiple directory and text input while retaining prior selection',async()=>{
+  const app=setup(()=>response({})),prior=importSelectionFile('kept.wav');
+  app.element('recording-file').files=[prior];app.element('recording-file').onchange();
+  for(const file of [importSelectionFile('empty.wav','audio/wav',0),importSelectionFile('notes.txt','text/plain'),importSelectionFile('large.wav','audio/wav',1024**3+1)]) {
+    app.element('recording-file').files=[file];app.element('recording-file').onchange();
+    assert.equal(app.run('currentRecordingFile()'),prior);
+    await app.element('recording-dropzone').ondrop(recordingDrop([file]));
+    assert.equal(app.run('currentRecordingFile()'),prior);
+  }
+  await app.element('recording-dropzone').ondrop(recordingDrop([prior,prior]));
+  const directory=recordingDrop([prior],{items:[{kind:'file',webkitGetAsEntry:()=>({isDirectory:true})}]});
+  await app.element('recording-dropzone').ondrop(directory);assert.match(app.element('notice').textContent,/폴더/);
+  const text=recordingDrop([],{types:['text/plain'],items:[{kind:'string'}]});
+  await app.element('recording-dropzone').ondrop(text);
+  assert.equal(text.defaultPrevented,false,'Ordinary text drag is not blocked');
+  assert.equal(app.run('currentRecordingFile()'),prior);assert.match(app.element('recording-file-selection').textContent,/kept\.wav/);
+});
+
+test('file selection and drop cannot replace a file during live capture authentication or active file work',async()=>{
+  for(const state of ["recording=true","paused=true","starting=true","stopping=true","sending=true","recordingFinalizePending=true",
+    "authenticating=true","loggingOut=true","token=''","importStarting=true","importCancelling=true",
+    "fileUploader={running:true,file:'original'}; importJob={status:'uploading'}",
+    "fileUploader={running:false}; importJob={status:'processing'}"]){
+    const app=setup(()=>response({})),prior=importSelectionFile('original.wav'),next=importSelectionFile('replacement.wav');
+    await app.element('recording-dropzone').ondrop(recordingDrop([prior]));
+    app.run(`${state}; updateControls()`);
+    assert.equal(app.element('recording-file').disabled,true,state);
+    await app.element('recording-dropzone').ondrop(recordingDrop([next]));
+    app.element('recording-file').files=[next];app.element('recording-file').onchange();
+    assert.equal(app.run('currentRecordingFile()'),prior,state);
+    assert.equal(app.element('import-button').disabled,true,state);
+  }
+});
+
+test('a stopped upload uses the dropped File only for the existing explicit fingerprint-checked resume',async()=>{
+  const app=setup(()=>response({}));
+  app.run("globalThis.resumeFiles=[]; fileUploader={running:false,resume(file){globalThis.resumeFiles.push(file);return new Promise(()=>{});}}; importJob={id:'same-job',status:'uploading',lecture_id:'lesson'}; updateControls()");
+  const file=importSelectionFile('same-original.wav');
+  await app.element('recording-dropzone').ondrop(recordingDrop([file]));
+  assert.equal(app.run('globalThis.resumeFiles.length'),0);
+  assert.equal(app.element('import-button').textContent,'같은 파일 이어 올리기');
+  await app.run('startOrResumeFileImport()');
+  assert.equal(app.run('globalThis.resumeFiles.length'),1);assert.equal(app.run('globalThis.resumeFiles[0]'),file);
+  assert.equal(app.run('importJob.id'),'same-job');
+});
+
+test('delayed file handle checks cannot override a newer picker selection or a changed account token or origin',async()=>{
+  for(const change of ['picker','owner','token','origin','recording']){
+    const app=setup(()=>response({})),handle=deferred(),old=importSelectionFile('older.wav'),latest=importSelectionFile('latest.wav');
+    const event=recordingDrop([old],{items:[{kind:'file',getAsFileSystemHandle:()=>handle.promise}]});
+    const dropping=app.element('recording-dropzone').ondrop(event);
+    assert.equal(app.element('import-button').disabled,true);
+    if(change==='picker'){app.element('recording-file').files=[latest];app.element('recording-file').onchange();}
+    else if(change==='owner') app.run("user='different-user'");
+    else if(change==='token') app.run("token='different-token'");
+    else if(change==='origin') app.run("apiUrl='https://different.example'");
+    else app.run('recording=true');
+    handle.resolve({kind:'file'});await dropping;
+    assert.equal(app.run('currentRecordingFile()'),change==='picker'?latest:null,change);
+    assert.equal(app.run('recordingSelectionLoading'),false,change);
+    assert.doesNotMatch(app.element('recording-file-selection').textContent || '',/older/);
+  }
+});
+
+test('page-level file drops prevent navigation but preserve ordinary text drags and explicit picker accessibility',async()=>{
+  const app=setup(()=>response({})),file=importSelectionFile();
+  const outside=recordingDrop([file]);await app.dispatchDocument('drop',outside);
+  assert.equal(outside.defaultPrevented,true);assert.equal(app.run('currentRecordingFile()'),null);
+  assert.match(app.element('notice').textContent,/영역/);
+  const text=recordingDrop([],{types:['text/plain'],items:[{kind:'string'}]});
+  await app.dispatchDocument('dragover',text);await app.dispatchDocument('drop',text);
+  assert.equal(text.defaultPrevented,false);
+  const drag=recordingDrop([file]);app.element('recording-dropzone').ondragenter(drag);
+  app.element('recording-dropzone').ondragenter(drag);
+  assert.equal(app.element('recording-dropzone').classList.values.has('is-dragover'),true);
+  app.element('recording-dropzone').ondragleave();assert.equal(app.element('recording-dropzone').classList.values.has('is-dragover'),true);
+  await app.dispatchDocument('dragend');assert.equal(app.element('recording-dropzone').classList.values.has('is-dragover'),false);
+  app.element('recording-file').files=[file];app.element('recording-file').onchange();
+  assert.equal(app.run('currentRecordingFile()'),file);
+});
+
+function studyNoteEnvelope(status = 'completed') {
+  const time='2026-01-01T00:00:00Z';
+  return {configured:true,model:'synthetic-study-note',study_note:status === null ? null : {
+    lecture_id:'study-lesson',status,model:'synthetic-study-note',error_code:null,error:null,
+    created_at:time,updated_at:time,completed_at:status === 'completed' ? time : null,
+    document:status === 'completed' ? {paragraphs:[{heading:'개념과 조건',source_ids:['study-a','study-b'],
+      text:'**개념**을 살펴봅니다. 조건이 불명확해요.',edits:[
+        {original:'살펴봅시다',replacement:'살펴봅니다',uncertain:false},
+        {original:'흐릿해요',replacement:'불명확해요',uncertain:true},
+      ]}]} : null,
+    markdown:status === 'completed' ? '# 수업 정리본\n\n## 개념과 조건\n원문 00:05–00:20\n\n**개념**을 살펴봅니다.' : null,
+  }};
+}
+function studyNoteApp(handler) {
+  return setup((url,options={})=>url.endsWith('/study-note') ? handler(url,options)
+    : response({configured:false,model:'synthetic',summary:null}));
+}
+function openStudyNoteFixture(app,{finalized=true,open=true}={}) {
+  app.run(`current={id:'study-lesson',title:'합성 수업',created_at:'2026-01-01T00:00:00Z',recording_finalized:${finalized},segments:[
+    {id:'study-a',start:5,end:10,text:'개념을 살펴봅시다.'},{id:'study-b',start:10,end:20,text:'조건이 흐릿해요.'}]};renderCurrent();`);
+  if(open) { app.element('study-note-details').open=true; app.element('study-note-details').ontoggle(); }
+}
+
+test('study note generation is explicit finalized-only and independent of other live recording', async () => {
+  const methods=[]; let posted=false;
+  const app=studyNoteApp((_url,options)=>{
+    methods.push(options.method);
+    if(options.method==='POST') {posted=true;return response(studyNoteEnvelope('queued'),202);}
+    return response(studyNoteEnvelope(posted ? 'completed' : null));
+  });
+  openStudyNoteFixture(app,{finalized:false}); app.element('study-note-create').onclick(); await tick();
+  assert.deepEqual(methods,[]); assert.equal(app.element('study-note-create').disabled,true);
+  app.run('current.recording_finalized=true;renderCurrent()');
+  assert.deepEqual(methods,[]);
+  app.element('study-note-details').open=true; app.element('study-note-details').ontoggle();
+  await until(()=>app.run('studyNoteView.loaded')); assert.deepEqual(methods,['GET']);
+  app.run(`recording=true;capture={recording:true,paused:false,stopCalls:0,stop(){this.stopCalls++;}};
+    captureSession={id:'another-live-class',lecture:{id:'another-live-class'},source:'microphone',asrProvider:'qwen'};`);
+  const raw=app.run('JSON.stringify(current.segments)');
+  app.element('study-note-create').onclick(); app.element('study-note-create').onclick();
+  await until(()=>app.run('studyNoteView.row?.status')==='queued');
+  assert.deepEqual(methods,['GET','POST']); await app.runTimeout(3000);
+  assert.equal(app.run('studyNoteView.row.status'),'completed'); assert.equal(app.run('recording'),true);
+  assert.equal(app.run('capture.stopCalls'),0); assert.equal(app.run('JSON.stringify(current.segments)'),raw);
+  const link=app.element('study-note-download'),url=link.href;
+  assert.equal(link.hidden,false); assert.equal(app.element('study-note-create').disabled,true);
+  assert.equal(await app.objectUrlBlob(url).text(),studyNoteEnvelope().study_note.markdown);
+  assert.match(link.download,/수업 정리본\.md$/);
+  const paragraph=app.element('study-note-content').children[0];
+  assert.match(paragraph.children[1].textContent,/00:05–00:20/);
+  assert.equal(paragraph.children[2].children[0].tagName,'STRONG');
+  assert.match(paragraph.children[3].children[0].textContent,/문맥을 참고한 복원 1곳/);
+  assert.match(paragraph.children[4].children[0].textContent,/불명확.*1곳/);
+  app.run('renderCurrent()'); assert.equal(link.href,url); assert.equal(app.element('study-note-content').children[0],paragraph);
+  app.run("correctionView='corrected';reviewView.query='old';$('transcript-search').value='old'");
+  paragraph.children.at(-1).onclick(); assert.equal(app.run('correctionView'),'raw');
+  assert.equal(app.element('transcript-search').value,''); assert.equal(app.run('recording'),true);
+});
+
+test('lost study-note POST response requires GET first and never repeats automatically', async () => {
+  const methods=[],app=studyNoteApp((_url,options)=>{
+    methods.push(options.method); if(options.method==='POST') throw new Error('synthetic network loss');
+    return response(studyNoteEnvelope(methods.length===1 ? null : 'completed'));
+  });
+  openStudyNoteFixture(app); await until(()=>app.run('studyNoteView.loaded'));
+  app.element('study-note-create').onclick(); await until(()=>!!app.run('studyNoteView.error'));
+  app.element('study-note-create').onclick(); await tick();
+  assert.deepEqual(methods,['GET','POST']); assert.match(app.element('study-note-state').textContent,/상태 새로고침/);
+  app.element('study-note-refresh').onclick(); await until(()=>app.run('studyNoteView.row?.status')==='completed');
+  assert.deepEqual(methods,['GET','POST','GET']);
+});
+
+test('study-note polling is bounded and closing details stops polling without cancelling server work', async () => {
+  const methods=[],app=studyNoteApp((_url,options)=>{methods.push(options.method);return response(studyNoteEnvelope('processing'));});
+  openStudyNoteFixture(app); await until(()=>app.run('studyNoteView.loaded'));
+  app.run('studyNoteView.polls=199'); await app.runTimeout(3000);
+  assert.equal(app.run('studyNoteView.polls'),200); assert.equal(app.run('studyNotePollTimer'),null);
+  assert.match(app.element('study-note-state').textContent,/서버의 작업은 계속/);
+  app.element('study-note-refresh').onclick(); await until(()=>!app.run('studyNoteView.busy'));
+  const callback=app.timeouts.get(app.run('studyNotePollTimer')).callback;
+  app.element('study-note-details').open=false; app.element('study-note-details').ontoggle(); await callback();
+  assert.equal(app.run('studyNotePollTimer'),null); assert.deepEqual(methods,['GET','GET','GET']);
+});
+
+test('study-note explicit capacity and input rejections expose safe server reasons without auto retry', async () => {
+  for(const status of [400,403,409,413,422,429,503]) {
+    const methods=[],app=studyNoteApp((_url,options)=>{methods.push(options.method);return options.method==='POST'
+      ? response({detail:'합성 입력 한도를 확인하세요.'},status) : response(studyNoteEnvelope(null));});
+    openStudyNoteFixture(app); await until(()=>app.run('studyNoteView.loaded')); app.element('study-note-create').onclick();
+    await until(()=>!!app.run('studyNoteView.error')); assert.match(app.element('study-note-state').textContent,/합성 입력 한도/);
+    assert.deepEqual(methods,['GET','POST']);assert.equal(app.run('studyNotePollTimer'),null);
+  }
+});
+
+test('study-note late responses are discarded after owner token API lecture raw-source or dialog changes', async () => {
+  for(const change of ["user='user-beta'","token='new-token'","apiUrl='https://changed.example'",
+    "current.id='another'","current.segments[0].text='다른 원문'","current.segments[0].start=0",
+    "current.segments.reverse()","current.recording_finalized=false",
+    "$('study-note-details').open=false;$('study-note-details').ontoggle()"]){
+    const pending=deferred(),app=studyNoteApp(()=>pending.promise); openStudyNoteFixture(app);
+    await tick(); app.run(change); pending.resolve(response(studyNoteEnvelope())); await tick(); await tick();
+    assert.equal(app.run('studyNoteView.row'),null,change); assert.equal(app.element('study-note-content').children.length,0,change);
+    assert.equal(app.element('study-note-download').hidden,true,change);
+  }
+});
+
+test('study-note malformed coverage or missing metadata fail closed without a download', async () => {
+  for(const mutate of [r=>r.document.paragraphs[0].source_ids.reverse(),r=>r.document.paragraphs[0].source_ids.pop(),
+    r=>r.document.paragraphs[0].source_ids=['study-a','foreign'],r=>r.lecture_id='other',r=>delete r.error_code,
+    r=>r.document.paragraphs[0].edits[0].replacement='본문에 없음']){
+    const value=studyNoteEnvelope();mutate(value.study_note);const app=studyNoteApp(()=>response(value));
+    openStudyNoteFixture(app);await until(()=>!!app.run('studyNoteView.error'));
+    assert.equal(app.run('studyNoteView.row'),null);assert.equal(app.element('study-note-download').hidden,true);
+    assert.equal(app.element('study-note-content').children.length,0);
+  }
+});
+
+test('study-note unsupported disabled and failed services have explicit safe recovery controls', async () => {
+  for(const disabled of [true,false]){
+    let calls=0;const app=studyNoteApp(()=>{++calls;return disabled?response({...studyNoteEnvelope(null),configured:false}):response({detail:'not found'},404);});
+    openStudyNoteFixture(app);await until(()=>!app.run('studyNoteView.busy'));
+    assert.equal(app.element('study-note-create').disabled,true);
+    assert.match(app.element('study-note-state').textContent,disabled?/API 설정/:/아직 지원하지 않거나/);
+    app.element('study-note-create').onclick();await tick();assert.equal(calls,1);
+  }
+  const methods=[],app=studyNoteApp((_url,options)=>{methods.push(options.method);return response(studyNoteEnvelope('failed'));});
+  openStudyNoteFixture(app);await until(()=>app.run('studyNoteView.loaded'));
+  assert.match(app.element('study-note-create').textContent,/다시/);app.element('study-note-create').onclick();
+  await until(()=>!app.run('studyNoteView.busy'));assert.deepEqual(methods,['GET','POST']);
+});
+
+test('study-note URLs are revoked on logout or source changes and stale download clicks are blocked', async () => {
+  for(const change of ["token='';showLogin(false)","user='user-beta';renderCurrent()",
+    "apiUrl='https://changed.example';renderCurrent()","current.segments[0].text='다른 원문';renderCurrent()"]){
+    const app=studyNoteApp(()=>response(studyNoteEnvelope()));openStudyNoteFixture(app);await until(()=>app.run('studyNoteView.row?.status')==='completed');
+    const url=app.element('study-note-download').href;assert.ok(app.objectUrlBlob(url));app.run(change);
+    assert.equal(app.objectUrlBlob(url),undefined,change);assert.equal(app.element('study-note-download').hidden,true,change);
+    assert.equal(app.element('study-note-content').children.length,0,change);
+  }
+  const app=studyNoteApp(()=>response(studyNoteEnvelope()));openStudyNoteFixture(app);await until(()=>app.run('studyNoteView.row?.status')==='completed');
+  const url=app.element('study-note-download').href;app.run("current.segments[0].end=11");let blocked=false;
+  app.element('study-note-download').onclick({preventDefault(){blocked=true;}});assert.equal(blocked,true);assert.equal(app.objectUrlBlob(url),undefined);
+  const expired=studyNoteApp(()=>response(studyNoteEnvelope()));openStudyNoteFixture(expired);
+  await until(()=>expired.run('studyNoteView.row?.status')==='completed');
+  const expiredURL=expired.element('study-note-download').href;expired.run('authSessionExpiresAt=Date.now()-1');let expiryBlocked=false;
+  expired.element('study-note-download').onclick({preventDefault(){expiryBlocked=true;}});
+  assert.equal(expiryBlocked,true);assert.equal(expired.objectUrlBlob(expiredURL),undefined);
+});
+
+test('study-note model markup is literal except safe emphasis without executable or external elements', async () => {
+  const value=studyNoteEnvelope();value.study_note.document.paragraphs[0].text+=' <img src=x> [외부](https://invalid.example) <script>bad()</script>';
+  const app=studyNoteApp(()=>response(value));openStudyNoteFixture(app);await until(()=>app.run('studyNoteView.row?.status')==='completed');
+  const body=app.element('study-note-content').children[0].children[2];
+  assert.ok(body.children.every(node=>['SPAN','STRONG'].includes(node.tagName)));
+  assert.match(body.children.at(-1).textContent,/<img src=x>/);assert.equal(app.createdAll('script').length,0);assert.equal(app.createdAll('img').length,0);
+});
+
+test('retained usage requires study-note metrics and includes saved study-note results in totals', async () => {
+  const value=usageFixture();value.accounts[0].ai.study_note.completed=2;value.totals.ai.study_note.completed=2;
+  const app=setup(()=>response(value));openUsageFixture(app);await app.run('loadAdminUsage()');
+  assert.equal(app.element('admin-usage-ai').textContent,'9개');
+  assert.match(app.element('admin-usage-accounts').children[0].children.at(-1).textContent,/수업 정리본: 완료 2/);
+  delete value.accounts[0].ai.study_note;await app.run('loadAdminUsage()');assert.match(app.run('adminUsageError'),/합계/);
+});
+
+test('older usage servers consistently missing study-note metrics remain readable without invented zeros', async () => {
+  const value=usageFixture();for(const row of [value.totals,...value.accounts])delete row.ai.study_note;
+  const app=setup(()=>response(value));openUsageFixture(app);await app.run('loadAdminUsage()');
+  assert.equal(app.run('adminUsageError'),'');assert.equal(app.run('adminUsageSnapshot.studyNotesSupported'),false);
+  assert.equal(app.element('admin-usage-ai').textContent,'7개');assert.match(app.element('admin-usage-ai-detail').textContent,/서버 미지원/);
+  assert.equal(app.element('admin-usage-accounts').children[0].children.at(-1).textContent,'수업 정리본: 서버 미지원');
+  value.totals.ai.study_note=usageStates();await app.run('loadAdminUsage()');assert.match(app.run('adminUsageError'),/합계/);
+  for(const row of value.accounts)row.ai.study_note=usageStates();value.accounts[0].ai.study_note.completed=-1;
+  await app.run('loadAdminUsage()');assert.match(app.run('adminUsageError'),/합계/);
+});
+
+test('partial TXT and MD exports snapshot already received text during pause blocked uploads and active capture',async()=>{
+  const app=setup(()=>response({}));
+  app.run(`current={id:'partial-lesson',title:'부분 수업',created_at:'2026-01-01T00:00:00Z',language:'ko',recording_finalized:false,
+    segments:[{id:'partial-a',start:2,end:4,text:'현재 받은 문장'}]};
+    pending=[{id:'waiting',owner:user,lectureId:current.id}];sendError='전송 보류';paused=true;renderCurrent();`);
+  assert.equal(app.element('download').disabled,false);assert.equal(app.element('export-format').disabled,false);
+  const retained=app.run('JSON.stringify(pending)');
+  for(const format of ['text','markdown']){
+    app.element('export-format').value=format;app.element('download').onclick();const link=app.created('a');
+    assert.match(link.download,/_부분_.*\.(txt|md)$/);const before=await app.objectUrlBlob(link.href).text();
+    assert.match(before,/현재 받은 문장/);assert.match(before,/내보낸 시점/);assert.match(before,/이후 받아쓴 내용은 포함하지 않습니다/);
+    app.run("current.segments.push({id:crypto.randomUUID(),start:4,end:5,text:'추가 문장'});recording=true;paused=false;renderCurrent()");
+    assert.equal(await app.objectUrlBlob(link.href).text(),before);assert.equal(app.run('JSON.stringify(pending)'),retained);assert.equal(app.run('sendError'),'전송 보류');
+  }
+  assert.ok([...app.timeouts.values()].some(timer=>timer.delay===60000));
+  const url=app.created('a').href;app.run("token='';showLogin(false)");assert.equal(app.objectUrlBlob(url),undefined);
+  const count=app.createdAll('a').length;app.element('download').onclick();assert.equal(app.createdAll('a').length,count);
+});
+
+test('expired text export cannot use a timer-delayed token or export another account workspace',()=>{
+  const app=setup(()=>response({}));app.run("current={id:'own',title:'수업',segments:[{text:'문장'}]};renderCurrent();authSessionExpiresAt=Date.now()-1");
+  app.element('download').onclick();assert.equal(app.createdAll('a').length,0);assert.equal(app.run('token'),'');
+  for(const change of ["user='another-owner'","apiUrl='https://another.example'"]){
+    const other=setup(()=>response({}));other.run("current={id:'owned',title:'수업',segments:[{text:'문장'}]};renderCurrent()");
+    other.run(change);other.element('download').onclick();assert.equal(other.createdAll('a').length,0);
+  }
+});
+
+test('saved finalized WAV ticket and local residual WAV are available without disturbing other audio work',async()=>{
+  const requests=[],app=setup((url,options)=>{requests.push({url,options});return response({path:`/recording-downloads/${'z'.repeat(43)}`});});
+  app.run(`current={id:'saved',title:'저장된 수업',recording_available:true,recording_finalized:true,segments:[]};
+    recording=true;capture={recording:true,stopCalls:0,stop(){this.stopCalls++;}};pending=[{id:'other',owner:user,lectureId:'other'}];sendError='전송 보류';renderCurrent()`);
+  assert.equal(app.element('recording-download').disabled,false);await app.run('downloadRecording()');
+  assert.equal(requests.length,1);assert.match(requests[0].url,/recording-download-ticket$/);
+  assert.equal(app.run('recording'),true);assert.equal(app.run('capture.stopCalls'),0);assert.equal(app.run('pending.length'),1);assert.equal(app.run('sendError'),'전송 보류');
+  const local=await localAudioExportFixture();local.run("current={id:captureSession.id,title:'기기 수업',recording_finalized:false,recording_available:true,segments:[]};updateControls()");
+  assert.equal(local.element('recording-download').disabled,false);await local.run('downloadRecording()');
+  assert.equal(local.element('local-audio-dialog').open,true);assert.ok(local.element('local-audio-files').children.length>0);
+  assert.equal(local.run('recording'),true);assert.equal(local.run('sendError'),'합성 전송 보류');
+});
+
+function continuationApp({dropParent=false}={}){
+  const calls=[];const app=setup((url,options={})=>{
+    if(url.endsWith('/status'))return response({capabilities:{lecture_continuations:true},transcription_providers:{qwen:{configured:true},clova:{configured:true}}});
+    if(url.endsWith('/lectures')&&options.method==='POST'){
+      const body=JSON.parse(options.body),id=options.headers.get('X-Lecture-Id');calls.push({id,body});
+      return response({id,title:body.title,language:body.language,asr_provider:body.asr_provider,created_at:'2026-01-01T00:00:00Z',
+        segments:[],recording_available:false,recording_finalized:false,...(dropParent?{}:{continuation_of:body.continuation_of||null,continuations:[]})});
+    }
+    if(url.endsWith('/chunks'))throw new Error('blocked old chunks must never automatically post');
+    return response({});
+  });return {app,calls};
+}
+async function seedContinuationParent(app){
+  const parent=webcrypto.randomUUID();
+  app.run(`current={id:${JSON.stringify(parent)},title:'원본 수업',language:'ko',asr_provider:'qwen',created_at:'2026-01-01T00:00:00Z',
+    recording_available:true,recording_finalized:false,continuation_of:null,continuations:[],segments:[{id:'source',start:0,end:1,text:'원본 문장'}]};lectures=[current];renderCurrent()`);
+  await app.seedDurableFailedFinal({lectureId:parent,error:'이전 CLOVA 처리 여부 불명확'});
+  await app.run('updateStatus()');return parent;
+}
+
+test('continuation preserves an unfinished parent and blocked queue while capturing a separately linked child',async()=>{
+  const {app,calls}=continuationApp(),parent=await seedContinuationParent(app);
+  const old=app.run('pending[0]'),oldRaw=app.run('JSON.stringify(current.segments)'),error=app.run('sendError');
+  app.run(`liveSessions.get(${JSON.stringify(parent)}).createdAt=Date.now()+1000`);
+  assert.equal(app.element('continue-recording').disabled,false);app.element('continue-recording').onclick();
+  await until(()=>app.run('recording && !draft'));
+  assert.equal(calls.length,1);assert.notEqual(calls[0].id,parent);assert.equal(calls[0].body.continuation_of,parent);
+  assert.equal(app.run('sendError'),error);assert.equal(app.run('pending[0]'),old);
+  assert.equal(app.run(`JSON.stringify(lectures.find(l=>l.id===${JSON.stringify(parent)}).segments)`),oldRaw);
+  assert.equal(app.run(`lectures.find(l=>l.id===${JSON.stringify(parent)}).recording_finalized`),false);
+  assert.ok(app.run(`captureSession.createdAt>liveSessions.get(${JSON.stringify(parent)}).createdAt`));
+  const child=app.run('captureSession.id');app.microphone().callbacks.onChunk(chunk(0,8));
+  await until(()=>app.run('pending.length===2 && pending[1].durable'));
+  assert.equal(app.run('pending[1].captureId'),child);assert.equal(app.run('pending[1].sequence'),0);assert.equal(app.run('pending[0]'),old);
+  assert.equal(app.run('sendError'),error);assert.equal(app.element('pause-button').disabled,false);
+  await app.run('pauseRecording()');await app.run('resumeRecording()');assert.equal(app.run('recording'),true);assert.equal(app.run('captureSession.id'),child);
+  const stored=await app.run('liveQueue.getSession(user,captureSession.id)');assert.equal(stored.continuationOf,parent);
+  assert.equal(app.run(`runtimeSessionFromStored(${JSON.stringify(stored)}).continuationOf`),parent);
+  app.run('captureSession.lecture=null');await app.run('assignLecture(captureSession)');
+  assert.equal(calls.length,2);assert.deepEqual(calls[0],calls[1],'same child UUID and full parent request are replayed');
+});
+
+test('continuation rejects unsupported servers live sessions foreign queues and unassigned drafts without starting or posting',async()=>{
+  for(const change of ["continuationCapability=''","capture={recording:false};paused=true","draft={id:crypto.randomUUID(),lecture:null}",
+    "pending[0].owner='another-owner'","token='different-token'","apiUrl='https://another.example'"]){
+    const {app,calls}=continuationApp();await seedContinuationParent(app);app.run(change);app.element('continue-recording').onclick();await tick();
+    assert.equal(calls.length,0,change);assert.equal(app.microphone(),undefined,change);
+  }
+});
+
+test('a server that omits the requested continuation never receives child audio and retains its local parent reference',async()=>{
+  const {app,calls}=continuationApp({dropParent:true}),parent=await seedContinuationParent(app);
+  app.element('continue-recording').onclick();await until(()=>calls.length===1&&!app.run('starting'));
+  await until(()=>!app.run('captureSession.creating'));assert.equal(app.run('captureSession.lecture'),null);
+  assert.equal(app.run('captureSession.continuationOf'),parent);assert.equal(app.run('recording'),true);
+  assert.equal(app.run('sendError'),'이전 CLOVA 처리 여부 불명확');
+  app.microphone().callbacks.onChunk(chunk(0,8));await until(()=>app.run('pending.length===2 && pending[1].durable'));
+  assert.equal(app.run('pending[1].lectureReady'),false);assert.equal(calls.length,1);
+});
+
+test('blocked uploads no longer prevent reading a different saved lecture or its available text',async()=>{
+  const other={id:webcrypto.randomUUID(),title:'다른 수업',recording_finalized:true,recording_available:true,segments:[{id:'other-raw',start:0,end:1,text:'별도 문장'}]};
+  const app=setup(url=>url.endsWith(other.id)?response(other):response({}));
+  app.run("pending=[{id:'old',owner:user,lectureId:'old'}];sendError='보류';capture=null;draft=null;recording=false;paused=false;updateControls()");
+  await app.run(`selectLecture(${JSON.stringify({id:other.id})})`);assert.equal(app.run('current.id'),other.id);
+  assert.equal(app.element('download').disabled,false);assert.equal(app.element('recording-download').disabled,false);assert.equal(app.run('sendError'),'보류');
+});
+
+test('logout and import completion clear dropped private file references and their visible names',async()=>{
+  const app=setup(url=>url.endsWith('/lectures')?response([]):response({})),file=importSelectionFile('private-recording.wav');
+  await app.element('recording-dropzone').ondrop(recordingDrop([file]));
+  app.run('showLogin()');
+  assert.equal(app.run('selectedRecordingFile'),null);assert.equal(app.element('recording-file-selection').textContent,'');
+  app.run("token='fresh';user='user-alpha'");
+  await app.element('recording-dropzone').ondrop(recordingDrop([file]));
+  await app.run("runFileImport(Promise.resolve({id:'finished',status:'completed',raw_deleted:true}),importGeneration)");
+  assert.equal(app.run('selectedRecordingFile'),null);assert.equal(app.element('recording-file').value,'');
+  assert.equal(app.element('recording-file-selection').textContent,'');
+});
+
+test('continuation keeps automatic language detection and rejects malformed parent language metadata',async()=>{
+  const {app,calls}=continuationApp();await seedContinuationParent(app);
+  app.run('current.language=null;renderCurrent()');app.element('continue-recording').onclick();
+  await until(()=>app.run('recording && !draft'));
+  assert.equal(calls[0].body.language,null);assert.equal(app.run('captureSession.language'),null);
+  assert.equal(app.element('language').value,'auto');
+  assert.equal((await app.run('liveQueue.getSession(user,captureSession.id)')).language,null);
+  for(const malformed of ['undefined',"'auto'","''"]){
+    const fixture=continuationApp();await seedContinuationParent(fixture.app);
+    fixture.app.run(`current.language=${malformed};updateControls()`);fixture.app.element('continue-recording').onclick();
+    await tick();assert.equal(fixture.calls.length,0);assert.equal(fixture.app.microphone(),undefined);
+  }
+});
+
+test('hidden parent recovery verifies the original creation body once then accepts refreshed hidden navigation links',async()=>{
+  const parent=webcrypto.randomUUID(),child=webcrypto.randomUUID(),posts=[],audioPosts=[];
+  const hidden={id:child,title:'이어 녹음',language:'en',asr_provider:'qwen',continuation_of:null,continuations:[],
+    created_at:'2026-01-01T00:00:00Z',recording_available:true,recording_finalized:false,segments:[]};
+  const app=setup((url,options={})=>{
+    if(url.endsWith('/lectures')&&options.method==='POST'){
+      posts.push({id:options.headers.get('X-Lecture-Id'),body:JSON.parse(options.body)});
+      return response({...hidden,continuation_creation_verified:true});
+    }
+    if(url.endsWith('/chunks')){audioPosts.push(options.headers.get('X-Chunk-Id'));return response({recording_available:true,recording_finalized:false,
+      segments:[{id:`result-${audioPosts.length}`,start:audioPosts.length-1,end:audioPosts.length,text:'복구된 문장'}]});}
+    return response({});
+  });
+  await app.run(`(async()=>{
+    current=${JSON.stringify(hidden)};lectures=[current];continuationCapability=JSON.stringify([user,token,apiUrl]);
+    await openLiveQueue();await liveQueue.createSession({id:${JSON.stringify(child)},owner:user,title:'이어 녹음',language:'en',
+      source:'microphone',asrProvider:'qwen',continuationOf:${JSON.stringify(parent)},createdAt:Date.now()});
+    liveQueue.recoverOwner=async owner=>({sessions:[...liveQueue.sessions.values()].filter(s=>s.owner===owner).map(s=>({...s})),
+      chunks:[...liveQueue.chunks.values()].filter(c=>c.owner===owner).map(c=>({...c})),snapshots:[],stats:{bytes:32044,count:1}});
+    await liveQueue.updateSession(user,current.id,{lectureCreated:true});
+    await liveQueue.enqueueChunk(user,current.id,{id:crypto.randomUUID(),startSamples:0,durationSamples:16000,overlapSamples:0,final:false,blob:TestEncodeWav(new Float32Array(16000).fill(.2))});
+    const stored=await liveQueue.getSession(user,current.id),unverified=runtimeSessionFromStored(stored);
+    globalThis.__unverifiedLecture=lectureForStoredProvider(unverified,{...current,continuation_creation_verified:true});
+    renderCurrent();await recoverDurableLiveAudio(user);
+  })()`);
+  assert.equal(app.run('__unverifiedLecture'),null,'GET/list flags alone must never authorize a hidden parent');
+  await until(()=>audioPosts.length===1&&app.run('pending.length===0&&!sending'));
+  assert.equal(posts.length,1);assert.equal(posts[0].id,child);assert.equal(posts[0].body.continuation_of,parent);
+  assert.equal(app.run(`liveSessions.get(${JSON.stringify(child)}).continuationVerified`),true);
+  assert.equal(app.run('current.continuation_of'),null);assert.match(app.run('current.segments[0].text'),/복구된/);
+  await app.run(`(async()=>{
+    lectures=[${JSON.stringify(hidden)}];current={...lectures[0]};
+    await liveQueue.enqueueChunk(user,current.id,{id:crypto.randomUUID(),startSamples:16000,durationSamples:16000,overlapSamples:0,final:false,blob:TestEncodeWav(new Float32Array(16000).fill(.2))});
+    await recoverDurableLiveAudio(user);
+  })()`);
+  await until(()=>audioPosts.length===2&&app.run('pending.length===0&&!sending'));
+  assert.equal(posts.length,1,'already verified capture is not recreated after list refresh hides its parent');
+  assert.equal(new Set(audioPosts).size,2);assert.equal(app.run('sendError'),'');
+  assert.equal(app.run(`lectureForStoredProvider(liveSessions.get(${JSON.stringify(child)}),{...current,continuation_of:crypto.randomUUID()})`),null);
+  assert.equal(app.run(`lectureForStoredProvider(liveSessions.get(${JSON.stringify(child)}),{...current,language:'ko'})`),null);
+  app.run("apiUrl='https://different.example'");
+  assert.equal(app.run(`lectureForStoredProvider(liveSessions.get(${JSON.stringify(child)}),current)`),null,'creation verification is bound to its API origin');
+});
+
+test('server partial WAV uses a validated separate ticket without finalizing or changing live and queued audio',async()=>{
+  const calls=[],ticket={path:`/recording-snapshots/${'p'.repeat(43)}`,expires_in:60,bytes:320044,duration_seconds:10,scope:'server_saved_prefix'};
+  const app=setup((url,options)=>{calls.push({url,options});return response(ticket);});
+  app.run(`current={id:'unfinished',title:'부분 녹음',recording_available:true,recording_finalized:false,segments:[]};
+    partialRecordingCapability=JSON.stringify([user,token,apiUrl]);recording=true;capture={stopCalls:0,stop(){this.stopCalls++;}};
+    pending=[{id:'waiting',owner:user,lectureId:current.id}];sendError='전송 보류';renderCurrent()`);
+  assert.equal(app.element('recording-partial-download').disabled,false);await app.run('downloadPartialRecording()');
+  assert.equal(calls.length,1);assert.match(calls[0].url,/recording-snapshot-ticket$/);assert.equal(calls[0].options.method,'POST');
+  const link=app.created('a');assert.match(link.href,/\/recording-snapshots\//);assert.match(link.download,/_서버저장부분_/);
+  assert.equal(app.run('capture.stopCalls'),0);assert.equal(app.run('recording'),true);assert.equal(app.run('pending.length'),1);
+  assert.equal(app.run('sendError'),'전송 보류');assert.equal(app.run('current.recording_finalized'),false);
+  assert.match(app.element('notice').textContent,/미전송 음성은 별도/);
+});
+
+test('server partial WAV rejects unsupported capabilities malformed tickets and late owner or origin responses',async()=>{
+  const ticket={path:`/recording-snapshots/${'p'.repeat(43)}`,expires_in:60,bytes:32044,duration_seconds:1,scope:'server_saved_prefix'};
+  const seed=app=>app.run(`current={id:'unfinished',title:'부분 녹음',recording_available:true,recording_finalized:false,segments:[]};partialRecordingCapability=JSON.stringify([user,token,apiUrl]);renderCurrent()`);
+  for(const change of ["partialRecordingCapability=''","current.recording_finalized=true","token='changed'"]){
+    let count=0;const app=setup(()=>{count++;return response(ticket);});seed(app);app.run(change);await app.run('downloadPartialRecording()');assert.equal(count,0);
+  }
+  for(const invalid of [{path:'https://untrusted.example/file'},{scope:'whole_class'},{bytes:44},{duration_seconds:2},{expires_in:600}]){
+    const app=setup(()=>response({...ticket,...invalid}));seed(app);await app.run('downloadPartialRecording()');assert.equal(app.createdAll('a').length,0);
+  }
+  for(const change of ["user='another-owner'","token='changed'","apiUrl='https://another.example'","current={id:'different'}"]){
+    const wait=deferred(),app=setup(()=>wait.promise);seed(app);const operation=app.run('downloadPartialRecording()');
+    await tick();app.run(change);wait.resolve(response(ticket));await operation;assert.equal(app.createdAll('a').length,0);
+  }
+});
+
+test('late continuation assignment cannot repopulate a cleared workspace after IndexedDB confirmation waits',async()=>{
+  for(const change of ["token='';showLogin(false);lectures=[];current=null", "user='another-owner';token='another-token';lectures=[];current=null", "apiUrl='https://another.example';lectures=[];current=null"]){
+    const {app}=continuationApp();await seedContinuationParent(app);
+    app.run(`globalThis.__idbWaiting=false;globalThis.__releaseAssignment=null;
+      const update=liveQueue.updateSession.bind(liveQueue);liveQueue.updateSession=async(owner,id,fields)=>{
+        const result=await update(owner,id,fields);if(fields.lectureCreated){__idbWaiting=true;await new Promise(resolve=>{__releaseAssignment=resolve;});}return result;
+      };`);
+    app.element('continue-recording').onclick();await until(()=>app.run('__idbWaiting'));
+    app.run(change);const errorBefore=app.run('sendError');app.run('__releaseAssignment()');await until(()=>!app.run('captureSession.creating'));
+    assert.equal(app.run('lectures.length'),0);assert.equal(app.run('current'),null);
+    assert.equal(app.run('sendError'),errorBefore);
+  }
+});
+
+test('lecture assignment refuses foreign or unauthenticated sessions before sending a body',async()=>{
+  for(const change of ["captureSession.owner='another-owner'","token=''"]){
+    const {app,calls}=continuationApp();await seedContinuationParent(app);
+    app.run(`captureSession.lecture=null;${change}`);
+    await assert.rejects(app.run('assignLecture(captureSession)'));assert.equal(calls.length,0);
+  }
 });

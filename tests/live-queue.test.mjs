@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { encodeWav } from '../web/audio.js';
 import {
-  DurableLiveQueue, LiveQueueConflictError, LiveQueueOwnershipError, LiveQueueValidationError,
+  DurableLiveQueue, LiveQueueConflictError, LiveQueueOwnershipError, LiveQueueValidationError, LiveQueueCorruptError,
   LIVE_QUEUE_DB_VERSION,
 } from '../web/live-queue.js';
 
@@ -96,6 +96,50 @@ test('server confirmation is boolean and cannot be activated by a truthy string'
   assert.equal(writes.length,0);
 });
 
+test('existing-only rescue opens without a version and never upgrades existing v1 or v2',async () => {
+  for (const version of [1,2]) {
+    let closed = false;
+    const database = {version,objectStoreNames:{contains:name => name !== 'pcmSnapshots' || version === 2},
+      close(){closed = true;},createObjectStore(){throw new Error('rescue must not create stores');}};
+    const queue = new DurableLiveQueue({readOnlyExisting:true,keyRange:{bound(){}},indexedDB:{open(...args){
+      assert.equal(args.length,1,'must not request a version upgrade');
+      const request = {result:database}; queueMicrotask(() => request.onsuccess()); return request;
+    }}});
+    await queue.open(); assert.equal(queue.database,database);
+    queue.close(); assert.equal(closed,true);
+  }
+});
+
+test('existing-only rescue aborts absent database creation and rejects unknown schema',async () => {
+  let aborted = false;
+  const absent = new DurableLiveQueue({readOnlyExisting:true,keyRange:{bound(){}},indexedDB:{open(...args){
+    assert.equal(args.length,1);
+    const request = {result:{createObjectStore(){throw new Error('must never create');}},
+      transaction:{abort(){aborted = true;}}};
+    queueMicrotask(() => request.onupgradeneeded({oldVersion:0})); return request;
+  }}});
+  await assert.rejects(absent.open(),error => error.code === 'live_queue_not_found');
+  assert.equal(aborted,true); assert.equal(absent.database,null);
+  for (const [version,missing] of [[3,null],[2,'pcmSnapshots'],[1,'chunks']]) {
+    let closed = false;
+    const unknown = new DurableLiveQueue({readOnlyExisting:true,keyRange:{bound(){}},indexedDB:{open(){
+      const request = {result:{version,objectStoreNames:{contains:name => name !== missing},close(){closed = true;}}};
+      queueMicrotask(() => request.onsuccess()); return request;
+    }}});
+    await assert.rejects(unknown.open(),error => error.code === 'live_queue_corrupt');
+    assert.equal(closed,true); assert.equal(unknown.database,null);
+  }
+});
+
+test('existing-only reader rejects all write transactions and persistence changes before opening',async () => {
+  let opens = 0, persists = 0;
+  const queue = new DurableLiveQueue({readOnlyExisting:true,indexedDB:{open(){opens += 1;}},
+    storageManager:{persist(){persists += 1;}}});
+  await assert.rejects(queue._transaction(['chunks'],'readwrite',()=>{}),error => error.code === 'live_queue_read_only');
+  await assert.rejects(queue.requestPersistence(),error => error.code === 'live_queue_read_only');
+  assert.equal(opens,0); assert.equal(persists,0);
+});
+
 function memoryQueue() {
   const data = { sessions: new Map(), chunks: new Map(), pcmSnapshots: new Map() };
   const queue = new DurableLiveQueue({ now: () => 1700000000000,
@@ -175,6 +219,96 @@ async function journalQueue() {
     source: 'microphone', asrProvider: 'qwen', language: 'en' });
   return fixture;
 }
+
+test('continuation parent survives persistent session recovery without changing old audio',async () => {
+  const {queue,data} = await journalQueue();
+  const old = structuredClone(data.sessions.get(CAPTURE_ID));
+  const child = '30000000-0000-4000-8000-000000000000';
+  const input = {id:child,owner:OWNER,title:'이어서',language:'en',source:'microphone',asrProvider:'qwen',
+    createdAt:1700000000001,continuationOf:CAPTURE_ID};
+  const created = await queue.createSession(input);
+  assert.equal(created.continuationOf,CAPTURE_ID);
+  const reopened = new DurableLiveQueue({keyRange:{bound:(lower,upper) => ({lower,upper})}});
+  reopened._transaction = queue._transaction;
+  const recovered = await reopened.recoverOwner(OWNER);
+  assert.equal(recovered.sessions.find(row=>row.id===child).continuationOf,CAPTURE_ID);
+  assert.deepEqual(data.sessions.get(CAPTURE_ID),old);
+  assert.equal(Object.hasOwn(data.sessions.get(CAPTURE_ID),'continuationOf'),false);
+  assert.equal((await queue.readExportSnapshot(OWNER)).sessions.find(row=>row.id===child).continuationOf,CAPTURE_ID);
+  assert.deepEqual(await queue.createSession(input),created);
+  await assert.rejects(queue.createSession({...input,continuationOf:null}),LiveQueueConflictError);
+  await assert.rejects(queue.createSession({...input,continuationOf:CHUNK_ID}),LiveQueueConflictError);
+  await assert.rejects(queue.getSession('other-owner',child),LiveQueueOwnershipError);
+});
+
+test('legacy sessions remain v2-compatible and invalid continuation references cannot be saved',async () => {
+  const {queue,data} = memoryQueue();
+  const input = {id:CAPTURE_ID,owner:OWNER,title:'기존 수업',source:'microphone',asrProvider:'qwen',language:'ko',createdAt:1700000000000};
+  const legacy = await queue.createSession({...input,continuationOf:null});
+  assert.equal(Object.hasOwn(legacy,'continuationOf'),false);
+  assert.equal(Object.keys(data.sessions.get(CAPTURE_ID)).length,13);
+  assert.equal(LIVE_QUEUE_DB_VERSION,2);
+  for (const continuationOf of [CAPTURE_ID,'invalid',{},[],false,1]) {
+    await assert.rejects(queue.createSession({...input,continuationOf}),LiveQueueValidationError);
+  }
+  data.sessions.get(CAPTURE_ID).continuationOf = 'invalid';
+  await assert.rejects(queue.recoverOwner(OWNER),LiveQueueCorruptError);
+});
+
+test('export snapshot reads owner sessions chunks and PCM once without mutations or Blob reads',async () => {
+  const {queue,data} = await journalQueue();
+  await queue.enqueueChunk(OWNER,CAPTURE_ID,chunkInput({duration:128000}));
+  await queue.saveSnapshot(OWNER,CAPTURE_ID,snapshotInput({sequence:1,start:80000,duration:64000,overlap:48000}));
+  const other = 'another-owner', otherId = '30000000-0000-4000-8000-000000000000';
+  await queue.createSession({id:otherId,owner:other,title:'other private lesson',source:'microphone',asrProvider:'qwen',language:'ko'});
+  await queue.saveSnapshot(other,otherId,snapshotInput());
+  const before = structuredClone(data), actualTransaction = queue._transaction;
+  const calls = [];
+  queue._transaction = (names,mode,operation,...rest) => {
+    calls.push({names,mode}); return actualTransaction(names,mode,operation,...rest);
+  };
+  const original = Blob.prototype.arrayBuffer;
+  let result;
+  try {
+    Blob.prototype.arrayBuffer = () => { throw new Error('no Blob read inside readonly transaction'); };
+    result = await queue.readExportSnapshot(OWNER);
+  } finally { Blob.prototype.arrayBuffer = original; }
+  assert.deepEqual(calls,[{names:['sessions','chunks','pcmSnapshots'],mode:'readonly'}]);
+  assert.equal(result.owner,OWNER); assert.equal(result.sessions.length,1);
+  assert.equal(result.chunks.length,1); assert.equal(result.snapshots.length,1);
+  for (const row of [...result.sessions,...result.chunks,...result.snapshots]) assert.equal(row.owner,OWNER);
+  assert.equal(result.chunks[0].blob.size,128000*2+44);
+  assert.equal(result.snapshots[0].blob.size,64000*2+44);
+  assert.deepEqual(data,before);
+  // Subsequent ACK/deletion cannot invalidate already captured immutable blobs.
+  data.chunks.clear(); data.pcmSnapshots.clear();
+  assert.equal((await result.chunks[0].blob.arrayBuffer()).byteLength,128000*2+44);
+});
+
+test('v1 existing-only snapshot reads its two stores and does not create PCM store',async () => {
+  const {queue} = await journalQueue();
+  await queue.enqueueChunk(OWNER,CAPTURE_ID,chunkInput());
+  queue.readOnlyExisting = true;
+  queue.open = async () => { queue.database = {version:1}; return queue; };
+  const actual = queue._transaction;
+  queue._transaction = (names,mode,operation,...rest) => {
+    assert.deepEqual(names,['sessions','chunks']); assert.equal(mode,'readonly');
+    return actual(names,mode,operation,...rest);
+  };
+  const result = await queue.readExportSnapshot(OWNER);
+  assert.equal(result.chunks.length,1); assert.deepEqual(result.snapshots,[]);
+});
+
+test('export snapshot leaves invalid WAV metadata visible for later validation, never repairs it',async () => {
+  const {queue,data} = await journalQueue();
+  await queue.enqueueChunk(OWNER,CAPTURE_ID,chunkInput());
+  const row = data.chunks.get(CHUNK_ID);
+  row.blob = new Blob(); row.byteLength = 0;
+  const result = await queue.readExportSnapshot(OWNER);
+  assert.equal(result.chunks[0].blob.size,0);
+  assert.equal(data.chunks.get(CHUNK_ID).byteLength,0);
+  assert.equal(data.chunks.get(CHUNK_ID).state,'queued');
+});
 
 function snapshotInput({ sequence = 0, start = 0, duration = 32000, overlap = 0, sample = 0.125 } = {}) {
   return { sequence, startSamples: start, durationSamples: duration, overlapSamples: overlap,

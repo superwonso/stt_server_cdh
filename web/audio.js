@@ -6,6 +6,8 @@ export const PAUSE_SECONDS = 0.24;
 export const PAUSE_RMS = 0.006;
 export const PCM_SNAPSHOT_SECONDS = 2;
 const AUTO_RESUME_RETRY_MS = 2000;
+const INPUT_WATCHDOG_MS = 1000;
+const INPUT_STALL_MS = 5000;
 const RECONNECT_DRAIN_TIMEOUT_MS = 350;
 const MIN_UPLOAD_SAMPLES = Math.ceil(PCM_SAMPLE_RATE * 0.05);
 
@@ -184,6 +186,8 @@ function captureError(error, source = 'microphone') {
  * Browser/OS suspension and track mute are recoverable. They call
  * onInputUnavailable(error, details), retry AudioContext.resume() while the
  * page is visible, and call onInputRecovered(details) after input returns.
+ * A PCM watchdog also detects a running graph which stopped delivering data;
+ * silence is valid input and never triggers a pause or device replacement.
  * A permanently ended track, closed context, or failed worklet calls
  * onReconnectNeeded(error, details) after its old graph has been drained. The
  * caller must expose a button which calls reconnect(); this intentionally does
@@ -251,6 +255,9 @@ export class MicrophoneCapture {
     this._controlSequence = 0;
     this._resumeAttempt = null;
     this._resumeRetryTimer = null;
+    this._inputWatchdogTimer = null;
+    this._pcmExpectedAt = null;
+    this._lastPCMAt = null;
     this._unavailableReasons = new Map();
     this._availabilityEpisode = false;
     this._reconnectReported = false;
@@ -262,6 +269,46 @@ export class MicrophoneCapture {
   get paused() { return this._state === 'paused'; }
   get capturedSeconds() { return ((this._chunkStartSamples || 0) + (this._chunkUsed || 0)) / PCM_SAMPLE_RATE; }
   get reconnectNeeded() { return this._state === 'reconnect-needed'; }
+
+  // This describes received PCM, not volume or the independent upload queue.
+  // A silent PCM block is a healthy input; a running AudioContext alone is not.
+  get inputHealth() {
+    const now = this._inputNow();
+    const since = Math.max(this._lastPCMAt ?? -Infinity, this._pcmExpectedAt ?? now);
+    let status = 'waiting';
+    let reason = this._unavailableReasons.values().next().value?.reason || null;
+    if (this._state === 'idle' || this._state === 'stopping' || this._stopRequested) status = 'idle';
+    else if (this.reconnectNeeded || this._state === 'reconnecting') status = 'reconnect-needed';
+    else if (this.paused || this._state === 'pausing') status = 'paused';
+    else if (this._unavailableReasons.size) status = 'unavailable';
+    else if (this.recording && now - since >= INPUT_STALL_MS) {
+      // Background tabs may delay the watchdog. A read must never claim old
+      // PCM is live, but it must not mutate capture or fire recovery callbacks.
+      status = 'unavailable';
+      reason = 'pcm-stalled';
+    } else if (this.recording && this._lastPCMAt !== null) status = 'receiving';
+    return {
+      status,
+      reason,
+      lastPcmAgeSeconds: this._lastPCMAt === null ? null : Math.max(0, now - this._lastPCMAt) / 1000,
+      capturedSeconds: this.capturedSeconds,
+    };
+  }
+
+  // Read only the samples already delivered to this page. Do not send a
+  // worklet control, alter overlap/sequence, or wait for storage/network work.
+  // The caller combines this immutable tail with queued WAVs by sample offset.
+  snapshotForExport() {
+    if (!this._chunk || !this._chunkUsed || this._stopRequested
+        || ['idle', 'starting', 'stopping'].includes(this._state)) return null;
+    return {
+      sequence: this._snapshotSequence,
+      startSamples: this._chunkStartSamples,
+      durationSamples: this._chunkUsed,
+      overlapSamples: this._chunkOverlap,
+      blob: encodeWav(this._chunk.subarray(0, this._chunkUsed)),
+    };
+  }
 
   start() {
     if (this._state !== 'idle' || this._startPromise || this._reconnectPromise
@@ -339,6 +386,9 @@ export class MicrophoneCapture {
   }
 
   resumeInput() {
+    // A user gesture may arrive before a throttled watchdog timer. Recheck the
+    // actual graph now so a running-but-stalled context cannot report success.
+    if (this.recording && !this._stopRequested) this._checkInputLiveness();
     // Use the same button for a temporary AudioContext suspension and a fully
     // ended device. Calling reconnect() here preserves getDisplayMedia's user
     // activation because there is no await before it opens the picker.
@@ -377,12 +427,13 @@ export class MicrophoneCapture {
       this._resumeRetryTimer = null;
       this._clearInputUnavailable('context-state', 'user-resume');
       if (this.recording) this._requestWakeLock();
-      if ([...this._unavailableReasons.keys()].some((key) => key.startsWith('track-muted-'))) {
+      const pcmStalled = this._unavailableReasons.has('pcm-stalled');
+      if (pcmStalled || [...this._unavailableReasons.keys()].some((key) => key.startsWith('track-muted-'))) {
         this._requireReconnect(
           new Error(this.captureSource === 'system'
             ? '공유 오디오 신호가 돌아오지 않았습니다. 같은 수업에서 화면을 다시 선택해 주세요.'
             : '마이크 신호가 돌아오지 않았습니다. 같은 수업에서 마이크를 다시 연결해 주세요.'),
-          'track-muted-user-reconnect',
+          pcmStalled ? 'pcm-stalled-user-reconnect' : 'track-muted-user-reconnect',
         );
       }
       // false means the context resumed but another condition (normally a
@@ -567,6 +618,7 @@ export class MicrophoneCapture {
     }
     this._state = this._desiredPaused ? 'paused' : 'recording';
     if (!this._desiredPaused) this._connectSource();
+    this._resetInputClock();
 
     // A successful reconnect clears the permanent failure, but a newly opened
     // track can already be muted. In that case keep the same unavailable episode.
@@ -590,7 +642,7 @@ export class MicrophoneCapture {
       }
     });
     if (this._unavailableReasons.size === 0) {
-      this._reportInputRecovered(expectedState === 'reconnecting' ? 'reconnected' : 'started');
+      this._clearInputUnavailable('reconnect', expectedState === 'reconnecting' ? 'reconnected' : 'started');
     } else if (!this._availabilityEpisode || expectedState === 'reconnecting') {
       const first = this._unavailableReasons.values().next().value;
       this._availabilityEpisode = true;
@@ -605,6 +657,7 @@ export class MicrophoneCapture {
     this._reconnectReason = null;
     this._reconnectReported = false;
     if (this.recording) this._requestWakeLock();
+    this._startInputWatchdog();
   }
 
   _listen(target, event, handler, bucket = this._resourceListeners) {
@@ -617,6 +670,7 @@ export class MicrophoneCapture {
     this._listen(document, 'visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         this._requestWakeLock();
+        this._checkInputLiveness();
         this._scheduleInputResume();
       } else {
         this.checkpoint();
@@ -653,7 +707,15 @@ export class MicrophoneCapture {
 
   _clearInputUnavailable(key, recoveredBy) {
     this._unavailableReasons.delete(key);
-    if (this._unavailableReasons.size === 0) this._reportInputRecovered(recoveredBy);
+    if (this._unavailableReasons.size === 0 && this._availabilityEpisode && this.recording) {
+      // A context/track recovery event can precede actual audio delivery. Keep
+      // the warning until a real (possibly silent) PCM block confirms recovery.
+      this._pcmExpectedAt = this._inputNow();
+      this._unavailableReasons.set('pcm-waiting', {
+        error: new Error('오디오 연결이 돌아왔습니다. 실제 입력이 도착하는지 확인하고 있습니다.'),
+        reason: 'pcm-waiting',
+      });
+    } else if (this._unavailableReasons.size === 0) this._reportInputRecovered(recoveredBy);
   }
 
   _reportInputRecovered(recoveredBy) {
@@ -674,31 +736,90 @@ export class MicrophoneCapture {
     this._reconnectReported = false;
     this._reconnectError = null;
     this._reconnectReason = null;
+    this._lastPCMAt = null;
+    this._pcmExpectedAt = null;
+  }
+
+  _inputNow() { return globalThis.performance?.now?.() ?? Date.now(); }
+
+  _resetInputClock() {
+    this._pcmExpectedAt = this._inputNow();
+    this._lastPCMAt = null;
+  }
+
+  _stopInputWatchdog() {
+    if (this._inputWatchdogTimer !== null) clearTimeout(this._inputWatchdogTimer);
+    this._inputWatchdogTimer = null;
+  }
+
+  _startInputWatchdog() {
+    this._stopInputWatchdog();
+    if (!this.recording || this._stopRequested) return;
+    this._inputWatchdogTimer = setTimeout(() => {
+      this._inputWatchdogTimer = null;
+      this._checkInputLiveness();
+      this._startInputWatchdog();
+    }, INPUT_WATCHDOG_MS);
+    this._inputWatchdogTimer?.unref?.();
+  }
+
+  _checkInputLiveness() {
+    if (!this.recording || this._stopRequested || !this._context || !this._sourceConnected) return;
+    const context = this._context;
+    const tracks = this._stream?.getAudioTracks() || [];
+    if (context.state === 'closed' || !tracks.some(track => track.readyState === 'live')
+        || (this.captureSource === 'system'
+          && !this._stream?.getVideoTracks().some(track => track.readyState === 'live'))) {
+      this._requireReconnect(new Error('오디오 입력이 종료되었습니다. 같은 수업에서 입력을 다시 연결해 주세요.'), 'input-ended');
+      return;
+    }
+    if (context.state !== 'running') {
+      this._markInputUnavailable('context-state', new Error('브라우저가 오디오 입력을 잠시 멈췄습니다. 페이지로 돌아오면 자동으로 재개합니다.'), `context-${context.state}`);
+      this._scheduleInputResume();
+      return;
+    }
+    if (this._unavailableReasons.has('context-state')) this._clearInputUnavailable('context-state', 'context-running');
+    tracks.forEach((track, index) => {
+      const key = `track-muted-${index}`;
+      if (track.muted) this._markInputUnavailable(key, new Error('오디오 입력이 잠시 중단되었습니다. 입력이 돌아올 때까지 기다립니다.'), 'track-muted');
+      else if (this._unavailableReasons.has(key)) this._clearInputUnavailable(key, 'track-unmuted');
+    });
+    if (tracks.some(track => track.muted)) return;
+    const since = Math.max(this._lastPCMAt ?? -Infinity, this._pcmExpectedAt ?? this._inputNow());
+    if (this._inputNow() - since < INPUT_STALL_MS) return;
+    this._unavailableReasons.delete('pcm-waiting');
+    this._markInputUnavailable('pcm-stalled', new Error('오디오 연결은 열려 있지만 실제 입력이 도착하지 않고 있습니다. 입력이 돌아오면 계속 녹음하며, 계속 멈춰 있으면 입력 재개 버튼을 눌러 주세요.'), 'pcm-stalled');
+  }
+
+  _queueInputResumeRetry(context) {
+    if (this._resumeRetryTimer !== null || context !== this._context
+        || !this.recording || this._stopRequested || context.state === 'running'
+        || context.state === 'closed' || document.visibilityState !== 'visible') return;
+    this._resumeRetryTimer = setTimeout(() => {
+      this._resumeRetryTimer = null;
+      this._scheduleInputResume();
+    }, AUTO_RESUME_RETRY_MS);
   }
 
   _scheduleInputResume() {
     if (this._resumeRetryTimer !== null || this._resumeAttempt
         || !this._context || this._context.state === 'closed'
-        || this._state === 'idle' || this._state === 'stopping'
-        || this._state === 'reconnect-needed' || this._state === 'reconnecting') return;
+        || !this.recording || this._stopRequested) return;
     if (document.visibilityState !== 'visible') return;
     const context = this._context;
     if (context.state === 'running') return;
     let resumed;
-    try { resumed = context.resume(); } catch { return; }
+    try { resumed = context.resume(); } catch {
+      this._queueInputResumeRetry(context);
+      return;
+    }
     let attempt;
     attempt = Promise.resolve(resumed).catch(() => {}).finally(() => {
       if (this._context === context && context.state === 'running') {
         this._clearInputUnavailable('context-state', 'automatic-resume');
       }
       if (this._resumeAttempt === attempt) this._resumeAttempt = null;
-      if (this._context === context && context.state !== 'running'
-          && context.state !== 'closed' && document.visibilityState === 'visible') {
-        this._resumeRetryTimer = setTimeout(() => {
-          this._resumeRetryTimer = null;
-          this._scheduleInputResume();
-        }, AUTO_RESUME_RETRY_MS);
-      }
+      this._queueInputResumeRetry(context);
     });
     this._resumeAttempt = attempt;
   }
@@ -709,6 +830,7 @@ export class MicrophoneCapture {
         || this._state === 'reconnecting' || this._stopRequested) return;
     this._desiredPaused = this._state === 'paused' || this._state === 'pausing';
     this._state = 'reconnect-needed';
+    this._stopInputWatchdog();
     this._disconnectSource();
     this._cancelControl(error);
     this._reconnectError = captureError(error, this.captureSource);
@@ -762,6 +884,12 @@ export class MicrophoneCapture {
   }
 
   _acceptSamples(samples) {
+    if (samples?.length > 0 && this.recording && !this._stopRequested) {
+      this._lastPCMAt = this._inputNow();
+      this._unavailableReasons.delete('pcm-stalled');
+      this._unavailableReasons.delete('pcm-waiting');
+      if (this._unavailableReasons.size === 0) this._reportInputRecovered('pcm-received');
+    }
     this._consumePCM(this._resampler.push(samples));
     if (this.recording) {
       let power = 0;
@@ -946,10 +1074,13 @@ export class MicrophoneCapture {
     }
     this._desiredPaused = true;
     this._state = 'pausing';
+    this._stopInputWatchdog();
     this._pausePromise = this._finishPause().catch((error) => {
       if (this._state === 'pausing') {
         this._state = 'recording';
         this._desiredPaused = false;
+        this._resetInputClock();
+        this._startInputWatchdog();
       }
       throw error;
     }).finally(() => { this._pausePromise = null; });
@@ -1079,6 +1210,8 @@ export class MicrophoneCapture {
       throw connected;
     }
     this._state = 'recording';
+    this._resetInputClock();
+    this._startInputWatchdog();
     this._requestWakeLock();
   }
 
@@ -1086,6 +1219,7 @@ export class MicrophoneCapture {
     if (this._stopPromise) return this._stopPromise;
     if (this._state === 'idle') return Promise.resolve();
     this._stopRequested = true;
+    this._stopInputWatchdog();
     this._stopPromise = (async () => {
       // Navigation/auth expiry can request a stop while a pause or resume
       // acknowledgement is in flight. Serialize the controls so two commands
@@ -1179,6 +1313,7 @@ export class MicrophoneCapture {
 
   async _releaseResources() {
     ++this._resourceGeneration;
+    this._stopInputWatchdog();
     if (this._resumeRetryTimer !== null) clearTimeout(this._resumeRetryTimer);
     this._resumeRetryTimer = null;
     this._resumeAttempt = null;

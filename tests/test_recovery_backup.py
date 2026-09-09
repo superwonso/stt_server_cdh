@@ -54,6 +54,28 @@ def seed_question_jobs(database):
 
 
 class RecoveryQuestionInfoTests(unittest.TestCase):
+    def test_study_note_backup_warnings_are_readonly_and_legacy_optional(self):
+        with tempfile.TemporaryDirectory(prefix="stt-study-note-backup-test-") as temporary:
+            database = Database(Path(temporary) / "private" / "database.sqlite3", ACCOUNTS)
+            database.initialize()
+            with database.connect() as connection:
+                for owner,status in zip(ACCOUNTS,("queued","processing")):
+                    identifier = str(uuid.uuid4())
+                    connection.execute("INSERT INTO lectures(id,username,title,created_at,recording_finalized) "
+                                       "VALUES(?,?,'Synthetic','2026-09-06',1)",(identifier,owner))
+                    connection.execute("INSERT INTO lecture_study_notes(lecture_id,username,job_id,raw_revision,status,model,"
+                                       "created_at,updated_at) VALUES(?,?,?,?,?,'synthetic','now','now')",
+                                       (identifier,owner,str(uuid.uuid4()),"a"*64,status))
+                before = [tuple(row) for row in connection.execute("SELECT * FROM lecture_study_notes ORDER BY lecture_id")]
+            result = _database_info(database.path)
+            self.assertEqual(result["schema_version"],21)
+            self.assertEqual(result["unfinished_jobs"],2)
+            with database.connect() as connection:
+                self.assertEqual([tuple(row) for row in connection.execute("SELECT * FROM lecture_study_notes ORDER BY lecture_id")],before)
+                connection.execute("DROP TABLE lecture_study_notes")
+                connection.execute("PRAGMA user_version=19")
+            self.assertEqual(_database_info(database.path)["unfinished_jobs"],0)
+
     def test_unfinished_question_warning_counts_only_queued_and_processing_without_changes(self):
         with tempfile.TemporaryDirectory(prefix="stt-question-backup-test-") as temporary:
             database = Database(Path(temporary) / "private" / "database.sqlite3", ACCOUNTS)

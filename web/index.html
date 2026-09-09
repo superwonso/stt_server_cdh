@@ -88,6 +88,8 @@
       </form>
 
       <button id="auth-capture-stop" class="danger-button auth-capture-stop" type="button" hidden>■ 이 기기의 녹음 종료</button>
+      <button id="auth-local-audio-open" class="secondary-button" type="button" hidden>기기에 남은 음성 내려받기</button>
+      <a class="account-recovery-help" href="./rescue.html" target="_blank" rel="noopener noreferrer">현재 탭을 유지하고 별도 음성 구조 창 열기 ↗</a>
       <button id="auth-toggle" class="text-button" type="button">처음이라면 · 비밀번호 설정하기</button>
       <p class="account-recovery-help">아이디나 비밀번호를 잊었나요? 관리자에게 개인적으로 문의해 주세요. 본인 확인 후 아이디 안내 또는 일회용 비밀번호 복구 링크를 받을 수 있어요.</p>
       <p class="session-note"><span aria-hidden="true">○</span> 로그인 정보는 이 탭을 닫으면 사라집니다.</p>
@@ -158,10 +160,16 @@
             </select>
             <button id="download" class="secondary-button" type="button" disabled>↓ 내보내기</button>
             <button id="recording-download" class="secondary-button" type="button" disabled>↓ 녹음 WAV</button>
+            <button id="recording-partial-download" class="secondary-button" type="button" disabled hidden>↓ 서버에 저장된 부분 WAV</button>
+            <button id="recording-finalize" class="secondary-button" type="button" disabled hidden>중단된 수업 저장 마무리</button>
+            <button id="continue-recording" class="secondary-button" type="button" disabled>이어 녹음 · 별도 기록</button>
             <button id="metadata-open" class="secondary-button" type="button" aria-haspopup="dialog" disabled>이름 · 과목 정리</button>
             <button id="delete-lecture" class="danger-button" type="button" disabled>휴지통으로</button>
           </div>
         </header>
+        <p id="recording-download-note" class="panel-help"></p>
+        <p id="continuation-state" class="panel-help" role="status"></p>
+        <div id="continuation-links" class="study-actions"></div>
 
         <section class="recorder" aria-labelledby="recorder-title">
           <h2 id="recorder-title" class="visually-hidden">받아쓰기 설정과 녹음</h2>
@@ -214,15 +222,17 @@
             </div>
           </div>
 
-          <div class="file-import-panel">
+          <div id="recording-dropzone" class="file-import-panel" role="group" aria-labelledby="file-import-title" aria-describedby="recording-drop-hint recording-file-selection">
             <div class="file-import-copy">
-              <strong>녹음 파일 가져오기</strong>
+              <strong id="file-import-title">녹음 파일 가져오기</strong>
+              <p id="recording-drop-hint">녹음 파일 한 개를 여기에 끌어 놓거나 파일 선택 버튼으로 골라 주세요. 확인 후 “파일 올려 변환”을 눌러야 업로드가 시작됩니다.</p>
               <p>WAV, MP3, M4A, AAC, FLAC, OGG, Opus, WebM과 오디오가 든 MP4·MKV·MOV 파일을 올려 이 PC의 Qwen으로 새 수업 기록을 만듭니다.</p>
               <small>파일은 Cloudflare를 거쳐 이 서버에 임시 저장되며, 변환 완료·취소·실패 시 원본을 삭제합니다. 최대 1 GiB·4시간입니다.</small>
             </div>
             <div class="file-import-actions">
               <label class="visually-hidden" for="recording-file">변환할 녹음 파일</label>
               <input id="recording-file" type="file" accept="audio/*,video/mp4,video/webm,video/quicktime,video/x-matroska,.wav,.mp3,.m4a,.aac,.flac,.ogg,.oga,.opus,.webm,.mp4,.mkv,.mov">
+              <p id="recording-file-selection" class="recording-file-selection" role="status" aria-live="polite"></p>
               <button id="import-button" class="secondary-button import-button" type="button">파일 올려 변환</button>
             </div>
           </div>
@@ -239,6 +249,8 @@
             <span class="save-check" aria-hidden="true">✓</span>
             <span id="save-state">녹음 저장 준비</span>
           </div>
+          <p id="capture-input-status" class="capture-input-status" role="status" aria-live="polite">마이크 녹음 중이 아닙니다.</p>
+          <button id="local-audio-open" class="secondary-button" type="button">기기에 남은 음성 내려받기</button>
           <div id="processing" class="processing" role="status" aria-live="polite" hidden>
             <span class="processing-spinner" aria-hidden="true"></span>
             <span id="processing-text">다음 문장을 듣고 있어요…</span>
@@ -246,7 +258,7 @@
           <div id="queue-warning" class="queue-warning" role="alert" hidden>
             <p id="queue-message"></p>
             <div class="queue-actions">
-              <button id="save-failed" type="button">실패 WAV 내려받기</button>
+              <button id="save-failed" type="button">첫 실패 조각만 WAV 내려받기</button>
               <button id="skip-failed" type="button" hidden>파일 저장 확인 · 건너뛰기</button>
               <button id="retry" type="button">다시 전송</button>
             </div>
@@ -336,6 +348,20 @@
               <button id="translation-full" type="button" aria-pressed="false">한국어 전체 보기</button>
             </div>
             <div id="translation-content"></div>
+          </section>
+          <section id="study-note-panel" class="lesson-summary lesson-study-note" aria-label="수업 정리본" hidden>
+            <details id="study-note-details">
+              <summary>수업 정리본.md · 원문 흐름을 따라 주제별 정리</summary>
+              <p class="summary-privacy">후보정·요약·번역과 별도로 만드는 한국어 수업 정리본입니다. 확정 원문 전체의 맥락을 참고해 영어는 한국어로 옮기고, 한글로 잘못 받아쓴 영어 표현도 문맥에 따라 복원합니다. 모든 원문 구간을 순서대로 묶어 주제·시간범위와 함께 보여 줍니다. 핵심용어·문맥 복원·불명확한 부분은 AI의 판단이므로 원문·녹음으로 확인하세요. 원문·후보정본·번역본을 덮어쓰지 않습니다.</p>
+              <p class="summary-privacy">생성을 누를 때 받아쓴 원문 텍스트를 NOVA(Mindlogic)로 보냅니다. 오디오·수업 제목·계정 ID·개인 필기는 보내지 않습니다. 숫자와 일부 개인정보는 가리지만 이름 등은 포함될 수 있습니다. 다른 수업을 녹음하는 동안에도 사용할 수 있어요.</p>
+              <div class="summary-actions">
+                <button id="study-note-create" class="secondary-button" type="button" disabled>수업 정리본 만들기</button>
+                <button id="study-note-refresh" class="secondary-button" type="button" disabled>상태 새로고침</button>
+                <a id="study-note-download" class="secondary-button study-note-download" download hidden>↓ 수업 정리본.md</a>
+              </div>
+              <p id="study-note-state" role="status" aria-live="polite"></p>
+              <div id="study-note-content"></div>
+            </details>
           </section>
           <section id="question-panel" class="lesson-summary" aria-label="수업 내용에 질문하기" hidden>
             <details id="question-details">
@@ -611,6 +637,7 @@
           <article><span>AI 후보정</span><strong id="admin-correction-queue">0</strong><small>대기·처리</small></article>
           <article><span>수업 요약</span><strong id="admin-summary-queue">0</strong><small>대기·처리</small></article>
           <article><span>수업 번역</span><strong id="admin-translation-queue">0</strong><small>대기·처리</small></article>
+          <article><span>수업 정리본</span><strong id="admin-study-note-queue">0</strong><small>대기·처리</small></article>
           <article><span>수업 질문</span><strong id="admin-question-queue">0</strong><small>대기·처리</small></article>
         </div>
       </section>
@@ -662,7 +689,7 @@
         <div class="admin-usage-summary" aria-label="선택 기간 전체 보관 현황">
           <article class="admin-metric"><span>보관 수업</span><strong id="admin-usage-lectures">—</strong><small id="admin-usage-lecture-detail">휴지통 포함</small></article>
           <article class="admin-metric"><span>확인된 녹음 시간</span><strong id="admin-usage-recording">—</strong><small id="admin-usage-recording-detail">확인 가능한 기록만 합산</small></article>
-          <article class="admin-metric"><span>완료된 AI 결과</span><strong id="admin-usage-ai">—</strong><small>후보정 · 요약 · 번역 · 질문</small></article>
+          <article class="admin-metric"><span>완료된 AI 결과</span><strong id="admin-usage-ai">—</strong><small id="admin-usage-ai-detail">서버가 지원하는 보관 결과만 합산</small></article>
         </div>
         <div id="admin-usage-accounts" class="admin-usage-accounts" aria-label="사용자별 보관 수업과 처리 결과"></div>
         <details class="admin-usage-source">
@@ -716,6 +743,21 @@
       </div>
       <p id="admin-recovery-status" class="account-recovery-help" role="status" aria-live="polite"></p>
       <p class="account-recovery-help">이 창을 닫으면 링크는 지워지고 다시 표시할 수 없습니다. 링크는 취소하거나 만료되기 전까지 유효합니다. 복사한 링크도 안전하게 관리해 주세요.</p>
+    </div>
+  </dialog>
+
+  <dialog id="local-audio-dialog" class="delete-dialog local-audio-dialog" aria-labelledby="local-audio-title" aria-describedby="local-audio-description">
+    <div class="delete-dialog-content">
+      <div class="dialog-heading">
+        <h2 id="local-audio-title">기기에 남은 음성 내려받기</h2>
+        <button id="local-audio-close" class="dialog-close" type="button" aria-label="기기 음성 내려받기 닫기">×</button>
+      </div>
+      <p id="local-audio-description">현재 계정의 이 브라우저에 남아 있는 음성만 복사합니다. 녹음·전송을 멈추거나 원본을 삭제하지 않습니다. 이미 서버로 전송되어 기기에서 지워진 구간, 다른 기기의 음성은 포함되지 않으므로 전체 수업 파일이 아닐 수 있습니다.</p>
+      <p>겹친 부분은 한 번만 담고, 비어 있는 구간은 무음으로 채우지 않고 별도 파일로 나눕니다. 준비한 파일을 각각 눌러 저장하세요. 다운로드가 끝날 때까지 이 창을 열어 두세요.</p>
+      <button id="local-audio-refresh" class="secondary-button" type="button">현재 남은 음성 다시 확인</button>
+      <p id="local-audio-status" role="status" aria-live="polite"></p>
+      <div id="local-audio-files"></div>
+      <a href="./rescue.html" target="_blank" rel="noopener noreferrer">원래 탭을 유지하고 별도 구조 창 열기 ↗</a>
     </div>
   </dialog>
 

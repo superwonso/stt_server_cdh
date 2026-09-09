@@ -134,6 +134,17 @@ test('AI correction controls keep raw and corrected transcripts explicit without
   assert.doesNotMatch(html, /MINDLOGIC_API_KEY|OPENAI_API_KEY|Bearer\s+[A-Za-z0-9_-]/i);
 });
 
+test('separate study-note details provide explicit generation safe Markdown and source-limit guidance', () => {
+  assert.match(html,/<details id="study-note-details">/);
+  assert.match(html,/<button[^>]*id="study-note-create"[^>]*type="button"[^>]*disabled/);
+  assert.match(html,/<button[^>]*id="study-note-refresh"/);
+  assert.match(html,/<a[^>]*id="study-note-download"[^>]*download[^>]*hidden/);
+  assert.match(html,/원문·후보정본·번역본을 덮어쓰지 않습니다/);
+  assert.match(html,/오디오·수업 제목·계정 ID·개인 필기는 보내지 않습니다/);
+  assert.match(html,/다른 수업을 녹음하는 동안에도/);
+  assert.match(css,/\.lesson-study-note \.summary-actions > \* \{ width: 100%/);
+});
+
 test('admin controls are hidden by default, accessible, and contain no embedded account data', () => {
   assert.match(html, /<button\b[^>]*\bid="admin-open"[^>]*\baria-haspopup="dialog"[^>]*\baria-controls="admin-dialog"[^>]*\bhidden/i);
   assert.match(html, /<dialog\b[^>]*\bid="admin-dialog"[^>]*\baria-labelledby="admin-title"[^>]*\baria-describedby="admin-description"/i);

@@ -151,6 +151,13 @@ function cleanTitle(value) {
   return value;
 }
 
+function cleanContinuation(value, id) {
+  if (value === undefined || value === null) return null;
+  const parent = cleanUuid(value, '이전 수업 ID');
+  if (parent === id) throw new LiveQueueValidationError('녹음 세션 자신을 이전 수업으로 연결할 수 없습니다.');
+  return parent;
+}
+
 function cleanLanguage(value) {
   if (!LANGUAGES.has(value)) throw new LiveQueueValidationError('수업 언어가 올바르지 않습니다.');
   return value;
@@ -251,7 +258,7 @@ async function sameBlobBytes(left, right) {
 }
 
 function normalizeSessionInput(value, now) {
-  onlyKeys(value, new Set(['id', 'owner', 'title', 'language', 'source', 'asrProvider', 'createdAt']), '녹음 세션');
+  onlyKeys(value, new Set(['id', 'owner', 'title', 'language', 'source', 'asrProvider', 'createdAt', 'continuationOf']), '녹음 세션');
   const createdAt = value.createdAt === undefined ? now : value.createdAt;
   const session = {
     id: cleanUuid(value.id, '녹음 세션 ID'),
@@ -263,6 +270,11 @@ function normalizeSessionInput(value, now) {
     createdAt: finiteInteger(createdAt, '녹음 시작 시각', { min: 1, max: MAX_TIMESTAMP }),
   };
   validateSessionPolicy(session.source, session.asrProvider, session.language);
+  const parent = cleanContinuation(value.continuationOf, session.id);
+  // Keep ordinary v2 records byte-shape compatible with old tabs. Only new
+  // continuation records have this field; old strict readers reject them
+  // instead of silently creating a lecture with the parent reference lost.
+  if (parent !== null) session.continuationOf = parent;
   return session;
 }
 
@@ -283,11 +295,13 @@ function validateSessionRecord(value) {
     'id', 'owner', 'title', 'language', 'source', 'asrProvider', 'createdAt', 'updatedAt',
     'state', 'lectureCreated', 'finalQueued', 'nextSequence', 'capturedSamples',
   ]);
+  if (ownObject(value) && Object.hasOwn(value, 'continuationOf')) expected.add('continuationOf');
   onlyKeys(value, expected, '저장된 녹음 세션');
   if (Object.keys(value).length !== expected.size) {
     throw new LiveQueueValidationError('저장된 녹음 세션에 필요한 값이 없습니다.');
   }
   cleanUuid(value.id, '녹음 세션 ID');
+  cleanContinuation(value.continuationOf, value.id);
   cleanOwner(value.owner);
   cleanTitle(value.title);
   cleanLanguage(value.language);
@@ -320,6 +334,7 @@ function sessionCopy(value) {
     finalQueued: value.finalQueued,
     nextSequence: value.nextSequence,
     capturedSamples: value.capturedSamples,
+    ...(value.continuationOf != null ? {continuationOf: value.continuationOf} : {}),
   };
 }
 
@@ -545,7 +560,8 @@ function countCursor(request, callback) {
 function sameSessionIdentity(left, right) {
   return left.id === right.id && left.owner === right.owner && left.title === right.title
     && left.language === right.language && left.source === right.source
-    && left.asrProvider === right.asrProvider && left.createdAt === right.createdAt;
+    && left.asrProvider === right.asrProvider && left.createdAt === right.createdAt
+    && (left.continuationOf ?? null) === (right.continuationOf ?? null);
 }
 
 /**
@@ -610,11 +626,13 @@ export class DurableLiveQueue {
     keyRange = globalThis.IDBKeyRange,
     storageManager = globalThis.navigator?.storage,
     now = () => Date.now(),
+    readOnlyExisting = false,
   } = {}) {
     this.indexedDB = indexedDB;
     this.keyRange = keyRange;
     this.storageManager = storageManager;
     this.now = now;
+    this.readOnlyExisting = readOnlyExisting === true;
     this.database = null;
     this.opening = null;
   }
@@ -637,13 +655,25 @@ export class DurableLiveQueue {
         ));
       },INDEXED_DB_OPEN_TIMEOUT_MS);
       try {
-        request = this.indexedDB.open(LIVE_QUEUE_DB_NAME, LIVE_QUEUE_DB_VERSION);
+        request = this.readOnlyExisting
+          ? this.indexedDB.open(LIVE_QUEUE_DB_NAME)
+          : this.indexedDB.open(LIVE_QUEUE_DB_NAME, LIVE_QUEUE_DB_VERSION);
       } catch (error) {
         clearTimeout(deadline);
         reject(storageError(error, '음성 대기열 저장소를 열지 못했습니다.'));
         return;
       }
       request.onupgradeneeded = () => {
+        if (this.readOnlyExisting) {
+          // An unversioned open only upgrades when the DB does not exist.
+          // Abort creation instead of leaving an empty rescue-created database.
+          try { request.transaction.abort(); } catch { /* Reject in every case. */ }
+          if (!settled) {
+            settled = true; clearTimeout(deadline);
+            reject(new LiveQueueNotFoundError('이 브라우저에 기존 음성 저장소가 없습니다.'));
+          }
+          return;
+        }
         const database = request.result;
         let sessions;
         if (!database.objectStoreNames.contains(SESSION_STORE)) {
@@ -709,6 +739,14 @@ export class DurableLiveQueue {
         settled = true;
         clearTimeout(deadline);
         const database = request.result;
+        if (this.readOnlyExisting && (![1,2].includes(database.version)
+            || !database.objectStoreNames.contains(SESSION_STORE)
+            || !database.objectStoreNames.contains(CHUNK_STORE)
+            || (database.version === 2 && !database.objectStoreNames.contains(SNAPSHOT_STORE)))) {
+          database.close();
+          reject(new LiveQueueCorruptError('기존 음성 저장소의 버전을 안전하게 읽을 수 없습니다.'));
+          return;
+        }
         this.database = database;
         database.onclose = () => {
           if (this.database === database) {
@@ -736,6 +774,7 @@ export class DurableLiveQueue {
   }
 
   async requestPersistence() {
+    if (this.readOnlyExisting) throw new LiveQueueUnavailableError('복구 창에서는 저장소를 변경하지 않습니다.', {code:'live_queue_read_only'});
     return requestPersistentStorage(this.storageManager);
   }
 
@@ -766,6 +805,9 @@ export class DurableLiveQueue {
   }
 
   async _transaction(storeNames, mode, operation, message, reconnectRetries = 1) {
+    if (this.readOnlyExisting && mode !== 'readonly') {
+      throw new LiveQueueUnavailableError('복구 창에서는 음성 대기열을 변경하지 않습니다.', {code:'live_queue_read_only'});
+    }
     await this.open();
     const database = this.database;
     let transaction;
@@ -1338,6 +1380,31 @@ export class DurableLiveQueue {
       });
       return stats;
     }, '음성 대기열 크기를 확인하지 못했습니다.');
+  }
+
+  async readExportSnapshot(ownerValue) {
+    const owner = cleanOwner(ownerValue);
+    if (this.readOnlyExisting) await this.open();
+    const storesToRead = [SESSION_STORE,CHUNK_STORE];
+    if (!this.readOnlyExisting || this.database.version >= 2) storesToRead.push(SNAPSHOT_STORE);
+    return this._transaction(storesToRead, 'readonly', async stores => {
+      let count = 0;
+      const ownedCopy = value => {
+        if (value?.owner !== owner) throw new LiveQueueOwnershipError();
+        if (++count > 50000) throw new LiveQueueUnavailableError('복구할 음성 항목이 한 번에 읽을 수 있는 범위를 넘었습니다.', {code:'export_snapshot_limit'});
+        // Copy metadata, retain immutable Blob handles, and do no asynchronous
+        // WAV reads in this transaction. The export engine validates afterwards.
+        return {...value};
+      };
+      const sessionRequest = stores[SESSION_STORE].index('ownerCreated').openCursor(this._ownerSessionRange(owner));
+      const chunkRequest = stores[CHUNK_STORE].index('ownerOrder').openCursor(this._ownerChunkRange(owner));
+      const snapshotRequest = stores[SNAPSHOT_STORE]?.index('owner').openCursor(this.keyRange.bound(owner,owner));
+      const [sessions,chunks,snapshots] = await Promise.all([
+        cursorValues(sessionRequest,ownedCopy), cursorValues(chunkRequest,ownedCopy),
+        snapshotRequest ? cursorValues(snapshotRequest,ownedCopy) : Promise.resolve([]),
+      ]);
+      return {owner,sessions,chunks,snapshots};
+    }, '기기에 남은 음성을 읽지 못했습니다.');
   }
 
   async recoverOwner(ownerValue) {

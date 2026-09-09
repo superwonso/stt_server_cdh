@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://*.trycloudflare.com http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:*; media-src blob:; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>여백 · 기기에 남은 음성 구조</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./rescue.js"></script>
+</head>
+<body>
+  <header class="site-header"><span class="brand"><span class="brand-mark" aria-hidden="true">여</span><span><strong>여백</strong><small>기기에 남은 음성 구조</small></span></span></header>
+  <main class="auth-screen">
+    <section class="auth-intro" aria-labelledby="rescue-title">
+      <p class="eyebrow">READ-ONLY AUDIO RESCUE</p>
+      <h1 id="rescue-title">원래 탭은<br><em>그대로 두세요.</em></h1>
+      <p class="auth-lead">원래 탭을 새로고침하거나 닫지 말고, 같은 브라우저·프로필에서 이 화면을 사용하세요.</p>
+      <p class="rescue-limits">이 창은 브라우저 저장소에 남은 구간만 읽습니다. <strong>원래 탭의 메모리(RAM)에만 남은 음성은 가져올 수 없고, 전체 수업 녹음이 아닐 수 있습니다.</strong> 파일을 확보하기 전에는 사이트 데이터를 지우지 마세요.</p>
+      <div class="privacy-card"><div>
+        <strong>기기에 저장된 내 음성만 복사합니다.</strong>
+        <p>이 화면은 녹음·재전송·대기열 변경·삭제를 하지 않습니다. 로그인이 확인된 계정의 브라우저 저장소만 읽습니다. 서버 연결·로그인 확인 요청만 보내며, 이 창에서 음성은 서버로 전송하지 않습니다.</p>
+        <p><strong>원래 탭의 메모리에만 남은 음성은 여기서 가져올 수 없습니다.</strong> RAM 경고가 있었다면 원래 탭을 반드시 유지하고, 그 탭에서 제공하는 음성 저장 기능도 사용하세요.</p>
+        <p>다운로드 대상은 조회 시점에 기기에 남은 구간입니다. 서버에 이미 저장되어 기기에서 정리된 음성이나 다른 기기·프로필의 음성은 포함되지 않으며, 전체 수업 파일을 보장하지 않습니다.</p>
+        <p>중간에 빈 구간이 있으면 파일을 나누어 제공합니다. 원본 시간 위치를 확인하고 모든 필요한 파일을 각각 저장하세요. 다운로드해도 대기열은 남습니다.</p>
+      </div></div>
+    </section>
+    <section class="auth-panel" aria-label="인증과 음성 파일 저장">
+      <h2>내 계정 확인</h2>
+      <p id="rescue-status" role="status" aria-live="polite">현재 서버 연결을 확인합니다.</p>
+      <button id="rescue-connect" class="secondary-button" type="button">서버 연결 다시 확인</button>
+      <details>
+        <summary>서버 주소 직접 입력</summary>
+        <form id="rescue-server-form" class="auth-form">
+          <div class="field"><label for="rescue-origin">현재 서버 주소</label><input id="rescue-origin" type="url" maxlength="256" autocomplete="off" spellcheck="false" placeholder="https://…trycloudflare.com"></div>
+          <button class="secondary-button" type="submit">연결 확인</button>
+        </form>
+      </details>
+      <form id="rescue-login-form" class="auth-form">
+        <div class="field"><label for="rescue-username">아이디</label><input id="rescue-username" type="text" required maxlength="32" autocomplete="username" autocapitalize="none" spellcheck="false"></div>
+        <div class="field"><label for="rescue-password">비밀번호</label><input id="rescue-password" type="password" required maxlength="128" autocomplete="current-password"></div>
+        <button id="rescue-login" class="primary-button" type="submit" disabled>로그인 후 남은 음성 확인</button>
+      </form>
+      <p id="rescue-error" class="form-error" role="alert" hidden></p>
+      <section id="rescue-results" hidden aria-labelledby="rescue-files-title">
+        <h2 id="rescue-files-title">저장할 음성</h2>
+        <p id="rescue-owner"></p>
+        <p id="rescue-summary"></p>
+        <p id="rescue-warnings"></p>
+        <div id="rescue-files"></div>
+        <button id="rescue-scan" class="secondary-button" type="button">현재 남은 음성 다시 읽기</button>
+        <button id="rescue-lock" class="text-button" type="button">이 화면 잠금</button>
+        <p>다시 읽으면 현재 다운로드 링크가 바뀝니다. 필요한 파일을 먼저 저장하세요. 저장 완료 여부를 브라우저의 다운로드 목록에서 확인하세요.</p>
+      </section>
+      <p class="session-note">로그인 정보와 파일 링크는 이 화면 메모리에서만 사용합니다. 잠그면 링크를 제거하며 원래 탭과 서버 로그인은 건드리지 않습니다.</p>
+    </section>
+  </main>
+</body>
+</html>

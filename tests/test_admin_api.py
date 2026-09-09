@@ -261,7 +261,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(result["server"]["state"], "online")
         self.assertEqual(result["server"]["model"], "fake-model")
         self.assertEqual(result["queues"], {"transcription": 1, "imports": 1, "corrections": 1,
-                                          "summaries": 0, "translations": 0, "questions": 0})
+                                          "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0})
         self.assertEqual(result["tunnel"]["state"], "online")
         self.assertEqual(
             set(result["tunnel"]),
@@ -284,7 +284,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(accounts["user-beta"]["activity"], "transcribing")
         self.assertEqual(
             accounts["user-beta"]["jobs"],
-            {"transcription": 1, "imports": 1, "corrections": 1, "summaries": 0, "translations": 0, "questions": 0},
+            {"transcription": 1, "imports": 1, "corrections": 1, "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0},
         )
         self.assertNotEqual(accounts["user-beta"]["account_id"], "user-beta")
         self.assertEqual(result["recent_audit"], [])
@@ -325,7 +325,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         result = response.json()
         self.assertEqual(result["queues"], {"transcription": 0, "imports": 0, "corrections": 0,
-                                          "summaries": 1, "translations": 1, "questions": 0})
+                                          "summaries": 1, "translations": 1, "questions": 0, "study_notes": 0})
         accounts = {account["label"]: account for account in result["accounts"]}
         for username, expected in (("user-alpha", (0, 0)), ("user-beta", (1, 0)), ("user-gamma", (0, 1))):
             self.assertEqual((accounts[username]["jobs"]["summaries"], accounts[username]["jobs"]["translations"]), expected)
@@ -358,7 +358,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         result = response.json()
         self.assertEqual(result["queues"], {"transcription": 0, "imports": 0, "corrections": 0,
-                                          "summaries": 0, "translations": 0, "questions": 3})
+                                          "summaries": 0, "translations": 0, "questions": 3, "study_notes": 0})
         accounts = {account["label"]: account for account in result["accounts"]}
         for username, expected in (("user-alpha", 2), ("user-beta", 1), ("user-gamma", 0)):
             self.assertEqual(accounts[username]["jobs"]["questions"], expected)
@@ -366,6 +366,31 @@ class AdminApiTests(unittest.TestCase):
         for private in (*private_ids, "PRIVATE-QUESTION-TITLE", "PRIVATE-QUESTION-TEXT",
                         "PRIVATE-QUESTION-MODEL", "PRIVATE-QUESTION-ANSWER"):
             self.assertNotIn(private, response.text)
+
+    def test_study_note_counts_include_only_active_jobs_without_private_contents(self):
+        private_ids = []
+        rows = (("user-alpha","queued"),("user-beta","processing"),("user-gamma","completed"))
+        with self.app.state.database.connect() as connection:
+            for username,status in rows:
+                lecture_id,job_id = str(uuid.uuid4()),str(uuid.uuid4())
+                private_ids.extend((lecture_id,job_id))
+                connection.execute("INSERT INTO lectures(id,username,title,created_at,recording_finalized) "
+                                   "VALUES(?,?,'PRIVATE-NOTE-TITLE','now',1)",(lecture_id,username))
+                connection.execute("INSERT INTO lecture_study_notes(lecture_id,username,job_id,raw_revision,status,model,document_json,"
+                                   "created_at,updated_at,completed_at) VALUES(?,?,?,?,?,'PRIVATE-NOTE-MODEL',?,'now','now',?)",
+                                   (lecture_id,username,job_id,"a"*64,status,
+                                    '{"private":"PRIVATE-NOTE-BODY"}' if status=="completed" else None,
+                                    "now" if status=="completed" else None))
+        response = self.client.get("/admin/overview",headers=self.headers())
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual(response.json()["queues"]["study_notes"],2)
+        accounts = {row["label"]:row for row in response.json()["accounts"]}
+        self.assertEqual([accounts[owner]["jobs"]["study_notes"] for owner,_ in rows],[1,1,0])
+        for private in (*private_ids,"PRIVATE-NOTE-TITLE","PRIVATE-NOTE-MODEL","PRIVATE-NOTE-BODY"):
+            self.assertNotIn(private,response.text)
+        self.assertEqual(self.client.get("/status").status_code,401)
+        self.assertEqual(self.client.get("/status",headers=self.headers()).json()["study_notes"],
+                         {"configured":False,"model":self.settings.translation_model})
 
     def test_third_account_is_listed_but_remains_data_isolated_and_non_admin(self):
         created = self.client.post(

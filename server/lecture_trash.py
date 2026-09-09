@@ -26,12 +26,13 @@ def _require_idle(connection, lecture_id):
         ("lecture_summaries", "'queued','processing'"),
         ("lecture_translations", "'queued','processing'"),
         ("lecture_questions", "'queued','processing'"),
+        ("lecture_study_notes", "'queued','processing'"),
     ):
         if connection.execute(
             f"SELECT 1 FROM {table} WHERE lecture_id=? AND status IN ({states}) LIMIT 1",
             (lecture_id,),
         ).fetchone() is not None:
-            raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역·수업 질문이 끝난 뒤 휴지통으로 옮기세요.")
+            raise HTTPException(409, "진행 중인 음성 처리·후보정·요약·번역·수업 질문·정리본이 끝난 뒤 휴지통으로 옮기세요.")
 
 
 def install(app, database, *, identity, import_fs_lock, recording_lock, purge_tickets, limiter):

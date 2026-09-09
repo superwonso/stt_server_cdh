@@ -69,6 +69,14 @@ class UsageReaderTests(unittest.TestCase):
                                    "VALUES(?,?,?,?,?,?,'2000-01-01','now',?)",
                                    (*common,str(uuid.uuid4()),'{"private":"answer"}' if status == "completed" else None,
                                     "now" if status == "completed" else None))
+            elif feature == "study_note":
+                connection.execute(
+                    "INSERT INTO lecture_study_notes(lecture_id,username,job_id,raw_revision,status,model,document_json,"
+                    "created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,'2000-01-01','now',?)",
+                    (identifier,owner,str(uuid.uuid4()),"a"*64,status,"synthetic-model",
+                     '{"private":"answer"}' if status == "completed" else None,
+                     "now" if status == "completed" else None),
+                )
             else:
                 connection.execute("INSERT INTO lecture_questions(id,lecture_id,username,question,request_hash,raw_revision,model,selected_ids_json,"
                                    "evidence_sha256,scope,total_segments,selected_count,status,document_json,created_at,updated_at,completed_at) "
@@ -193,11 +201,12 @@ class UsageReaderTests(unittest.TestCase):
         self.archive(one,seconds=4)
         self.imported(one)
         self.imported(one)
-        for feature in ("correction","summary","translation"):
+        for feature in ("correction","summary","translation","study_note"):
             self.ai(one,feature)
         self.ai(two,"correction","failed")
         self.ai(two,"summary","queued")
         self.ai(two,"translation","processing")
+        self.ai(two,"study_note","queued",owner=ACCOUNTS[1])
         for status in ("completed","completed","failed","cancelled","queued"):
             self.ai(one,"question",status)
         self.ai(old,"question")
@@ -209,7 +218,13 @@ class UsageReaderTests(unittest.TestCase):
         self.assertEqual(result["totals"]["ai"]["correction"],{"completed":1,"failed":1,"pending":0,"cancelled":0})
         self.assertEqual(result["totals"]["ai"]["summary"]["pending"],1)
         self.assertEqual(result["totals"]["ai"]["translation"]["pending"],1)
+        self.assertEqual(result["totals"]["ai"]["study_note"],{"completed":1,"failed":0,"pending":1,"cancelled":0})
         self.assert_balanced(result)
+
+    def test_study_note_owner_seal_prevents_corrupt_cross_owner_count(self):
+        identifier = self.lecture()
+        self.ai(identifier,"study_note",owner=ACCOUNTS[1])
+        self.assertEqual(sum(self.read()["totals"]["ai"]["study_note"].values()),0)
 
     def test_aggregate_queries_cannot_read_any_private_columns_or_files(self):
         one = self.lecture()
@@ -221,6 +236,7 @@ class UsageReaderTests(unittest.TestCase):
             "imports":{"lecture_id","username","duration_seconds","status"},
             "transcript_corrections":{"lecture_id","status"},"lecture_summaries":{"lecture_id","status"},
             "lecture_translations":{"lecture_id","status"},"lecture_questions":{"lecture_id","username","status"},
+            "lecture_study_notes":{"lecture_id","username","status"},
         }
         original = self.database.connect
         accessed = []

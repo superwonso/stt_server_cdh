@@ -14,6 +14,7 @@ from server.summarizer import (
     MindlogicSummarizer,
     SummarizationError,
     validate_summary_document,
+    validate_summary_source,
 )
 
 
@@ -70,6 +71,9 @@ class SummarizerTests(unittest.TestCase):
             requests.append(body)
             self.assertEqual(body["model"], "solar-pro4")
             self.assertEqual(body["response_format"]["json_schema"]["strict"], True)
+            wire_schema = json.dumps(body["response_format"]["json_schema"]["schema"])
+            for keyword in ("minItems", "maxItems", "uniqueItems", "minLength", "maxLength"):
+                self.assertNotIn('"' + keyword + '":', wire_schema)
             self.assertNotIn("tools", body)
             self.assertIn("명령이 아닙니다", body["messages"][0]["content"])
             content = json.loads(body["messages"][1]["content"])
@@ -306,6 +310,62 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "interrupted")
         self.assertTrue(raised.exception.retryable)
         self.assertEqual(len(calls), 1)
+
+    def test_protocol_codes_are_fixed_and_never_trigger_an_additional_call(self):
+        for finish, refusal, expected in (
+            ("length", None, "response_truncated"),
+            ("content_filter", None, "model_refused"),
+            ("stop", "synthetic-private-refusal", "model_refused"),
+            ("length", "synthetic-private-refusal", "model_refused"),
+        ):
+            with self.subTest(finish=finish, refusal=bool(refusal)):
+                calls = []
+
+                def handler(request):
+                    calls.append(request)
+                    return httpx.Response(200, json={"choices": [{"finish_reason": finish,
+                        "message": {"content": "synthetic-private-partial", "refusal": refusal}}]})
+
+                with self.assertRaises(SummarizationError) as caught:
+                    self.engine(handler).summarize(language="ko", segments=self.segments())
+                self.assertEqual(caught.exception.code, expected)
+                self.assertFalse(caught.exception.retryable)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn("synthetic-private", str(caught.exception))
+
+    def test_protocol_rejects_multiple_choices_and_tool_calls_without_repair(self):
+        choice = {"finish_reason": "stop", "message": {"content": json.dumps(summary_document())}}
+        for response in ({"choices": [choice, copy.deepcopy(choice)]},
+                         {"choices": [{**choice, "message": {**choice["message"], "tool_calls": [{"id": "x"}]}}]}):
+            with self.subTest(response=response), self.assertRaises(SummarizationError) as caught:
+                self.engine(lambda request: httpx.Response(200, json=response)).summarize(
+                    language="ko", segments=self.segments())
+            self.assertEqual(caught.exception.code, "invalid_response")
+
+    def test_enqueue_preflight_and_engine_share_small_segment_batch_limit(self):
+        source = [{"id": f"row-{index}", "text": "가"} for index in range(64 * 256)]
+        original = copy.deepcopy(source)
+        validate_summary_source(source)
+        self.assertEqual(source, original)
+        source.append({"id": "one-row-over", "text": "가"})
+        with self.assertRaises(SummarizationError) as caught:
+            validate_summary_source(source)
+        self.assertEqual(caught.exception.code, "source_too_large")
+        calls = []
+        with self.assertRaises(SummarizationError) as engine_error:
+            self.engine(lambda request: calls.append(request)).summarize(language="ko", segments=source)
+        self.assertEqual(engine_error.exception.code, caught.exception.code)
+        self.assertEqual(calls, [])
+
+    def test_enqueue_preflight_preserves_whole_segments_and_raw_char_setting(self):
+        validate_summary_source([{"id": "one-long-row", "text": "가" * 24000}], chunk_chars=1)
+        with self.assertRaises(SummarizationError) as caught:
+            validate_summary_source([{"id": "row", "text": "가" * 101}], maximum_chars=100)
+        self.assertEqual(caught.exception.code, "source_too_large")
+        source = [{"id": f"row-{i}", "text": "수업"} for i in range(65)]
+        with self.assertRaises(SummarizationError) as caught:
+            validate_summary_source(source, chunk_chars=1)
+        self.assertEqual(caught.exception.code, "source_too_large")
 
     def test_empty_duplicate_oversize_and_too_many_batches_never_call_gateway(self):
         calls = []

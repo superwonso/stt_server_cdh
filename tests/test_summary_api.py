@@ -14,9 +14,10 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from server.app import create_app
+from server.postprocessor import PostprocessingError
 from server.security import digest
 from server.settings import Settings
-from server.summarizer import LectureSummary
+from server.summarizer import LectureSummary, SummarizationError
 
 
 class FakeTranscriber:
@@ -227,6 +228,36 @@ class SummaryApiTests(unittest.TestCase):
         self.assertEqual(self.row(lecture_id)["status"], "failed")
         self.assertIsNone(self.row(lecture_id)["summary_json"])
         self.assertIsNone(self.get(lecture_id).json()["summary"]["document"])
+
+    def test_typed_provider_failure_preserves_only_known_fixed_code_and_message(self):
+        with patch.object(self.service.limiter, "allow", return_value=True):
+            for code in ("authentication_failed", "credit_exhausted", "rate_limited",
+                         "response_truncated", "model_refused", "unsupported_claim", "synthetic-private-code"):
+                with self.subTest(code=code):
+                    lecture_id, _ = self.lecture()
+                    before = self.transcript_snapshot(lecture_id)
+                    self.engine.error = PostprocessingError(code, "synthetic-private-provider-body", retryable=True)
+                    self.assert_queued(lecture_id)
+                    self.service.process_next()
+                    result = self.get(lecture_id).json()["summary"]
+                    expected = SummarizationError(code)
+                    self.assertEqual((result["status"], result["error_code"], result["error"], result["document"]),
+                                     ("failed", expected.code, str(expected), None))
+                    self.assertNotIn("synthetic-private", str(self.row(lecture_id)))
+                    self.assertFalse(self.service.process_next())
+                    self.assertEqual(self.transcript_snapshot(lecture_id), before)
+
+    def test_batch_limit_is_rejected_before_job_creation_and_worker_start(self):
+        lecture_id, _ = self.lecture()
+        source = [{"id": f"synthetic-{i}", "start": i, "end": i + 1, "text": "가"}
+                  for i in range(64 * 256 + 1)]
+        with patch.object(self.service, "raw_segments", return_value=source):
+            response = self.post(lecture_id)
+        self.assertEqual(response.status_code, 413, response.text)
+        self.assertIn("구간 수", response.json()["detail"])
+        self.assertIsNone(self.row(lecture_id))
+        self.assertEqual(self.engine.calls, [])
+        self.start.assert_not_called()
 
     def test_each_owner_has_one_active_job_but_different_owners_are_independent(self):
         first, _ = self.lecture()

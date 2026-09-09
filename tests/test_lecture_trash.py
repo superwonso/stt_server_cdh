@@ -191,7 +191,7 @@ class LectureTrashTests(unittest.TestCase):
         identifier = self.lecture(finalized=False)
         self.assertEqual(self.trash(identifier).status_code,409)
         self.assertIsNone(self.state(identifier)["trashed_at"])
-        for table in ("chunks","imports","transcript_corrections","lecture_summaries","lecture_translations"):
+        for table in ("chunks","imports","transcript_corrections","lecture_summaries","lecture_translations","lecture_study_notes"):
             for status in (("pending",) if table=="chunks" else ("uploading","queued","processing") if table=="imports" else ("queued","processing")):
                 with self.subTest(table=table,status=status):
                     identifier = self.lecture(audio=False)
@@ -205,6 +205,9 @@ class LectureTrashTests(unittest.TestCase):
                         elif table=="transcript_corrections":
                             connection.execute("INSERT INTO transcript_corrections(lecture_id,raw_revision,status,model,created_at,updated_at) "
                                 "VALUES(?,?,?,'synthetic','now','now')",(identifier,"a"*64,status))
+                        elif table=="lecture_study_notes":
+                            connection.execute("INSERT INTO lecture_study_notes(lecture_id,username,job_id,raw_revision,status,model,created_at,updated_at) "
+                                "VALUES(?,'user-alpha',?,?,?,'synthetic','now','now')",(identifier,str(uuid.uuid4()),"a"*64,status))
                         else:
                             connection.execute(f"INSERT INTO {table}(lecture_id,job_id,raw_revision,status,model,created_at,updated_at) "
                                 "VALUES(?,?,?,?,'synthetic','now','now')",(identifier,str(uuid.uuid4()),"a"*64,status))

@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException
 
-from .translator import validate_translation_segments
+from .translator import TranslationError, validate_translation_segments
+from .postprocessor import PostprocessingError
 
 
 def _now():
@@ -177,6 +178,11 @@ class TranslationService:
                                            interrupted=self.shutdown.is_set)
             document = output.segments
             document = validate_translation_segments(document, segments)
+        except PostprocessingError as error:
+            # Rebuild a known code from fixed messages. Never persist a
+            # provider-controlled exception string, even on this typed path.
+            safe = TranslationError(error.code)
+            document, code, message = None, safe.code, safe.message
         except Exception:
             # Never persist provider bodies, keys, raw text, or exception strings.
             document = None

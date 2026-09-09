@@ -21,7 +21,8 @@ from fastapi.testclient import TestClient
 from server.app import create_app
 from server.security import digest
 from server.settings import Settings
-from server.translator import LectureTranslation
+from server.translator import LectureTranslation, TranslationError
+from server.postprocessor import PostprocessingError
 from server.summarizer import LectureSummary
 
 
@@ -366,6 +367,24 @@ class TranslationApiTests(unittest.TestCase):
         self.assertEqual(self.get(lecture_id).json()["translation"]["status"], "completed")
         self.assertEqual(len(self.engine.calls), 2)
         self.assertEqual(self.transcript_snapshot(lecture_id), before)
+
+    def test_known_provider_errors_keep_fixed_actionable_messages_without_private_details(self):
+        for code in ("authentication_failed", "credit_exhausted", "rate_limited", "gateway_unavailable",
+                     "response_truncated", "model_refused", "invalid_response", "protected_content_changed"):
+            with self.subTest(code=code):
+                lecture_id, _ = self.lecture()
+                before = self.transcript_snapshot(lecture_id)
+                self.engine.error = PostprocessingError(code, "secret-provider-key private-response raw-text")
+                self.assert_queued(lecture_id)
+                self.service.process_next()
+                row = self.row(lecture_id)
+                self.assertEqual((row["status"],row["error_code"],row["translation_json"]), ("failed",code,None))
+                self.assertEqual(row["error"], TranslationError(code).message)
+                self.assertNotIn("secret-provider-key", json.dumps(row))
+                self.assertEqual(self.transcript_snapshot(lecture_id), before)
+                self.assertFalse(self.service.process_next())
+                # Each case is an independent simulated owner's hourly limit.
+                self.service.limiter._events.clear()
 
     def test_worker_rejects_invalid_citations_without_persisting_document(self):
         lecture_id, _ = self.lecture()

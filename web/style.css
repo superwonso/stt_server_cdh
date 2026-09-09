@@ -1105,6 +1105,26 @@ button {
   font-size: 14px;
 }
 
+.file-import-panel.is-dragover {
+  outline: 2px dashed var(--forest-700);
+  outline-offset: -5px;
+  background: #edf3ec;
+}
+
+.file-import-panel:focus-within {
+  box-shadow: inset 0 0 0 1px var(--forest-700);
+}
+
+.recording-file-selection {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.recording-file-selection:empty { display: none; }
+
 .file-import-copy p,
 .file-import-copy small {
   display: block;
@@ -2513,7 +2533,29 @@ button {
 .translation-row:last-child { border-bottom: 0; }
 .translation-source { color: #606977; margin: 6px 0; white-space: pre-wrap; }
 .translation-target { margin: 6px 0; white-space: pre-wrap; }
+.lesson-study-note { background: #faf8f2; border-color: #e0d9c9; }
+.lesson-study-note summary { cursor: pointer; line-height: 1.65; font-weight: 650; }
+.study-note-paragraph { border-top: 1px solid #e0d9c9; margin-top: 18px; padding-top: 4px; }
+.study-note-text { white-space: pre-wrap; line-height: 1.85; }
+.study-note-text strong { font-weight: 750; }
+.study-note-edits { margin: 12px 0; font-size: .9rem; line-height: 1.7; }
+.study-note-edits li { white-space: pre-wrap; }
+.study-note-download { display: inline-flex; align-items: center; text-decoration: none; }
+.study-note-download[hidden] { display: none; }
+#continuation-links:empty, #continuation-state:empty { display: none; }
+#continuation-links { flex-wrap: wrap; margin-bottom: 16px; }
+#recording-download-note, #continuation-state { overflow-wrap: anywhere; line-height: 1.65; }
+@media (max-width: 520px) { .lesson-study-note .summary-actions > * { width: 100%; justify-content: center; } }
 @media print { .summary-actions, .summary-privacy, #summary-state, #translation-state, #translation-views { display: none !important; } }
+
+.capture-input-status { margin: 8px 0; font-size: .9rem; line-height: 1.6; }
+.capture-input-status[data-state="unavailable"], .capture-input-status[data-state="reconnect-needed"] { color: #963a25; font-weight: 650; }
+.local-audio-dialog { max-width: min(680px, calc(100vw - 32px)); }
+.local-audio-dialog p { line-height: 1.7; overflow-wrap: anywhere; }
+.local-audio-file { padding: 14px 0; border-bottom: 1px solid #dedbd4; overflow-wrap: anywhere; }
+.local-audio-file a { display: inline-block; padding: 10px 0; }
+.local-audio-file p { margin: 4px 0; }
+.rescue-limits { font-size: .9rem; line-height: 1.7; margin: 16px 0; overflow-wrap: anywhere; }
 
 @media (prefers-reduced-motion: reduce) {
   *,

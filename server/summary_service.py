@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException
 
-from .summarizer import validate_summary_document
+from .postprocessor import PostprocessingError
+from .summarizer import SummarizationError, validate_summary_document, validate_summary_source
 
 
 def _now():
@@ -75,6 +76,15 @@ class SummaryService:
                     saved = self.result(existing, connection)
                     if saved["status"] == "completed":
                         return {"summary": saved}
+                try:
+                    validate_summary_source(
+                        segments, chunk_chars=self.settings.summary_chunk_chars,
+                        maximum_chars=self.settings.summary_max_source_chars,
+                    )
+                except SummarizationError as error:
+                    safe_error = SummarizationError(error.code)
+                    status = 413 if safe_error.code == "source_too_large" else 422
+                    raise HTTPException(status, str(safe_error)) from None
                 active = connection.execute(
                     "SELECT 1 FROM lecture_summaries s JOIN lectures l ON l.id=s.lecture_id "
                     "WHERE l.username=? AND l.deleting=0 AND l.trashed_at IS NULL "
@@ -174,6 +184,12 @@ class SummaryService:
                                            interrupted=self.shutdown.is_set)
             document = output.to_dict()
             document = validate_summary_document(document, segments)
+        except PostprocessingError as error:
+            # Reconstruct from a closed code set, never from provider-supplied
+            # exception text (even if a typed exception was modified).
+            safe_error = SummarizationError(error.code)
+            document = None
+            code, message = safe_error.code, str(safe_error)
         except Exception:
             # Never persist provider bodies, keys, raw text, or exception strings.
             document = None

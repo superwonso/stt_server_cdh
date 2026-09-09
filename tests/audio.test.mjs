@@ -761,6 +761,8 @@ test('a transient system-track mute that recovers does not end a long capture', 
 
     browser.audioTrack.muted = false;
     browser.audioTrack.dispatch('unmute');
+    assert.equal(recovered.length,0,'an unmute event alone is not proof that PCM has returned');
+    browser.workletNode.port.onmessage({data:{type:'samples',samples:new Float32Array(4800)}});
     assert.equal(recovered.length,1);
     assert.equal(capture.recording,true);
     assert.ok(chunks.every(chunk => chunk.final === false));
@@ -951,6 +953,403 @@ test('ended microphone input after silence can reconnect without losing or final
     assert.equal(capture.capturedSeconds, 14);
     assert.equal(chunks.filter(chunk => chunk.final).length, 1);
   } finally {
+    browser.restore();
+  }
+});
+
+test('export snapshot copies the latest accepted PCM without changing capture, journal, or ASR boundaries', async () => {
+  const chunks = [], snapshots = [];
+  const capture = prepareCapture(16000, chunks, {onSnapshot: snapshot => snapshots.push(snapshot)});
+  assert.equal(capture.snapshotForExport(), null);
+  capture._consumePCM(new Float32Array(16000 * 17).fill(0.25));
+  await capture.flushSnapshots();
+  const before = {
+    count: chunks.length, writes: snapshots.length, sequence: capture._snapshotSequence,
+    start: capture._chunkStartSamples, used: capture._chunkUsed, overlap: capture._chunkOverlap,
+    snapshotAt: capture._snapshotAtSamples, pending: capture._snapshotPending,
+  };
+  const snapshot = capture.snapshotForExport();
+  assert.deepEqual({sequence: snapshot.sequence, start: snapshot.startSamples,
+    duration: snapshot.durationSamples, overlap: snapshot.overlapSamples},
+  {sequence: 1, start: 12 * 16000, duration: 5 * 16000, overlap: 3 * 16000});
+  assert.equal(snapshot.blob.size, 44 + 5 * 16000 * 2);
+  const frozen = await snapshot.blob.arrayBuffer();
+  assert.equal(new DataView(frozen).getInt16(44, true), 8192);
+  assert.deepEqual({
+    count: chunks.length, writes: snapshots.length, sequence: capture._snapshotSequence,
+    start: capture._chunkStartSamples, used: capture._chunkUsed, overlap: capture._chunkOverlap,
+    snapshotAt: capture._snapshotAtSamples, pending: capture._snapshotPending,
+  }, before);
+  capture._consumePCM(new Float32Array(16000 * 10).fill(-0.25));
+  assert.deepEqual(await snapshot.blob.arrayBuffer(), frozen, 'future buffer reuse cannot mutate exported WAV');
+  await capture.stop();
+  assert.equal(capture.snapshotForExport(), null);
+  assert.equal(acceptedSamples(chunks), 27 * 16000);
+});
+
+test('PCM liveness distinguishes a stalled running graph from silent audio and preserves the final tail', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const chunks = [], unavailable = [], recovered = [];
+  const capture = new MicrophoneCapture({onChunk: item => chunks.push(item),
+    onInputUnavailable: (_error, details) => unavailable.push(details),
+    onInputRecovered: details => recovered.push(details)});
+  let now = 0;
+  capture._inputNow = () => now;
+  try {
+    await capture.start();
+    assert.equal(capture.inputHealth.status, 'waiting');
+    for (let second = 1; second <= 12; second += 1) {
+      now = second * 1000;
+      browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(48000)}});
+      capture._checkInputLiveness();
+      assert.equal(capture.inputHealth.status, 'receiving');
+    }
+    assert.equal(unavailable.length, 0, 'real zero-valued PCM never triggers a stall');
+    const receivedBefore = capture.capturedSeconds;
+    now += 4999;
+    capture._checkInputLiveness();
+    assert.equal(unavailable.length, 0);
+    now += 1;
+    capture._checkInputLiveness();
+    assert.equal(unavailable.length, 1);
+    assert.equal(unavailable[0].reason, 'pcm-stalled');
+    assert.equal(capture.inputHealth.status, 'unavailable');
+    assert.equal(capture.inputHealth.lastPcmAgeSeconds, 5);
+    assert.equal(capture.recording, true, 'watchdog never stops a live graph');
+    assert.equal(browser.requests.length, 1, 'watchdog never opens a device permission prompt');
+    assert.equal(capture.capturedSeconds, receivedBefore, 'no synthetic gap or timeline growth');
+    now += 30000;
+    capture._checkInputLiveness();
+    assert.equal(unavailable.length, 1, 'one stalled episode produces one warning');
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].reason, 'pcm-received');
+    assert.equal(capture.inputHealth.status, 'receiving');
+    await capture.stop();
+    assert.equal(capture._inputWatchdogTimer, null);
+    assert.equal(capture.inputHealth.status, 'idle');
+    assert.equal(acceptedSamples(chunks), 12.1 * 16000);
+    assert.equal(chunks.filter(item => item.final).length, 1);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('first PCM absence is reported but no WAV or captured duration is invented', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const chunks = [];
+  const capture = new MicrophoneCapture({onChunk: item => chunks.push(item)});
+  let now = 0;
+  capture._inputNow = () => now;
+  try {
+    await capture.start();
+    now = 5000;
+    capture._checkInputLiveness();
+    assert.equal(capture.inputHealth.reason, 'pcm-stalled');
+    assert.equal(capture.inputHealth.lastPcmAgeSeconds, null);
+    assert.equal(capture.capturedSeconds, 0);
+    assert.equal(capture.snapshotForExport(), null);
+    assert.equal(chunks.length, 0);
+    assert.equal(await capture.resumeInput(), false, 'explicit input recovery prepares the old graph for reconnection');
+    await capture._reconnectPreparation;
+    assert.equal(capture.reconnectNeeded, true);
+    assert.equal(browser.requests.length, 1);
+    browser.audioTrack.readyState = 'live'; // A new permission result supplies a new live device in a browser.
+    await capture.reconnect();
+    assert.equal(browser.requests.length, 2);
+    assert.equal(capture.inputHealth.status, 'unavailable', 'new device waits for actual PCM before reporting recovered');
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    assert.equal(capture.inputHealth.status, 'receiving');
+    await capture.stop();
+    assert.equal(acceptedSamples(chunks), 1600);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('watchdog checks track and context status even when the browser omitted the corresponding event', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const capture = new MicrophoneCapture({onChunk() {}});
+  try {
+    await capture.start();
+    browser.audioTrack.muted = true;
+    capture._checkInputLiveness();
+    assert.equal(capture.inputHealth.reason, 'track-muted');
+    browser.audioTrack.muted = false;
+    capture._checkInputLiveness();
+    assert.equal(capture.inputHealth.reason, 'pcm-waiting');
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    assert.equal(capture.inputHealth.status, 'receiving');
+    browser.audioTrack.readyState = 'ended';
+    capture._checkInputLiveness();
+    await capture._reconnectPreparation;
+    assert.equal(capture.reconnectNeeded, true);
+    assert.equal(capture._inputWatchdogTimer, null);
+    assert.equal(browser.requests.length, 1);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('synchronous context resume failure schedules retry and successful context still waits for PCM', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const recovered = [];
+  const capture = new MicrophoneCapture({onChunk() {}, onInputRecovered: details => recovered.push(details)});
+  try {
+    await capture.start();
+    browser.audioContext.state = 'suspended';
+    browser.audioContext.resume = () => { throw new Error('fake temporary browser rejection'); };
+    capture._checkInputLiveness();
+    assert.notEqual(capture._resumeRetryTimer, null, 'synchronous failures use the same bounded retry delay');
+    clearTimeout(capture._resumeRetryTimer);
+    capture._resumeRetryTimer = null;
+    browser.audioContext.resume = async () => { browser.audioContext.state = 'running'; };
+    capture._scheduleInputResume();
+    await capture._resumeAttempt;
+    assert.equal(capture.inputHealth.reason, 'pcm-waiting');
+    assert.equal(recovered.length, 0);
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    assert.equal(recovered.length, 1);
+    assert.equal(capture.inputHealth.status, 'receiving');
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('manual pause and explicit stop cannot be undone by watchdog, visibility, or automatic context recovery', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const capture = new MicrophoneCapture({onChunk() {}});
+  let now = 0, resumeCalls = 0;
+  capture._inputNow = () => now;
+  try {
+    await capture.start();
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    await capture.pause();
+    const count = capture.capturedSeconds;
+    browser.audioContext.state = 'suspended';
+    browser.audioContext.resume = async () => { resumeCalls += 1; browser.audioContext.state = 'running'; };
+    now = 100000;
+    capture._checkInputLiveness();
+    document.dispatch('visibilitychange');
+    browser.audioContext.dispatch('statechange');
+    await Promise.resolve();
+    assert.equal(resumeCalls, 0);
+    assert.equal(capture._inputWatchdogTimer, null);
+    assert.equal(capture._resumeRetryTimer, null);
+    assert.equal(capture.inputHealth.status, 'paused');
+    assert.equal(capture.capturedSeconds, count);
+    await capture.resume();
+    assert.equal(resumeCalls, 1, 'only explicit resume wakes a paused input');
+    capture._checkInputLiveness();
+    assert.notEqual(capture.inputHealth.reason, 'pcm-stalled', 'manual pause wall time is not an input stall');
+    await capture.stop();
+    const stoppedCalls = resumeCalls;
+    capture._checkInputLiveness();
+    capture._scheduleInputResume();
+    document.dispatch('visibilitychange');
+    assert.equal(resumeCalls, stoppedCalls);
+    assert.equal(capture._inputWatchdogTimer, null);
+    assert.equal(capture._resumeRetryTimer, null);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('independent delayed and failed upload promises do not backpressure or stop PCM capture', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const chunks = [], failures = [];
+  const pendingUpload = new Promise(() => {});
+  const capture = new MicrophoneCapture({onChunk: item => {
+    chunks.push(item);
+    return chunks.length === 1 ? pendingUpload
+      : Promise.reject(new Error('fake offline upload')).catch(error => failures.push(error.message));
+  }});
+  try {
+    await capture.start();
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(48000 * 45).fill(0.25)}});
+    await Promise.resolve();
+    assert.equal(capture.recording, true);
+    assert.equal(capture.inputHealth.status, 'receiving');
+    assert.ok(chunks.length >= 3);
+    assert.ok(failures.length >= 2);
+    assert.equal(browser.requests.length, 1);
+    await capture.stop();
+    assert.equal(acceptedSamples(chunks), 45 * 16000);
+    assert.equal(chunks.filter(item => item.final).length, 1);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('watchdog timer detects missing PCM and synchronous resume retry runs only while recording', async t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const capture = new MicrophoneCapture({onChunk() {}});
+  let now = 0, calls = 0;
+  capture._inputNow = () => now;
+  try {
+    await capture.start();
+    now = 5000;
+    t.mock.timers.tick(1000);
+    assert.equal(capture.inputHealth.reason, 'pcm-stalled', 'periodic checking does not depend on a UI callback');
+    browser.audioContext.state = 'suspended';
+    browser.audioContext.resume = () => {
+      calls += 1;
+      if (calls === 1) throw new Error('fake synchronous resume rejection');
+      browser.audioContext.state = 'running';
+      return Promise.resolve();
+    };
+    t.mock.timers.tick(1000);
+    assert.equal(calls, 1);
+    t.mock.timers.tick(1999);
+    assert.equal(calls, 1, 'one-second liveness checks cannot bypass the two-second retry backoff');
+    t.mock.timers.tick(1);
+    await capture._resumeAttempt;
+    assert.equal(calls, 2);
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    assert.equal(capture.inputHealth.status, 'receiving');
+    await capture.pause();
+    browser.audioContext.state = 'suspended';
+    t.mock.timers.tick(60000);
+    assert.equal(calls, 2, 'no pending watchdog or retry may restart a manually paused capture');
+    await capture.stop();
+    const stoppedCalls = calls;
+    t.mock.timers.tick(60000);
+    assert.equal(calls, stoppedCalls);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+    t.mock.timers.reset();
+  }
+});
+
+test('watchdog detects a closed context without its event and preserves accepted samples for explicit stop', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const chunks = [];
+  const capture = new MicrophoneCapture({onChunk: item => chunks.push(item)});
+  try {
+    await capture.start();
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4801).fill(0.25)}});
+    browser.audioContext.state = 'closed';
+    capture._checkInputLiveness();
+    await capture._reconnectPreparation;
+    assert.equal(capture.reconnectNeeded, true);
+    assert.ok(chunks.every(item => !item.final));
+    await capture.stop();
+    assert.equal(acceptedSamples(chunks), Math.round(4801 / 3));
+    assert.equal(chunks.filter(item => item.final).length, 1);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('input health detects stale PCM without waiting for or mutating the watchdog', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const unavailable = [], recovered = [], chunks = [];
+  const capture = new MicrophoneCapture({onChunk: chunk => chunks.push(chunk),
+    onInputUnavailable: (_error, details) => unavailable.push(details),
+    onInputRecovered: details => recovered.push(details)});
+  let now = 0;
+  capture._inputNow = () => now;
+  try {
+    await capture.start();
+    capture._stopInputWatchdog(); // Simulate a background timer that never ran.
+    now = 4999;
+    assert.equal(capture.inputHealth.status, 'waiting');
+    now = 5000;
+    assert.equal(capture.inputHealth.status, 'unavailable');
+    assert.equal(capture.inputHealth.reason, 'pcm-stalled');
+    assert.equal(capture.inputHealth.lastPcmAgeSeconds, null);
+    assert.equal(capture.capturedSeconds, 0);
+    assert.equal(capture._unavailableReasons.size, 0);
+    assert.equal(capture._availabilityEpisode, false);
+    assert.equal(unavailable.length, 0, 'read-only status never fires a callback');
+    assert.equal(chunks.length, 0, 'read-only status never checkpoints audio');
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    assert.equal(capture.inputHealth.status, 'receiving', 'fresh silent PCM is healthy');
+    now += 4999;
+    assert.equal(capture.inputHealth.status, 'receiving');
+    now += 1;
+    assert.equal(capture.inputHealth.status, 'unavailable');
+    assert.equal(capture.inputHealth.lastPcmAgeSeconds, 5);
+    assert.equal(capture._unavailableReasons.size, 0);
+    assert.equal(capture._inputWatchdogTimer, null);
+    assert.equal(capture.recording, true);
+    assert.equal(recovered.length, 0);
+    await capture.pause();
+    now += 60000;
+    assert.equal(capture.inputHealth.status, 'paused', 'normal pause never becomes a stale-input warning');
+    await capture.resume();
+    capture._stopInputWatchdog();
+    assert.equal(capture.inputHealth.status, 'waiting', 'manual resume needs a fresh PCM block');
+    assert.equal(capture.inputHealth.lastPcmAgeSeconds, null);
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    assert.equal(capture.inputHealth.status, 'receiving');
+    await capture.stop();
+    assert.equal(acceptedSamples(chunks), 3200);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('manual input recovery checks stale PCM before a delayed watchdog and preserves accepted audio', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const unavailable = [], chunks = [];
+  const capture = new MicrophoneCapture({onChunk: chunk => chunks.push(chunk),
+    onInputUnavailable: (_error, details) => unavailable.push(details)});
+  let now = 0;
+  capture._inputNow = () => now;
+  try {
+    await capture.start();
+    capture._stopInputWatchdog();
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    now = 10000;
+    assert.equal(capture._unavailableReasons.size, 0);
+    assert.equal(await capture.resumeInput(), false);
+    await capture._reconnectPreparation;
+    assert.equal(capture.reconnectNeeded, true);
+    assert.equal(unavailable[0].reason, 'pcm-stalled');
+    assert.equal(browser.requests.length, 1, 'a detected stall prepares reconnection without an automatic picker');
+    assert.ok(chunks.every(chunk => !chunk.final));
+    await capture.stop();
+    assert.equal(acceptedSamples(chunks), 1600);
+    assert.equal(chunks.filter(chunk => chunk.final).length, 1);
+  } finally {
+    await capture.stop().catch(() => {});
+    browser.restore();
+  }
+});
+
+test('PCM arriving just before manual recovery avoids a stale reconnect and paused input stays paused', async () => {
+  const browser = installCaptureBrowser({allowMicrophone: true});
+  const capture = new MicrophoneCapture({onChunk() {}});
+  let now = 0;
+  capture._inputNow = () => now;
+  try {
+    await capture.start();
+    capture._stopInputWatchdog();
+    now = 10000;
+    assert.equal(capture.inputHealth.reason, 'pcm-stalled');
+    browser.workletNode.port.onmessage({data: {type: 'samples', samples: new Float32Array(4800)}});
+    assert.equal(await capture.resumeInput(), true);
+    assert.equal(capture.reconnectNeeded, false);
+    assert.equal(capture.inputHealth.status, 'receiving');
+    await capture.pause();
+    now += 60000;
+    assert.equal(await capture.resumeInput(), true);
+    assert.equal(capture.paused, true, 'input recovery is not an explicit manual capture resume');
+    assert.equal(capture.inputHealth.status, 'paused');
+    assert.equal(browser.requests.length, 1);
+  } finally {
+    await capture.stop().catch(() => {});
     browser.restore();
   }
 });

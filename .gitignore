@@ -23,6 +23,9 @@ recipient.txt
 .samples/
 
 # Audio and runtime output must never be committed
+# Emergency downloads contain private recordings even when wrapped in ZIP.
+/scripts/yeobaek-emergency-audio*.zip
+/scripts/*_정리본.md
 *.[Ww][Aa][Vv]
 *.[Ww][Ee][Bb][Mm]
 *.[Mm]4[Aa]

@@ -345,8 +345,6 @@ class QuestionAnswererTests(unittest.TestCase):
         invalid_responses = [
             httpx.Response(200, content=b"x" * (64 * 1024 + 1)),
             httpx.Response(200, json={"choices": []}),
-            gateway(answer(), finish_reason="length"),
-            httpx.Response(200, json={"choices": [{"message": {"content": "{}", "refusal": "no"}}]}),
             httpx.Response(200, json={"choices": [{"message": {"content": '{"answerability":"answered","answerability":"insufficient_evidence","paragraphs":[]}'}}]}),
             httpx.Response(200, json={"choices": [{"message": {"content": '{"answerability":NaN,"paragraphs":[]}'}}]}),
             httpx.Response(200, json={"choices": [{"message": {"content": "[" * 1100 + "]" * 1100}}]}),
@@ -356,6 +354,28 @@ class QuestionAnswererTests(unittest.TestCase):
             with self.subTest(kind=len(response.content)), self.assertRaises(QuestionAnsweringError) as caught:
                 self.engine(lambda request: response).answer("광합성은?", [segment()])
             self.assertEqual(caught.exception.code, "invalid_response")
+
+    def test_truncated_or_refused_answer_has_a_fixed_code_without_retry(self):
+        for finish, refusal, expected in (
+            ("length", None, "response_truncated"),
+            ("content_filter", None, "model_refused"),
+            ("stop", "synthetic-private-refusal", "model_refused"),
+            ("length", "synthetic-private-refusal", "model_refused"),
+        ):
+            with self.subTest(finish=finish, refusal=bool(refusal)):
+                calls = []
+
+                def handler(request):
+                    calls.append(request)
+                    return httpx.Response(200, json={"choices": [{"finish_reason": finish,
+                        "message": {"content": "synthetic-private-partial", "refusal": refusal}}]})
+
+                with self.assertRaises(QuestionAnsweringError) as caught:
+                    self.engine(handler).answer("광합성은?", [segment()])
+                self.assertEqual(caught.exception.code, expected)
+                self.assertFalse(caught.exception.retryable)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn("synthetic-private", str(caught.exception))
 
     def test_restored_text_must_also_fit_output_bounds(self):
         # A compact masked input may expand on restoration. Both representations

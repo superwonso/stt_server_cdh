@@ -144,6 +144,16 @@ class Database:
                         CHECK (asr_provider IN ('qwen', 'clova'))
                 );
                 CREATE INDEX IF NOT EXISTS lectures_user ON lectures(username, created_at);
+                CREATE TABLE IF NOT EXISTS lecture_continuations (
+                    child_lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
+                    parent_lecture_id TEXT REFERENCES lectures(id) ON DELETE SET NULL,
+                    parent_request_hash TEXT NOT NULL CHECK (
+                        length(parent_request_hash) = 64 AND parent_request_hash NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    CHECK (parent_lecture_id IS NULL OR child_lecture_id != parent_lecture_id)
+                );
+                CREATE INDEX IF NOT EXISTS lecture_continuations_parent
+                    ON lecture_continuations(parent_lecture_id, child_lecture_id);
                 CREATE TABLE IF NOT EXISTS lecture_metadata (
                     lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
                     display_title TEXT CHECK (
@@ -441,6 +451,28 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS lecture_translations_queue
                     ON lecture_translations(status, created_at);
+                CREATE TABLE IF NOT EXISTS lecture_study_notes (
+                    lecture_id TEXT PRIMARY KEY REFERENCES lectures(id) ON DELETE CASCADE,
+                    username TEXT NOT NULL REFERENCES users(username),
+                    job_id TEXT NOT NULL UNIQUE CHECK (length(job_id) = 36),
+                    raw_revision TEXT NOT NULL CHECK (length(raw_revision) = 64),
+                    status TEXT NOT NULL CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
+                    model TEXT NOT NULL,
+                    document_json TEXT,
+                    error_code TEXT,
+                    error TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 1),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    CHECK ((status = 'completed' AND document_json IS NOT NULL
+                            AND completed_at IS NOT NULL AND error IS NULL AND error_code IS NULL)
+                        OR (status != 'completed' AND document_json IS NULL AND completed_at IS NULL))
+                );
+                CREATE INDEX IF NOT EXISTS lecture_study_notes_queue
+                    ON lecture_study_notes(status, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS lecture_study_notes_active_owner
+                    ON lecture_study_notes(username) WHERE status IN ('queued', 'processing');
                 CREATE TABLE IF NOT EXISTS operational_state (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     access_enabled INTEGER NOT NULL CHECK (access_enabled IN (0, 1)),
@@ -598,5 +630,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 19:
-                connection.execute("PRAGMA user_version = 19")
+            if schema_version < 21:
+                connection.execute("PRAGMA user_version = 21")

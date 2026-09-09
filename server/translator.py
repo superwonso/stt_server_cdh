@@ -15,6 +15,7 @@ from typing import Any, Callable
 import httpx
 
 from .postprocessor import MindlogicPostprocessor, PostprocessingError, _MODEL_NAME, _NUMBER, _PROTECTED_VALUE
+from .llm_protocol import ProtocolError, gateway_schema, parse_json_document
 from .settings import Settings, mindlogic_gateway_base_url
 
 
@@ -26,6 +27,9 @@ MAX_TRANSLATED_CHARS = 1_000_000
 MAX_BATCHES = 64
 MAX_BATCH_SEGMENTS = 128
 MAX_MODEL_CALLS = 149  # 64 outline maps + 16 + 4 + 1 combines + 64 translations.
+MAX_ADAPTIVE_CALLS = 16  # Additional logical calls, only after explicit output truncation.
+MAX_ADAPTIVE_DEPTH = 4
+MAX_TARGET_JSON_BYTES = 12_000
 MAX_OUTLINE_CHARS = 2400
 MAX_INPUT_BYTES = 900 * 1024  # Leave room for instructions within the transport's 1 MiB cap.
 _MAX_OUTLINE_LIST_ITEMS = 32
@@ -53,6 +57,8 @@ _MESSAGES = {
     "invalid_source": "번역할 원문 구간을 확인할 수 없습니다.",
     "empty_transcript": "번역할 받아쓰기 내용이 없습니다.",
     "invalid_response": "수업 번역 결과의 형식이나 원문 대응을 확인하지 못해 저장하지 않았습니다.",
+    "response_truncated": "AI 출력이 길이 한도에서 끊겨 수업 번역을 저장하지 않았습니다. 원문은 그대로 보관됩니다.",
+    "model_refused": "AI가 번역 결과 생성을 거절했습니다. 원문은 그대로 보관됩니다.",
     "protected_content_changed": "숫자나 기존 한국어가 바뀐 수업 번역은 저장하지 않았습니다.",
 }
 
@@ -159,19 +165,6 @@ def _encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate key")
-        result[key] = value
-    return result
-
-
-def _reject_constant(value):
-    raise ValueError("non-finite JSON")
-
-
 def _outline_list_labels(text: str, allowed: set[str]) -> str:
     """Normalize only unambiguous generated outline enumeration, not values.
 
@@ -256,13 +249,19 @@ class MindlogicTranslator:
             item = {"id": f"S{index + 1:06d}", "text": _MASKABLE.sub(protect, source["text"])}
             masked.append(item)
             locked.append({**item, "text": _KOREAN.sub(preserve_korean, item["text"])})
-        ranges, begin, used = [], 0, 0
+        ranges, begin, used, output_bytes = [], 0, 0, 16
         for index, source in enumerate(sources):
             width = len(source["text"])
-            if index > begin and (used + width > self.chunk_chars or index - begin >= MAX_BATCH_SEGMENTS):
+            # Numbers and Korean spans expand into immutable tokens, and every
+            # output row has an alias/JSON overhead. Raw character count alone
+            # underestimates the response, especially for many short rows.
+            row_bytes = len(_encode(locked[index])) + 1 if targets[index] else 0
+            if index > begin and (used + width > self.chunk_chars or index - begin >= MAX_BATCH_SEGMENTS
+                                  or output_bytes + row_bytes > MAX_TARGET_JSON_BYTES):
                 ranges.append((begin, index))
-                begin, used = index, 0
+                begin, used, output_bytes = index, 0, 16
             used += width
+            output_bytes += row_bytes
         ranges.append((begin, len(sources)))
         if len(ranges) > MAX_BATCHES:
             raise TranslationError("source_too_large")
@@ -294,7 +293,7 @@ class MindlogicTranslator:
         def request(kind, data):
             nonlocal calls
             calls += 1
-            if calls > MAX_MODEL_CALLS:
+            if calls > MAX_MODEL_CALLS + MAX_ADAPTIVE_CALLS:
                 raise TranslationError("source_too_large")
             self._interrupted(interrupted)
             output = self._request(kind, data, language, interrupted)
@@ -321,15 +320,31 @@ class MindlogicTranslator:
                 data = {"outlines": group}
                 combined.append(self._outline(request("outline", data), data))
             outlines = combined
-        translated, total = [], 0
+        translated, total, extra_calls = [], 0, 0
         restore = {**private, **korean}
-        for begin, end in ranges:
+
+        def translate_range(begin, end, depth=0):
+            nonlocal extra_calls
             self._interrupted(interrupted)
             expected = [index for index in range(begin, end) if targets[index]]
             returned = {}
             if expected:
                 data = translation_input(begin, end, outlines[0])
-                response = request("translation", data)
+                try:
+                    response = request("translation", data)
+                except TranslationError as error:
+                    # Never repair partial JSON, resend an ambiguous network
+                    # result, or retry refusal/protected-content/ID errors.
+                    # An explicit length stop may be retried as smaller whole
+                    # source-row batches using the same full-course context.
+                    if (error.code != "response_truncated" or len(expected) < 2
+                            or depth >= MAX_ADAPTIVE_DEPTH or extra_calls + 2 > MAX_ADAPTIVE_CALLS):
+                        raise
+                    extra_calls += 2
+                    middle = expected[len(expected) // 2]
+                    left = translate_range(begin, middle, depth + 1)
+                    right = translate_range(middle, end, depth + 1)
+                    return {**left, **right}
                 if not isinstance(response, dict) or set(response) != {"segments"}:
                     raise TranslationError("invalid_response")
                 items = response["segments"]
@@ -344,6 +359,10 @@ class MindlogicTranslator:
                         raise TranslationError("protected_content_changed")
                     text = _LOCKED.sub(lambda match: restore[match.group(0)], text)
                     returned[index] = text
+            return returned
+
+        for begin, end in ranges:
+            returned = translate_range(begin, end)
             for index in range(begin, end):
                 text = returned.get(index, sources[index]["text"])
                 total += len(text)
@@ -408,13 +427,14 @@ class MindlogicTranslator:
                 "type": "object", "properties": {"id": {"type": "string", "enum": expected_ids}, "text": {"type": "string"}},
                 "required": ["id", "text"], "additionalProperties": False}}},
                 "required": ["segments"], "additionalProperties": False}
+        expected_bytes = len(_encode({"segments": data.get("segments", [])})) if kind == "translation" else 0
         payload = {
-            "model": self.model, "temperature": 0, "max_tokens": 8192,
+            "model": self.model, "temperature": 0, "max_tokens": min(16384, max(8192, expected_bytes + 4096)),
             "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": json.dumps(
                 {"language": language if language in {"ko", "en", "ja"} else "auto", **data},
                 ensure_ascii=False, separators=(",", ":"))}],
             "response_format": {"type": "json_schema", "json_schema": {
-                "name": f"lecture_{kind}", "strict": True, "schema": schema}},
+                "name": f"lecture_{kind}", "strict": True, "schema": gateway_schema(schema)}},
         }
         try:
             response = self._transport._request(payload, interrupted)
@@ -423,16 +443,6 @@ class MindlogicTranslator:
         except (httpx.HTTPError, OSError):
             raise TranslationError("gateway_unavailable", retryable=True) from None
         try:
-            choices = response["choices"]
-            if not isinstance(choices, list) or len(choices) != 1:
-                raise ValueError("invalid choices")
-            choice = choices[0]
-            message = choice["message"]
-            if choice.get("finish_reason") not in {None, "stop"} or message.get("refusal"):
-                raise ValueError("incomplete result")
-            content = message["content"]
-            if not isinstance(content, str):
-                raise ValueError("invalid content")
-            return json.loads(content, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
-        except (KeyError, IndexError, TypeError, ValueError, AttributeError):
-            raise TranslationError("invalid_response") from None
+            return parse_json_document(response)
+        except ProtocolError as error:
+            raise TranslationError(error.code) from None
