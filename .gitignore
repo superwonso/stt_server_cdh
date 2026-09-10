@@ -26,6 +26,8 @@ recipient.txt
 # Emergency downloads contain private recordings even when wrapped in ZIP.
 /scripts/yeobaek-emergency-audio*.zip
 /scripts/*_정리본.md
+# User-provided support screenshots can contain account and classroom details.
+/scripts/KakaoTalk_*.png
 *.[Ww][Aa][Vv]
 *.[Ww][Ee][Bb][Mm]
 *.[Mm]4[Aa]

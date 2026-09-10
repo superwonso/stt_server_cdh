@@ -575,3 +575,342 @@ test('receipt write failure rolls back cursor and keeps PCM for a bounded retry'
   await queue.advanceSettledChunk(OWNER, CAPTURE_ID, receipt(), { serverConfirmed: true });
   assert.equal(data.sessions.get(CAPTURE_ID).nextSequence, 1);
 });
+
+async function heldQueueFixture() {
+  const fixture = memoryQueue();
+  const {queue} = fixture;
+  await queue.createSession({id:CAPTURE_ID, owner:OWNER, title:'보관할 합성 수업',
+    source:'microphone', asrProvider:'clova', language:'ko'});
+  const ids = [CHUNK_ID, '20000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000002'];
+  for (let index = 0; index < ids.length; index += 1) {
+    await queue.enqueueChunk(OWNER,CAPTURE_ID,chunkInput({id:ids[index],start:index * 800,duration:800}));
+  }
+  await queue.markChunkInflight(OWNER,ids[0]);
+  await queue.markChunkInflight(OWNER,ids[1]);
+  await queue.markChunkBlocked(OWNER,ids[1],'response_lost');
+  await queue.saveSnapshot(OWNER,CAPTURE_ID,snapshotInput({sequence:3,start:1600,duration:1600,overlap:800}));
+  return {...fixture,ids};
+}
+
+async function audioRowsWithBytes(data) {
+  return Promise.all(['chunks','pcmSnapshots'].map(async name => [name,await Promise.all(
+    [...data[name]].map(async ([id,row]) => {
+      // Compare every original field and byte, separately asserting the only
+      // newly permitted field (the strict-reader uploadHeld guard) below.
+      const {uploadHeld,...original} = row;
+      return [id,{...original,blob:new Uint8Array(await row.blob.arrayBuffer())}];
+    }),
+  )]));
+}
+
+test('explicit upload hold survives reopen and preserves every uncertain chunk and unfinished PCM byte',async () => {
+  const {queue,data} = await heldQueueFixture();
+  const before = await audioRowsWithBytes(data);
+  const previousSession = await queue.getSession(OWNER,CAPTURE_ID);
+  const held = await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  assert.deepEqual(held,{...previousSession,uploadHeld:true});
+  assert.equal([...data.chunks.values()].every(row=>row.uploadHeld===true),true);
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+  const reopened = new DurableLiveQueue({keyRange:queue.keyRange});
+  reopened._transaction = queue._transaction;
+  const recovered = await reopened.recoverOwner(OWNER);
+  assert.equal(recovered.sessions[0].uploadHeld,true);
+  assert.deepEqual(recovered.chunks.map(row => row.state),['inflight','blocked','queued']);
+  assert.equal(recovered.chunks.every(row=>row.uploadHeld===true),true);
+  assert.equal(recovered.snapshots[0].durationSamples,1600);
+  assert.equal(recovered.inflightChunks.length,1);
+  assert.equal(recovered.stats.count,3);
+  assert.equal(recovered.stats.snapshotFreshSamples,800);
+  const exported = await reopened.readExportSnapshot(OWNER);
+  assert.equal(exported.sessions[0].uploadHeld,true);
+  assert.equal(exported.chunks.length,3);
+  assert.equal(exported.snapshots.length,1);
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+});
+
+test('explicit resume removes only the hold gate and never clears CLOVA inflight or blocked uncertainty',async () => {
+  const {queue,data,ids} = await heldQueueFixture();
+  const before = await audioRowsWithBytes(data);
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  for (const id of ids) {
+    for (const change of ['markChunkQueued','markChunkInflight']) {
+      await assert.rejects(queue[change](OWNER,id),error => error instanceof LiveQueueConflictError
+        && error.code === 'live_queue_upload_held');
+    }
+  }
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+  const resumed = await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  assert.equal(Object.hasOwn(resumed,'uploadHeld'),false);
+  assert.equal(Object.hasOwn(data.sessions.get(CAPTURE_ID),'uploadHeld'),false);
+  assert.equal([...data.chunks.values()].every(row=>!Object.hasOwn(row,'uploadHeld')),true);
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+  await assert.rejects(queue.markChunkInflight(OWNER,ids[0]),LiveQueueConflictError);
+  await assert.rejects(queue.markChunkInflight(OWNER,ids[1]),LiveQueueConflictError);
+  assert.equal((await queue.markChunkInflight(OWNER,ids[2])).state,'inflight');
+});
+
+test('hold and resume are strict owner-only decisions and repeated decisions do not write',async () => {
+  const {queue,data,failures} = await heldQueueFixture();
+  const before = structuredClone(data.sessions);
+  for (const value of [undefined,null,1,0,'true','false',{},[]]) {
+    await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,value),LiveQueueValidationError);
+  }
+  await assert.rejects(queue.setSessionUploadHeld('other-owner',CAPTURE_ID,true),LiveQueueOwnershipError);
+  await assert.rejects(queue.setSessionUploadHeld(OWNER,'30000000-0000-4000-8000-000000000000',true),
+    error => error.code === 'live_queue_not_found');
+  assert.deepEqual(data.sessions,before);
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  failures.add('sessions');
+  assert.equal((await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true)).uploadHeld,true);
+  await assert.rejects(queue.setSessionUploadHeld('other-owner',CAPTURE_ID,false),LiveQueueOwnershipError);
+  failures.clear();
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  failures.add('sessions');
+  assert.equal(Object.hasOwn(await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false),'uploadHeld'),false);
+});
+
+test('failed hold or resume commits preserve the prior gate and all local audio for explicit retry',async () => {
+  const {queue,data,failures} = await heldQueueFixture();
+  const before = await audioRowsWithBytes(data);
+  const original = structuredClone(data.sessions);
+  failures.add('sessions');
+  await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true),/fake write failure/);
+  assert.deepEqual(data.sessions,original);
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+  failures.clear();
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  const held = structuredClone(data.sessions);
+  failures.add('sessions');
+  await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false),/fake write failure/);
+  assert.deepEqual(data.sessions,held);
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+  failures.clear();
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+});
+
+test('a held older capture does not gate a new capture or disclose another owner recordings',async () => {
+  const {queue,data} = await heldQueueFixture();
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  const oldBytes = await audioRowsWithBytes(data);
+  const newId = '30000000-0000-4000-8000-000000000000';
+  const newChunk = '40000000-0000-4000-8000-000000000000';
+  await queue.createSession({id:newId,owner:OWNER,title:'새 합성 수업',source:'microphone',asrProvider:'qwen'});
+  await queue.enqueueChunk(OWNER,newId,chunkInput({id:newChunk,duration:800,final:true}));
+  assert.equal((await queue.markChunkQueued(OWNER,newChunk)).state,'queued');
+  await queue.ackChunk(OWNER,newChunk,{serverConfirmed:true});
+  assert.equal(data.sessions.has(newId),false);
+  assert.equal(data.chunks.has(newChunk),false);
+  assert.deepEqual(await audioRowsWithBytes(data),oldBytes);
+  assert.equal((await queue.getSession(OWNER,CAPTURE_ID)).uploadHeld,true);
+  const other = await queue.recoverOwner('other-owner');
+  assert.equal(other.sessions.length,0);
+  assert.equal(other.chunks.length,0);
+  assert.equal(other.snapshots.length,0);
+});
+
+test('held capture still persists trailing chunks and snapshots without changing its transmission gate',async () => {
+  const {queue,data} = await journalQueue();
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  await queue.saveSnapshot(OWNER,CAPTURE_ID,snapshotInput({duration:800}));
+  const final = await queue.enqueueChunk(OWNER,CAPTURE_ID,chunkInput({duration:800,final:true}));
+  assert.equal(final.state,'queued');
+  assert.equal(final.uploadHeld,true);
+  assert.equal(final.attempts,0);
+  assert.equal(final.downloadRequested,false);
+  assert.equal(data.pcmSnapshots.size,0);
+  const stored = await queue.getSession(OWNER,CAPTURE_ID);
+  assert.equal(stored.uploadHeld,true);
+  assert.equal(stored.state,'stopped');
+  assert.equal(stored.finalQueued,true);
+  await assert.rejects(queue.markChunkQueued(OWNER,CHUNK_ID),error => error.code === 'live_queue_upload_held');
+});
+
+test('late session updates and stale create retries cannot implicitly clear or reactivate a hold',async () => {
+  const {queue} = memoryQueue();
+  const input = {id:CAPTURE_ID,owner:OWNER,title:'합성 세션',source:'microphone',asrProvider:'qwen',createdAt:1700000000000};
+  await queue.createSession(input);
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  for (const state of ['paused','input-unavailable','recording','blocked','stopped']) {
+    assert.equal((await queue.updateSession(OWNER,CAPTURE_ID,{state})).uploadHeld,true);
+  }
+  assert.equal((await queue.createSession(input)).uploadHeld,true);
+  await assert.rejects(queue.updateSession(OWNER,CAPTURE_ID,{uploadHeld:false}),LiveQueueValidationError);
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  assert.equal(Object.hasOwn(await queue.createSession({...input,uploadHeld:true}),'uploadHeld'),false);
+});
+
+test('RAM-only recovery can create a held session atomically while ordinary v2 rows stay compatible',async () => {
+  const {queue,data} = memoryQueue();
+  const input = {id:CAPTURE_ID,owner:OWNER,title:'합성 복구',source:'microphone',asrProvider:'qwen'};
+  for (const uploadHeld of [false,undefined,null,'true',1,{}]) {
+    await assert.rejects(queue.createSession({...input,uploadHeld}),LiveQueueValidationError);
+  }
+  const held = await queue.createSession({...input,uploadHeld:true});
+  assert.equal(held.uploadHeld,true);
+  assert.equal(LIVE_QUEUE_DB_VERSION,2);
+  const legacyKeys = new Set(['id','owner','title','language','source','asrProvider','createdAt','updatedAt',
+    'state','lectureCreated','finalQueued','nextSequence','capturedSamples']);
+  // The deployed legacy reader only accepts these exact keys, so it cannot
+  // silently interpret a newly held session as an ordinary queued session.
+  assert.deepEqual(Object.keys(data.sessions.get(CAPTURE_ID)).filter(key => !legacyKeys.has(key)),['uploadHeld']);
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  assert.equal(Object.keys(data.sessions.get(CAPTURE_ID)).every(key => legacyKeys.has(key)),true);
+});
+
+test('malformed stored hold markers fail closed and completed sessions cannot be held',async () => {
+  const {queue,data} = await journalQueue();
+  for (const value of [false,null,'true',1]) {
+    data.sessions.get(CAPTURE_ID).uploadHeld = value;
+    await assert.rejects(queue.getSession(OWNER,CAPTURE_ID),LiveQueueCorruptError);
+    await assert.rejects(queue.recoverOwner(OWNER),LiveQueueCorruptError);
+    await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false),LiveQueueCorruptError);
+  }
+  delete data.sessions.get(CAPTURE_ID).uploadHeld;
+  data.sessions.get(CAPTURE_ID).state = 'completed';
+  data.sessions.get(CAPTURE_ID).finalQueued = true;
+  await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true),LiveQueueConflictError);
+});
+
+test('hold and CLOVA inflight transitions serialize across queue instances without erasing ambiguity',async () => {
+  const {queue,data} = memoryQueue();
+  await queue.createSession({id:CAPTURE_ID,owner:OWNER,title:'합성 경합',source:'microphone',asrProvider:'clova'});
+  await queue.enqueueChunk(OWNER,CAPTURE_ID,chunkInput({duration:800}));
+  const another = new DurableLiveQueue({keyRange:queue.keyRange});
+  another._transaction = queue._transaction;
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  await assert.rejects(another.markChunkInflight(OWNER,CHUNK_ID),error => error.code === 'live_queue_upload_held');
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  await Promise.all([
+    another.markChunkInflight(OWNER,CHUNK_ID),
+    queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true),
+  ]);
+  assert.equal(data.chunks.get(CHUNK_ID).state,'inflight');
+  assert.equal(data.chunks.get(CHUNK_ID).attempts,1);
+  await another.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  assert.equal(data.chunks.get(CHUNK_ID).state,'inflight');
+  await assert.rejects(queue.markChunkInflight(OWNER,CHUNK_ID),LiveQueueConflictError);
+});
+
+// Frozen pre-hold v2 chunk whitelist. These legacy methods intentionally do
+// not inspect the session: stopped old tabs used only this strict chunk reader
+// for getChunk/markChunkQueued/markChunkInflight. No Git revision is needed in
+// CI, and accepting new fields here would invalidate this compatibility test.
+function frozenLegacyChunkReader(queue) {
+  const keys = new Set(['id','captureId','owner','sessionCreatedAt','sequence','startSamples',
+    'durationSamples','overlapSamples','final','asrProvider','blob','byteLength','state','attempts',
+    'errorKind','downloadRequested','createdAt','updatedAt']);
+  const read = (owner,id,change) => queue._transaction(['chunks'],change?'readwrite':'readonly',async stores=>{
+    const value=await new Promise((resolve,reject)=>{
+      const request=stores.chunks.get(id);request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);
+    });
+    if(!value)return null;
+    if(Object.keys(value).length!==keys.size || Object.keys(value).some(key=>!keys.has(key))) {
+      throw new Error('legacy_strict_chunk_rejected');
+    }
+    if(value.owner!==owner)throw new Error('legacy_owner_mismatch');
+    if(change){
+      change(value);
+      await new Promise((resolve,reject)=>{
+        const request=stores.chunks.put(value);request.onsuccess=()=>resolve();request.onerror=()=>reject(request.error);
+      });
+    }
+    return value;
+  });
+  return {
+    getChunk:(owner,id)=>read(owner,id),
+    markChunkQueued:(owner,id)=>read(owner,id,row=>{row.state='queued';row.errorKind='';}),
+    markChunkInflight:(owner,id)=>read(owner,id,row=>{
+      if(row.asrProvider!=='clova'||row.state!=='queued')throw new Error('legacy_conflict');
+      row.state='inflight';row.attempts+=1;row.errorKind='';
+    }),
+  };
+}
+
+test('all held chunk guards block legacy stopped-tab read and transitions until explicit resume',async () => {
+  const {queue,data,ids} = await heldQueueFixture();
+  const legacy=frozenLegacyChunkReader(queue);
+  assert.equal((await legacy.getChunk(OWNER,ids[2])).state,'queued');
+  const original=await audioRowsWithBytes(data);
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  for(const id of ids){
+    assert.equal((await queue.getChunk(OWNER,id)).uploadHeld,true);
+    for(const method of ['getChunk','markChunkQueued','markChunkInflight']){
+      await assert.rejects(legacy[method](OWNER,id),/legacy_strict_chunk_rejected/);
+    }
+  }
+  assert.deepEqual(await audioRowsWithBytes(data),original);
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  for(const id of ids)assert.equal(Object.hasOwn(await legacy.getChunk(OWNER,id),'uploadHeld'),false);
+  assert.deepEqual(await audioRowsWithBytes(data),original);
+});
+
+test('hold and resume guards roll back together after a middle chunk write fails',async () => {
+  for(const held of [true,false]){
+    const {queue,data}=await heldQueueFixture();
+    if(!held)await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+    const original=structuredClone(data);
+    const originalBytes=await audioRowsWithBytes(data);
+    const transaction=queue._transaction;
+    queue._transaction=(names,mode,operation)=>transaction(names,mode,stores=>{
+      let writes=0;
+      if(stores.chunks){
+        const put=stores.chunks.put;
+        stores.chunks.put=value=>++writes===2
+          ? asynchronousRequest(null,new DOMException('synthetic quota','QuotaExceededError')) : put(value);
+      }
+      return operation(stores);
+    });
+    await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,held),error=>error.name==='QuotaExceededError');
+    assert.deepEqual(data,original);
+    assert.deepEqual(await audioRowsWithBytes(data),originalBytes);
+    queue._transaction=transaction;
+    await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,held);
+    assert.equal(data.sessions.get(CAPTURE_ID).uploadHeld===true,held);
+    assert.equal([...data.chunks.values()].every(row=>(row.uploadHeld===true)===held),true);
+  }
+});
+
+test('queued writes racing a hold inherit its guard and keep all sample metadata',async () => {
+  for(const holdFirst of [true,false]){
+    const {queue,data}=await journalQueue();
+    const save=()=>queue.enqueueChunk(OWNER,CAPTURE_ID,chunkInput({duration:800,final:true}));
+    const hold=()=>queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+    if(holdFirst){await hold();await save();}else{await save();await hold();}
+    const row=data.chunks.get(CHUNK_ID);
+    assert.equal(row.uploadHeld,true);assert.equal(row.state,'queued');assert.equal(row.attempts,0);
+    assert.equal(row.durationSamples,800);assert.equal(row.final,true);assert.equal(row.updatedAt,1700000000000);
+    assert.equal(data.sessions.get(CAPTURE_ID).uploadHeld,true);
+    await assert.rejects(frozenLegacyChunkReader(queue).getChunk(OWNER,CHUNK_ID),/legacy_strict_chunk_rejected/);
+  }
+});
+
+test('holding one capture does not mark another capture or owner and never reads WAV payloads',async () => {
+  const {queue,data}=await heldQueueFixture();
+  const otherId='50000000-0000-4000-8000-000000000000',otherChunk='60000000-0000-4000-8000-000000000000';
+  await queue.createSession({id:otherId,owner:'other-owner',title:'다른 합성 수업',source:'microphone',asrProvider:'qwen'});
+  await queue.enqueueChunk('other-owner',otherId,chunkInput({id:otherChunk,duration:800}));
+  const untouched=structuredClone(data.chunks.get(otherChunk));
+  const oldArrayBuffer=Blob.prototype.arrayBuffer,oldSlice=Blob.prototype.slice;
+  Blob.prototype.arrayBuffer=()=>{throw new Error('hold must not read a WAV');};
+  Blob.prototype.slice=()=>{throw new Error('hold must not slice a WAV');};
+  try{await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);}
+  finally{Blob.prototype.arrayBuffer=oldArrayBuffer;Blob.prototype.slice=oldSlice;}
+  assert.deepEqual(data.chunks.get(otherChunk),untouched);
+  assert.equal(Object.hasOwn(data.sessions.get(otherId),'uploadHeld'),false);
+});
+
+test('malformed chunk guard fails closed while a stray true guard blocks transitions until explicit resume',async () => {
+  const {queue,data}=await journalQueue();
+  await queue.enqueueChunk(OWNER,CAPTURE_ID,chunkInput({duration:800}));
+  for(const uploadHeld of [false,null,'true',1]){
+    data.chunks.get(CHUNK_ID).uploadHeld=uploadHeld;
+    await assert.rejects(queue.getChunk(OWNER,CHUNK_ID),LiveQueueCorruptError);
+    await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true),LiveQueueCorruptError);
+    assert.equal(Object.hasOwn(data.sessions.get(CAPTURE_ID),'uploadHeld'),false);
+  }
+  data.chunks.get(CHUNK_ID).uploadHeld=true;
+  await assert.rejects(queue.markChunkQueued(OWNER,CHUNK_ID),error=>error.code==='live_queue_upload_held');
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  assert.equal(Object.hasOwn(data.chunks.get(CHUNK_ID),'uploadHeld'),false);
+});

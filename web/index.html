@@ -251,6 +251,8 @@
           </div>
           <p id="capture-input-status" class="capture-input-status" role="status" aria-live="polite">마이크 녹음 중이 아닙니다.</p>
           <button id="local-audio-open" class="secondary-button" type="button">기기에 남은 음성 내려받기</button>
+          <button id="hold-new-note" class="secondary-button" type="button" disabled>기존 음성 보관 · 새 수업</button>
+          <p class="panel-help">이전 수업의 전송 오류가 남았다면 음성을 보관하고 새 수업을 열 수 있어요. 현재 녹음은 마지막 음성까지 종료하고, 새 화면에서 시작 버튼을 눌러 주세요. 보관한 음성은 삭제하거나 자동 재전송하지 않습니다.</p>
           <div id="processing" class="processing" role="status" aria-live="polite" hidden>
             <span class="processing-spinner" aria-hidden="true"></span>
             <span id="processing-text">다음 문장을 듣고 있어요…</span>
@@ -263,6 +265,11 @@
               <button id="retry" type="button">다시 전송</button>
             </div>
           </div>
+          <section id="held-audio-panel" class="held-audio-panel" aria-labelledby="held-audio-title" hidden>
+            <h3 id="held-audio-title">보관 중 · 전송 보류한 수업</h3>
+            <p id="held-audio-state" class="panel-help" role="status"></p>
+            <div id="held-audio-list"></div>
+          </section>
         </section>
 
         <section class="transcript-section" aria-labelledby="transcript-title">

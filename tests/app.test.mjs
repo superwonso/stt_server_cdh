@@ -309,6 +309,15 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
         if (stored && stored.owner !== owner) throw new Error('session ownership mismatch');
         return stored ? {...stored} : null;
       }
+      async setSessionUploadHeld(owner,id,held) {
+        requireOwner(owner);requireUuid(id,'captureId');assert.equal(typeof held,'boolean');
+        const stored=this.sessions.get(id);if(!stored || stored.owner!==owner)throw new Error('session ownership mismatch');
+        if(held)stored.uploadHeld=true;else delete stored.uploadHeld;
+        for(const chunk of this.chunks.values())if(chunk.owner===owner&&chunk.captureId===id){
+          if(held)chunk.uploadHeld=true;else delete chunk.uploadHeld;
+        }
+        return {...stored};
+      }
       async saveSnapshot(owner,captureId,value) {
         const session = await this.getSession(owner,captureId);
         if (!session) throw new Error('missing session');
@@ -344,7 +353,8 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
         if (value.startSamples + value.overlapSamples !== session.capturedSamples) throw new Error('chunk timeline conflict');
         const stored = {...value,owner,captureId,lectureId:captureId,asrProvider:session.asrProvider,
           sessionCreatedAt:session.createdAt,sequence:session.nextSequence++,byteLength:value.blob.size,
-          state:'queued',attempts:0,errorKind:'',downloadRequested:false,inflightAt:null};
+          state:'queued',attempts:0,errorKind:'',downloadRequested:false,inflightAt:null,
+          ...(session.uploadHeld===true?{uploadHeld:true}:{})};
         session.capturedSamples = value.startSamples + value.durationSamples;
         if (value.final) { session.finalQueued = true; session.state = 'stopped'; this.snapshots.delete(captureId); }
         this.chunks.set(value.id,stored); return {...stored};
@@ -378,6 +388,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       async markChunkInflight(owner,id) {
         requireOwner(owner); requireUuid(id,'chunkId');
         const item = this.chunks.get(id); if (!item || item.owner !== owner) throw new Error('missing chunk');
+        if(this.sessions.get(item.captureId)?.uploadHeld)throw new Error('upload held');
         if (item.asrProvider !== 'clova' || item.state !== 'queued') throw new Error('invalid inflight transition');
         item.state = 'inflight'; item.inflightAt = new Date().toISOString();
         item.attempts += 1;
@@ -393,6 +404,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       async markChunkQueued(owner,id) {
         requireOwner(owner); requireUuid(id,'chunkId');
         const item = this.chunks.get(id); if (!item || item.owner !== owner) throw new Error('missing chunk');
+        if(this.sessions.get(item.captureId)?.uploadHeld)throw new Error('upload held');
         Object.assign(item,{state:'queued',errorKind:'',inflightAt:null});
       }
       async setDownloadRequested(owner,id,requested) {
@@ -3974,6 +3986,8 @@ test('a renewed lease with a new tunnel preserves queued-audio ownership until s
     pending=[{blob:new Blob([new Uint8Array(1644)],{type:'audio/wav'}),startSeconds:0,durationSeconds:0.05,overlapSeconds:0,final:false,id:${JSON.stringify(durableChunkId)},captureId:'lesson',lectureId:'lesson',owner:'user-alpha',asrProvider:'qwen',lectureReady:true,durable:true}];
     setConnectionState('connected'); renderCurrent();
   `);
+  await app.run("openLiveQueue()");
+  app.run("liveQueue.getSession=async(owner,id)=>owner==='user-alpha'&&id==='lesson'?{id,owner,asrProvider:'qwen'}:null");
   await app.run('drain()');
 
   assert.equal(requests.some(request => request.url.startsWith(oldUrl)), false);
@@ -6540,17 +6554,22 @@ test('saved finalized WAV ticket and local residual WAV are available without di
   assert.equal(local.run('recording'),true);assert.equal(local.run('sendError'),'합성 전송 보류');
 });
 
-function continuationApp({dropParent=false}={}){
-  const calls=[];const app=setup((url,options={})=>{
+function continuationApp({dropParent=false,rejectChunks=false}={}){
+  const calls=[],audioCalls=[];const app=setup((url,options={})=>{
     if(url.endsWith('/status'))return response({capabilities:{lecture_continuations:true},transcription_providers:{qwen:{configured:true},clova:{configured:true}}});
     if(url.endsWith('/lectures')&&options.method==='POST'){
       const body=JSON.parse(options.body),id=options.headers.get('X-Lecture-Id');calls.push({id,body});
       return response({id,title:body.title,language:body.language,asr_provider:body.asr_provider,created_at:'2026-01-01T00:00:00Z',
         segments:[],recording_available:false,recording_finalized:false,...(dropParent?{}:{continuation_of:body.continuation_of||null,continuations:[]})});
     }
-    if(url.endsWith('/chunks'))throw new Error('blocked old chunks must never automatically post');
+    if(url.endsWith('/chunks')){
+      const lectureId=url.split('/').at(-2);assert.equal(app.run(`isHeldCapture(${JSON.stringify(lectureId)})`),false);
+      audioCalls.push({lectureId,id:options.headers.get('X-Chunk-Id')});
+      if(rejectChunks)return response({detail:'합성 모델 처리 실패'},422);
+      return response({segments:[{id:webcrypto.randomUUID(),start:0,end:8,text:'새 수업 실제 전사'}],recording_available:true,recording_finalized:options.headers.get('X-Final-Chunk')==='true'});
+    }
     return response({});
-  });return {app,calls};
+  });return {app,calls,audioCalls};
 }
 async function seedContinuationParent(app){
   const parent=webcrypto.randomUUID();
@@ -6560,21 +6579,22 @@ async function seedContinuationParent(app){
   await app.run('updateStatus()');return parent;
 }
 
-test('continuation preserves an unfinished parent and blocked queue while capturing a separately linked child',async()=>{
-  const {app,calls}=continuationApp(),parent=await seedContinuationParent(app);
+test('continuation preserves an unfinished held parent while actually transcribing a separately linked child',async()=>{
+  const {app,calls,audioCalls}=continuationApp(),parent=await seedContinuationParent(app);
   const old=app.run('pending[0]'),oldRaw=app.run('JSON.stringify(current.segments)'),error=app.run('sendError');
   app.run(`liveSessions.get(${JSON.stringify(parent)}).createdAt=Date.now()+1000`);
   assert.equal(app.element('continue-recording').disabled,false);app.element('continue-recording').onclick();
   await until(()=>app.run('recording && !draft'));
   assert.equal(calls.length,1);assert.notEqual(calls[0].id,parent);assert.equal(calls[0].body.continuation_of,parent);
-  assert.equal(app.run('sendError'),error);assert.equal(app.run('pending[0]'),old);
+  assert.equal(app.run('sendError'),'');assert.equal(app.run(`liveSessions.get(${JSON.stringify(parent)}).heldError`),error);assert.equal(app.run('pending[0]'),old);
   assert.equal(app.run(`JSON.stringify(lectures.find(l=>l.id===${JSON.stringify(parent)}).segments)`),oldRaw);
   assert.equal(app.run(`lectures.find(l=>l.id===${JSON.stringify(parent)}).recording_finalized`),false);
   assert.ok(app.run(`captureSession.createdAt>liveSessions.get(${JSON.stringify(parent)}).createdAt`));
   const child=app.run('captureSession.id');app.microphone().callbacks.onChunk(chunk(0,8));
-  await until(()=>app.run('pending.length===2 && pending[1].durable'));
-  assert.equal(app.run('pending[1].captureId'),child);assert.equal(app.run('pending[1].sequence'),0);assert.equal(app.run('pending[0]'),old);
-  assert.equal(app.run('sendError'),error);assert.equal(app.element('pause-button').disabled,false);
+  await until(()=>audioCalls.length===1&&app.run('pending.length===1&&!sending'));
+  assert.equal(audioCalls[0].lectureId,child);assert.equal(app.run('pending[0]'),old);
+  assert.match(app.run('current.segments[0].text'),/새 수업 실제 전사/);
+  assert.equal(app.run('sendError'),'');assert.equal(app.element('pause-button').disabled,false);
   await app.run('pauseRecording()');await app.run('resumeRecording()');assert.equal(app.run('recording'),true);assert.equal(app.run('captureSession.id'),child);
   const stored=await app.run('liveQueue.getSession(user,captureSession.id)');assert.equal(stored.continuationOf,parent);
   assert.equal(app.run(`runtimeSessionFromStored(${JSON.stringify(stored)}).continuationOf`),parent);
@@ -6595,7 +6615,8 @@ test('a server that omits the requested continuation never receives child audio 
   app.element('continue-recording').onclick();await until(()=>calls.length===1&&!app.run('starting'));
   await until(()=>!app.run('captureSession.creating'));assert.equal(app.run('captureSession.lecture'),null);
   assert.equal(app.run('captureSession.continuationOf'),parent);assert.equal(app.run('recording'),true);
-  assert.equal(app.run('sendError'),'이전 CLOVA 처리 여부 불명확');
+  assert.match(app.run('sendError'),/원래 수업과의 연결/);
+  assert.equal(app.run(`liveSessions.get(${JSON.stringify(parent)}).heldError`),'이전 CLOVA 처리 여부 불명확');
   app.microphone().callbacks.onChunk(chunk(0,8));await until(()=>app.run('pending.length===2 && pending[1].durable'));
   assert.equal(app.run('pending[1].lectureReady'),false);assert.equal(calls.length,1);
 });
@@ -6727,4 +6748,156 @@ test('lecture assignment refuses foreign or unauthenticated sessions before send
     app.run(`captureSession.lecture=null;${change}`);
     await assert.rejects(app.run('assignLecture(captureSession)'));assert.equal(calls.length,0);
   }
+});
+
+async function seedHeldScenario(app,{count=1}={}){
+  const id=webcrypto.randomUUID();
+  await app.run(`(async()=>{
+    current={id:${JSON.stringify(id)},title:'이전 보관 수업',language:'ko',asr_provider:'clova',created_at:'2026-01-01T00:00:00Z',
+      recording_available:true,recording_finalized:false,segments:[]};lectures=[current];
+    await openLiveQueue();const session={id:current.id,owner:user,lecture:current,title:current.title,language:'ko',source:'microphone',asrProvider:'clova',
+      createdAt:Date.now()-1000,durable:true,cancelled:true,persistChain:Promise.resolve(),storeReady:Promise.resolve(),assignmentTimer:null,nextRuntimeSequence:${count}};
+    await liveQueue.createSession(storedSessionInput(session));await liveQueue.updateSession(user,session.id,{lectureCreated:true});
+    liveSessions.set(session.id,session);captureSession=session;
+    const blob=TestEncodeWav(new Float32Array(800).fill(.1));
+    for(let index=0;index<${count};index++){
+      const stored=await liveQueue.enqueueChunk(user,session.id,{id:crypto.randomUUID(),startSamples:index*800,durationSamples:800,overlapSamples:0,final:index===${count}-1,blob});
+      if(index===0){await liveQueue.markChunkInflight(user,stored.id);await liveQueue.markChunkBlocked(user,stored.id,'unknown_result');}
+      pending.push({id:stored.id,captureId:session.id,lectureId:session.id,owner:user,asrProvider:'clova',sequence:stored.sequence,
+        sessionCreatedAt:session.createdAt,startSeconds:index*.05,durationSeconds:.05,overlapSeconds:0,final:stored.final,
+        blob:null,durable:true,byteLength:stored.byteLength,lectureReady:true,blocked:index===0,inflight:false,persistPromise:Promise.resolve()});
+    }
+    sendError='이전 CLOVA 결과를 확인하지 못해 자동 재전송하지 않았어요.';renderCurrent();
+  })()`);
+  return id;
+}
+
+test('holding 403 previous chunks permits independent real transcription and another new lesson without deleting old audio',async()=>{
+  const {app,audioCalls}=continuationApp(),oldId=await seedHeldScenario(app,{count:403});
+  const queue=app.run('liveQueue'),before=[...queue.chunks.values()].map(row=>({...row}));
+  await app.run('prepareIndependentLesson()');
+  assert.equal(app.run('current'),null);assert.equal(app.run('pending.length'),403);assert.equal(app.run('activePendingCount()'),0);
+  assert.equal(queue.sessions.get(oldId).uploadHeld,true);assert.equal(audioCalls.length,0);assert.equal(app.run('sendError'),'');
+  assert.equal(app.element('new-note').disabled,false);assert.equal(app.element('record-button').disabled,false);
+  assert.equal(app.element('processing').hidden,true);assert.match(app.element('record-state').textContent,/보관 중/);
+  assert.equal(app.element('held-audio-list').dataset.signature,undefined);assert.doesNotMatch(JSON.stringify(app.element('held-audio-list').dataset),/token|bearer/i);
+  app.element('asr-provider').value='qwen';await app.run('startRecording()');const childId=app.run('captureSession.id');
+  app.microphone().callbacks.onChunk(chunk(0,1));await until(()=>audioCalls.length===1&&app.run('!sending'));
+  assert.equal(audioCalls[0].lectureId,childId);assert.match(app.run('current.segments[0].text'),/새 수업 실제 전사/);
+  app.microphone().tail=chunk(1,.05,0,true);await app.run('stopRecording()');await until(()=>audioCalls.length===2&&app.run('!sending'));
+  assert.equal(app.run('pending.length'),403);assert.equal(queue.chunks.size,403);
+  const storedAfter=[...queue.chunks.values()];
+  assert.ok(storedAfter.every(row=>row.uploadHeld===true),'every retained chunk carries the legacy-reader hold guard');
+  assert.deepEqual(storedAfter.map(({uploadHeld,...row})=>row),before,'only the hold guard changes; all 403 UUIDs, order, states, attempts and original Blob objects remain unchanged');
+  for(const row of before)assert.deepEqual(new Uint8Array(await queue.chunks.get(row.id).blob.arrayBuffer()),new Uint8Array(await row.blob.arrayBuffer()));
+  assert.equal(app.element('new-note').disabled,false);await app.run('prepareIndependentLesson()');
+  assert.equal(app.element('record-button').disabled,false);assert.equal(app.run('pending.length'),403);
+  assert.equal(app.element('logout').disabled,true,'retained private work keeps its owner guard');
+  app.run("token='';showLogin(false)");assert.equal(app.element('held-audio-list').children.length,0);
+});
+
+test('explicit held CLOVA recovery discards stale retry approval and queries unknown results without resubmitting audio',async()=>{
+  let uploads=0,lookups=0;const app=setup((url,options={})=>{
+    if(url.endsWith('/result')){lookups++;return response({state:'unknown'});}
+    if(url.endsWith('/chunks')){uploads++;return response({segments:[]});}
+    return response({});
+  });const id=await seedHeldScenario(app);const original=app.run('pending[0]');
+  app.run('manualRetryApprovedIds.add(pending[0].id)');await app.run('prepareIndependentLesson()');
+  assert.equal(app.run('manualRetryApprovedIds.size'),0);
+  app.run('manualRetryApprovedIds.add(pending[0].id)');await app.run(`restoreHeldAudio(${JSON.stringify(id)})`);
+  await until(()=>app.run('!!sendError&&!sending'));
+  assert.equal(uploads,0);assert.equal(lookups,1);assert.equal(app.run('pending[0]'),original);
+  assert.equal(app.run('manualRetryApprovedIds.size'),0);assert.equal(app.run('liveQueue.chunks.size'),1);
+  assert.equal(app.run('liveQueue.chunks.values().next().value.uploadHeld'),undefined,'explicit restore removes only the hold guard');
+  assert.match(app.element('retry').textContent,/위험 이해.*수동 재전송/);
+});
+
+test('fresh durable holds precede stale blocked state and manual approvals while a different capture continues',async()=>{
+  const {app,audioCalls}=continuationApp(),oldId=await seedHeldScenario(app);await app.run('prepareIndependentLesson()');
+  const original={...app.run('liveQueue.chunks.values().next().value')};
+  app.element('asr-provider').value='qwen';await app.run('startRecording()');
+  app.run(`liveSessions.get(${JSON.stringify(oldId)}).uploadHeld=false;manualRetryApprovedIds.add(pending[0].id);sendError=''`);
+  app.microphone().callbacks.onChunk(chunk(0,1));await until(()=>audioCalls.length===1&&app.run('!sending'));
+  assert.equal(app.run(`isHeldCapture(${JSON.stringify(oldId)})`),true);assert.equal(app.run('manualRetryApprovedIds.size'),0);
+  assert.deepEqual({...app.run('liveQueue.chunks.values().next().value')},original);assert.equal(app.run('pending.length'),1);
+  assert.equal(app.run('recording'),true);assert.equal(app.run('sendError'),'');
+});
+
+test('holding stops and persists a final microphone tail without sending it before the durable hold',async()=>{
+  const {app,audioCalls}=continuationApp();await app.run('startRecording()');
+  app.run("sendError='이전 오류'");app.microphone().callbacks.onChunk(chunk(0,1));
+  await until(()=>app.run('pending[0]?.durable'));app.microphone().tail=chunk(1,.1,0,true);
+  await app.run('prepareIndependentLesson()');
+  assert.equal(app.microphone().stopCalls,1);assert.equal(app.run('capture'),null);assert.equal(app.run('current'),null);
+  assert.equal(app.run('pending.length'),2);assert.equal(app.run('pending[1].final'),true);
+  assert.equal(audioCalls.length,0);assert.equal(app.run('heldAudioSessions().length'),1);
+});
+
+test('RAM-only or unverified other-tab capture cannot be abandoned to start a new lesson',async()=>{
+  const {app}=continuationApp();await app.run('startRecording()');
+  const queue=app.run('liveQueue');queue.enqueueChunk=async()=>{throw Object.assign(new Error('synthetic quota'),{code:'live_queue_quota'});};
+  app.microphone().callbacks.onChunk(chunk(0,1));
+  for(const delay of [500,1000,2000]){await until(()=>[...app.timeouts.values()].some(timer=>timer.delay===delay));await app.runTimeout(delay);}
+  await until(()=>app.run('pending.length===1&&!pending[0].durable&&!!sendError'));
+  const retained=app.run('pending[0].blob'),id=app.run('captureSession.id');await app.run('prepareIndependentLesson()');
+  assert.equal(app.run('pending[0].blob'),retained);assert.equal(app.run('current.id'),id);assert.equal(app.run('isHeldCapture(captureSession.id)'),false);
+  assert.match(app.element('notice').textContent,/메모리에만|탭을 닫거나 새로고침하지/);assert.equal(app.element('record-button').disabled,true);
+  assert.ok(app.run('captureSession.captureLease'));assert.equal(app.coordination.releasedCaptureLeases,0);
+  const other=continuationApp();await seedHeldScenario(other.app);other.app.coordination.acquireLiveCapture=async()=>({supported:true,acquired:false});
+  await other.app.run('prepareIndependentLesson()');assert.equal(other.app.run('pending.length'),1);assert.equal(other.app.run('heldAudioSessions().length'),0);
+  assert.match(other.app.element('notice').textContent,/다른 탭/);
+});
+
+test('holding an unregistered durable draft preserves its creation identity while freeing a new assignment slot',async()=>{
+  const {app,calls}=continuationApp();const id=await seedHeldScenario(app);
+  app.run(`const previous=liveSessions.get(${JSON.stringify(id)});previous.lecture=null;draft=previous;current=null;lectures=[];`);
+  const snapshot=app.run('JSON.stringify(storedSessionInput(draft))');await app.run('prepareIndependentLesson()');
+  assert.equal(app.run('draft'),null);assert.equal(app.run('pending.length'),1);assert.equal(calls.length,0);
+  assert.equal(app.run(`liveSessions.get(${JSON.stringify(id)}).id`),JSON.parse(snapshot).id);
+  app.element('asr-provider').value='qwen';await app.run('startRecording()');
+  assert.equal(calls.length,1);assert.notEqual(calls[0].id,id);assert.equal(app.run(`liveSessions.get(${JSON.stringify(id)}).uploadHeld`),true);
+});
+
+test('late hold confirmation does not reset another account or server workspace',async()=>{
+  for(const change of ["user='user-beta';token='beta-token'","apiUrl='https://different.example'"]){
+    const {app}=continuationApp();await seedHeldScenario(app);const wait=deferred();let entered=false;
+    const queue=app.run('liveQueue'),original=queue.setSessionUploadHeld.bind(queue);
+    queue.setSessionUploadHeld=async(...args)=>{entered=true;await wait.promise;return original(...args);};
+    const operation=app.run('prepareIndependentLesson()');await until(()=>entered);
+    app.run(`${change};current={id:'new-workspace',segments:[]}`);wait.resolve();await operation;
+    assert.equal(app.run('current.id'),'new-workspace');assert.equal(app.run('pending.length'),1);
+    assert.equal(app.element('held-audio-list').dataset.signature,undefined);
+  }
+});
+
+test('fresh held-session reads cannot send old audio with a token or origin changed during IndexedDB wait',async()=>{
+  for(const change of ["token='replacement-token'","apiUrl='https://different.example'","user='user-beta';token='beta-token'"]){
+    const {app,audioCalls}=continuationApp();await app.run('startRecording()');
+    const queue=app.run('liveQueue'),original=queue.getSession.bind(queue),wait=deferred();let entered=false;
+    queue.getSession=async(...args)=>{entered=true;await wait.promise;return original(...args);};
+    app.microphone().callbacks.onChunk(chunk(0,1));await until(()=>entered);
+    app.run(change);wait.resolve();await until(()=>app.run('!sending'));
+    assert.equal(audioCalls.length,0);assert.equal(app.run('pending.length'),1);assert.equal(queue.chunks.size,1);
+  }
+});
+
+test('failed WAV download and explicit skip target the active lesson behind a held physical queue head',async()=>{
+  const {app,audioCalls}=continuationApp({rejectChunks:true});await seedHeldScenario(app);
+  await app.run('prepareIndependentLesson()');
+  const old=app.run('pending[0]'),queue=app.run('liveQueue'),storedOld={...queue.chunks.get(old.id)};
+  app.element('asr-provider').value='qwen';await app.run('startRecording()');
+  const activeId=app.run('captureSession.id');app.microphone().callbacks.onChunk(chunk(0,1));
+  await until(()=>audioCalls.length===1&&app.run('!!sendError&&!sending'));
+  const failed=app.run('nextPendingChunk()');app.microphone().callbacks.onChunk(chunk(1,1));
+  await until(()=>app.run('pending.length===3&&pending.every(item=>item.durable)'));
+  await app.run('saveFailedChunk()');
+  assert.equal(failed.downloadRequested,true);assert.equal(old.downloadRequested,undefined);
+  const downloaded=app.objectUrlBlob(app.created('a').href);
+  assert.deepEqual(new Uint8Array(await downloaded.arrayBuffer()),new Uint8Array(await queue.chunks.get(failed.id).blob.arrayBuffer()));
+  assert.equal(app.run('pending.length'),3,'download does not acknowledge either lecture');
+  await app.run('skipFailedChunk()');await until(()=>audioCalls.length===2&&app.run('!!sendError&&!sending'));
+  assert.equal(app.run('pending[0]'),old);assert.equal(app.run('pending.length'),2);
+  assert.deepEqual(queue.chunks.get(old.id),storedOld,'the held audio and all original processing metadata remain intact');
+  assert.equal(queue.chunks.has(failed.id),false);assert.ok(audioCalls.every(call=>call.lectureId===activeId));
+  assert.equal(app.run('recording'),true);assert.equal(app.microphone().stopCalls,undefined);
 });

@@ -30,6 +30,8 @@ let authSessionExpiresAt = 0, authSessionExpiryTimer = null;
 let authRestoreSequence = 0, authRestoreController = null, authRestorePromise = null;
 let capture = null, recording = false, paused = false, starting = false, pausing = false, resuming = false, stopping = false, sending = false, authenticating = false, loggingOut = false;
 let pending = [], sendError = '', sampleSeconds = 0, timer = null, requestGeneration = 0;
+let holdingAudio = false, holdAudioSequence = 0;
+let heldAudioRenderSignature = '';
 let draft = null, captureSession = null, pausePromise = null, resumePromise = null, stopPromise = null;
 let elapsedActiveMs = 0, elapsedStartedAt = 0;
 let noticeTimer, statusTimer, statusSequence = 0, retryTimer = null, retryAttempt = 0, retryMessage = '';
@@ -287,7 +289,7 @@ function blockUploadUntilStored(chunk) {
 }
 
 function clearRecoveredStorageBlock(session) {
-  const first = pending[0];
+  const first = nextPendingChunk();
   if (first?.captureId !== session.id || !first.storageBlocked || !first.durable) return;
   first.storageBlocked = false;
   if (sendError === first.storageBlockMessage) sendError = '';
@@ -385,6 +387,9 @@ function recoverSessionStorage(session) {
     if (!queue) throw new Error('브라우저의 음성 임시 저장소를 아직 열지 못했습니다.');
     if (!storageSessionIsCurrent(session,server)) return false;
     const storedSession = await queue.createSession(storedSessionInput(session));
+    if (session.uploadHeld && storedSession.uploadHeld !== true) {
+      throw new Error('기존 음성의 전송 보류 표시를 확인하지 못했습니다. 보관·새 수업 버튼으로 다시 확인해 주세요.');
+    }
     if (!storageSessionIsCurrent(session,server)) return false;
     session.durable = true;
     session.durableNextSequence = Math.max(session.durableNextSequence || 0,storedSession.nextSequence);
@@ -505,7 +510,12 @@ async function releaseSessionCaptureLease(session) {
 }
 
 function hasVolatilePendingAudio(session) {
-  return !!session && pending.some(chunk => chunk.captureId === session.id && !chunk.durable);
+  if (!session) return false;
+  if (pending.some(chunk => chunk.captureId === session.id && !chunk.durable)) return true;
+  const snapshot=session.latestSnapshot,stored=localPcmSnapshots.get(session.id);
+  return !!snapshot && !session.finalPersisted && snapshot.sequence >= (session.durableNextSequence || 0)
+    && snapshot.startSamples+snapshot.durationSamples > Math.max(stored ? stored.startSamples+stored.durationSamples : 0,
+      ...pending.filter(chunk=>chunk.captureId===session.id).map(chunk=>Math.round((chunk.startSeconds+chunk.durationSeconds)*16000)));
 }
 
 async function releaseStoppedSessionCaptureLeaseWhenSafe(session) {
@@ -584,6 +594,7 @@ async function refreshLiveQueueStats() {
 function storedSessionInput(session) {
   return {id:session.id,owner:session.owner,title:session.title,language:session.language,
     source:session.source,asrProvider:session.asrProvider,createdAt:session.createdAt,
+    ...(session.uploadHeld ? {uploadHeld:true} : {}),
     ...(session.continuationOf ? {continuationOf:session.continuationOf} : {})};
 }
 
@@ -833,6 +844,8 @@ function runtimeSessionFromStored(stored) {
     source:stored.source,
     asrProvider:stored.asrProvider,
     continuationOf:stored.continuationOf || null,
+    uploadHeld:stored.uploadHeld === true,
+    heldDurable:stored.uploadHeld === true,
     continuationVerified:!!stored.continuationOf && !!lecture,
     continuationVerificationOrigin:stored.continuationOf && lecture ? apiUrl : '',
     cancelled:true,
@@ -883,6 +896,10 @@ async function performDurableLiveAudioRecovery(owner) {
       session = runtimeSessionFromStored(stored);
       liveSessions.set(stored.id,session);
     } else {
+      // Never let a stale ordinary create/recovery undo an in-memory hold that
+      // has not yet been made durable; only the explicit restore action may.
+      session.uploadHeld = session.uploadHeld === true || stored.uploadHeld === true;
+      if (stored.uploadHeld === true) session.heldDurable = true;
       const candidate = lectures.find(item => item.id === stored.id) || null;
       session.lecture = lectureForStoredProvider(session,candidate);
       session.providerMismatch = !!candidate && !session.lecture && !continuationNeedsVerification(session,candidate);
@@ -964,6 +981,7 @@ async function performDurableLiveAudioRecovery(owner) {
   for (const [id,session] of byId) {
     const sessionChunks = pending.filter(chunk => chunk.captureId === id);
     const snapshot = localPcmSnapshots.get(id);
+    if (session.uploadHeld) continue;
     const stillCapturedHere = session === captureSession && !!capture
       && (recording || paused || starting || pausing || resuming || inputUnavailable);
     const recoveredActiveSession = session.recovered && !stillCapturedHere
@@ -1005,7 +1023,8 @@ async function performDurableLiveAudioRecovery(owner) {
       void ensureLectureAssigned(session);
     }
   }
-  const blocked = pending[0]?.owner === owner && pending[0].blocked ? pending[0] : null;
+  const firstActive = nextPendingChunk();
+  const blocked = firstActive?.owner === owner && firstActive.blocked ? firstActive : null;
   if (blocked?.recoveryOnly) {
     sendError = '';
     retryMessage = '기기에 남아 있는 음성의 서버 저장 결과를 확인합니다.';
@@ -1650,6 +1669,7 @@ function showLogin(clear = true) {
   }
   $('auth-local-audio-open').hidden = !mayExportLocalAudio();
   $('auth-local-audio-open').disabled = localAudioExportBusy;
+  heldAudioRenderSignature='';$('held-audio-list').replaceChildren();$('held-audio-state').textContent='';$('held-audio-panel').hidden=true;
 }
 $('auth-toggle').onclick = () => setActivation(passwordReset ? false : !activation);
 function openConnectionDialog() {
@@ -2117,19 +2137,22 @@ async function recoverFileImport() {
   void runFileImport(recovered, generation);
   await refreshImportLecture(active, true, generation);
 }
+function isHeldCapture(id) { return liveSessions.get(id)?.uploadHeld === true; }
+function nextPendingChunk() { return pending.find(chunk => !isHeldCapture(chunk.captureId)) || null; }
+function activePendingCount() { return pending.reduce((count,chunk)=>count+(isHeldCapture(chunk.captureId)?0:1),0); }
 function queuedCount() { return pending.length; }
 function clovaManualRetryRequired() {
   return !!sendError && (draft?.asrProvider === 'clova'
-    || pending.some(chunk => chunk.asrProvider === 'clova'));
+    || pending.some(chunk => !isHeldCapture(chunk.captureId) && chunk.asrProvider === 'clova'));
 }
 function ownerScheduledCorrectionPending(inFlightOnly = false) {
   return [...scheduledCorrections.values()].some(scheduled =>
     scheduled.owner === user && (scheduled.status === 'starting'
       || (!inFlightOnly && scheduled.status === 'scheduled')));
 }
-function isBusy() { return authenticating || loggingOut || recording || paused || starting || pausing || resuming || stopping || !!draft || pending.length > 0 || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture || ownerScheduledCorrectionPending(true); }
+function isBusy() { return authenticating || loggingOut || holdingAudio || recording || paused || starting || pausing || resuming || stopping || !!draft || activePendingCount() > 0 || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture || ownerScheduledCorrectionPending(true); }
 function hasOwnerLockedWork() {
-  return recording || paused || starting || pausing || resuming || stopping || !!capture
+  return holdingAudio || recording || paused || starting || pausing || resuming || stopping || !!capture
     || !!draft || pending.length > 0 || sending || recordingFinalizePending || ownerScheduledCorrectionPending();
 }
 function retainScheduledCorrectionsForLogin() {
@@ -2195,7 +2218,7 @@ function historyNavigationBusy() {
   // Reading another saved lecture does not consume or modify queued audio.
   // Keep transitions and unassigned capture scoped, but do not let a blocked
   // old upload make saved transcripts and server recordings inaccessible.
-  return authenticating || loggingOut || starting || pausing || resuming || stopping || !!draft
+  return authenticating || loggingOut || holdingAudio || starting || pausing || resuming || stopping || !!draft
     || deletingLecture || recordingFinalizePending || importStarting || importCancelling
     || (!!capture && !stableLiveCapture());
 }
@@ -3710,7 +3733,7 @@ function presenceActivity() {
   if (document.hidden) return 'away';
   if (recording || paused || starting || pausing || resuming) return 'recording';
   if (importStarting || importJob?.status === 'uploading') return 'uploading';
-  if (sending || pending.length || ['queued','processing'].includes(importJob?.status)) return 'transcribing';
+  if (sending || activePendingCount() || ['queued','processing'].includes(importJob?.status)) return 'transcribing';
   if (correctionStarting || ['queued','processing'].includes(correction?.status)) return 'correcting';
   if (Date.now() - lastPresenceInteraction >= PRESENCE_IDLE_MS) return 'idle';
   return 'viewing';
@@ -4705,6 +4728,149 @@ function resetNewNote({ focus = false } = {}) {
   renderCurrent(); renderHistory();
   if (focus) $('lecture-title').focus();
 }
+function holdAudioBlockReason() {
+  if (!user || !token || authenticating || loggingOut) return '같은 계정으로 로그인한 뒤 이전 음성을 보관할 수 있어요.';
+  if (holdingAudio || starting || pausing || resuming || stopping || liveQueueRecoveryPromise) return '녹음 또는 기기 저장 전환이 끝날 때까지 기다려 주세요.';
+  if (sending) return '이미 보낸 음성의 응답을 기다리고 있어요. 요청이 끝나거나 시간 초과된 뒤 보관할 수 있습니다.';
+  if (importIsActive() || importStarting || importCancelling || deletingLecture || recordingDownloadPending || recordingFinalizePending) return '진행 중인 파일·저장 작업을 먼저 마쳐 주세요.';
+  if (pending.some(chunk=>chunk.owner!==user)) return '다른 계정의 음성을 변경하지 않았어요. 원래 계정에서 확인해 주세요.';
+  return '';
+}
+function newLessonBlockReason() {
+  return capture || recording || paused || inputUnavailable ? '현재 녹음은 종료하거나 “기존 음성 보관 · 새 수업”을 사용하세요.' : holdAudioBlockReason();
+}
+function heldAudioSessions() {
+  return [...liveSessions.values()].filter(session=>session.owner===user && session.uploadHeld);
+}
+function heldRestoreBlockReason() {
+  return holdAudioBlockReason() || (capture || recording || paused || inputUnavailable || draft || activePendingCount()
+    ? '현재 녹음과 전송을 마친 뒤 보관한 수업을 복구할 수 있어요. 지금도 원문 보기와 음성 다운로드는 가능합니다.' : '');
+}
+function renderHeldAudio() {
+  const rows=user && token && !$('workspace').hidden ? heldAudioSessions() : [],target=$('held-audio-list');
+  $('held-audio-panel').hidden=!rows.length;
+  $('held-audio-state').textContent=rows.length ? `${rows.length}개 수업은 새 수업과 별도로 보관하며 자동 전송하지 않습니다. `
+    + (heldRestoreBlockReason() || '전송 복구는 수업별로 직접 선택하세요. CLOVA의 처리 여부가 불명확하면 먼저 서버 결과만 확인합니다.') : '';
+  const signature=JSON.stringify([user,token,apiUrl,!!heldRestoreBlockReason(),historyNavigationBusy(),rows.map(session=>[session.id,session.title,session.heldError,
+    session.heldDurable,!!session.lecture,pending.filter(chunk=>chunk.captureId===session.id).length])]);
+  if(heldAudioRenderSignature===signature)return;
+  heldAudioRenderSignature=signature;target.replaceChildren();
+  const owner=user,sessionToken=token,server=apiUrl;
+  const sameAccount=()=>owner===user && sessionToken===token && server===apiUrl;
+  for(const session of rows.slice(0,100)){
+    const card=document.createElement('article');card.className='held-audio-card';card.dataset.captureId=session.id;
+    const title=document.createElement('strong');title.textContent=session.title || '보관한 수업';
+    const detail=document.createElement('p');detail.textContent=`${pending.filter(chunk=>chunk.captureId===session.id).length}개 음성 조각 · `
+      + (session.lecture ? '서버 수업 연결됨' : '서버 미등록 · 기기 원본 보관') + (session.heldDurable ? ' · 기기 저장 확인' : ' · 저장 확인 필요, 탭을 닫지 마세요.');
+    const reason=document.createElement('p');reason.textContent=session.heldError || '이 수업의 음성은 직접 복구하기 전까지 전송하지 않습니다.';
+    const actions=document.createElement('div');actions.className='study-actions';
+    const view=document.createElement('button');view.type='button';view.textContent='수업 보기';view.disabled=!session.lecture || historyNavigationBusy();
+    view.onclick=()=>{if(sameAccount()&&session.lecture)void selectLecture({id:session.id});};
+    const download=document.createElement('button');download.type='button';download.textContent='보관 음성 다운로드';
+    download.onclick=()=>{if(sameAccount())void prepareLocalAudioExport();};
+    const restore=document.createElement('button');restore.type='button';restore.textContent='선택한 수업 전송 복구';restore.dataset.action='restore-held';
+    restore.disabled=!!heldRestoreBlockReason();restore.onclick=()=>{if(sameAccount())void restoreHeldAudio(session.id);};
+    actions.append(view,download,restore);card.append(title,detail,reason,actions);target.append(card);
+  }
+}
+async function holdPreviousAudio() {
+  const blocked=holdAudioBlockReason();if(blocked){notice(blocked);return false;}
+  const owner=user,sessionToken=token,server=apiUrl,generation=requestGeneration,sequence=++holdAudioSequence;
+  const isCurrent=()=>owner===user&&sessionToken===token&&server===apiUrl&&generation===requestGeneration&&sequence===holdAudioSequence;
+  const previousError=sendError,previousFirst=nextPendingChunk();
+  holdingAudio=true;updateControls();
+  let lease=null;
+  try{
+    if(capture)await stopRecording('이전 녹음을 마지막 음성까지 종료하고 보관합니다.');
+    if(!isCurrent())return false;
+    const targets=[...liveSessions.values()].filter(session=>session.owner===owner && (!session.uploadHeld || !session.heldDurable)
+      && (pending.some(chunk=>chunk.captureId===session.id) || localPcmSnapshots.has(session.id) || session.latestSnapshot || draft===session));
+    if(pending.some(chunk=>chunk.owner===owner&&!liveSessions.has(chunk.captureId)))throw new Error('음성의 원래 수업 정보를 확인하지 못했습니다. 원본을 내려받고 저장 상태를 확인해 주세요.');
+    for(const session of targets){
+      await session.persistChain?.catch(()=>{});
+      if(!isCurrent())return false;
+      if(session.storageFailed || hasVolatilePendingAudio(session))await recoverSessionStorage(session);
+      if(!isCurrent())return false;
+      if(hasVolatilePendingAudio(session))throw new Error('음성이 아직 이 탭 메모리에만 남아 있어 새 녹음을 열지 않았어요. 탭을 닫거나 새로고침하지 말고, 기기 저장 공간을 확보한 뒤 임시 저장을 다시 시도하거나 음성을 내려받아 주세요.');
+    }
+    if(targets.length){
+      lease=await liveCoordination.acquireLiveCapture(owner);
+      if(!isCurrent())return false;
+      noteCoordinationSupport(lease.supported);
+      if(!lease.acquired || !lease.supported)throw new Error('다른 탭의 녹음 상태를 안전하게 확인하지 못해 전송 보류를 바꾸지 않았어요. 기존 수업 탭에서 녹음을 종료한 뒤 다시 시도해 주세요.');
+      const result=await liveCoordination.runUploader(owner,async()=>{
+        const queue=await openLiveQueue();
+        if(!isCurrent())return false;
+        if(!queue || typeof queue.setSessionUploadHeld!=='function')throw new Error('기기 저장소에 전송 보류를 기록할 수 없습니다. 원본은 그대로 보관합니다.');
+        for(const session of targets){
+          if(!isCurrent())return false;
+          const stored=await queue.getSession(owner,session.id);
+          if(!stored)await queue.createSession(storedSessionInput(session));
+          if(!isCurrent())return false;
+          await queue.setSessionUploadHeld(owner,session.id,true);
+          session.uploadHeld=true;session.heldDurable=true;
+          for(const chunk of pending)if(chunk.captureId===session.id)manualRetryApprovedIds.delete(chunk.id);
+          session.heldError=previousFirst?.captureId===session.id && previousError ? previousError : '새 수업을 위해 이전 음성을 전송 보류했습니다.';
+          if(session.assignmentTimer!==null)clearTimeout(session.assignmentTimer);session.assignmentTimer=null;
+          if(draft===session)draft=null;
+        }
+        return isCurrent();
+      });
+      if(!result.value || !isCurrent())return false;
+    }
+    clearUploadRetry();sendError='';
+    if(captureSession?.uploadHeld)captureSession=null;
+    return true;
+  }catch(error){if(isCurrent())notice(errorText(error));return false;}
+  finally{
+    if(lease?.acquired)await lease.release?.().catch(()=>{});
+    if(sequence===holdAudioSequence){holdingAudio=false;updateControls();}
+  }
+}
+async function prepareIndependentLesson() {
+  if(expireActiveAuthSession())return;
+  if(await holdPreviousAudio()){
+    resetNewNote({focus:true});
+    notice('기존 음성은 전송 보류 목록에 보관했습니다. 새 수업 이름·인식 방식을 고르고 받아쓰기 시작을 눌러 주세요.');
+  }
+}
+async function restoreHeldAudio(captureId) {
+  if(expireActiveAuthSession())return;
+  const reason=heldRestoreBlockReason();if(reason){notice(reason);return;}
+  const session=liveSessions.get(captureId);
+  if(!session || session.owner!==user || !session.uploadHeld)return;
+  const owner=user,sessionToken=token,server=apiUrl,generation=requestGeneration,sequence=++holdAudioSequence;
+  const isCurrent=()=>owner===user&&sessionToken===token&&server===apiUrl&&generation===requestGeneration&&sequence===holdAudioSequence;
+  let lease=null;holdingAudio=true;updateControls();
+  try{
+    lease=await liveCoordination.acquireLiveCapture(owner);
+    if(!isCurrent())return;
+    if(!lease.acquired || !lease.supported)throw new Error('다른 탭의 녹음이 끝난 뒤 이 수업을 복구해 주세요.');
+    const result=await liveCoordination.runUploader(owner,async()=>{
+      const queue=await openLiveQueue();if(!isCurrent())return false;
+      if(!queue)throw new Error('기기 저장소를 확인하지 못해 보관을 유지합니다.');
+      await queue.setSessionUploadHeld(owner,captureId,false);
+      if(!isCurrent())return false;
+      session.uploadHeld=false;session.heldDurable=false;return true;
+    });
+    if(!result.value || !isCurrent())return;
+    clearUploadRetry();sendError='';
+    for(const chunk of pending)if(chunk.captureId===captureId)manualRetryApprovedIds.delete(chunk.id);
+    const first=nextPendingChunk();
+    if(first?.captureId===captureId && first.blocked){
+      if(first.asrProvider==='clova'){first.recoveryOnly=true;first.resultPolls=0;first.resultPollDeadline=0;}
+      else sendError=session.heldError || '보관한 음성에 이전 오류가 있어요. 안내를 확인하고 다시 전송을 선택해 주세요.';
+    }
+    if(localPcmSnapshots.has(captureId))recoveryFinalizationRequired.add(captureId);
+    if(!session.lecture)draft=session;
+    notice('선택한 수업의 전송 복구를 준비합니다. 처리 여부가 불명확한 CLOVA 음성은 자동으로 다시 보내지 않습니다.');
+  }catch(error){if(isCurrent())notice(errorText(error));}
+  finally{
+    if(lease?.acquired)await lease.release?.().catch(()=>{});
+    if(sequence===holdAudioSequence){holdingAudio=false;updateControls();}
+    if(isCurrent()&&!session.uploadHeld){if(!session.lecture)void ensureLectureAssigned(session);if(!sendError)void drain();}
+  }
+}
 function renderImportStatus() {
   const panel = $('import-status');
   const state = importJob?.status;
@@ -4885,7 +5051,11 @@ $('local-audio-close').onclick = clearLocalAudioExports;
 $('local-audio-dialog').onclose = () => { if (!$('local-audio-dialog').open) clearLocalAudioExports(); };
 
 function updateControls() {
-  const busy = isBusy(), queued = queuedCount(), system = selectedCaptureSource() === 'system', activeImport = importIsActive(); $('new-note').disabled = busy; $('logout').disabled = busy;
+  const busy = isBusy(), queued = queuedCount(), activeQueued=activePendingCount(), system = selectedCaptureSource() === 'system', activeImport = importIsActive();
+  $('new-note').disabled = !!newLessonBlockReason(); $('logout').disabled = busy || pending.length>0
+    || [...liveSessions.values()].some(session=>session.owner===user && hasVolatilePendingAudio(session));
+  $('hold-new-note').disabled = !!holdAudioBlockReason();
+  $('hold-new-note').textContent = holdingAudio ? '기존 음성을 안전하게 보관 중…' : '기존 음성 보관 · 새 수업';
   const inputState = inputCaptureDescription().state;
   const inputBlocked = ['unavailable','reconnect-needed'].includes(inputState);
   const provider = captureSession?.asrProvider || displayedAsrProvider();
@@ -4935,10 +5105,10 @@ function updateControls() {
   $('asr-provider-clova').disabled = !transcriptionProviders.clova.configured;
   $('asr-provider').disabled = busy || !!current || system;
   updateProviderGuidance();
-  $('record-button').disabled = authenticating || loggingOut || captureTransition || activeImport || importStarting || recordingFinalizePending || (!liveSession && (!!draft || pending.length > 0 || sending));
+  $('record-button').disabled = authenticating || loggingOut || holdingAudio || captureTransition || activeImport || importStarting || recordingFinalizePending || (!liveSession && (!!draft || activePendingCount() > 0 || sending));
   $('record-button').classList.toggle('stop', liveSession);
   $('record-button').textContent = stopping ? '마지막 음성 정리 중…' : liveSession ? '■ 받아쓰기 종료' : starting ? (system ? '공유 화면 준비 중…' : '마이크 준비 중…') : activeImport || importStarting ? '파일 변환이 끝난 뒤 시작' : current ? '＋ 새 수업 시작' : system ? '● 화면 소리 받아쓰기' : '● 받아쓰기 시작';
-  $('pause-button').disabled = authenticating || loggingOut || pausing || resuming || stopping
+  $('pause-button').disabled = authenticating || loggingOut || holdingAudio || pausing || resuming || stopping
     || (!recording && !paused && !inputUnavailable);
   $('pause-button').classList.toggle('resume', paused || inputBlocked);
   $('pause-button').setAttribute('aria-pressed',String(paused));
@@ -4950,7 +5120,8 @@ function updateControls() {
     : pausing ? '마지막 음성까지 저장하고 일시정지해요' : resuming ? '같은 수업의 오디오를 다시 연결하고 있어요'
       : paused ? '받아쓰기를 일시정지했어요' : recording ? (system ? '공유한 화면의 소리를 듣고 있어요' : '수업을 듣고 있어요')
         : starting ? (system ? '공유할 화면과 오디오를 준비하고 있어요' : '마이크와 노트를 준비하고 있어요')
-          : queued ? (sendError ? '녹음 중 아님 · 음성 전송 보류' : '남은 음성을 받아쓰고 있어요') : current ? '수업 기록을 저장했어요' : '시작할 준비가 됐어요';
+          : activeQueued ? (sendError ? '녹음 중 아님 · 음성 전송 보류' : '남은 음성을 받아쓰고 있어요')
+            : queued ? '기존 음성 보관 중 · 새 수업 시작 가능' : current ? '수업 기록을 저장했어요' : '시작할 준비가 됐어요';
   $('record-hint').textContent = inputBlocked ? (inputUnavailableMessage || '이미 받은 음성은 보관 중입니다. 입력 복구 버튼으로 같은 수업을 이어갈 수 있어요.')
     : paused ? '정지한 동안의 소리는 녹음하거나 전송하지 않으며, 재개하면 같은 수업에 이어집니다.'
       : recording ? (system ? '선택한 탭이나 화면을 재생해 주세요. 화면 영상은 전송하지 않아요.' : clova ? '마이크 음성을 이 서버를 거쳐 운영자가 설정한 NAVER Cloud CLOVA Speech로 보내 받아씁니다.' : '서버가 늦어도 음성을 이 기기에 보관하며 녹음을 계속합니다.')
@@ -4967,7 +5138,7 @@ function updateControls() {
         : recoveryFinalizationRequired.size ? `${recoveryFinalizationRequired.size}개 수업 · 마지막 문장 마무리 확인 필요`
         : captureWarning ? '마지막 오디오 일부 누락 가능 · 받은 내용만 저장됨' : recordingStorageLabel(current);
   if (volatileDetail) $('save-state').textContent += ` · ${volatileDetail}`;
-  $('processing').hidden = !recording && !starting && !pausing && !resuming && !inputUnavailable && !queued && !sending;
+  $('processing').hidden = !recording && !starting && !pausing && !resuming && !inputUnavailable && !activeQueued && !sending;
   $('processing-text').textContent = inputBlocked
     ? '새 음성을 받지 못하고 있습니다. 입력 복구 버튼으로 마이크를 확인해 주세요. 이미 받은 음성은 내려받을 수 있습니다.'
     : sendError ? '서버 전송이 보류됐습니다. 마이크 수신 상태는 위 안내를 확인하고, 기기에 남은 음성은 내려받을 수 있습니다.'
@@ -4984,13 +5155,14 @@ function updateControls() {
       ? ' 메모리에 남은 음성이 많이 쌓였습니다. 계속 녹음하면 탭이 종료될 위험이 있으니 직접 일시정지하고 공간을 확보하거나 실패 WAV를 내려받아 주세요.' : '') : '';
   $('queue-message').textContent = [sendError ? `${sendError} 이미 받은 음성은 기기에 보관되어 있습니다.` : '',recoveryWarning,liveQueueWarning,ramWarning,liveCoordinationWarning,volatilePendingWarning].filter(Boolean).join(' ');
   $('retry').hidden = !sendError;
-  $('retry').disabled = !sendError || sending || starting || pausing || resuming || stopping;
-  $('retry').textContent = pending[0]?.storageBlocked ? '임시 저장 다시 시도'
-    : sendError && pending[0]?.asrProvider === 'clova' ? '위험 이해 · 수동 재전송' : '다시 전송';
-  $('save-failed').hidden = !sendError || !pending.length;
-  $('save-failed').disabled = sending || starting || pausing || resuming || stopping || !pending.length;
-  $('skip-failed').hidden = !sendError || !pending[0]?.downloadRequested;
-  $('skip-failed').disabled = sending || starting || pausing || resuming || stopping || !pending[0]?.downloadRequested;
+  const failedChunk = nextPendingChunk();
+  $('retry').disabled = !sendError || sending || holdingAudio || starting || pausing || resuming || stopping;
+  $('retry').textContent = failedChunk?.storageBlocked ? '임시 저장 다시 시도'
+    : sendError && failedChunk?.asrProvider === 'clova' ? '위험 이해 · 수동 재전송' : '다시 전송';
+  $('save-failed').hidden = !sendError || !failedChunk;
+  $('save-failed').disabled = sending || holdingAudio || starting || pausing || resuming || stopping || !failedChunk;
+  $('skip-failed').hidden = !sendError || !failedChunk?.downloadRequested;
+  $('skip-failed').disabled = sending || holdingAudio || starting || pausing || resuming || stopping || !failedChunk?.downloadRequested;
   updateInputCaptureStatus();
   $('local-audio-open').disabled = !mayExportLocalAudio() || localAudioExportBusy;
   $('auth-local-audio-open').hidden = !mayExportLocalAudio() || $('auth-screen').hidden;
@@ -5005,6 +5177,7 @@ function updateControls() {
   $('import-button').textContent = canResumeImport ? '같은 파일 이어 올리기' : '파일 올려 변환';
   for (const button of $('lecture-list').querySelectorAll('button')) button.disabled = historyNavigationBusy();
   updateCorrectionControls(noteToolsBusy);
+  renderHeldAudio();
   renderImportStatus();
   notePresenceStateChange();
 }
@@ -5024,7 +5197,7 @@ function clearRecordingSelection() {
 }
 function recordingSelectionBlock() {
   if (!token || !user || authenticating || loggingOut) return '로그인한 뒤 녹음 파일을 선택해 주세요.';
-  if (recording || paused || starting || pausing || resuming || stopping || draft || pending.length || sending || recordingFinalizePending) {
+  if (recording || paused || holdingAudio || starting || pausing || resuming || stopping || draft || activePendingCount() || sending || recordingFinalizePending) {
     return '실시간 녹음과 남은 음성 전송이 모두 끝난 뒤 녹음 파일을 선택해 주세요.';
   }
   if (importStarting || importCancelling || fileUploader?.running || (importIsActive() && importJob.status !== 'uploading')) {
@@ -5108,7 +5281,7 @@ async function startOrResumeFileImport() {
   const file = currentRecordingFile();
   if (!file) { notice('먼저 변환할 녹음 파일을 선택해 주세요.'); return; }
   try { validateRecordingSelection(file); } catch (error) { notice(errorText(error)); return; }
-  if (recording || paused || starting || pausing || resuming || stopping || draft || pending.length || sending) {
+  if (recording || paused || holdingAudio || starting || pausing || resuming || stopping || draft || activePendingCount() || sending) {
     notice('실시간 음성 전송이 모두 끝난 뒤 녹음 파일을 올려 주세요.'); return;
   }
   const reconcilingUnknownJob = !importJob && fileUploader?.importId && importError;
@@ -5210,7 +5383,8 @@ async function cancelFileImport() {
   }
 }
 $('import-cancel').onclick = () => { void cancelFileImport(); };
-$('new-note').onclick = () => { if (!isBusy()) resetNewNote({focus:true}); };
+$('new-note').onclick = () => { if (!newLessonBlockReason()) void prepareIndependentLesson(); };
+$('hold-new-note').onclick = () => { if (!holdAudioBlockReason()) void prepareIndependentLesson(); };
 function startElapsedClock() {
   if (!capture || !recording || paused || capture.paused
       || inputUnavailable || inputReconnectNeeded || starting || pausing || resuming || stopping
@@ -5293,7 +5467,7 @@ function handleReconnectNeeded(error, details = {}) {
   updateControls();
 }
 function continuationBlockReason() {
-  if (!user || !token || authenticating || loggingOut) return '로그인한 계정의 수업에서 이어 녹음할 수 있어요.';
+  if (!user || !token || authenticating || loggingOut || holdingAudio) return '로그인·음성 보관이 끝난 뒤 이어 녹음할 수 있어요.';
   if (capture || recording || paused || starting || pausing || resuming || stopping || inputUnavailable) {
     return '현재 녹음 세션이 남아 있습니다. 일시정지했다면 재개, 입력이 끊겼다면 오디오 다시 연결을 사용하세요.';
   }
@@ -5328,6 +5502,9 @@ $('continue-recording').onclick = () => {
 };
 async function startRecording({continuation = null} = {}) {
   if (continuation ? continuationBlockReason() || current?.id !== continuation.id : isBusy() || importIsActive() || importStarting) return;
+  if (continuation && activePendingCount()) {
+    if (!await holdPreviousAudio() || current?.id!==continuation.id || continuationBlockReason()) return;
+  }
   if (current) resetNewNote();
   else if (lectureDateFilter) { lectureDateFilter = ''; renderHistory(); }
   if (continuation) {
@@ -5348,7 +5525,7 @@ async function startRecording({continuation = null} = {}) {
     notice('CLOVA 실시간 받아쓰기는 한국어와 영어만 지원해 한국어로 바꿨어요.');
   }
   ++requestGeneration; starting = true; paused = false; pausing = false; resuming = false;
-  if (!continuation) sendError = '';
+  if (!nextPendingChunk()) sendError = '';
   captureWarning = '';
   inputUnavailable = false; inputReconnectNeeded = false; inputUnavailableMessage = '';
   sampleSeconds = 0; elapsedActiveMs = 0; elapsedStartedAt = 0; $('elapsed').textContent = '00:00'; updateControls();
@@ -5543,7 +5720,7 @@ function enqueueChunk(session, chunk) {
   if (item.lectureReady) void drain();
 }
 async function assignLecture(session) {
-  if (!session || session.owner !== user || !token) throw connectionChangedBeforeRequestError();
+  if (!session || session.owner !== user || !token || session.uploadHeld) throw connectionChangedBeforeRequestError();
   if (session.lecture) return;
   if (session.creating) return session.creating;
   session.creating = (async () => {
@@ -5551,7 +5728,7 @@ async function assignLecture(session) {
     const assignmentToken = token;
     const assignmentServer = apiUrl;
     const assignmentGeneration = requestGeneration;
-    const assignmentIsCurrent = () => session.owner === assignmentOwner && user === assignmentOwner
+    const assignmentIsCurrent = () => !session.uploadHeld && session.owner === assignmentOwner && user === assignmentOwner
       && token === assignmentToken && apiUrl === assignmentServer && requestGeneration === assignmentGeneration;
     if (session.continuationOf && continuationCapability !== JSON.stringify([user,token,apiUrl])) {
       await updateStatus();
@@ -5631,9 +5808,9 @@ function scheduleLectureAssignmentRetry(session, error) {
 }
 
 async function ensureLectureAssigned(session) {
-  if (!session || session.lecture || session.creating || !token || session.owner !== user) return;
+  if (!session || session.uploadHeld || session.lecture || session.creating || !token || session.owner !== user) return;
   const owner=user,sessionToken=token,server=apiUrl,generation=requestGeneration;
-  const isCurrent=()=>owner===user && sessionToken===token && server===apiUrl && generation===requestGeneration;
+  const isCurrent=()=>!session.uploadHeld && owner===user && sessionToken===token && server===apiUrl && generation===requestGeneration;
   try {
     await assignLecture(session);
     if (!isCurrent()) return;
@@ -5727,14 +5904,14 @@ function clearUploadRetry() {
   retryTimer = null; retryAttempt = 0; retryMessage = '';
 }
 function nudgeQueuedUpload() {
-  if (!pending.length && !draft) return;
+  if (!nextPendingChunk() && !draft) return;
   if (retryTimer !== null) clearTimeout(retryTimer);
   retryTimer = null; retryMessage = '';
   void recoverPublishedServerAfterTransportFailure();
   if (!sendError) {
     if (draft) void ensureLectureAssigned(draft);
     for (const session of liveSessions.values()) {
-      if (!session.lecture && pending.some(chunk => chunk.captureId === session.id)) {
+      if (!session.uploadHeld && !session.lecture && pending.some(chunk => chunk.captureId === session.id)) {
         void ensureLectureAssigned(session);
       }
     }
@@ -5862,7 +6039,7 @@ function scheduleClovaResultPoll(chunk, session, scope) {
   const scheduled = setTimeout(() => {
     if (retryTimer !== scheduled) return;
     retryTimer = null; retryMessage = '';
-    if (!chunkResponseScopeIsCurrent(chunk,session,scope) || pending[0] !== chunk) return;
+    if (!chunkResponseScopeIsCurrent(chunk,session,scope) || nextPendingChunk() !== chunk) return;
     updateControls(); void drain();
   },delay);
   retryTimer = scheduled;
@@ -5889,23 +6066,48 @@ function mergeChunkSegments(lecture, response) {
   if (!ordered) lecture.segments.sort((a,b) => a.start - b.start);
 }
 async function drain() {
-  if (sending || liveQueueRecoveryPromise || sendError || retryTimer !== null || !token || !pending.length) return;
+  if (sending || holdingAudio || liveQueueRecoveryPromise || sendError || retryTimer !== null || !token || !nextPendingChunk()) return;
   const drainOwner = user;
+  const drainToken=token,drainServer=apiUrl;
+  const drainScopeIsCurrent=()=>user===drainOwner&&token===drainToken&&apiUrl===drainServer;
+  let processingChunk=null;
   sending = true; updateControls();
   try {
     const coordinated = await liveCoordination.runUploader(drainOwner,async () => {
-    while (pending.length && token && user === drainOwner) {
-      const chunk = pending[0];
+    while (nextPendingChunk() && token && drainScopeIsCurrent() && !holdingAudio) {
+      const chunk = nextPendingChunk();processingChunk=chunk;
       if (chunk.owner !== drainOwner) {
         sendError = '다른 계정의 음성은 현재 로그인으로 전송할 수 없어요.';
         break;
+      }
+      const session = liveSessions.get(chunk.captureId);
+      if (!session || session.owner !== chunk.owner || session.asrProvider !== chunk.asrProvider) {
+        sendError = '기기에 보관된 음성과 수업의 인식 설정을 안전하게 확인하지 못해 전송을 보류했어요.';
+        break;
+      }
+      await chunk.persistPromise;
+      if (!token || !drainScopeIsCurrent() || nextPendingChunk()!==chunk) break;
+      if (!chunk.durable) { blockUploadUntilStored(chunk); break; }
+      // This check precedes manual-retry and blocked handling: another tab's
+      // durable hold must not become a queued/blocked mutation in this tab.
+      const freshSession=await liveQueue.getSession(drainOwner,chunk.captureId);
+      if (!token || !drainScopeIsCurrent() || nextPendingChunk()!==chunk) break;
+      if (freshSession?.uploadHeld===true) {
+        session.uploadHeld=true;session.heldDurable=true;manualRetryApprovedIds.delete(chunk.id);
+        continue;
+      }
+      if (!freshSession) {
+        if (!await liveQueue.getChunk(drainOwner,chunk.id)) {
+          pending.splice(pending.indexOf(chunk),1);await finishRemovedPendingChunk(chunk);continue;
+        }
+        throw new Error('기기 음성의 수업 정보를 확인하지 못해 전송하지 않았어요.');
       }
       if (manualRetryApprovedIds.has(chunk.id)) {
         await chunk.persistPromise;
         if (chunk.durable && liveQueueAvailable) {
           const stored = await liveQueue.getChunk(drainOwner,chunk.id);
           if (!stored) {
-            pending.splice(0,1);
+            pending.splice(pending.indexOf(chunk),1);
             manualRetryApprovedIds.delete(chunk.id);
             await finishRemovedPendingChunk(chunk);
             void refreshLiveQueueStats();
@@ -5931,17 +6133,6 @@ async function drain() {
           : '이 음성 조각은 이전 오류를 확인한 뒤 직접 재전송해야 해요.';
         break;
       }
-      const session = liveSessions.get(chunk.captureId);
-      if (!session || session.owner !== chunk.owner || session.asrProvider !== chunk.asrProvider) {
-        sendError = '기기에 보관된 음성과 수업의 인식 설정을 안전하게 확인하지 못해 전송을 보류했어요.';
-        break;
-      }
-      await chunk.persistPromise;
-      if (!token || user !== drainOwner || pending[0] !== chunk) break;
-      if (!chunk.durable) {
-        blockUploadUntilStored(chunk);
-        break;
-      }
       // Recheck even a previously ready item. A lecture list refresh or a
       // recovered in-memory flag must never route locally captured Qwen audio
       // into a CLOVA lecture (or the reverse).
@@ -5962,7 +6153,7 @@ async function drain() {
       session.providerMismatch = false;
       session.lecture = known;
       chunk.lectureReady = true;
-      const responseScope = {owner:drainOwner,sessionToken:token,server:apiUrl};
+      const responseScope = {owner:drainOwner,sessionToken:drainToken,server:drainServer};
       let blob;
       try {
         blob = await uploadBlob(chunk);
@@ -6089,25 +6280,26 @@ async function drain() {
     if (error?.coordinationRetrySafe) {
       scheduleUploadRetry(error);
     } else {
-      sendError = pending[0]?.asrProvider === 'clova' ? clovaManualUploadError(error) : manualUploadError(error);
-      await markPendingBlocked(pending[0],error);
+      sendError = processingChunk?.asrProvider === 'clova' ? clovaManualUploadError(error) : manualUploadError(error);
+      await markPendingBlocked(processingChunk,error);
     }
   } finally {
     sending = false; updateControls();
     // Pick up a final microphone tail that may have arrived while an upload awaited.
-    if (pending[0]?.owner === user && token && !sendError && retryTimer === null) void drain();
+    if (drainScopeIsCurrent() && nextPendingChunk()?.owner === user && token && !sendError && retryTimer === null && !holdingAudio) void drain();
   }
 }
 async function retryPending({manual = true} = {}) {
-  if (sending || starting || pausing || resuming || stopping) return;
-  if (pending[0]?.storageBlocked) {
-    const session = liveSessions.get(pending[0].captureId);
+  if (sending || holdingAudio || starting || pausing || resuming || stopping) return;
+  const first=nextPendingChunk();
+  if (first?.storageBlocked) {
+    const session = liveSessions.get(first.captureId);
     if (session) await recoverSessionStorage(session);
     if (!sendError) void drain();
     return;
   }
   clearUploadRetry(); sendError = '';
-  if (manual && pending[0]) manualRetryApprovedIds.add(pending[0].id);
+  if (manual && first) manualRetryApprovedIds.add(first.id);
   if (draft) {
     await ensureLectureAssigned(draft);
   }
@@ -6115,8 +6307,8 @@ async function retryPending({manual = true} = {}) {
 }
 $('retry').onclick = () => { void retryPending(); };
 async function saveFailedChunk() {
-  if (!sendError || sending || starting || pausing || resuming || stopping || !pending.length) return;
-  const chunk = pending[0], owner = user;
+  if (!sendError || sending || holdingAudio || starting || pausing || resuming || stopping || !nextPendingChunk()) return;
+  const chunk = nextPendingChunk(), owner = user;
   const isCurrent = () => owner === user && chunk.owner === owner && pending.includes(chunk) && mayExportLocalAudio();
   try {
     if (!isCurrent()) return;
@@ -6264,8 +6456,8 @@ async function discardEmptyUnassignedDraft(captureId) {
   return true;
 }
 async function skipFailedChunk() {
-  if (!sendError || sending || starting || pausing || resuming || stopping || !pending[0]?.downloadRequested) return;
-  const skipped = pending[0];
+  if (!sendError || sending || holdingAudio || starting || pausing || resuming || stopping || !nextPendingChunk()?.downloadRequested) return;
+  const skipped = nextPendingChunk();
   const owner = user;
   const server = apiUrl, sessionToken = token, generation = requestGeneration;
   const operationIsCurrent = () => owner === user && server === apiUrl
@@ -6274,7 +6466,7 @@ async function skipFailedChunk() {
   sending = true; updateControls();
   try {
     const coordinated = await liveCoordination.runUploader(owner,async () => {
-      if (!operationIsCurrent() || pending[0] !== skipped) return false;
+      if (!operationIsCurrent() || nextPendingChunk() !== skipped) return false;
       await acknowledgePendingChunk(skipped,{strict:true});
       const skippedIndex = pending.indexOf(skipped);
       if (skippedIndex >= 0) pending.splice(skippedIndex,1);

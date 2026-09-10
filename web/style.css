@@ -2543,6 +2543,11 @@ button {
 .study-note-download { display: inline-flex; align-items: center; text-decoration: none; }
 .study-note-download[hidden] { display: none; }
 #continuation-links:empty, #continuation-state:empty { display: none; }
+.held-audio-panel { margin-top: 20px; padding: 16px; border: 1px solid var(--line); border-radius: 14px; }
+.held-audio-card { padding: 12px 0; overflow-wrap: anywhere; }
+.held-audio-card + .held-audio-card { border-top: 1px solid var(--line); }
+.held-audio-card p { line-height: 1.6; margin: 8px 0; }
+.held-audio-card .study-actions { flex-wrap: wrap; }
 #continuation-links { flex-wrap: wrap; margin-bottom: 16px; }
 #recording-download-note, #continuation-state { overflow-wrap: anywhere; line-height: 1.65; }
 @media (max-width: 520px) { .lesson-study-note .summary-actions > * { width: 100%; justify-content: center; } }
