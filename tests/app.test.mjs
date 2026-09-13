@@ -1421,6 +1421,18 @@ test('the selected computer-audio source is passed to capture without a precedin
   assert.equal(app.coordination.releasedCaptureLeases,1);
 });
 
+test('an offline or starting local model does not mislabel the API as down or disable CLOVA', async () => {
+  for (const state of ['offline','loading','busy','error']) {
+    const app = setup(async () => response({model_state:state,
+      transcription_providers:{qwen:{configured:true},clova:{configured:true}}}));
+    await app.run('updateStatus()');
+    assert.match(app.element('model-status').textContent,/API 연결됨/);
+    assert.equal(app.element('asr-provider-clova').disabled,false);
+    assert.equal(app.element('asr-provider').value,'clova');
+    assert.equal(app.element('record-button').disabled,false);
+  }
+});
+
 test('authenticated status enables only the advertised CLOVA choice and ignores provider-supplied display or secret fields', async () => {
   const app = setup(async url => url.endsWith('/status') ? response({
     model_state:'ready',
@@ -2661,6 +2673,17 @@ function adminOverviewFixture(overrides = {}) {
   };
 }
 
+test('admin distinguishes a reachable API from an offline local model without disabling operator controls', async () => {
+  const app = setup(async () => response(adminOverviewFixture({
+    server:{uptime_seconds:10,model_state:'offline',engine:'qwen3-asr-transformers-uds',model:'Qwen3-ASR-1.7B',device:'cuda:0'},
+  })));
+  await app.run('loadAdminOverview({probe:true})');
+  assert.equal(app.element('admin-server-state').textContent,'API 응답 중 · 로컬 모델 연결 대기');
+  assert.equal(app.element('admin-server-state')['data-state'],'offline');
+  assert.equal(app.element('admin-access-toggle').disabled,false);
+  assert.equal(app.element('admin-refresh').disabled,false);
+});
+
 test('admin discovery stays hidden after 403 and ignores an overview from an old session', async () => {
   const denied = setup(async () => response({detail:'관리자 권한이 필요합니다.'},403));
   await denied.run('loadAdminOverview({probe:true})');
@@ -2738,7 +2761,7 @@ test('admin overview renders safe operational metadata, refreshes while open, an
   await app.run('loadAdminOverview({probe:true})');
 
   assert.equal(app.element('admin-open').hidden, false);
-  assert.equal(app.element('admin-server-state').textContent, '음성 모델 준비됨');
+  assert.equal(app.element('admin-server-state').textContent, 'API 응답 중 · 음성 모델 준비됨');
   assert.match(app.element('admin-server-detail').textContent, /Qwen3-ASR-1\.7B/);
   assert.match(app.element('admin-server-detail').textContent, /시스템 부하 0\.50/);
   assert.match(app.element('admin-gpu-detail').textContent, /서버 프로세스 할당 3\.00 GiB/);

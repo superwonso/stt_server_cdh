@@ -7,13 +7,15 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 DATA_DIR="$PROJECT_ROOT/.data"
 PORT=${PORT:-8765}
+LOCAL_MODEL_SOCKET=${LOCAL_MODEL_SOCKET:-$DATA_DIR/model-server/model.sock}
 
 usage() {
     cat <<'EOF'
-Usage: scripts/status.sh [--port PORT]
+Usage: scripts/status.sh [--port PORT] [--model-socket ABS_PATH]
 
 Show PID ownership, local API health, the current temporary tunnel URL, and
-the runtime log locations. This command does not start or stop anything.
+the model process/communication/readiness, and runtime log locations.
+This command does not start or stop anything.
 EOF
 }
 
@@ -32,6 +34,11 @@ while (($#)); do
         -h|--help)
             usage
             exit 0
+            ;;
+        --model-socket)
+            (($# >= 2)) || die "--model-socket 뒤에 절대 경로가 필요합니다."
+            LOCAL_MODEL_SOCKET=$2
+            shift 2
             ;;
         *)
             die "알 수 없는 옵션입니다: $1"
@@ -124,6 +131,13 @@ else
     printf 'API 상태: 응답 없음 (http://127.0.0.1:%s/health)\n' "$PORT"
 fi
 printf 'Cloudflare 터널: %s\n' "$tunnel_status"
+if [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
+    if ! (cd -- "$PROJECT_ROOT" && "$PROJECT_ROOT/.venv/bin/python" -m server.model_process status --socket "$LOCAL_MODEL_SOCKET"); then
+        printf '로컬 모델 상태: 소유권·실행 기록 확인 필요 (자동 수정하지 않았습니다).\n' >&2
+    fi
+else
+    printf '로컬 모델 상태: Python 환경 없음\n'
+fi
 
 public_url=
 if [[ "$tunnel_status" == running* && -s "$DATA_DIR/tunnel-url.txt" ]]; then
@@ -148,3 +162,4 @@ fi
 
 printf '서버 로그: %s\n' "$DATA_DIR/server.log"
 printf '터널 로그: %s\n' "$DATA_DIR/tunnel.log"
+printf '모델 로그: %s\n' "$(dirname -- "$LOCAL_MODEL_SOCKET")/model.log"

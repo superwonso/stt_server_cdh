@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -116,6 +117,10 @@ class Settings:
     attention: str = "sdpa"
     stability_guard_seconds: float = 0.6
     model_warmup: bool = False
+    # None retains the in-process adapter for isolated fixtures/legacy use.
+    # The managed launcher explicitly selects the private same-PC UDS.
+    local_model_socket: Path | None = field(default=None, repr=False)
+    local_model_timeout_seconds: float = 90.0
     session_hours: int = 24
     max_pending_chunks: int = 2
     max_upload_bytes: int = 512_000
@@ -165,6 +170,20 @@ class Settings:
     correction_max_response_bytes: int = 2 * 1024 * 1024
 
     def __post_init__(self) -> None:
+        if self.local_model_socket is not None and (
+            not isinstance(self.local_model_socket, Path)
+            or not self.local_model_socket.is_absolute()
+            or "\x00" in str(self.local_model_socket)
+            or len(os.fsencode(self.local_model_socket)) > 107
+        ):
+            raise ValueError("LOCAL_MODEL_SOCKET must be an absolute Unix socket path of at most 107 bytes")
+        if (
+            isinstance(self.local_model_timeout_seconds, bool)
+            or not isinstance(self.local_model_timeout_seconds, (int, float))
+            or not math.isfinite(self.local_model_timeout_seconds)
+            or not 5 <= self.local_model_timeout_seconds <= 300
+        ):
+            raise ValueError("LOCAL_MODEL_TIMEOUT_SECONDS must be between 5 and 300 seconds")
         if account_usernames(",".join(self.accounts)) != self.accounts:
             raise ValueError("Settings.accounts must contain 2-10 normalized account IDs")
         if self.admin_username is not None and (
@@ -213,6 +232,9 @@ class Settings:
             attention=os.getenv("ASR_ATTENTION", "sdpa"),
             stability_guard_seconds=max(0.2, min(float(os.getenv("STABILITY_GUARD_SECONDS", "0.6")), 1.0)),
             model_warmup=os.getenv("MODEL_WARMUP", "0").strip().lower() in {"1", "true", "yes", "on"},
+            local_model_socket=_path(os.environ["LOCAL_MODEL_SOCKET"])
+            if os.getenv("LOCAL_MODEL_SOCKET", "").strip() else None,
+            local_model_timeout_seconds=float(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "90")),
             session_hours=max(1, min(int(os.getenv("SESSION_HOURS", "24")), 168)),
             max_pending_chunks=max(1, min(int(os.getenv("MAX_PENDING_CHUNKS", "2")), 8)),
             # The static protocol uses 480 KiB import parts, and a 15-second

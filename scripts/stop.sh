@@ -9,20 +9,24 @@ DATA_DIR="$PROJECT_ROOT/.data"
 TUNNEL_LOCK_FILE="$DATA_DIR/tunnel-start.lock"
 STOP_SERVER=1
 STOP_TUNNEL=1
+STOP_MODEL=1
+LOCAL_MODEL_SOCKET=${LOCAL_MODEL_SOCKET:-$DATA_DIR/model-server/model.sock}
 STOP_TIMEOUT=${STOP_TIMEOUT:-20}
 
 usage() {
     cat <<'EOF'
 Usage: scripts/stop.sh [options]
 
-Stop the tunnel first and then the API server. Each process receives SIGTERM
+Stop the tunnel, API, and then the independent model server. Each receives SIGTERM
 and is given time for a safe shutdown before SIGKILL is used as a last resort.
 When the tunnel is stopped, request an OFFLINE Pages config without waiting for
 the deployment; publication failure does not undo the local shutdown.
 
 Options:
-  --server-only      Stop only the API server
+  --server-only      Stop only the API server; keep the model loaded
+  --model-only       Stop only the local model; keep API and tunnel running
   --tunnel-only      Stop only the Cloudflare tunnel
+  --model-socket P   Private model socket (absolute path)
   --timeout SEC      Grace period for each process (default: 20)
   -h, --help         Show this help
 EOF
@@ -38,12 +42,25 @@ while (($#)); do
         --server-only)
             STOP_SERVER=1
             STOP_TUNNEL=0
+            STOP_MODEL=0
             shift
             ;;
         --tunnel-only)
             STOP_SERVER=0
             STOP_TUNNEL=1
+            STOP_MODEL=0
             shift
+            ;;
+        --model-only)
+            STOP_SERVER=0
+            STOP_TUNNEL=0
+            STOP_MODEL=1
+            shift
+            ;;
+        --model-socket)
+            (($# >= 2)) || die "--model-socket 뒤에 절대 경로가 필요합니다."
+            LOCAL_MODEL_SOCKET=$2
+            shift 2
             ;;
         --timeout)
             (($# >= 2)) || die "--timeout 뒤에 초가 필요합니다."
@@ -139,6 +156,13 @@ fi
 if ((STOP_SERVER == 1)); then
     stop_one server "로컬 API 서버" "$DATA_DIR/server.pid"
 fi
+model_stop_failed=0
+if ((STOP_MODEL == 1)); then
+    if ! "$SCRIPT_DIR/stop-model-server.sh" --socket "$LOCAL_MODEL_SOCKET" --timeout "$STOP_TIMEOUT"; then
+        model_stop_failed=1
+        printf '모델 종료를 확인하지 못했습니다. 불명 프로세스·소켓은 변경하지 않았습니다.\n' >&2
+    fi
+fi
 if ((STOP_TUNNEL == 1)); then
     # Finish the desired-state update before returning so an immediate next
     # start cannot be overwritten by a late background OFFLINE request. The
@@ -153,3 +177,4 @@ if ((STOP_TUNNEL == 1)); then
     flock -u 8
     exec 8>&-
 fi
+exit "$model_stop_failed"

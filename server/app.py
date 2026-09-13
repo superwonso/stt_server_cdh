@@ -58,6 +58,8 @@ from .study_note_service import StudyNoteService
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
 from .settings import Settings
 from .transcriber import LocalTranscriber
+from .remote_transcriber import RemoteTranscriber
+from .model_protocol import ModelUnavailableError
 
 log = logging.getLogger("classroom")
 Username = Annotated[str, StringConstraints(min_length=1, max_length=32)]
@@ -73,6 +75,17 @@ class ChunkNotStartedError(HTTPException):
             "음성 처리 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.",
             headers={"Retry-After": "2"},
         )
+
+
+def local_model_retry_error(error: ModelUnavailableError) -> HTTPException:
+    protocol_error = error.code == "model_protocol_error"
+    return HTTPException(
+        503,
+        ("로컬 음성 모델 응답 확인이 필요합니다. 원본을 보관하고 재시도를 기다립니다."
+         if protocol_error else
+         "로컬 음성 모델 연결을 기다리고 있습니다. 음성을 보관한 뒤 다시 전송합니다. 로그인·수업 조회·CLOVA는 계속 사용할 수 있습니다."),
+        headers={"Retry-After": "60" if protocol_error else "5", "X-Local-Model-Retryable": "1"},
+    )
 
 
 def _single_byte_range(value: str | None, total: int) -> tuple[int | None, int | None]:
@@ -353,7 +366,9 @@ def create_app(
     accounts = frozenset(settings.accounts)
     database = Database(settings.database_path, settings.accounts)
     database.initialize()
-    engine = transcriber or LocalTranscriber(settings)
+    engine = transcriber or (
+        RemoteTranscriber(settings) if settings.local_model_socket else LocalTranscriber(settings)
+    )
     clova_engine = clova_transcriber or ClovaStreamingTranscriber(settings)
     correction_engine = postprocessor or MindlogicPostprocessor(settings)
     limiter = RateLimiter()
@@ -435,7 +450,7 @@ def create_app(
         translation_service.recover()
         question_service.recover()
         study_note_service.recover()
-        if settings.model_warmup and hasattr(engine, "warmup"):
+        if settings.model_warmup and not settings.local_model_socket and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
         try:
             # Even a partially failed startup must stop workers already started.
@@ -469,7 +484,7 @@ def create_app(
             translation_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             question_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             study_note_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
-            stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
+            import_stopped = stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
             archive_stopped = archive_manager.stop(
                 timeout=max(0.0, shutdown_deadline - time.monotonic())
             )
@@ -482,6 +497,9 @@ def create_app(
                 correction_engine.close()
             if archive_stopped:
                 archive_manager.close()
+            if import_stopped and isinstance(engine, RemoteTranscriber):
+                # Close only this API's HTTP pool, never the model process.
+                engine.close()
 
     app = FastAPI(title="Classroom Transcription", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings = settings
@@ -532,7 +550,7 @@ def create_app(
             "X-Upload-Offset",
             "X-Part-SHA256",
         ],
-        expose_headers=["Retry-After", "X-Clip-Start-Seconds", "X-Clip-Duration-Seconds"],
+        expose_headers=["Retry-After", "X-Local-Model-Retryable", "X-Clip-Start-Seconds", "X-Clip-Duration-Seconds"],
         max_age=600,
     )
     # add_middleware inserts at the front, so this guard is the outermost
@@ -661,7 +679,7 @@ def create_app(
             return fallback
         try:
             state = raw.get("model_state")
-            if not isinstance(state, str) or state not in {"unloaded", "loading", "ready", "error"}:
+            if not isinstance(state, str) or state not in {"unloaded", "loading", "ready", "error", "offline", "busy"}:
                 state = "unknown"
             model = str(raw.get("model") or settings.model)
             # A custom deployment can configure an absolute local model path.
@@ -735,6 +753,13 @@ def create_app(
             "process_allocated_bytes": None,
             "process_reserved_bytes": None,
         }
+        if isinstance(engine, RemoteTranscriber):
+            # Metrics are fetched from the private model process; the API must
+            # never import PyTorch or allocate its own ROCm context to poll them.
+            try:
+                return engine.gpu_resources()
+            except Exception:
+                return result
         # Merely opening the admin screen must not import PyTorch or initialize
         # ROCm.  Report allocator counters only after the model did so itself.
         torch = sys.modules.get("torch")
@@ -1966,6 +1991,8 @@ def create_app(
             }
         except HTTPException:
             raise
+        except ModelUnavailableError as error:
+            raise local_model_retry_error(error) from None
         except Exception as error:
             log.exception("Could not finalize the stored recording guard")
             raise HTTPException(
@@ -2470,6 +2497,11 @@ def create_app(
                 424,
                 "CLOVA Speech 응답을 안전하게 확정하지 못했습니다. 다시 보내면 같은 음성이 중복 기록될 수 있습니다.",
             ) from None
+        except ModelUnavailableError as error:
+            # Local inference has no provider-side commit. Only the API commits
+            # a validated result, so retrying the same chunk ID/context is safe.
+            # Do not treat storage/corruption errors as model outages.
+            raise local_model_retry_error(error) from None
         except Exception as error:
             log.exception("Local transcription failed")
             raise HTTPException(503, "이 PC에서 음성 인식을 실행하지 못했습니다. 서버 상태를 확인하고 다시 시도하세요.", headers={"Retry-After": "5"}) from error
@@ -3053,15 +3085,35 @@ def create_app(
                         )
                         break
                     except HTTPException as error:
-                        if error.status_code != 429:
+                        model_wait = (
+                            error.status_code == 503
+                            and (error.headers or {}).get("X-Local-Model-Retryable") == "1"
+                        )
+                        if error.status_code != 429 and not model_wait:
                             raise
+                        if model_wait:
+                            with database.connect() as connection:
+                                connection.execute(
+                                    "UPDATE imports SET error = ?, updated_at = ? "
+                                    "WHERE id = ? AND status = 'processing'",
+                                    ("로컬 음성 모델 연결 대기 중입니다. 업로드 원본과 처리된 부분은 보관 중이며 연결되면 자동 재개합니다.",
+                                     now_text(), job["id"]),
+                                )
                         if interrupted():
                             raise ImportInterrupted("interrupted while waiting for inference") from error
-                        time.sleep(0.25)
+                        # A model restart can take minutes. Keep the current
+                        # bounded decoded chunk and raw upload, release ASR
+                        # admission slots, and remain promptly cancellable.
+                        retry_seconds = 60.0 if (error.headers or {}).get("Retry-After") == "60" else 5.0
+                        deadline = time.monotonic() + (retry_seconds if model_wait else 0.25)
+                        while time.monotonic() < deadline:
+                            if interrupted():
+                                raise ImportInterrupted("interrupted while waiting for model") from error
+                            import_worker_shutdown.wait(min(0.25, max(0.0, deadline - time.monotonic())))
                 duration = max(duration, chunk.start_seconds + chunk.duration_seconds)
                 with database.connect() as connection:
                     connection.execute(
-                        "UPDATE imports SET processed_seconds = ?, updated_at = ? "
+                        "UPDATE imports SET processed_seconds = ?, error = NULL, updated_at = ? "
                         "WHERE id = ? AND status = 'processing'",
                         (round(duration, 3), now_text(), job["id"]),
                     )
@@ -3177,7 +3229,7 @@ def create_app(
         import_worker_shutdown.set()
         import_worker_wake.set()
 
-    def stop_import_worker(*, timeout: float = 15) -> None:
+    def stop_import_worker(*, timeout: float = 15) -> bool:
         request_import_worker_shutdown()
         with import_worker_lock:
             worker = import_worker_thread
@@ -3189,6 +3241,8 @@ def create_app(
             worker.join(timeout=timeout)
             if worker.is_alive():
                 log.warning("File import worker did not stop before shutdown; its raw upload is retained")
+                return False
+        return True
 
     app.state.stop_import_worker = stop_import_worker
 

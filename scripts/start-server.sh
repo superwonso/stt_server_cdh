@@ -14,6 +14,8 @@ PREVIOUS_LOG_FILE="$DATA_DIR/server.previous.log"
 LOCK_FILE="$DATA_DIR/server-start.lock"
 PORT=${PORT:-8765}
 WARMUP=${MODEL_WARMUP:-1}
+API_ONLY=0
+LOCAL_MODEL_SOCKET=${LOCAL_MODEL_SOCKET:-$DATA_DIR/model-server/model.sock}
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-60}
 SERVER_PID=
 PID_TEMPORARY=
@@ -28,13 +30,15 @@ Start one local API worker in the background. The API always binds to
 
 Options:
   --port PORT       Local port (default: 8765, or PORT)
-  --warmup          Ask the configured model backend to load during startup
-  --no-warmup       Skip model warmup (not recommended before class)
-  --timeout SEC     Startup wait time (default: 60; warmup default: 600)
+  --api-only        Start the API without starting or stopping the model server
+  --model-socket P  Private model Unix socket (absolute path)
+  --warmup          Load the separate model in the background (default)
+  --no-warmup       Start the separate model without loading GPU weights yet
+  --timeout SEC     API startup wait time (default: 60)
   -h, --help        Show this help
 
-Warmup is enabled by default so the first classroom chunk does not pay model
-load/kernel compilation time. The switch never changes the configured model.
+The API never loads Qwen itself. Model loading/failure does not stop the API.
+Use start-model-server.sh --wait-ready --timeout 600 to wait for GPU readiness.
 EOF
 }
 
@@ -54,6 +58,15 @@ while (($#)); do
         --warmup)
             WARMUP=1
             shift
+            ;;
+        --api-only)
+            API_ONLY=1
+            shift
+            ;;
+        --model-socket)
+            (($# >= 2)) || die "--model-socket 뒤에 절대 경로가 필요합니다."
+            LOCAL_MODEL_SOCKET=$2
+            shift 2
             ;;
         --no-warmup)
             WARMUP=0
@@ -86,9 +99,8 @@ case "${WARMUP,,}" in
     0|false|no|off) WARMUP=0 ;;
     *) die "MODEL_WARMUP은 0/1, false/true, no/yes 중 하나여야 합니다." ;;
 esac
-if ((WARMUP == 1 && timeout_was_set == 0)) && [[ ${STARTUP_TIMEOUT:-60} == 60 ]]; then
-    STARTUP_TIMEOUT=600
-fi
+[[ "$LOCAL_MODEL_SOCKET" == /* && "$LOCAL_MODEL_SOCKET" != *$'\n'* && "$LOCAL_MODEL_SOCKET" != *$'\r'* ]] \
+    || die "모델 소켓은 절대 경로여야 합니다."
 
 [[ -x "$PYTHON" ]] || die "scripts/setup.sh를 먼저 실행하세요."
 [[ -f "$ENV_FILE" ]] || die "server/.env가 없습니다. 먼저 계정 및 공개 URL 설정을 초기화하세요."
@@ -150,6 +162,28 @@ PY
     fi
 }
 
+request_model_start() {
+    local pid=$1 entry mode=
+    if ((API_ONLY == 1)); then
+        printf 'API만 시작했습니다. 별도 모델 서버는 변경하지 않았습니다.\n'
+        return 0
+    fi
+    # Do not load a second GPU model beside a still-running legacy embedded
+    # API. Inspect only this known process's selected environment entry.
+    while IFS= read -r -d '' entry; do
+        if [[ "$entry" == LOCAL_MODEL_SOCKET=* ]]; then mode=${entry#LOCAL_MODEL_SOCKET=}; fi
+    done <"/proc/$pid/environ"
+    if [[ "$mode" != "$LOCAL_MODEL_SOCKET" ]]; then
+        printf '기존 API가 모델 분리 모드가 아닙니다. API만 재시작한 뒤 모델을 시작하세요. 현재 API는 유지합니다.\n' >&2
+        return 0
+    fi
+    local option=--no-warmup
+    ((WARMUP == 0)) || option=--warmup
+    if ! "$SCRIPT_DIR/start-model-server.sh" --socket "$LOCAL_MODEL_SOCKET" "$option" 9>&-; then
+        printf '별도 모델 시작을 확인하지 못했습니다. API는 정상 유지됩니다. scripts/status.sh에서 모델 상태를 확인하세요.\n' >&2
+    fi
+}
+
 remove_our_pid_file() {
     local pid=$1 recorded=
     if [[ -s "$PID_FILE" ]]; then
@@ -181,6 +215,7 @@ if [[ -s "$PID_FILE" ]]; then
         fi
         if health_ok; then
             printf '서버가 이미 준비되어 있습니다 (PID %s): http://127.0.0.1:%s\n' "$previous_pid" "$PORT"
+            request_model_start "$previous_pid"
             exit 0
         fi
         printf '서버(PID %s)가 아직 준비 중입니다. 최대 %s초 동안 기다립니다...\n' "$previous_pid" "$STARTUP_TIMEOUT"
@@ -193,6 +228,7 @@ if [[ -s "$PID_FILE" ]]; then
             fi
             if health_ok; then
                 printf '서버 준비 완료 (PID %s): http://127.0.0.1:%s\n' "$previous_pid" "$PORT"
+                request_model_start "$previous_pid"
                 exit 0
             fi
             sleep 1
@@ -287,8 +323,8 @@ else
 fi
 : >"$LOG_FILE"
 chmod 0600 "$LOG_FILE"
-printf '\n[%s] server start requested (port=%s, warmup=%s)\n' "$(date --iso-8601=seconds)" "$PORT" "$WARMUP" >>"$LOG_FILE"
-nohup setsid env PYTHONNOUSERSITE=1 MODEL_WARMUP="$WARMUP" "$PYTHON" -m uvicorn server.app:create_app --factory \
+printf '\n[%s] API start requested (port=%s, separate_model=1)\n' "$(date --iso-8601=seconds)" "$PORT" >>"$LOG_FILE"
+nohup setsid env PYTHONNOUSERSITE=1 MODEL_WARMUP=0 LOCAL_MODEL_SOCKET="$LOCAL_MODEL_SOCKET" "$PYTHON" -m uvicorn server.app:create_app --factory \
     --host 127.0.0.1 \
     --port "$PORT" \
     --workers 1 \
@@ -320,9 +356,7 @@ while ((SECONDS < deadline)); do
         trap - EXIT INT TERM HUP
         printf '서버 시작 완료 (PID %s): http://127.0.0.1:%s\n' "$SERVER_PID" "$PORT"
         printf '로그: %s\n' "$LOG_FILE"
-        if ((WARMUP == 1)); then
-            printf '모델 warmup 요청이 적용됐습니다 (MODEL_WARMUP=1).\n'
-        fi
+        request_model_start "$SERVER_PID"
         exit 0
     fi
     sleep 1

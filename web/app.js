@@ -1940,7 +1940,7 @@ async function updateStatus() {
     $('asr-provider-clova').textContent = clovaConfigured
       ? 'NAVER CLOVA Speech · 운영자 클라우드 · 기본' : 'NAVER CLOVA Speech · 운영자 설정 필요';
     applyNewLectureProvider();
-    $('model-status').textContent = ({unloaded:'첫 받아쓰기 준비됨',loading:'음성 인식 모델 준비 중',ready:'음성 인식 모델 연결됨',error:'음성 인식 모델 확인 필요'})[status.model_state] || '서버 연결됨';
+    $('model-status').textContent = ({unloaded:'로컬 모델 · 첫 받아쓰기 준비됨',loading:'API 연결됨 · 로컬 모델 준비 중',ready:'음성 인식 모델 연결됨',busy:'API 연결됨 · 로컬 모델 처리 중',offline:'API 연결됨 · 로컬 모델 연결 대기',error:'API 연결됨 · 로컬 모델 확인 필요'})[status.model_state] || '서버 연결됨';
     updateProviderGuidance(); updateControls();
     if (lectures.some(lecture => TRANSIENT_RECORDING_STORAGE_STATES.has(lecture?.recording_storage_state))) {
       void refreshLectures().catch(() => {});
@@ -3354,11 +3354,11 @@ function renderAdminOverview() {
   $('admin-access-toggle').classList.toggle('secondary-button',!enabled);
 
   const server = overview.server || {};
-  const modelStateToServer = {ready:'ready',loading:'starting',unloaded:'running',error:'error'};
+  const modelStateToServer = {ready:'ready',loading:'starting',unloaded:'running',busy:'running',error:'error',offline:'offline'};
   const reportedServerState = String(modelStateToServer[server.model_state] || server.state || server.status || 'unknown');
   const serverState = new Set(['running','ready','online','starting','error','offline','unknown']).has(reportedServerState)
     ? reportedServerState : 'unknown';
-  const serverLabels = {running:'서버 실행 중',ready:'음성 모델 준비됨',online:'API 응답 중',starting:'음성 모델 준비 중',error:'모델 오류',offline:'서버 중지됨',unknown:'확인 중'};
+  const serverLabels = {running:'API 응답 중 · 로컬 모델 실행 중',ready:'API 응답 중 · 음성 모델 준비됨',online:'API 응답 중',starting:'API 응답 중 · 음성 모델 준비 중',error:'API 응답 중 · 모델 확인 필요',offline:'API 응답 중 · 로컬 모델 연결 대기',unknown:'확인 중'};
   $('admin-server-state').textContent = serverLabels[serverState] || serverState;
   $('admin-server-state').setAttribute('data-state',serverState);
   const load = overview.resources?.load || {};
