@@ -111,6 +111,65 @@ test('history, export, recording, and destructive controls are explicit and acce
   assert.match(html, /<button\b[^>]*\bid="return-live-capture"[^>]*>현재 녹음으로 돌아가기<\/button>/i);
 });
 
+test('lesson heading separates its title from a wrapping toolbar without enabling unavailable actions', () => {
+  const heading = html.match(/<header\b[^>]*class="note-heading"[^>]*>([\s\S]*?)<\/header>/)?.[1];
+  assert.ok(heading, 'the current lesson must keep a heading and a separate action group');
+  const title = heading.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/);
+  assert.ok(title);
+  assert.doesNotMatch(title[1], /<(?:button|select)\b/i);
+  assert.match(heading, /<\/h1>[\s\S]*<div\b[^>]*class="note-actions"[^>]*role="group"[^>]*aria-label="[^"]+"/);
+  for (const id of ['export-format','download','recording-download','recording-partial-download',
+    'recording-finalize','continue-recording','metadata-open','delete-lecture']) {
+    const control = heading.match(new RegExp(`<(?:button|select)\\b[^>]*\\bid="${id}"[^>]*>`))?.[0];
+    assert.ok(control, `the lesson toolbar must retain ${id}`);
+    assert.match(control, /\sdisabled(?:\s|>)/);
+    if (control.startsWith('<button')) assert.match(control, /\btype="button"/);
+    if (['recording-partial-download','recording-finalize'].includes(id)) assert.match(control, /\shidden(?:\s|>)/);
+  }
+  assert.match(css, /\.note-heading\s*\{[^}]*flex-direction:\s*column\s*;/);
+  assert.match(css, /\.note-actions\s*\{[^}]*flex-wrap:\s*wrap\s*;/);
+});
+
+test('audio recovery panel groups live input status with explicit preservation controls and guidance', () => {
+  const panel = html.match(/<section\b[^>]*class="audio-recovery-panel"[^>]*>([\s\S]*?)<\/section>/);
+  assert.ok(panel, 'input health and local recovery must remain in the recorder panel');
+  assert.match(panel[0], /aria-labelledby="audio-recovery-title"/);
+  assert.match(panel[1], /<h[23]\b[^>]*id="audio-recovery-title"[^>]*>[^<]+<\/h[23]>/);
+  assert.match(panel[1], /<p\b[^>]*id="capture-input-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(panel[1], /<div\b[^>]*class="recovery-actions"[^>]*role="group"[^>]*aria-label="[^"]+"/);
+  for (const id of ['local-audio-open','hold-new-note']) {
+    const button = panel[1].match(new RegExp(`<button\\b[^>]*\\bid="${id}"[^>]*>`))?.[0];
+    assert.ok(button, `the recovery panel must retain ${id}`);
+    assert.match(button, /\btype="button"/);
+    if (id === 'hold-new-note') assert.match(button, /\sdisabled(?:\s|>)/);
+  }
+  const help = panel[1].match(/<p\b[^>]*class="panel-help"[^>]*>([^<]+)<\/p>/)?.[1];
+  assert.ok(help, 'preservation and new-capture instructions must not disappear with the layout');
+  assert.match(help, /현재 녹음.*종료/);
+  assert.match(help, /시작 버튼/);
+  assert.match(help, /삭제하거나 자동 재전송하지 않습니다/);
+  assert.match(css, /\.recovery-actions\s*\{[^}]*flex-wrap:\s*wrap\s*;/);
+});
+
+test('queue warning separates readable failure text from wrapping actions and retains safe initial visibility', () => {
+  const warning = html.match(/<div\b[^>]*id="queue-warning"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/);
+  assert.ok(warning);
+  assert.match(warning[0], /role="alert"[^>]*\shidden(?:\s|>)/);
+  assert.match(warning[1], /<p\b[^>]*id="queue-message"[^>]*>[\s\S]*?<\/p>\s*<div\b[^>]*class="queue-actions"/);
+  const message = warning[1].match(/<p\b[^>]*id="queue-message"[^>]*>([\s\S]*?)<\/p>/)?.[1];
+  assert.doesNotMatch(message, /<button\b/i);
+  for (const id of ['save-failed','skip-failed','retry']) {
+    const button = warning[1].match(new RegExp(`<button\\b[^>]*\\bid="${id}"[^>]*>`))?.[0];
+    assert.ok(button, `the failure actions must retain ${id}`);
+    assert.match(button, /\btype="button"/);
+    if (id === 'skip-failed') assert.match(button, /\shidden(?:\s|>)/);
+  }
+  assert.match(css, /\.queue-warning\s*\{[^}]*flex-direction:\s*column\s*;/);
+  assert.match(css, /\.queue-warning\s+p\s*\{[^}]*overflow-wrap:\s*anywhere\s*;/);
+  assert.match(css, /\.queue-actions\s*\{[^}]*flex-wrap:\s*wrap\s*;/);
+  assert.match(css, /\.queue-warning:not\(\[hidden\]\)\s*\{[^}]*display:\s*flex\s*;/);
+});
+
 test('library search has no classification filters while metadata editing remains available', () => {
   assert.doesNotMatch(html, /\bid="library-(?:course|semester)"/);
   assert.doesNotMatch(app, /\$\(['"]library-(?:course|semester)['"]\)|libraryCourse|librarySemester|renderLibraryFilters/);
