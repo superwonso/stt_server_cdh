@@ -252,6 +252,8 @@
           <section class="audio-recovery-panel" aria-labelledby="audio-recovery-title">
             <h3 id="audio-recovery-title">녹음 상태 · 음성 보관</h3>
             <p id="capture-input-status" class="capture-input-status" role="status" aria-live="polite">마이크 녹음 중이 아닙니다.</p>
+            <p id="recording-upload-status" class="capture-input-status" role="status" aria-live="polite" hidden></p>
+            <button id="recording-upload-retry" class="secondary-button" type="button" hidden>원본 녹음 업로드 다시 시도</button>
             <div class="recovery-actions" role="group" aria-label="기기에 남은 음성 관리">
               <button id="local-audio-open" class="secondary-button" type="button">기기에 남은 음성 내려받기</button>
               <button id="hold-new-note" class="secondary-button" type="button" disabled>기존 음성 보관 · 새 수업</button>

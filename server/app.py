@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import secrets
+import sqlite3
 import shutil
 import sys
 import threading
@@ -47,6 +48,7 @@ from .recordings import (
 )
 from .postprocessor import MindlogicPostprocessor, PostprocessingError
 from .recording_snapshot import RecordingSnapshot, SnapshotStream
+from .recording_uploads import RecordingUploadStore, require_asr_receipt, stored_seconds
 from .summarizer import MindlogicSummarizer
 from .summary_service import SummaryService
 from .question_service import QuestionService
@@ -395,6 +397,8 @@ def create_app(
         # in-memory queue to continue into the same recording.
         max_gap_seconds=180,
     )
+    recording_uploads = RecordingUploadStore(database, recording_store)
+    raw_upload_capacity = threading.BoundedSemaphore(4)
     archive_manager = DriveArchiveManager(
         settings,
         database,
@@ -1113,7 +1117,7 @@ def create_app(
         trash_clause = "" if include_trashed else " AND trashed_at IS NULL"
         with database.connect() as connection:
             lecture = connection.execute(
-                "SELECT id, username, title, language, created_at, deleting, trashed_at, recording_finalized, asr_provider "
+                "SELECT id, username, title, language, created_at, deleting, trashed_at, recording_finalized, audio_finalized, asr_provider "
                 f"FROM lectures WHERE id = ? AND username = ?{deleting_clause}{trash_clause}",
                 (lecture_id, username),
             ).fetchone()
@@ -1122,8 +1126,17 @@ def create_app(
         return dict(lecture)
 
     def recording_flags(username: str, lecture_id: str, finalized: bool) -> dict:
-        result = archive_manager.storage(username, lecture_id, finalized)
+        with database.connect() as connection:
+            row = connection.execute(
+                "SELECT audio_finalized FROM lectures WHERE id=? AND username=?",
+                (lecture_id, username),
+            ).fetchone()
+            audio_finalized = bool(finalized or (row and row["audio_finalized"]))
+            seconds = stored_seconds(connection, lecture_id) if row is not None else 0
+        result = archive_manager.storage(username, lecture_id, audio_finalized)
         result["recording_finalized"] = bool(finalized)
+        result["recording_audio_finalized"] = audio_finalized
+        result["recording_stored_seconds"] = seconds
         return result
 
     def lecture_result(lecture: dict, *, segments: list[dict] | None = None) -> dict:
@@ -1226,7 +1239,8 @@ def create_app(
         }
         result["question_answering"] = {"configured": question_service.configured, "model": question_service.model}
         result["study_notes"] = {"configured": study_note_service.configured, "model": study_note_service.model}
-        result["capabilities"] = {"lecture_continuations": True, "recording_partial_download": True}
+        result["capabilities"] = {"lecture_continuations": True, "recording_partial_download": True,
+                                  "recording_audio_upload": True}
         return result
 
     @app.get("/lectures")
@@ -1525,11 +1539,11 @@ def create_app(
             with database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current = connection.execute(
-                    "SELECT recording_finalized FROM lectures "
+                    "SELECT recording_finalized, audio_finalized FROM lectures "
                     "WHERE id = ? AND username = ? AND deleting = 0",
                     (lecture_id, username),
                 ).fetchone()
-                if current is not None and current["recording_finalized"]:
+                if current is not None and (current["recording_finalized"] or current["audio_finalized"]):
                     queued = archive_manager.queue(connection, username, lecture_id)
         if queued:
             archive_manager.wake()
@@ -1542,7 +1556,7 @@ def create_app(
         )
         if not recording["recording_available"]:
             raise HTTPException(404, "이 수업에는 내려받을 녹음이 없습니다.")
-        if not lecture["recording_finalized"]:
+        if not (lecture["recording_finalized"] or lecture["audio_finalized"]):
             raise HTTPException(409, "녹음이 완전히 저장된 뒤 내려받아 주세요.")
         if not limiter.allow(("recording-download", user["username"]), 30, 60):
             raise HTTPException(429, "잠시 후 녹음을 다시 내려받아 주세요.", headers={"Retry-After": "60"})
@@ -1577,7 +1591,7 @@ def create_app(
     @app.post("/lectures/{lecture_id}/recording-snapshot-ticket")
     def create_recording_snapshot_ticket(lecture_id: str, user: dict = Depends(data_identity)):
         lecture = owned_lecture(lecture_id, user["username"])
-        if lecture["recording_finalized"]:
+        if lecture["recording_finalized"] or lecture["audio_finalized"]:
             raise HTTPException(409, "완료된 수업은 기존 녹음 다운로드를 이용해 주세요.")
         if not limiter.allow(("recording-download", user["username"]), 30, 60):
             raise HTTPException(429, "잠시 후 녹음을 다시 내려받아 주세요.", headers={"Retry-After": "60"})
@@ -1596,7 +1610,7 @@ def create_app(
             # Match normal ticket issuance: revoked sessions and trashed rows
             # cannot race an old authenticated request into a new grant.
             current = owned_lecture(lecture_id, user["username"])
-            if current["recording_finalized"]:
+            if current["recording_finalized"] or current["audio_finalized"]:
                 raise HTTPException(409, "완료된 수업은 기존 녹음 다운로드를 이용해 주세요.")
             with database.connect() as connection:
                 live = connection.execute(
@@ -1726,6 +1740,13 @@ def create_app(
         *,
         exclude_chunk_id: str | None = None,
     ) -> None:
+        raw_state = connection.execute(
+            "SELECT audio_finalized FROM lectures WHERE id=? AND EXISTS "
+            "(SELECT 1 FROM recording_chunks WHERE lecture_id=lectures.id)", (lecture_id,),
+        ).fetchone()
+        if raw_state is not None and not raw_state["audio_finalized"]:
+            raise HTTPException(409, "원본 녹음의 마지막 조각까지 저장된 뒤 수업을 종료해 주세요.",
+                                headers={"Retry-After": "2"})
         active_import = connection.execute(
             "SELECT 1 FROM imports WHERE lecture_id = ? "
             "AND status IN ('uploading', 'queued', 'processing')",
@@ -1789,7 +1810,7 @@ def create_app(
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     current = connection.execute(
-                        "SELECT recording_finalized FROM lectures "
+                        "SELECT recording_finalized, audio_finalized FROM lectures "
                         "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                         (lecture_id, user["username"]),
                     ).fetchone()
@@ -1833,6 +1854,9 @@ def create_app(
         # before waiting for the single local GPU. A final overlap-only chunk
         # emits only the stability guard withheld by the latest non-final pass.
         snapshot = recording_guard_snapshot(user["username"], lecture_id)
+        if snapshot is None and lecture["audio_finalized"]:
+            raise HTTPException(409, "원본 녹음은 안전하게 보관되어 있지만 마지막 전사 구간을 확인할 수 없습니다. "
+                                "기기에 남은 마지막 음성 조각으로 전사를 다시 시도해 주세요.")
         payload_hash = None if snapshot is None else hashlib.sha256(snapshot["payload"]).hexdigest()
         processing_seconds = 0.0
         segments = []
@@ -1926,7 +1950,7 @@ def create_app(
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     current = connection.execute(
-                        "SELECT recording_finalized FROM lectures "
+                        "SELECT recording_finalized, audio_finalized FROM lectures "
                         "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                         (lecture_id, user["username"]),
                     ).fetchone()
@@ -1945,6 +1969,9 @@ def create_app(
                             lecture_id,
                             exclude_chunk_id=guard_chunk_id if claimed_guard else None,
                         )
+                        if snapshot is None and current["audio_finalized"]:
+                            raise HTTPException(409, "원본 녹음은 보관되어 있지만 마지막 전사 구간을 확인할 수 없습니다. "
+                                                "기기에 남은 마지막 음성 조각으로 전사를 다시 시도해 주세요.")
                         if current_frames != expected_frames:
                             raise HTTPException(
                                 409,
@@ -2126,7 +2153,7 @@ def create_app(
         granted = claim_recording_ticket(ticket)
         _, username, lecture_id, _, _ = granted
         lecture = owned_lecture(lecture_id, username)
-        if not lecture["recording_finalized"]:
+        if not (lecture["recording_finalized"] or lecture["audio_finalized"]):
             raise HTTPException(404, "다운로드 링크가 만료됐습니다.")
         filename = "".join(
             "_" if character in '<>:"/\\|?*' or ord(character) < 32 else character
@@ -2254,10 +2281,11 @@ def create_app(
             "recording_finalized": bool(lecture["recording_finalized"]),
         }
 
-    def replay_response(lecture_id: str, replay: dict) -> dict:
+    def replay_response(lecture_id: str, chunk_id: str, replay: dict) -> dict:
         # Never wait for the recording filesystem lock while a SQLite
         # connection/transaction is held; DELETE and normal writes use the
         # opposite (filesystem -> SQLite) order.
+        recording_uploads.check_source_for_chunk(lecture_id, replay["_recording_owner"], chunk_id)
         if replay["recording_finalized"]:
             queue_completed_recording(replay["_recording_owner"], lecture_id)
         return {
@@ -2312,6 +2340,7 @@ def create_app(
                 raise
         if replay is None:
             return {"state": "unknown"}
+        recording_uploads.check_source_for_chunk(lecture_id, user["username"], normalized_chunk)
         # Unlike POST replay this read-only route must not queue archive work.
         return {
             "state": "done",
@@ -2350,7 +2379,7 @@ def create_app(
                 lecture["username"],
             )
         if replay is not None:
-            return replay_response(lecture_id, replay)
+            return replay_response(lecture_id, chunk_id, replay)
         if not capacity.acquire(blocking=False):
             raise ChunkNotStartedError()
         admission_key = (lecture["username"], lecture_id)
@@ -2375,7 +2404,7 @@ def create_app(
                 )
                 if replay is None:
                     still_owned = connection.execute(
-                        "SELECT recording_finalized FROM lectures "
+                        "SELECT id, recording_finalized, audio_finalized FROM lectures "
                         "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                         (lecture_id, lecture["username"]),
                     ).fetchone()
@@ -2383,6 +2412,8 @@ def create_app(
                         raise HTTPException(404, "수업을 찾을 수 없습니다.")
                     if still_owned["recording_finalized"]:
                         raise HTTPException(409, "이미 종료된 수업에는 음성을 더 추가할 수 없습니다.")
+                    require_asr_receipt(connection, still_owned, chunk_id, payload_hash,
+                                        start_seconds, duration, overlap_seconds, final_chunk)
                     connection.execute(
                         "INSERT INTO chunks(lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, final_chunk, status) "
                         "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
@@ -2390,7 +2421,8 @@ def create_app(
                     )
                     claimed = True
             if replay is not None:
-                return replay_response(lecture_id, replay)
+                return replay_response(lecture_id, chunk_id, replay)
+            recording_uploads.check_source_for_chunk(lecture_id, lecture["username"], chunk_id)
             started = time.perf_counter()
             boundary_json = None
             provider = lecture.get("asr_provider", "qwen")
@@ -2433,7 +2465,7 @@ def create_app(
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     still_owned = connection.execute(
-                        "SELECT recording_finalized FROM lectures "
+                        "SELECT id, recording_finalized, audio_finalized FROM lectures "
                         "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                         (lecture_id, lecture["username"]),
                     ).fetchone()
@@ -2441,14 +2473,23 @@ def create_app(
                         raise HTTPException(404, "수업을 찾을 수 없습니다.")
                     if still_owned["recording_finalized"]:
                         raise HTTPException(409, "이미 종료된 수업에는 음성을 더 추가할 수 없습니다.")
+                    raw_receipt = require_asr_receipt(
+                        connection, still_owned, chunk_id, payload_hash,
+                        start_seconds, duration, overlap_seconds, final_chunk,
+                    )
+                    if raw_receipt is not None:
+                        recording_uploads.source_frames(connection,
+                            {"id": lecture_id, "username": lecture["username"]},
+                            raw_receipt["start_samples"] + raw_receipt["duration_samples"])
                     try:
-                        recording_store.write_chunk(
-                            lecture["username"],
-                            lecture_id,
-                            start_seconds=start_seconds,
-                            overlap_seconds=overlap_seconds,
-                            pcm=pcm,
-                        )
+                        if raw_receipt is None:
+                            recording_store.write_chunk(
+                                lecture["username"],
+                                lecture_id,
+                                start_seconds=start_seconds,
+                                overlap_seconds=overlap_seconds,
+                                pcm=pcm,
+                            )
                     except RecordingConflict as error:
                         raise HTTPException(409, "녹음 조각의 시간 순서가 기존 파일과 맞지 않습니다.") from error
                     except RecordingCapacityError as error:
@@ -2468,17 +2509,23 @@ def create_app(
                         "WHERE lecture_id = ? AND chunk_id = ?",
                         (processing_seconds, boundary_json, lecture_id, chunk_id),
                     )
-                    if final_chunk:
+                    # An opted-in raw lane may be ahead/behind ASR. Never let
+                    # an ASR final race close a still-growing raw recording.
+                    raw_started = connection.execute(
+                        "SELECT 1 FROM recording_chunks WHERE lecture_id=? LIMIT 1", (lecture_id,),
+                    ).fetchone() is not None
+                    transcript_finalized = bool(final_chunk and (still_owned["audio_finalized"] or not raw_started))
+                    if transcript_finalized:
                         connection.execute(
                             "UPDATE lectures SET recording_finalized = 1 WHERE id = ?",
                             (lecture_id,),
                         )
-            if final_chunk:
+            if transcript_finalized:
                 queue_completed_recording(lecture["username"], lecture_id)
             return {
                 "segments": segments,
                 "processing_seconds": processing_seconds,
-                **recording_flags(lecture["username"], lecture_id, final_chunk),
+                **recording_flags(lecture["username"], lecture_id, transcript_finalized),
             }
         except (HTTPException, ImportInterrupted):
             raise
@@ -2514,6 +2561,64 @@ def create_app(
                 with chunk_admission_lock:
                     active_chunk_lectures.discard(admission_key)
                 capacity.release()
+
+    @app.get("/lectures/{lecture_id}/recording-chunks/{chunk_id}/result")
+    def recording_chunk_result(lecture_id: str, chunk_id: str, user: dict = Depends(data_identity)):
+        try:
+            chunk_id = str(uuid.UUID(chunk_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(422, "음성 ID가 올바르지 않습니다.") from None
+        if not limiter.allow(("recording-upload-result", user["username"]), 1200, 60):
+            raise HTTPException(429, "잠시 후 원본 저장 상태를 다시 확인하세요.", headers={"Retry-After": "5"})
+        return recording_uploads.result(lecture_id, user["username"], chunk_id)
+
+    @app.post("/lectures/{lecture_id}/recording-chunks")
+    async def upload_recording_chunk(
+        lecture_id: str, request: Request,
+        x_chunk_id: Annotated[str, Header(max_length=64)],
+        x_start_seconds: Annotated[str, Header(max_length=40)],
+        x_overlap_seconds: Annotated[str, Header(max_length=40)] = "0",
+        x_final_chunk: Annotated[str, Header(max_length=8)] = "true",
+        user: dict = Depends(data_identity),
+    ):
+        await run_in_threadpool(owned_lecture, lecture_id, user["username"])
+        try:
+            chunk_id = str(uuid.UUID(x_chunk_id))
+            start_seconds, overlap_seconds = float(x_start_seconds), float(x_overlap_seconds)
+            final_value = x_final_chunk.strip().lower()
+            if (not math.isfinite(start_seconds) or not 0 <= start_seconds <= 86400
+                    or not math.isfinite(overlap_seconds) or not 0 <= overlap_seconds <= 3
+                    or final_value not in {"true", "false"}):
+                raise ValueError("invalid metadata")
+        except (ValueError, OverflowError):
+            raise HTTPException(422, "음성 ID 또는 시작 시간이 올바르지 않습니다.") from None
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "audio/wav":
+            raise HTTPException(415, "audio/wav 형식으로 전송하세요.")
+        if not limiter.allow(("recording-upload", user["username"]), 600, 60):
+            raise HTTPException(429, "잠시 후 원본 녹음을 다시 보내세요.", headers={"Retry-After": "5"})
+        if not raw_upload_capacity.acquire(blocking=False):
+            raise HTTPException(429, "원본 녹음 저장이 진행 중입니다. 잠시 후 다시 보내세요.",
+                                headers={"Retry-After": "2"})
+        try:
+            payload = bytearray()
+            async for part in request.stream():
+                if len(payload) + len(part) > settings.max_upload_bytes:
+                    raise HTTPException(413, "음성 조각이 너무 큽니다.")
+                payload.extend(part)
+            _, duration, pcm = decode_wav(bytes(payload))
+            result = await run_in_threadpool(
+                recording_uploads.store, lecture_id, user, chunk_id,
+                hashlib.sha256(payload).hexdigest(), start_seconds, duration,
+                overlap_seconds, final_value == "true", pcm,
+            )
+            if result["recording_audio_finalized"]:
+                await run_in_threadpool(queue_completed_recording, user["username"], lecture_id)
+            return result
+        except (sqlite3.Error, OSError):
+            raise HTTPException(503, "원본 녹음의 저장 완료를 확인하지 못했습니다. 같은 조각으로 다시 확인해 주세요.",
+                                headers={"Retry-After": "2"}) from None
+        finally:
+            raw_upload_capacity.release()
 
     @app.post("/lectures/{lecture_id}/chunks")
     async def upload_chunk(

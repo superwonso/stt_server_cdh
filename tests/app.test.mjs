@@ -180,8 +180,20 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     values.push(node); createdElements.set(tag,values);
     return node;
   };
+  const uploaderTails = new Map(), audioUploaderTails = new Map();
+  const runMockLane = async (tails,owner,work) => {
+    const previous = tails.get(owner);
+    const turn = deferred();
+    tails.set(owner,turn.promise);
+    if (previous) await previous.catch(() => undefined);
+    try { return {supported:true,value:await work()}; }
+    finally {
+      turn.resolve();
+      if (tails.get(owner) === turn.promise) tails.delete(owner);
+    }
+  };
   const coordination = {
-    captureOwners:[], uploaderOwners:[], destructiveCalls:[], releasedCaptureLeases:0,
+    captureOwners:[], uploaderOwners:[], audioUploaderOwners:[], destructiveCalls:[], releasedCaptureLeases:0,
     async acquireLiveCapture(owner) {
       requireOwner(owner);
       this.captureOwners.push(owner);
@@ -200,7 +212,19 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       requireOwner(owner);
       if (typeof work !== 'function') throw new TypeError('uploader work is invalid');
       this.uploaderOwners.push(owner);
-      return {supported:true,value:await work()};
+      return runMockLane(uploaderTails,owner,work);
+    },
+    async runAudioUploader(owner,work) {
+      requireOwner(owner);
+      if (typeof work !== 'function') throw new TypeError('audio uploader work is invalid');
+      this.audioUploaderOwners.push(owner);
+      return runMockLane(audioUploaderTails,owner,work);
+    },
+    async runAllUploaders(owner,work) {
+      requireOwner(owner);
+      if (typeof work !== 'function') throw new TypeError('uploader transition work is invalid');
+      const outer = await this.runUploader(owner,() => this.runAudioUploader(owner,work));
+      return {supported:outer.supported && outer.value.supported,value:outer.value.value};
     },
     async runDestructiveLectureAction(owner,lectureId,work,{hasActiveSession} = {}) {
       requireOwner(owner); requireUuid(lectureId,'lectureId');
@@ -4492,6 +4516,369 @@ test('an ambiguous CLOVA chunk failure never auto-retries or silently switches t
   await tick(); await tick();
   assert.equal(app.microphone().stopCalls,1);
   assert.equal(app.run('pending.length'),2,'an explicit stop appends the final tail behind the blocked chunk');
+});
+
+function originalAudioApp({capability = true,store,lookup,transcribe} = {}) {
+  const rawPosts = [], asrPosts = [], lookups = [], tickets = [], events = [], receipts = new Map();
+  let storedSeconds = 0;
+  const app = setup(async (url,options = {}) => {
+    if (url.endsWith('/status')) return response({model_state:'ready',
+      transcription_providers:{qwen:{configured:true},clova:{configured:true}},
+      capabilities:{recording_audio_upload:capability}});
+    if (url.endsWith('/lectures')) return response({id:options.headers.get('X-Lecture-Id'),title:'Synthetic audio backup',
+      language:'en',asr_provider:'clova',created_at:'2026-01-01T00:00:00Z',segments:[],
+      recording_available:false,recording_finalized:false,recording_audio_finalized:false},201);
+    if (url.endsWith('/recording-chunks')) {
+      const bytes = await options.body.arrayBuffer();
+      const entry = {url,options,id:options.headers.get('X-Chunk-Id'),bytes:new Uint8Array(bytes)};
+      rawPosts.push(entry);events.push(`audio:${entry.id}`);
+      const start = Number(options.headers.get('X-Start-Seconds'));
+      const duration = (bytes.byteLength - 44) / 32000;
+      const final = options.headers.get('X-Final-Chunk') === 'true';
+      storedSeconds = Math.max(storedSeconds,start + duration);
+      const receipt = {status:'stored',chunk_id:entry.id,
+        payload_sha256:Buffer.from(await webcrypto.subtle.digest('SHA-256',bytes)).toString('hex'),
+        start_seconds:start,duration_seconds:duration,overlap_seconds:Number(options.headers.get('X-Overlap-Seconds')),
+        final_chunk:final,recording_audio_finalized:final,recording_stored_seconds:storedSeconds};
+      receipts.set(entry.id,receipt);
+      return store ? store({entry,receipt,rawPosts,receipts,app}) : response(receipt);
+    }
+    if (/\/recording-chunks\/[^/]+\/result$/.test(url)) {
+      const id = url.split('/').at(-2);lookups.push({url,options,id});events.push(`audio-lookup:${id}`);
+      return lookup ? lookup({id,url,options,receipts,app}) : response(receipts.get(id) || {status:'unknown',chunk_id:id});
+    }
+    if (url.endsWith('/chunks')) {
+      const entry = {url,options,id:options.headers.get('X-Chunk-Id')};asrPosts.push(entry);events.push(`asr:${entry.id}`);
+      return transcribe ? transcribe({entry,asrPosts,app}) : response({detail:'Synthetic invalid_response'},424);
+    }
+    if (url.endsWith('/result')) return response({state:'unknown'});
+    if (url.endsWith('/recording-download-ticket')) {
+      tickets.push({url,options});return response({path:`/recording-downloads/${'a'.repeat(48)}`});
+    }
+    return response({});
+  });
+  const start = async () => {
+    await app.run('updateStatus()');
+    app.element('language').value = 'en';
+    await app.run('startRecording()');
+  };
+  return {app,start,rawPosts,asrPosts,lookups,tickets,events,receipts};
+}
+
+test('original audio storage continues after CLOVA 424 through later chunks and a final WAV without acknowledging ASR',async () => {
+  const {app,start,rawPosts,asrPosts,tickets,events} = originalAudioApp();
+  await start();
+  app.microphone().callbacks.onChunk(chunk(0));
+  await until(() => app.run('!!sendError && !sending'),'CLOVA rejection while raw storage remains live');
+  const firstId = app.run('pending[0].id');
+  assert.equal(rawPosts.length,1);
+  assert.equal(asrPosts.length,1);
+  assert.ok(events.indexOf(`audio:${firstId}`) < events.indexOf(`asr:${firstId}`),'save original WAV before attempting paid recognition');
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.microphone().stopCalls,undefined);
+
+  app.microphone().callbacks.onChunk(chunk(5,11,3));
+  await until(() => rawPosts.length === 2,'later audio bypasses the blocked transcript queue');
+  app.microphone().tail = chunk(13,3.2,3,true);
+  await app.run('stopRecording()');
+  await until(() => rawPosts.length === 3 && app.run('current.recording_audio_finalized === true'),'original recording finalization');
+  assert.equal(asrPosts.length,1,'raw retries and later audio never replay the ambiguous CLOVA POST');
+  assert.equal(app.run('pending.length'),3);
+  assert.equal(app.run('liveQueue.chunks.size'),3,'raw receipts do not delete untranscribed original chunks');
+  assert.equal(app.run('liveQueue.chunks.values().next().value.state'),'blocked');
+  assert.equal(app.run('liveQueue.markInflightCalls'),1);
+  assert.equal(app.run('manualRetryApprovedIds.size'),0);
+  assert.ok(app.run('!!sendError'),'original recording success does not resolve transcription uncertainty');
+  assert.ok(app.run('pending.every(item => item.audioStoredScope === JSON.stringify([user,token,apiUrl]))'));
+  assert.ok(app.run('pending.every(item => !item.serverConfirmed)'));
+  assert.equal(app.run('current.recording_available'),true);
+  assert.equal(app.run('current.recording_finalized'),false,'a full original WAV is not a completed transcript');
+  assert.equal(app.run('current.recording_stored_seconds'),16.2);
+  assert.deepEqual(rawPosts.map(({options}) => [options.headers.get('X-Start-Seconds'),options.headers.get('X-Overlap-Seconds'),options.headers.get('X-Final-Chunk')]),
+    [['0','0','false'],['5','3','false'],['13','3','true']]);
+  assert.equal(new Set(rawPosts.map(item => item.id)).size,3);
+  assert.equal(rawPosts[0].id,firstId);
+  assert.equal(app.element('recording-download').disabled,false);
+  await app.run('downloadRecording()');
+  assert.equal(tickets.length,1,'full original WAV uses the owner-checked server download instead of local-only export');
+  assert.match(app.created('a').href,/^https:\/\/classroom\.example\/recording-downloads\/[a-z]+$/);
+  assert.equal(app.run('pending.length'),3,'downloading a copy preserves local pending audio');
+});
+
+test('original audio keeps uploading while an earlier CLOVA response is still stalled',async () => {
+  const gate = deferred();
+  const {app,start,rawPosts,asrPosts} = originalAudioApp({transcribe:() => gate.promise});
+  await start();app.microphone().callbacks.onChunk(chunk(0));
+  await until(() => asrPosts.length === 1,'inflight ASR request');
+  assert.equal(app.run('sending'),true);
+  app.microphone().callbacks.onChunk(chunk(5,11,3));
+  await until(() => rawPosts.length === 2,'independent original-audio uploader');
+  app.microphone().tail = chunk(13,3.1,3,true);
+  await app.run('stopRecording()');
+  await until(() => app.run('current.recording_audio_finalized === true'),'raw final ACK before ASR response');
+  assert.equal(asrPosts.length,1);
+  assert.equal(rawPosts.length,3);
+  assert.equal(app.run('sending'),true);
+  assert.equal(app.run('liveQueue.chunks.size'),3);
+  assert.ok(app.coordination.audioUploaderOwners.length > 0);
+  gate.resolve(response({detail:'Synthetic delayed invalid_response'},424));
+  await until(() => app.run('!!sendError && !sending'),'delayed ASR failure');
+  assert.equal(rawPosts.length,3);
+  assert.equal(app.run('current.recording_audio_finalized'),true);
+});
+
+test('lost original-audio ACK is recovered by exact chunk lookup without replaying CLOVA or deleting pending audio',async () => {
+  const {app,start,rawPosts,asrPosts,lookups} = originalAudioApp({store:({app}) => {throw app.run("new TypeError('synthetic receipt lost after commit')");}});
+  await start();app.microphone().callbacks.onChunk(chunk(0));
+  await until(() => app.run('audioRetryTimer !== null'),'retry after lost original receipt');
+  assert.equal(asrPosts.length,0,'recognition waits until original storage is confirmed');
+  await app.runTimeout(1000);
+  await until(() => app.run('!!sendError && !sending'),'original receipt recovery followed by CLOVA failure');
+  assert.equal(rawPosts.length,1);
+  assert.equal(lookups.length,2,'preflight unknown then committed receipt lookup');
+  for (const item of lookups) {
+    assert.equal(item.id,rawPosts[0].id);
+    assert.equal(item.options.body,undefined);
+    assert.notEqual(item.options.method,'POST');
+    assert.equal(item.options.headers.get('Authorization'),'Bearer old-token');
+  }
+  assert.equal(asrPosts.length,1);
+  assert.equal(app.run('pending.length'),1);
+  assert.ok(app.run('pending[0].audioStoredScope === JSON.stringify([user,token,apiUrl])'));
+  assert.equal(app.run('liveQueue.chunks.size'),1);
+});
+
+test('an uncommitted original-audio upload retries identical WAV bytes and boundary headers before allowing ASR',async () => {
+  const {app,start,rawPosts,asrPosts} = originalAudioApp({store:({entry,receipt,rawPosts,receipts}) => {
+    if (rawPosts.length === 1) {receipts.delete(entry.id);return response({detail:'synthetic unavailable before commit'},503);}
+    return response(receipt);
+  }});
+  await start();app.microphone().callbacks.onChunk(chunk(0));
+  await until(() => app.run('audioRetryTimer !== null'),'original upload retry');
+  assert.equal(asrPosts.length,0);
+  assert.equal(app.run('liveQueue.chunks.values().next().value.state'),'queued');
+  await app.runTimeout(1000);
+  await until(() => app.run('!!sendError && !sending'),'safe original retry then provider failure');
+  assert.equal(rawPosts.length,2);
+  assert.equal(rawPosts[0].id,rawPosts[1].id);
+  assert.deepEqual(rawPosts[0].bytes,rawPosts[1].bytes);
+  for (const header of ['X-Chunk-Id','X-Start-Seconds','X-Overlap-Seconds','X-Final-Chunk','Content-Type']) {
+    assert.equal(rawPosts[0].options.headers.get(header),rawPosts[1].options.headers.get(header));
+  }
+  assert.equal(asrPosts.length,1);
+  assert.equal(asrPosts[0].id,rawPosts[0].id);
+  assert.equal(app.run('pending.length'),1);
+});
+
+test('mismatched original storage receipts never authorize recognition or falsely finalize the server WAV',async () => {
+  for (const mutate of [receipt => ({...receipt,payload_sha256:'0'.repeat(64)}),
+    receipt => ({...receipt,chunk_id:webcrypto.randomUUID()}),
+    receipt => ({...receipt,recording_audio_finalized:'true'}),
+    receipt => ({...receipt,start_seconds:receipt.start_seconds + 1}),
+    receipt => ({...receipt,recording_stored_seconds:0})]) {
+    const {app,start,rawPosts,asrPosts} = originalAudioApp({store:({receipt}) => response(mutate(receipt))});
+    await start();app.microphone().callbacks.onChunk(chunk(0));
+    await until(() => app.run('!!audioUploadError && !audioSending'),'invalid original receipt');
+    assert.equal(rawPosts.length,1);
+    assert.equal(asrPosts.length,0);
+    assert.equal(app.run('audioRetryTimer'),null);
+    assert.equal(app.run('pending.length'),1);
+    assert.equal(app.run('pending[0].audioStoredScope'),undefined);
+    assert.equal(app.run('current.recording_available'),false);
+    assert.equal(app.run('current.recording_audio_finalized'),false);
+    assert.equal(app.run('liveQueue.chunks.size'),1);
+    assert.equal(app.run('recording'),true);
+  }
+});
+
+test('late original-audio receipts cannot authorize ASR or reveal storage flags after an identity or server change',async () => {
+  for (const change of ["user='user-beta';token='new-token'","token='renewed-token'","apiUrl='https://changed.example'"]) {
+    const gate = deferred();let waitingReceipt;
+    const {app,start,rawPosts,asrPosts} = originalAudioApp({store:({receipt}) => {waitingReceipt = receipt;return gate.promise;}});
+    await start();app.microphone().callbacks.onChunk(chunk(0));
+    await until(() => !!waitingReceipt,'pending original receipt');
+    app.run(`${change};current={id:'different-workspace',segments:[],recording_available:false}`);
+    gate.resolve(response(waitingReceipt));
+    await tick();await tick();
+    assert.equal(rawPosts.length,1);
+    assert.equal(asrPosts.length,0);
+    assert.equal(app.run('current.recording_available'),false);
+    assert.equal(app.run('pending.length'),1);
+    assert.equal(app.run('pending[0].audioStoredScope'),undefined,'a stale ACK must not grant current-scope confirmation');
+    assert.equal(app.run('liveQueue.chunks.size'),1);
+  }
+});
+
+test('explicitly held audio is excluded from the independent original storage lane',async () => {
+  const {app,rawPosts,asrPosts} = originalAudioApp();
+  const oldId = await seedHeldScenario(app,{count:3});
+  await app.run('prepareIndependentLesson()');
+  await app.run('updateStatus()');
+  await app.run('drainRecordingAudio()');
+  assert.equal(rawPosts.length,0);
+  assert.equal(asrPosts.length,0);
+  assert.equal(app.run('pending.length'),3);
+  assert.equal(app.run(`liveQueue.sessions.get(${JSON.stringify(oldId)}).uploadHeld`),true);
+  assert.equal(app.run('liveQueue.chunks.size'),3);
+});
+
+test('same-owner reauthentication rechecks original receipts without resending WAV or clearing the manual CLOVA gate',async () => {
+  const {app,start,rawPosts,asrPosts,lookups} = originalAudioApp();
+  await start();app.microphone().callbacks.onChunk(chunk(0));
+  await until(() => app.run('!!sendError && !sending && !audioSending'),'first receipt and manual transcript gate');
+  const original = app.run('pending[0]'), oldScope = original.audioStoredScope;
+  assert.equal(rawPosts.length,1);
+  app.run("token='replacement-same-owner-token'");
+  await app.run('updateStatus()');
+  await until(() => app.run('pending[0].audioStoredScope === JSON.stringify([user,token,apiUrl])'),'new login verifies server-held original');
+  assert.notEqual(original.audioStoredScope,oldScope);
+  assert.equal(app.run('pending[0]'),original);
+  assert.equal(rawPosts.length,1,'already-stored original WAV is not uploaded again');
+  assert.equal(asrPosts.length,1,'same-owner login does not authorize ambiguous CLOVA replay');
+  assert.equal(lookups.length,2);
+  assert.equal(lookups.at(-1).options.headers.get('Authorization'),'Bearer replacement-same-owner-token');
+  assert.equal(app.run('liveQueue.chunks.values().next().value.state'),'blocked');
+  assert.equal(app.run('manualRetryApprovedIds.size'),0);
+  assert.ok(app.run('!!sendError'));
+});
+
+test('a newly observed durable hold blocks raw uploads even when runtime hold flags are stale',async () => {
+  const {app,rawPosts,asrPosts} = originalAudioApp();
+  const lectureId = await seedHeldScenario(app,{count:2});
+  await app.run(`liveQueue.setSessionUploadHeld(user,${JSON.stringify(lectureId)},true)`);
+  assert.equal(app.run(`liveSessions.get(${JSON.stringify(lectureId)}).uploadHeld`),undefined);
+  await app.run('updateStatus()');
+  await until(() => !app.run('audioSending'),'fresh durable hold read');
+  assert.equal(app.run(`liveSessions.get(${JSON.stringify(lectureId)}).uploadHeld`),true);
+  assert.equal(rawPosts.length,0);
+  assert.equal(asrPosts.length,0);
+  assert.equal(app.run('pending.length'),2);
+  assert.equal(app.run('liveQueue.chunks.size'),2);
+  assert.equal(app.run('liveQueue.chunks.values().next().value.state'),'blocked');
+});
+
+test('cross-tab acknowledged original chunks drop only stale memory references and allow the next recording upload',async () => {
+  for (const sessionSurvives of [false,true]) {
+    const {app,rawPosts,asrPosts} = originalAudioApp();
+    const staleLecture = await seedHeldScenario(app,{count:sessionSurvives ? 2 : 1});
+    const staleChunk = app.run('pending[0]'), queue = app.run('liveQueue');
+    assert.equal(staleChunk.blob,null);
+    await queue.ackChunk('user-alpha',staleChunk.id,{serverConfirmed:true});
+    if (!sessionSurvives) await seedHeldScenario(app);
+    assert.equal(queue.sessions.has(staleLecture),sessionSurvives);
+    const originalRows = [...queue.chunks.values()].map(row => ({...row}));
+    const mutations = [];
+    for (const method of ['ackChunk','deleteSession','updateSession','markChunkInflight','markChunkBlocked','markChunkQueued']) {
+      const original = queue[method].bind(queue);
+      queue[method] = async (...args) => {mutations.push(method);return original(...args);};
+    }
+    await app.run('updateStatus()');
+    await until(() => !app.run('pending.some(item => item.id === ' + JSON.stringify(staleChunk.id) + ')')
+      && rawPosts.length === 1 && !app.run('audioSending'),'discarded stale cross-tab queue entry and next original ACK');
+    assert.equal(app.run('pending.length'),1);
+    assert.notEqual(rawPosts[0].id,staleChunk.id);
+    assert.equal(asrPosts.length,0,'raw cleanup cannot clear the previous manual transcription gate');
+    assert.equal(staleChunk.serverConfirmed,undefined);
+    assert.equal(staleChunk.audioStoredScope,undefined,'missing source is not proof of a new server receipt');
+    assert.deepEqual(mutations,[],'only the already-stale runtime reference is removed');
+    assert.deepEqual([...queue.chunks.values()].map(row => ({...row})),originalRows);
+    assert.ok(app.run('!!sendError'));
+    assert.equal(app.run('audioRetryTimer'),null,'the missing source must not create an endless original-upload retry loop');
+  }
+});
+
+test('missing session metadata never discards retained RAM audio or an existing durable chunk',async () => {
+  for (const remainingSource of ['ram','durable']) {
+    const {app,rawPosts,asrPosts} = originalAudioApp();
+    const lectureId = await seedHeldScenario(app), queue = app.run('liveQueue');
+    const retained = app.run('pending[0]'), originalBlob = queue.chunks.get(retained.id).blob;
+    if (remainingSource === 'ram') {
+      await queue.ackChunk('user-alpha',retained.id,{serverConfirmed:true});
+      retained.blob = originalBlob;
+    } else queue.sessions.delete(lectureId);
+    const originalRows = [...queue.chunks.values()].map(row => ({...row}));
+    const mutations = [];
+    for (const method of ['ackChunk','deleteSession','updateSession','markChunkInflight','markChunkBlocked','markChunkQueued']) {
+      const original = queue[method].bind(queue);
+      queue[method] = async (...args) => {mutations.push(method);return original(...args);};
+    }
+    await app.run('updateStatus()');
+    await until(() => app.run('!!audioUploadError && !audioSending'),'missing metadata retains the actual source');
+    assert.equal(app.run('pending.length'),1);
+    assert.equal(app.run('pending[0]'),retained);
+    if (remainingSource === 'ram') assert.equal(retained.blob,originalBlob);
+    assert.deepEqual([...queue.chunks.values()].map(row => ({...row})),originalRows);
+    assert.deepEqual(mutations,[]);
+    assert.equal(rawPosts.length,0);
+    assert.equal(asrPosts.length,0);
+    assert.equal(retained.serverConfirmed,undefined);
+    assert.equal(retained.audioStoredScope,undefined);
+    assert.equal(app.run('audioRetryTimer'),null,'missing session metadata must be surfaced, not retried forever');
+  }
+});
+
+test('a cross-tab removal between metadata and WAV reads is rechecked before dropping the stale reference',async () => {
+  const {app,rawPosts,asrPosts} = originalAudioApp();
+  const staleLecture = await seedHeldScenario(app), staleChunk = app.run('pending[0]');
+  await seedHeldScenario(app);
+  const queue = app.run('liveQueue'), read = queue.getChunk.bind(queue);let staleReads = 0;
+  queue.getChunk = async (owner,id) => {
+    if (id === staleChunk.id && ++staleReads === 2) {
+      // Simulate the other tab's completed acknowledgement after this tab's
+      // metadata read but before it opens the original WAV Blob.
+      queue.chunks.delete(id);queue.sessions.delete(staleLecture);
+    }
+    return read(owner,id);
+  };
+  const mutations = [];
+  for (const method of ['ackChunk','deleteSession','updateSession','markChunkInflight','markChunkBlocked','markChunkQueued']) {
+    const original = queue[method].bind(queue);
+    queue[method] = async (...args) => {mutations.push(method);return original(...args);};
+  }
+  await app.run('updateStatus()');
+  await until(() => app.run('audioRetryTimer !== null'),'bounded retry after cross-tab removal');
+  assert.ok(staleReads >= 3,'the catch path confirms the source is still absent');
+  assert.equal(app.run('pending.some(item => item.id === ' + JSON.stringify(staleChunk.id) + ')'),false);
+  assert.equal(staleChunk.serverConfirmed,undefined);
+  assert.equal(staleChunk.audioStoredScope,undefined);
+  assert.equal(rawPosts.length,0);
+  await app.runTimeout(1000);
+  await until(() => rawPosts.length === 1 && !app.run('audioSending'),'next retained original upload');
+  assert.notEqual(rawPosts[0].id,staleChunk.id);
+  assert.equal(asrPosts.length,0);
+  assert.equal(app.run('pending.length'),1);
+  assert.deepEqual(mutations,[]);
+  assert.equal(app.run('audioRetryTimer'),null);
+});
+
+test('untrusted unknown-result lookup cannot authorize an original-audio POST',async () => {
+  for (const value of [id => ({status:'unknown',chunk_id:webcrypto.randomUUID()}),
+    id => ({state:'unknown',chunk_id:id}),id => null]) {
+    const {app,start,rawPosts,asrPosts} = originalAudioApp({lookup:({id}) => response(value(id))});
+    await start();app.microphone().callbacks.onChunk(chunk(0));
+    await until(() => app.run('!!audioUploadError && !audioSending'),'invalid original lookup');
+    assert.equal(rawPosts.length,0);
+    assert.equal(asrPosts.length,0);
+    assert.equal(app.run('pending.length'),1);
+    assert.equal(app.run('liveQueue.chunks.values().next().value.state'),'queued');
+    assert.equal(app.run('current.recording_available'),false);
+  }
+});
+
+test('older servers without the original-audio capability keep the existing single-lane failure behavior',async () => {
+  for (const capability of [false,undefined,'true']) {
+    const {app,start,rawPosts,asrPosts} = originalAudioApp({capability:capability === undefined ? null : capability});
+    await start();app.microphone().callbacks.onChunk(chunk(0));
+    await until(() => app.run('!!sendError && !sending'),'legacy CLOVA rejection');
+    app.microphone().callbacks.onChunk(chunk(5,11,3));
+    app.microphone().tail = chunk(13,3.1,3,true);await app.run('stopRecording()');
+    await tick();await tick();
+    assert.equal(rawPosts.length,0);
+    assert.equal(asrPosts.length,1);
+    assert.equal(app.run('pending.length'),3);
+    assert.equal(app.run('liveQueue.chunks.size'),3);
+    assert.equal(app.run('current.recording_audio_finalized'),false);
+  }
 });
 
 test('ambiguous CLOVA failure retains one WAV across delayed durable writes and real SHA-256 completion', async () => {

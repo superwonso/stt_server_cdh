@@ -89,6 +89,8 @@ let transcriptRenderState = {scope:'',rows:new Map()};
 const textExportUrls = new Set();
 const loadedLectureOwners = new WeakMap();
 let textExportIdentity = '', continuationCapability = '', partialRecordingCapability = '';
+let recordingUploadCapability = '', audioSending = false, audioRetryTimer = null, audioRetryAttempt = 0;
+let audioUploadError = '', audioUploadErrorScope = '';
 // null means "automatic": prefer CLOVA for a new microphone lesson when the
 // authenticated server advertises it, otherwise stay on the local Qwen path.
 // Keep an explicit user choice only in this account session; never persist it
@@ -144,7 +146,7 @@ function recordingStorageLabel(lecture) {
   if (!lecture) return '녹음 저장 준비';
   const state = lecture.recording_storage_state;
   if (state === 'local_recording') {
-    return lecture.recording_finalized ? '이 서버에 녹음 저장됨' : '이 서버에 녹음 저장 중';
+    return recordingAudioComplete(lecture) ? '이 서버에 녹음 저장됨' : '이 서버에 녹음 저장 중';
   }
   return RECORDING_STORAGE_LABELS[state]
     || (lecture.recording_available ? '이 서버에 녹음 저장됨' : '아직 저장된 녹음 없음');
@@ -192,7 +194,10 @@ function transcriptExportIsPartial() {
 }
 function canDownloadSavedRecording() {
   return !!(canReadCurrentLecture() && !recordingDownloadPending
-    && !recordingFinalizePending && !deletingLecture && current?.recording_available && current.recording_finalized);
+    && !recordingFinalizePending && !deletingLecture && current?.recording_available && recordingAudioComplete(current));
+}
+function recordingAudioComplete(lecture) {
+  return lecture?.recording_audio_finalized === true || lecture?.recording_finalized === true;
 }
 function canFinalizeStoppedRecording() {
   return !!(user && token && current && !current.recording_finalized
@@ -200,7 +205,7 @@ function canFinalizeStoppedRecording() {
     && !isBusy() && !importIsActive() && !importStarting && !importCancelling);
 }
 function canDownloadPartialRecording() {
-  return canReadCurrentLecture() && !recordingDownloadPending && !current.recording_finalized && !!current.recording_available
+  return canReadCurrentLecture() && !recordingDownloadPending && !recordingAudioComplete(current) && !!current.recording_available
     && partialRecordingCapability === JSON.stringify([user,token,apiUrl]);
 }
 const storage = { get() { try { return localStorage.getItem('yeobaek-server') || ''; } catch { return ''; } }, set(value) { try { localStorage.setItem('yeobaek-server', value); } catch {} } };
@@ -468,7 +473,7 @@ async function runWhenOwnerCaptureIdle(owner, lectureId, work, {allowSnapshot = 
     // Capture may already be stopped while its final queue is still uploading
     // in another tab. Serialize deletion/finalization with that uploader too,
     // so a late chunk cannot race the destructive server request.
-    const coordinated = await liveCoordination.runUploader(owner,async () => {
+    const coordinated = await liveCoordination.runAllUploaders(owner,async () => {
       if (liveQueueRecoveryPromise) await liveQueueRecoveryPromise;
       if (pending.some(chunk => chunk.owner === owner
           && (chunk.captureId === lectureId || chunk.lectureId === lectureId))) {
@@ -683,6 +688,7 @@ function persistPendingChunk(session, item) {
   }).finally(() => {
     liveQueuePersisting = Math.max(0,liveQueuePersisting - 1);
     updateControls();
+    void drainRecordingAudio();
   });
   return item.persistPromise;
 }
@@ -870,6 +876,7 @@ function recoverDurableLiveAudio(owner) {
   tracked = performDurableLiveAudioRecovery(owner).finally(() => {
     if (liveQueueRecoveryPromise === tracked) liveQueueRecoveryPromise = null;
     updateControls();
+    void drainRecordingAudio();
     if (token && pending.length && !sendError) void drain();
   });
   liveQueueRecoveryPromise = tracked;
@@ -1125,15 +1132,17 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
     throw expired;
   }
   const uploaderAlreadyLocked = options.uploaderAlreadyLocked === true;
+  const audioUploaderAlreadyLocked = options.audioUploaderAlreadyLocked === true;
   const {
     anonymous:_anonymous,
     uploaderAlreadyLocked:_uploaderAlreadyLocked,
+    audioUploaderAlreadyLocked:_audioUploaderAlreadyLocked,
     responseType,
     ...requestOptions
   } = options;
   const requestedServer = baseUrl || apiUrl, requestedToken = token;
   if (!anonymous) {
-    if (!hasRequestableServer()) await ensureTrustedApiRequest({uploaderAlreadyLocked});
+    if (!hasRequestableServer()) await ensureTrustedApiRequest({uploaderAlreadyLocked:uploaderAlreadyLocked || audioUploaderAlreadyLocked});
     if (!hasRequestableServer() || apiUrl !== requestedServer || token !== requestedToken) {
       throw connectionChangedBeforeRequestError();
     }
@@ -1445,7 +1454,7 @@ async function discoverServer({deadline = 0, serializeOwner = ''} = {}) {
       return true;
     };
     if (serializeOwner) {
-      const coordinated = await liveCoordination.runUploader(serializeOwner,installCandidate);
+      const coordinated = await liveCoordination.runAllUploaders(serializeOwner,installCandidate);
       noteCoordinationSupport(coordinated.supported);
       if (!coordinated.value) return;
     } else {
@@ -1500,9 +1509,14 @@ async function refreshExpiredAutomaticServer() {
 }
 async function refreshExpiredAutomaticServerAfterUploads(owner) {
   if (!owner) return refreshExpiredAutomaticServer();
-  const coordinated = await liveCoordination.runUploader(
+  const wasExpired = automaticLeaseExpired();
+  const coordinated = await liveCoordination.runAllUploaders(
     owner,
-    () => refreshExpiredAutomaticServer(),
+    () => {
+      // Another waiter may have already invalidated the expired origin.
+      if (wasExpired && !automaticLeaseExpired() && !hasVerifiedServer()) throw expiredLeaseError();
+      return refreshExpiredAutomaticServer();
+    },
   );
   noteCoordinationSupport(coordinated.supported);
   return coordinated.value;
@@ -1512,9 +1526,11 @@ async function ensureTrustedApiRequest({uploaderAlreadyLocked = false} = {}) {
   if (automaticLeaseExpired()) {
     // Ordinary status/history/import calls can become the first overdue timer
     // to notice an expired lease. They must wait behind an in-flight live WAV
-    // before replacing its origin. Calls already inside that uploader lock use
-    // the plain refresh path to avoid acquiring the same exclusive lock twice.
-    if (!uploaderAlreadyLocked && user) {
+    // before replacing its origin. Never change origins or upgrade transport
+    // locks inside either lane.
+    // Release it first; the next retry/status refresh takes both lanes.
+    if (uploaderAlreadyLocked) throw expiredLeaseError();
+    if (user) {
       return refreshExpiredAutomaticServerAfterUploads(user);
     }
     return refreshExpiredAutomaticServer();
@@ -1635,6 +1651,7 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
 }
 function showLogin(clear = true) {
   clearTextExports(); continuationCapability = ''; partialRecordingCapability = '';
+  recordingUploadCapability = ''; resetRecordingAudioRetry(); audioUploadError = ''; audioUploadErrorScope = '';
   clearLocalAudioExports();
   clearRecordingSelection();
   resetLibraryWorkspace();
@@ -1731,7 +1748,7 @@ $('connection-form').onsubmit = async event => {
       // Pause only network submission, not capture. This lock spans anonymous
       // health verification and origin installation, so an old-origin upload
       // cannot begin or finish in the middle of the switch in any same-origin tab.
-      const coordinated = await liveCoordination.runUploader(connectionOwner,verifyAndInstall);
+      const coordinated = await liveCoordination.runAllUploaders(connectionOwner,verifyAndInstall);
       noteCoordinationSupport(coordinated.supported);
       if (!coordinated.value) return;
     } else if (!await verifyAndInstall()) {
@@ -1931,6 +1948,7 @@ async function updateStatus() {
     if (!requestIsCurrent()) return;
     continuationCapability = status?.capabilities?.lecture_continuations === true ? JSON.stringify([user,token,apiUrl]) : '';
     partialRecordingCapability = status?.capabilities?.recording_partial_download === true ? JSON.stringify([user,token,apiUrl]) : '';
+    recordingUploadCapability = status?.capabilities?.recording_audio_upload === true ? JSON.stringify([user,token,apiUrl]) : '';
     const advertised = status?.transcription_providers;
     const qwenConfigured = advertised?.qwen?.configured !== false;
     const clovaConfigured = advertised?.clova?.configured === true;
@@ -1942,6 +1960,7 @@ async function updateStatus() {
     applyNewLectureProvider();
     $('model-status').textContent = ({unloaded:'로컬 모델 · 첫 받아쓰기 준비됨',loading:'API 연결됨 · 로컬 모델 준비 중',ready:'음성 인식 모델 연결됨',busy:'API 연결됨 · 로컬 모델 처리 중',offline:'API 연결됨 · 로컬 모델 연결 대기',error:'API 연결됨 · 로컬 모델 확인 필요'})[status.model_state] || '서버 연결됨';
     updateProviderGuidance(); updateControls();
+    void drainRecordingAudio();
     if (lectures.some(lecture => TRANSIENT_RECORDING_STORAGE_STATES.has(lecture?.recording_storage_state))) {
       void refreshLectures().catch(() => {});
     }
@@ -1972,6 +1991,12 @@ async function refreshLectures() {
     for (const key of ['continuation_of','continuations']) if (key in summary) target[key] = summary[key];
     target.recording_available = !!summary.recording_available;
     target.recording_finalized = !!summary.recording_finalized;
+    if (typeof summary.recording_audio_finalized === 'boolean') {
+      target.recording_audio_finalized = target.recording_audio_finalized === true || summary.recording_audio_finalized;
+    }
+    if (Number.isFinite(summary.recording_stored_seconds) && summary.recording_stored_seconds >= 0) {
+      target.recording_stored_seconds = Math.max(target.recording_stored_seconds || 0,summary.recording_stored_seconds);
+    }
     if (typeof summary.recording_storage_state === 'string') {
       target.recording_storage_state = summary.recording_storage_state;
     }
@@ -4798,7 +4823,7 @@ async function holdPreviousAudio() {
       if(!isCurrent())return false;
       noteCoordinationSupport(lease.supported);
       if(!lease.acquired || !lease.supported)throw new Error('다른 탭의 녹음 상태를 안전하게 확인하지 못해 전송 보류를 바꾸지 않았어요. 기존 수업 탭에서 녹음을 종료한 뒤 다시 시도해 주세요.');
-      const result=await liveCoordination.runUploader(owner,async()=>{
+      const result=await liveCoordination.runAllUploaders(owner,async()=>{
         const queue=await openLiveQueue();
         if(!isCurrent())return false;
         if(!queue || typeof queue.setSessionUploadHeld!=='function')throw new Error('기기 저장소에 전송 보류를 기록할 수 없습니다. 원본은 그대로 보관합니다.');
@@ -4846,7 +4871,7 @@ async function restoreHeldAudio(captureId) {
     lease=await liveCoordination.acquireLiveCapture(owner);
     if(!isCurrent())return;
     if(!lease.acquired || !lease.supported)throw new Error('다른 탭의 녹음이 끝난 뒤 이 수업을 복구해 주세요.');
-    const result=await liveCoordination.runUploader(owner,async()=>{
+    const result=await liveCoordination.runAllUploaders(owner,async()=>{
       const queue=await openLiveQueue();if(!isCurrent())return false;
       if(!queue)throw new Error('기기 저장소를 확인하지 못해 보관을 유지합니다.');
       await queue.setSessionUploadHeld(owner,captureId,false);
@@ -5052,6 +5077,11 @@ $('local-audio-dialog').onclose = () => { if (!$('local-audio-dialog').open) cle
 
 function updateControls() {
   const busy = isBusy(), queued = queuedCount(), activeQueued=activePendingCount(), system = selectedCaptureSource() === 'system', activeImport = importIsActive();
+  const audioDescription = recordingAudioUploadDescription();
+  $('recording-upload-status').hidden = !audioDescription;
+  $('recording-upload-status').textContent = audioDescription;
+  $('recording-upload-retry').hidden = !(audioUploadErrorScope === recordingAudioScope() && audioUploadError);
+  $('recording-upload-retry').disabled = audioSending || holdingAudio || !recordingAudioUploadEnabled();
   $('new-note').disabled = !!newLessonBlockReason(); $('logout').disabled = busy || pending.length>0
     || [...liveSessions.values()].some(session=>session.owner===user && hasVolatilePendingAudio(session));
   $('hold-new-note').disabled = !!holdAudioBlockReason();
@@ -5082,12 +5112,12 @@ function updateControls() {
   $('download').textContent = hasTranscript && transcriptExportIsPartial() ? '↓ 현재까지의 텍스트' : '↓ 텍스트';
   const recoverablePcm = !!current && localPcmSnapshots.has(current.id);
   $('recording-download').disabled = !current || (!canDownloadSavedRecording() && (!mayExportLocalAudio() || localAudioExportBusy || recordingDownloadPending));
-  $('recording-download').textContent = current?.recording_available && current.recording_finalized ? '↓ 저장된 녹음 WAV' : '↓ 기기에 남은 WAV';
+  $('recording-download').textContent = current?.recording_available && recordingAudioComplete(current) ? '↓ 저장된 녹음 WAV' : '↓ 기기에 남은 WAV';
   $('recording-finalize').hidden = !current || !!current.recording_finalized || (!current.recording_available && !recoverablePcm);
   $('recording-finalize').disabled = !canFinalizeStoppedRecording();
-  $('recording-partial-download').hidden = !current || !!current.recording_finalized;
+  $('recording-partial-download').hidden = !current || recordingAudioComplete(current);
   $('recording-partial-download').disabled = !canDownloadPartialRecording();
-  $('recording-download-note').textContent = current?.recording_finalized
+  $('recording-download-note').textContent = recordingAudioComplete(current)
     ? '저장된 전체 WAV와 아직 기기에만 남은 음성은 별도로 내려받습니다. 다운로드는 다른 수업의 녹음을 멈추지 않습니다.'
     : '텍스트는 현재까지 받은 부분입니다. 서버에 저장된 부분 WAV와 기기에 남은 WAV는 서로 다른 범위이며 각각 보관하세요. 미전송 음성은 서버 파일에 없고, 이미 전송된 앞부분은 기기 파일에 없을 수 있습니다. 다운로드는 수업 종료·전송 대기 삭제를 하지 않습니다.';
   const continueBlock = continuationBlockReason();
@@ -5138,6 +5168,10 @@ function updateControls() {
         : recoveryFinalizationRequired.size ? `${recoveryFinalizationRequired.size}개 수업 · 마지막 문장 마무리 확인 필요`
         : captureWarning ? '마지막 오디오 일부 누락 가능 · 받은 내용만 저장됨' : recordingStorageLabel(current);
   if (volatileDetail) $('save-state').textContent += ` · ${volatileDetail}`;
+  if (recordingAudioUploadEnabled() && current?.recording_audio_finalized && !current.recording_finalized) {
+    $('save-state').textContent = `${recordingStorageLabel(current)} · 받아쓰기 미완료 · 기기 사본 유지`
+      + (volatileDetail ? ` · ${volatileDetail}` : '');
+  }
   $('processing').hidden = !recording && !starting && !pausing && !resuming && !inputUnavailable && !activeQueued && !sending;
   $('processing-text').textContent = inputBlocked
     ? '새 음성을 받지 못하고 있습니다. 입력 복구 버튼으로 마이크를 확인해 주세요. 이미 받은 음성은 내려받을 수 있습니다.'
@@ -5717,6 +5751,7 @@ function enqueueChunk(session, chunk) {
   };
   pending.push(item);
   persistPendingChunk(session,item);
+  void drainRecordingAudio();
   if (item.lectureReady) void drain();
 }
 async function assignLecture(session) {
@@ -5815,6 +5850,7 @@ async function ensureLectureAssigned(session) {
     await assignLecture(session);
     if (!isCurrent()) return;
     if (!sendError) retryMessage = '';
+    void drainRecordingAudio();
     void drain();
   } catch (error) {
     if (!isCurrent()) return;
@@ -5904,6 +5940,7 @@ function clearUploadRetry() {
   retryTimer = null; retryAttempt = 0; retryMessage = '';
 }
 function nudgeQueuedUpload() {
+  void drainRecordingAudio();
   if (!nextPendingChunk() && !draft) return;
   if (retryTimer !== null) clearTimeout(retryTimer);
   retryTimer = null; retryMessage = '';
@@ -5970,7 +6007,7 @@ async function recoverPublishedServerAfterTransportFailure() {
       // The probe is anonymous and may overlap an old-origin request, but the
       // actual origin/token switch waits until every same-owner uploader has
       // left its critical section.
-      const coordinated = await liveCoordination.runUploader(recoveryOwner,installCandidate);
+      const coordinated = await liveCoordination.runAllUploaders(recoveryOwner,installCandidate);
       noteCoordinationSupport(coordinated.supported);
       return coordinated.value;
     } catch {
@@ -5987,8 +6024,199 @@ function manualUploadError(error) {
   return `${errorText(error)} ${reason}`;
 }
 function clovaManualUploadError(error) {
-  return `${errorText(error)} CLOVA 처리 결과를 확인할 수 없어 자동 재전송하지 않았어요. 같은 음성 조각을 다시 보내면 중복 기록이 생길 수 있습니다. 실패 WAV를 내려받아 보관하고 새 수업으로 다시 시작하거나, 위험을 이해한 경우에만 수동 재전송하세요.`;
+  const backup = recordingAudioUploadEnabled()
+    ? ' 원본 녹음 업로드는 별도로 계속합니다. 아래 원본 저장 상태를 확인하고 서버 WAV를 내려받을 수 있어요.' : '';
+  return `${errorText(error)} CLOVA 처리 결과를 확인할 수 없어 자동 재전송하지 않았어요. 같은 음성 조각을 다시 보내면 중복 기록이 생길 수 있습니다.${backup} 기기에 남은 음성은 삭제하지 않습니다. 위험을 이해한 경우에만 수동 전사 재전송을 선택하세요.`;
 }
+
+function recordingAudioScope() { return JSON.stringify([user,token,apiUrl]); }
+function recordingAudioUploadEnabled() {
+  return !!(user && token && recordingUploadCapability === recordingAudioScope());
+}
+function audioChunkStored(chunk) {
+  return chunk?.audioStoredScope === recordingAudioScope();
+}
+function nextRecordingAudioChunk() {
+  const scope = recordingAudioScope();
+  const blocked = new Set(pending.filter(chunk => chunk.audioBlockedScope === scope).map(chunk => chunk.captureId));
+  return pending.find(chunk => chunk.owner === user && !chunk.locallySkipped && !audioChunkStored(chunk)
+    && !blocked.has(chunk.captureId) && !isHeldCapture(chunk.captureId)
+    && !!liveSessions.get(chunk.captureId)?.lecture && chunk.lectureReady) || null;
+}
+function resetRecordingAudioRetry() {
+  if (audioRetryTimer !== null) clearTimeout(audioRetryTimer);
+  audioRetryTimer = null; audioRetryAttempt = 0;
+}
+function scheduleRecordingAudioRetry() {
+  if (audioRetryTimer !== null || !recordingAudioUploadEnabled()) return;
+  const scope = recordingAudioScope();
+  const delay = Math.min(30000,1000 * 2 ** Math.min(audioRetryAttempt++,5));
+  audioRetryTimer = setTimeout(() => {
+    audioRetryTimer = null;
+    if (scope === recordingAudioScope()) void drainRecordingAudio();
+  },delay);
+}
+async function audioPayloadHash(blob) {
+  const hash = await crypto.subtle.digest('SHA-256',await blob.arrayBuffer());
+  return Array.from(new Uint8Array(hash),value => value.toString(16).padStart(2,'0')).join('');
+}
+function validateRecordingAudioReceipt(receipt,chunk,blob,hash) {
+  const duration = (blob.size - 44) / 32000;
+  const sameTime = (left,right) => Number.isFinite(left) && Math.abs(left-right) < 1 / 32000;
+  if (!receipt || receipt.status !== 'stored' || receipt.chunk_id !== chunk.id
+      || receipt.payload_sha256 !== hash || !sameTime(receipt.start_seconds,chunk.startSeconds)
+      || !sameTime(receipt.duration_seconds,duration)
+      || !sameTime(receipt.overlap_seconds,chunk.overlapSeconds || 0)
+      || receipt.final_chunk !== !!chunk.final || typeof receipt.recording_audio_finalized !== 'boolean'
+      || (chunk.final && !receipt.recording_audio_finalized)
+      || !Number.isFinite(receipt.recording_stored_seconds)
+      || receipt.recording_stored_seconds + 1/32000 < chunk.startSeconds + duration
+      || receipt.recording_stored_seconds > 86400) {
+    const error = new Error('서버의 원본 녹음 저장 확인이 일치하지 않아 기기 음성을 유지합니다.');
+    error.code = 'invalid_audio_receipt';
+    throw error;
+  }
+  return receipt;
+}
+function applyRecordingAudioReceipt(chunk,receipt,scope) {
+  // This acknowledgement is ONLY for original audio. Never clear CLOVA
+  // inflight/blocked, acknowledge its queue, or report transcription complete.
+  chunk.audioStoredScope = scope;
+  chunk.audioBlockedScope = '';
+  const session = liveSessions.get(chunk.captureId);
+  const targets = new Set([session?.lecture,lectures.find(row=>row.id===chunk.lectureId),
+    current?.id===chunk.lectureId ? current : null].filter(Boolean));
+  for (const lecture of targets) {
+    lecture.recording_available = true;
+    lecture.recording_audio_finalized = lecture.recording_audio_finalized === true || receipt.recording_audio_finalized;
+    lecture.recording_stored_seconds = Math.max(lecture.recording_stored_seconds || 0,receipt.recording_stored_seconds);
+  }
+}
+async function drainRecordingAudio() {
+  if (audioSending || audioRetryTimer !== null || holdingAudio || liveQueueRecoveryPromise
+      || !recordingAudioUploadEnabled() || !nextRecordingAudioChunk()) return;
+  const scope = recordingAudioScope(), owner = user;
+  const stillCurrent = () => scope === recordingAudioScope() && recordingAudioUploadEnabled();
+  audioSending = true; updateControls();
+  let processing = null, retry = false, recoverConnection = false;
+  try {
+    // Refresh only OUTSIDE the independent lane. Origin changes take both
+    // transport locks; lock upgrades while holding audio would deadlock.
+    if (!hasRequestableServer()) await ensureTrustedApiRequest();
+    if (!stillCurrent()) return;
+    const coordinated = await liveCoordination.runAudioUploader(owner,async () => {
+      while (stillCurrent() && !holdingAudio) {
+        const chunk = nextRecordingAudioChunk();
+        if (!chunk) break;
+        processing = chunk;
+        const session = liveSessions.get(chunk.captureId);
+        const matches = () => stillCurrent() && !holdingAudio && pending.includes(chunk)
+          && !chunk.locallySkipped && liveSessions.get(chunk.captureId) === session
+          && session?.owner === owner && !session.uploadHeld
+          && !!lectureForStoredProvider(session,session.lecture);
+        await chunk.persistPromise;
+        if (!matches()) break;
+        // Read the latest cross-tab hold before any upload. Do not mutate its
+        // strict legacy IndexedDB records: old tabs must still rescue audio.
+        if (chunk.durable && liveQueueAvailable) {
+          const storedSession = await liveQueue.getSession(owner,chunk.captureId);
+          if (!matches()) break;
+          if (storedSession?.uploadHeld === true) {
+            session.uploadHeld = true; session.heldDurable = true; continue;
+          }
+          const storedChunk = await liveQueue.getChunk(owner,chunk.id);
+          if (!matches()) break;
+          if (!storedChunk && !(chunk.blob instanceof Blob)) {
+            // Another tab may already have acknowledged/deleted this IDB row.
+            // Drop ONLY the stale RAM reference. No WAV/session deletion and
+            // no ASR-success acknowledgement is inferred from its absence.
+            pending.splice(pending.indexOf(chunk),1);
+            manualRetryApprovedIds.delete(chunk.id);
+            await releaseStoppedSessionCaptureLeaseWhenSafe(session);
+            void refreshLiveQueueStats();
+            continue;
+          }
+          if (!storedSession || !storedChunk) {
+            throw new Error('기기 저장소의 녹음 정보가 바뀌었습니다. 남아 있는 원본은 유지하므로 저장 상태를 확인해 주세요.');
+          }
+        }
+        const blob = await uploadBlob(chunk);
+        const hash = await audioPayloadHash(blob);
+        if (!matches()) break;
+        const path = `/lectures/${encodeURIComponent(chunk.lectureId)}/recording-chunks`;
+        const options = {audioUploaderAlreadyLocked:true};
+        let receipt = await api(`${path}/${encodeURIComponent(chunk.id)}/result`,options,15000);
+        if (!matches()) break;
+        if (receipt?.status === 'unknown' && receipt.chunk_id === chunk.id) {
+          receipt = await api(path,{...options,method:'POST',body:blob,headers:{
+            'Content-Type':'audio/wav','X-Chunk-Id':chunk.id,
+            'X-Start-Seconds':String(chunk.startSeconds),
+            'X-Overlap-Seconds':String(chunk.overlapSeconds || 0),
+            'X-Final-Chunk':chunk.final ? 'true' : 'false',
+          }},UPLOAD_TIMEOUT_MS);
+        }
+        if (!matches()) break;
+        validateRecordingAudioReceipt(receipt,chunk,blob,hash);
+        applyRecordingAudioReceipt(chunk,receipt,scope);
+        audioRetryAttempt = 0; audioUploadError = ''; audioUploadErrorScope = '';
+        updateControls();
+        // ASR may now process this chunk, while this loop saves the next one.
+        // Never await it or acquire its exclusive lock inside the audio lane.
+        void drain();
+      }
+    });
+    noteCoordinationSupport(coordinated.supported);
+  } catch (error) {
+    if (stillCurrent()) {
+      if (error?.chunkAlreadyHandled) {
+        if (processing?.durable && !(processing.blob instanceof Blob) && liveQueueAvailable) {
+          const retained = await liveQueue.getChunk(owner,processing.id).catch(() => true);
+          if (stillCurrent() && !retained && pending.includes(processing)) {
+            pending.splice(pending.indexOf(processing),1);
+            manualRetryApprovedIds.delete(processing.id);
+          }
+        }
+        retry = true;
+      } else {
+        audioUploadErrorScope = scope;
+        audioUploadError = `원본 녹음을 서버에 아직 저장하지 못했습니다. 기기 음성은 유지합니다. ${errorText(error)}`;
+        retry = retryableUpload(error) || error?.coordinationRetrySafe === true
+          || error?.connectionLeaseExpired === true;
+        recoverConnection = shouldRecoverPublishedServer(error);
+        if (!retry && processing) processing.audioBlockedScope = scope;
+      }
+    }
+  } finally {
+    audioSending = false; updateControls();
+    if (recoverConnection && stillCurrent()) void recoverPublishedServerAfterTransportFailure();
+    if (retry && stillCurrent()) scheduleRecordingAudioRetry();
+    else if (stillCurrent() && nextRecordingAudioChunk()) {
+      // Yield between batches. Missing/changed local metadata is surfaced on
+      // the next retry rather than an unbounded synchronous drain loop.
+      scheduleRecordingAudioRetry();
+    }
+  }
+}
+function recordingAudioUploadDescription() {
+  if (!recordingAudioUploadEnabled()) return '';
+  const lecture = current;
+  const complete = lecture?.recording_audio_finalized === true;
+  const seconds = lecture?.recording_stored_seconds;
+  const saved = Number.isFinite(seconds) ? `${fmt(seconds)}까지 원본 녹음 서버 저장 확인. ` : '';
+  if (audioUploadErrorScope === recordingAudioScope() && audioUploadError) return saved + audioUploadError;
+  if (complete) return '원본 녹음 업로드 완료 · 한 개의 녹음 WAV로 내려받을 수 있습니다.'
+    + (!lecture.recording_finalized ? ' 받아쓰기는 아직 완료되지 않았으며 텍스트가 일부 빠져 있을 수 있습니다.' : '');
+  return saved + (audioSending ? '원본 녹음을 서버에 업로드하고 있습니다.'
+    : nextRecordingAudioChunk() ? '원본 녹음 서버 업로드 대기 중입니다.'
+      : '음성 인식과 원본 녹음 업로드를 별도로 처리합니다.')
+    + ' 전사 오류가 나도 원본 업로드는 계속하며, 네트워크가 끊기면 기기에 보관합니다.';
+}
+$('recording-upload-retry').onclick = () => {
+  if (!recordingAudioUploadEnabled() || audioSending) return;
+  for (const chunk of pending) if (chunk.owner === user) chunk.audioBlockedScope = '';
+  audioUploadError = ''; audioUploadErrorScope = ''; resetRecordingAudioRetry();
+  void drainRecordingAudio();
+};
 function validateChunkResponse(response) {
   if (!response || !Array.isArray(response.segments)
       || ['recording_available','recording_finalized'].some(name => response[name] !== undefined
@@ -6067,15 +6295,23 @@ function mergeChunkSegments(lecture, response) {
 }
 async function drain() {
   if (sending || holdingAudio || liveQueueRecoveryPromise || sendError || retryTimer !== null || !token || !nextPendingChunk()) return;
+  if (recordingAudioUploadEnabled() && !audioChunkStored(nextPendingChunk())) {
+    void drainRecordingAudio(); return;
+  }
   const drainOwner = user;
   const drainToken=token,drainServer=apiUrl;
   const drainScopeIsCurrent=()=>user===drainOwner&&token===drainToken&&apiUrl===drainServer;
   let processingChunk=null;
   sending = true; updateControls();
   try {
+    if (!hasRequestableServer()) await ensureTrustedApiRequest();
+    if (!drainScopeIsCurrent()) return;
     const coordinated = await liveCoordination.runUploader(drainOwner,async () => {
     while (nextPendingChunk() && token && drainScopeIsCurrent() && !holdingAudio) {
       const chunk = nextPendingChunk();processingChunk=chunk;
+      if (recordingAudioUploadEnabled() && !audioChunkStored(chunk)) {
+        void drainRecordingAudio(); break;
+      }
       if (chunk.owner !== drainOwner) {
         sendError = '다른 계정의 음성은 현재 로그인으로 전송할 수 없어요.';
         break;
@@ -6286,7 +6522,8 @@ async function drain() {
   } finally {
     sending = false; updateControls();
     // Pick up a final microphone tail that may have arrived while an upload awaited.
-    if (drainScopeIsCurrent() && nextPendingChunk()?.owner === user && token && !sendError && retryTimer === null && !holdingAudio) void drain();
+    if (drainScopeIsCurrent() && nextPendingChunk()?.owner === user && token && !sendError && retryTimer === null && !holdingAudio
+        && (!recordingAudioUploadEnabled() || audioChunkStored(nextPendingChunk()))) void drain();
   }
 }
 async function retryPending({manual = true} = {}) {
@@ -6356,14 +6593,25 @@ function applyRecordingFlags(lectureId, result) {
     recording_available: !!result?.recording_available,
     recording_finalized: !!result?.recording_finalized,
   };
+  if (typeof result?.recording_audio_finalized === 'boolean') state.recording_audio_finalized = result.recording_audio_finalized;
+  if (Number.isFinite(result?.recording_stored_seconds)) state.recording_stored_seconds = result.recording_stored_seconds;
   if (typeof result?.recording_storage_state === 'string'
       && (result.recording_storage_state === 'local_recording'
         || Object.hasOwn(RECORDING_STORAGE_LABELS,result.recording_storage_state))) {
     state.recording_storage_state = result.recording_storage_state;
   }
   const summary = lectures.find(lecture => lecture.id === lectureId);
-  if (summary) Object.assign(summary,state);
-  if (current?.id === lectureId) Object.assign(current,state);
+  for (const lecture of targets) {
+    // A slow ASR response can arrive after the audio lane saved later chunks.
+    // Do not move the independently confirmed audio boundary backwards.
+    const merged = {...state};
+    if (lecture.recording_audio_finalized === true) merged.recording_audio_finalized = true;
+    if (Number.isFinite(lecture.recording_stored_seconds)) {
+      merged.recording_stored_seconds = Math.max(lecture.recording_stored_seconds,state.recording_stored_seconds || 0);
+    }
+    if (merged.recording_audio_finalized === true) merged.recording_available = true;
+    Object.assign(lecture,merged);
+  }
   if (state.recording_finalized) {
     recoveryFinalizationRequired.delete(lectureId);
     const recoveredSession = liveSessions.get(lectureId);
@@ -6465,7 +6713,7 @@ async function skipFailedChunk() {
   const unresolvedError = sendError;
   sending = true; updateControls();
   try {
-    const coordinated = await liveCoordination.runUploader(owner,async () => {
+    const coordinated = await liveCoordination.runAllUploaders(owner,async () => {
       if (!operationIsCurrent() || nextPendingChunk() !== skipped) return false;
       await acknowledgePendingChunk(skipped,{strict:true});
       const skippedIndex = pending.indexOf(skipped);

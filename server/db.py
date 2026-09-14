@@ -182,6 +182,21 @@ class Database:
                     ),
                     PRIMARY KEY (lecture_id, chunk_id)
                 );
+                CREATE TABLE IF NOT EXISTS recording_chunks (
+                    lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
+                    chunk_id TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL CHECK (length(payload_hash) = 64),
+                    start_samples INTEGER NOT NULL CHECK (start_samples >= 0),
+                    duration_samples INTEGER NOT NULL CHECK (duration_samples BETWEEN 800 AND 240000),
+                    overlap_samples INTEGER NOT NULL CHECK (
+                        overlap_samples BETWEEN 0 AND 48000 AND overlap_samples <= duration_samples
+                    ),
+                    final_chunk INTEGER NOT NULL CHECK (final_chunk IN (0, 1)),
+                    stored_at TEXT NOT NULL,
+                    PRIMARY KEY (lecture_id, chunk_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS recording_chunks_final
+                    ON recording_chunks(lecture_id) WHERE final_chunk = 1;
                 CREATE TABLE IF NOT EXISTS segments (
                     id TEXT PRIMARY KEY,
                     lecture_id TEXT NOT NULL,
@@ -541,6 +556,13 @@ class Database:
                     "ALTER TABLE lectures ADD COLUMN recording_finalized INTEGER NOT NULL DEFAULT 0 "
                     "CHECK (recording_finalized IN (0, 1))"
                 )
+            if "audio_finalized" not in lecture_columns:
+                # Audio upload completion is independent of transcript completion.
+                # Existing recordings retain their original finalization semantics.
+                connection.execute(
+                    "ALTER TABLE lectures ADD COLUMN audio_finalized INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (audio_finalized IN (0, 1))"
+                )
             if "asr_provider" not in lecture_columns:
                 # Every pre-provider lecture was transcribed locally. Persist
                 # that fact so a later configuration change can never send an
@@ -630,5 +652,5 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 21:
-                connection.execute("PRAGMA user_version = 21")
+            if schema_version < 22:
+                connection.execute("PRAGMA user_version = 22")

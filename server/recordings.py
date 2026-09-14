@@ -179,6 +179,7 @@ class RecordingStore:
         start_seconds: float,
         overlap_seconds: float,
         pcm: bytes,
+        strict_contiguous: bool = False,
     ) -> bool:
         if len(pcm) % BYTES_PER_FRAME:
             raise RecordingConflict("PCM data is not frame-aligned")
@@ -192,7 +193,7 @@ class RecordingStore:
         if not 0 <= overlap_frames <= total_frames:
             raise RecordingConflict("recording overlap exceeds the chunk")
         fresh_pcm = pcm[overlap_frames * BYTES_PER_FRAME :]
-        if not fresh_pcm:
+        if not fresh_pcm and not strict_contiguous:
             return self.available(username, lecture_id)
         target_frame = start_frame + overlap_frames
         end_frame = target_frame + len(fresh_pcm) // BYTES_PER_FRAME
@@ -225,6 +226,17 @@ class RecordingStore:
                     _, current_frames = self._inspect_descriptor(descriptor, repair_stale_header=True)
                     os.lseek(descriptor, 0, os.SEEK_SET)
                     original_header = os.read(descriptor, WAV_HEADER_BYTES)
+                if strict_contiguous:
+                    # A raw-only upload is a lossless backup, not the legacy
+                    # explicit-skip path: never synthesize silence and verify
+                    # the retained overlap as well as already-written new PCM.
+                    if start_frame < 0 or target_frame > current_frames:
+                        raise RecordingConflict("raw recording chunks must be contiguous")
+                    compared = min(len(pcm), max(0, current_frames - start_frame) * BYTES_PER_FRAME)
+                    if compared:
+                        os.lseek(descriptor, WAV_HEADER_BYTES + start_frame * BYTES_PER_FRAME, os.SEEK_SET)
+                        if os.read(descriptor, compared) != pcm[:compared]:
+                            raise RecordingConflict("raw recording overlap conflicts with stored audio")
                 if target_frame > current_frames + self.max_gap_frames:
                     raise RecordingConflict("recording chunk is too far from the stored timeline")
 

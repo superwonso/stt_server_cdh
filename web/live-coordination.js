@@ -5,6 +5,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 // intentionally never touch localStorage/IndexedDB and cannot coordinate tabs.
 const localCaptureLocks = new Set();
 const localUploaderTails = new Map();
+const localAudioUploaderTails = new Map();
 
 export class LiveCoordinationValidationError extends TypeError {
   constructor(message) {
@@ -190,15 +191,42 @@ export class LiveCoordination {
     }
   }
 
-  /** Runs one owner's uploader work serially across same-origin tabs. */
+  /** Runs one owner's ASR uploader work serially across same-origin tabs. */
   async runUploader(owner, work) {
+    return this.#runUploaderLane(owner, work, 'uploader', localUploaderTails);
+  }
+
+  /**
+   * Stores original audio independently of a slow or blocked ASR request.
+   * This lock does not authorize origin changes or resolving ASR ambiguity.
+   * Never acquire runUploader/runAllUploaders from inside this lane: origin
+   * lease refresh must happen after releasing it, to preserve the lock order.
+   */
+  async runAudioUploader(owner, work) {
+    return this.#runUploaderLane(owner, work, 'audio-uploader', localAudioUploaderTails);
+  }
+
+  /**
+   * Excludes both transport lanes for origin, hold, or destructive transitions.
+   * Always acquire ASR before audio, including in the same-realm fallback.
+   * Neither this method nor an individual lane is reentrant; call this only
+   * outside uploader work. Work already holding ASR may acquire only audio.
+   */
+  async runAllUploaders(owner, work) {
+    const clean = cleanOwner(owner);
+    const operation = cleanWork(work, '업로드 전환');
+    const outer = await this.runUploader(clean, () => this.runAudioUploader(clean, operation));
+    return frozenResult({ supported: outer.supported && outer.value.supported, value: outer.value.value });
+  }
+
+  async #runUploaderLane(owner, work, lane, localTails) {
     const clean = cleanOwner(owner);
     const operation = cleanWork(work, '업로드');
     const ownerKey = await ownerFingerprint(clean);
-    if (!this.supported) return this.#runLocalUploader(ownerKey, operation);
+    if (!this.supported) return this.#runLocalUploader(ownerKey, operation, localTails);
 
     const manager = browserLockManager();
-    const name = lockName('uploader', ownerKey);
+    const name = lockName(lane, ownerKey);
     let callbackEntered = false;
     let outcome;
     try {
@@ -219,7 +247,7 @@ export class LiveCoordination {
       });
     } catch (error) {
       if (callbackEntered) {
-        if (outcome?.operationError) throw outcome.operationError;
+        if (outcome && Object.hasOwn(outcome, 'operationError')) throw outcome.operationError;
         throw outcome?.coordinationError || new LiveCoordinationError(
           '업로드 잠금 실행 중 브라우저 조정 기능이 중단되었습니다.',
           { code: 'uploader_lock_failed', cause: error },
@@ -231,7 +259,7 @@ export class LiveCoordination {
       );
     }
 
-    if (outcome?.operationError) throw outcome.operationError;
+    if (outcome && Object.hasOwn(outcome, 'operationError')) throw outcome.operationError;
     if (outcome?.coordinationError) throw outcome.coordinationError;
     return frozenResult({ supported: true, value: outcome?.value });
   }
@@ -325,8 +353,8 @@ export class LiveCoordination {
     return Object.freeze(handle);
   }
 
-  async #runLocalUploader(ownerKey, operation) {
-    const value = await runLocalExclusive(localUploaderTails, ownerKey, operation);
+  async #runLocalUploader(ownerKey, operation, localTails) {
+    const value = await runLocalExclusive(localTails, ownerKey, operation);
     return frozenResult({ supported: false, value });
   }
 

@@ -702,6 +702,8 @@ class RecordingApiTests(unittest.TestCase):
                 "recording_available": False,
                 "recording_finalized": True,
                 "recording_storage_state": "none",
+                "recording_audio_finalized": True,
+                "recording_stored_seconds": 0.0,
             },
         )
         repeated = self.client.post(

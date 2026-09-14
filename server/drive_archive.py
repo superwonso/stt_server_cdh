@@ -517,7 +517,8 @@ class DriveArchiveManager:
                 dict(row)
                 for row in connection.execute(
                     "SELECT id, username FROM lectures "
-                    "WHERE recording_finalized = 1 AND deleting = 0 ORDER BY created_at, id"
+                    "WHERE (recording_finalized = 1 OR audio_finalized = 1) "
+                    "AND deleting = 0 ORDER BY created_at, id"
                 ).fetchall()
             ]
         enqueued = 0
@@ -828,7 +829,7 @@ class DriveArchiveManager:
                 "SELECT a.*, l.username, l.created_at FROM recording_archives AS a "
                 "JOIN lectures AS l ON l.id = a.lecture_id "
                 "WHERE a.state = 'pending' AND a.next_attempt_at <= ? "
-                "AND l.recording_finalized = 1 AND l.deleting = 0 "
+                "AND (l.recording_finalized = 1 OR l.audio_finalized = 1) AND l.deleting = 0 "
                 "ORDER BY a.updated_at, a.lecture_id LIMIT 1",
                 (now,),
             ).fetchone()
@@ -1718,6 +1719,8 @@ def plan_existing_recordings(settings: Settings, *, limit: int | None = None) ->
         required = {"id", "username", "created_at", "recording_finalized", "deleting"}
         if not required.issubset(lecture_columns):
             raise RuntimeError("Classroom database must be upgraded before Drive planning")
+        audio_complete = " OR audio_finalized = 1" if "audio_finalized" in lecture_columns else ""
+        joined_audio_complete = " OR l.audio_finalized = 1" if "audio_finalized" in lecture_columns else ""
         has_archives = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'recording_archives'"
@@ -1735,7 +1738,7 @@ def plan_existing_recordings(settings: Settings, *, limit: int | None = None) ->
         if has_archives is None:
             query = (
                 "SELECT id, username, NULL AS state, 0 AS folder_layout_version FROM lectures "
-                "WHERE recording_finalized = 1 AND deleting = 0 "
+                f"WHERE (recording_finalized = 1{audio_complete}) AND deleting = 0 "
                 "ORDER BY created_at, id"
             )
         else:
@@ -1749,7 +1752,7 @@ def plan_existing_recordings(settings: Settings, *, limit: int | None = None) ->
                 + layout_value
                 + " AS folder_layout_version FROM lectures AS l "
                 "LEFT JOIN recording_archives AS a ON a.lecture_id = l.id "
-                "WHERE l.recording_finalized = 1 AND l.deleting = 0 "
+                f"WHERE (l.recording_finalized = 1{joined_audio_complete}) AND l.deleting = 0 "
                 "ORDER BY l.created_at, l.id"
             )
         rows = [dict(row) for row in connection.execute(query).fetchall()]

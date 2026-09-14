@@ -68,7 +68,7 @@ class RecoveryQuestionInfoTests(unittest.TestCase):
                                        (identifier,owner,str(uuid.uuid4()),"a"*64,status))
                 before = [tuple(row) for row in connection.execute("SELECT * FROM lecture_study_notes ORDER BY lecture_id")]
             result = _database_info(database.path)
-            self.assertEqual(result["schema_version"],21)
+            self.assertEqual(result["schema_version"],22)
             self.assertEqual(result["unfinished_jobs"],2)
             with database.connect() as connection:
                 self.assertEqual([tuple(row) for row in connection.execute("SELECT * FROM lecture_study_notes ORDER BY lecture_id")],before)
