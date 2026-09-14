@@ -193,6 +193,24 @@ test('AI correction controls keep raw and corrected transcripts explicit without
   assert.doesNotMatch(html, /MINDLOGIC_API_KEY|OPENAI_API_KEY|Bearer\s+[A-Za-z0-9_-]/i);
 });
 
+test('AI correction summary and translation start collapsed with native keyboard-accessible toggles', () => {
+  for (const [id,title,action,content] of [
+    ['correction','AI 후보정','correct-transcript','correction-detail'],
+    ['summary','AI 수업 요약','summarize-lecture','summary-content'],
+    ['translation','영어 수업 한국어 번역','translate-lecture','translation-content'],
+  ]) {
+    const details = html.match(new RegExp(`<details\\b([^>]*\\bid="${id}-details"[^>]*)>([\\s\\S]*?)<\\/details>`));
+    assert.ok(details, `missing ${id} disclosure`);
+    assert.doesNotMatch(details[1], /\bopen(?:\s|=|$)/);
+    assert.match(details[2], new RegExp(`^\\s*<summary\\b[^>]*>${title}<\\/summary>`));
+    assert.ok(details[2].includes(`id="${action}"`), 'generation stays inside the disclosure');
+    assert.ok(details[2].includes(`id="${content}"`), 'details and results stay inside the disclosure');
+    assert.doesNotMatch(details[2].match(/<summary\b[^>]*>([\s\S]*?)<\/summary>/)[1], /<(?:button|a|input)\b/);
+  }
+  assert.match(css, /\.ai-tool-details > summary:focus-visible\s*\{[^}]*outline:/);
+  assert.match(css, /\.ai-tool-details > summary\s*\{[^}]*overflow-wrap:\s*anywhere/);
+});
+
 test('separate study-note details provide explicit generation safe Markdown and source-limit guidance', () => {
   assert.match(html,/<details id="study-note-details">/);
   assert.match(html,/<button[^>]*id="study-note-create"[^>]*type="button"[^>]*disabled/);

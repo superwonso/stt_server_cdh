@@ -151,7 +151,7 @@ class StudyNoteTests(unittest.TestCase):
                                   dict(document["paragraphs"][0], source_ids=["b"])]
         with self.assertRaises(StudyNoteError): validate_study_note_document(document, raw)
 
-    def test_numbers_contacts_and_literal_markers_cannot_be_added_removed_changed_or_reordered(self):
+    def test_numbers_contacts_and_literal_markers_may_change_without_discarding_notes(self):
         raw = [source("온도 15, 수량 20, 메일 fake@example.com, 전화 010-1234-5678, __PRIVATE_000007__입니다.")]
         changes = [lambda text: text.replace("15", "16"), lambda text: text.replace("15", ""),
                    lambda text: text.replace("15", "20").replace("수량 20", "수량 15"),
@@ -159,32 +159,83 @@ class StudyNoteTests(unittest.TestCase):
                    lambda text: text.replace("__PRIVATE_000007__", ""), lambda text: text + " 추가 9"]
         for change in changes:
             document = raw_document(raw); document["paragraphs"][0]["text"] = change(raw[0]["text"])
-            with self.assertRaises(StudyNoteError) as error: validate_study_note_document(document, raw)
-            self.assertEqual(error.exception.code, "protected_content_changed")
+            with self.subTest(text=document["paragraphs"][0]["text"]):
+                self.assertEqual(validate_study_note_document(document, raw), document)
+                self.assertIn("# 수업 정리본", study_note_markdown(document, raw))
         no_numbers = [source("제 이 법칙입니다.")]
-        document = raw_document(no_numbers); document["paragraphs"][0]["text"] = "제2법칙입니다."
-        with self.assertRaises(StudyNoteError): validate_study_note_document(document, no_numbers)
+        document = raw_document(no_numbers)
+        document["paragraphs"][0].update(heading="2. 제2법칙", text="제2법칙입니다.")
+        self.assertEqual(validate_study_note_document(document, no_numbers), document)
 
-    def test_edit_audit_requires_real_group_source_and_replacement_in_text(self):
+    def test_contextual_edits_need_not_be_exact_substrings_but_structure_remains_required(self):
         raw = [source("알파 용어입니다.", "a"), source("베타 용어입니다.", "b", 1)]
         base = {"paragraphs": [{"heading": "용어", "source_ids": ["a"], "text": "alpha 용어입니다.", "edits": [
             {"original": "알파", "replacement": "alpha", "uncertain": False}]},
             {"heading": "다른 용어", "source_ids": ["b"], "text": raw[1]["text"], "edits": []}]}
         self.assertEqual(validate_study_note_document(base, raw), base)
-        cases = [{"original": "없는 용어"}, {"original": "베타"}, {"replacement": "absent"},
-                 {"original": "alpha", "replacement": "alpha"}, {"replacement": "term2"}, {"uncertain": "false"}]
+        accepted = [{"original": "없는 용어"}, {"original": "베타"}, {"replacement": "absent"},
+                    {"replacement": "term2"}, {"original": "010-1234-5678", "replacement": "fake@example.com"}]
+        for changes in accepted:
+            document = copy.deepcopy(base); document["paragraphs"][0]["edits"][0].update(changes)
+            with self.subTest(changes=changes):
+                self.assertEqual(validate_study_note_document(document, raw), document)
+        cases = [{"original": "alpha", "replacement": "alpha"}, {"uncertain": "false"},
+                 {"original": ""}, {"replacement": "a" * 257}]
         for changes in cases:
             document = copy.deepcopy(base); document["paragraphs"][0]["edits"][0].update(changes)
             with self.subTest(changes=changes), self.assertRaises(StudyNoteError): validate_study_note_document(document, raw)
         duplicate = copy.deepcopy(base); duplicate["paragraphs"][0]["edits"] *= 2
         with self.assertRaises(StudyNoteError): validate_study_note_document(duplicate, raw)
 
+    def test_generated_numbers_contacts_and_contextual_edits_survive_provider_and_export(self):
+        raw = [source("제 이 법칙과 한글 음차로 적힌 용어입니다.")]
+        document = {"paragraphs": [{"heading": "2. 핵심 개념", "source_ids": ["S000001"],
+            "text": "제2법칙과 batch normalization을 설명합니다. 문의: fake@example.com, 010-1234-5678.",
+            "edits": [{"original": "배치 놀말리제이션", "replacement": "배치 정규화", "uncertain": True}]}]}
+        with httpx.Client(transport=httpx.MockTransport(lambda request: response(document))) as client:
+            result = MindlogicStudyNotes(self.settings(), client).create(language="ko", segments=raw)
+        expected = copy.deepcopy(document); expected["paragraphs"][0]["source_ids"] = [raw[0]["id"]]
+        self.assertEqual(result.to_dict(), expected)
+        markdown = study_note_markdown(result.to_dict(), raw)
+        self.assertIn("제2법칙", markdown)
+        self.assertIn("fake@example\\.com", markdown)
+        self.assertIn("배치 놀말리제이션 → 배치 정규화", markdown)
+
+    def test_masks_are_restored_in_all_fields_without_order_or_count_rejection(self):
+        raw = [source("값 15, 메일 fake@example.com, 전화 010-1234-5678입니다.")]
+        calls = []
+        def handler(request):
+            _, data, rows = read_request(request)
+            calls.append(request.content.decode())
+            masks = study_notes._PLACEHOLDER.findall(rows["S000001"])
+            self.assertEqual(len(masks), 3)
+            return response({"paragraphs": [{"heading": f"1. 값 {masks[0]}", "source_ids": data["target_source_ids"],
+                "text": f"{masks[2]} / {masks[1]} / {masks[1]} / 새 값 16 / __PRIVATE_999999__",
+                "edits": [{"original": masks[0], "replacement": "16", "uncertain": True},
+                          {"original": "연락처 복원", "replacement": masks[1], "uncertain": True}]}]})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = MindlogicStudyNotes(self.settings(), client).create(language="ko", segments=raw)
+        paragraph = result.paragraphs[0]
+        self.assertEqual(paragraph["heading"], "1. 값 15")
+        self.assertEqual(paragraph["text"], "010-1234-5678 / fake@example.com / fake@example.com / 새 값 16 / [가려진 값 확인 필요]")
+        self.assertEqual(paragraph["edits"][0]["original"], "15")
+        self.assertEqual(paragraph["edits"][1]["replacement"], "fake@example.com")
+        self.assertNotIn("__PRIVATE_", study_note_markdown(result.to_dict(), raw))
+        for value in ("fake@example.com", "010-1234-5678", "값 15"):
+            self.assertNotIn(value, calls[0])
+
+    def test_legacy_value_rejection_message_offers_explicit_retry_without_claiming_saved_result(self):
+        message = str(StudyNoteError("protected_content_changed"))
+        self.assertIn("이전 검증 기준", message)
+        self.assertIn("다시 만들면", message)
+        self.assertNotIn("원문에 없는 용어", message)
+
     def test_exact_schema_types_and_size_limits_remain_local(self):
         raw = [source()]
         changes = [lambda d: d.update(extra="untrusted"), lambda d: d["paragraphs"][0].update(extra=True),
                    lambda d: d.update(paragraphs=[]), lambda d: d["paragraphs"][0].update(heading="가" * 121),
                    lambda d: d["paragraphs"][0].update(heading="주제\n새 문단"),
-                   lambda d: d["paragraphs"][0].update(heading="주제 1"), lambda d: d["paragraphs"][0].update(text="가" * 24_001),
+                   lambda d: d["paragraphs"][0].update(text="가" * 24_001),
                    lambda d: d["paragraphs"][0].update(text="가" * 1100), lambda d: d["paragraphs"][0].update(text="\x00"),
                    lambda d: d["paragraphs"][0].update(source_ids="local-row"), lambda d: d["paragraphs"][0].update(edits={}),
                    lambda d: d["paragraphs"][0].update(edits=[{}] * 17)]

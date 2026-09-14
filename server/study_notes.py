@@ -1,8 +1,8 @@
 """Source-complete study notes, separate from raw/corrected/translated text.
 
 Only aliased, masked source Markdown is sent to the existing NOVA gateway.
-Structural and protected-value validation cannot prove semantic accuracy: the
-result is an AI draft with source times and an explicit terminology audit.
+Structural validation cannot prove semantic accuracy: numbers, contacts and
+contextual terminology edits are saved as part of the separate AI draft.
 """
 from __future__ import annotations
 
@@ -49,7 +49,9 @@ _MESSAGES = {
     "invalid_response": "수업 정리본의 형식이나 원문 대응을 확인하지 못해 저장하지 않았습니다.",
     "response_truncated": "AI 출력이 길이 한도에서 끊겨 수업 정리본을 저장하지 않았습니다. 원문은 그대로 보관됩니다.",
     "model_refused": "AI가 수업 정리본 작성을 거절했습니다. 원문은 그대로 보관됩니다.",
-    "protected_content_changed": "숫자·연락처 또는 원문에 없는 용어 복원이 포함되어 정리본을 저장하지 않았습니다.",
+    # Kept only to explain previously failed jobs; new results are not rejected
+    # for numeric/contact changes or contextual terminology edits.
+    "protected_content_changed": "이전 검증 기준으로 저장되지 않은 정리본입니다. 다시 만들면 완화된 기준으로 저장합니다.",
 }
 
 
@@ -188,11 +190,8 @@ def _validate(document, sources):
         original = "\n".join(row["text"] for row in group)
         if len(text) > max(1000, len(original) * 3 + 1000):
             raise StudyNoteError("invalid_response")
-        # Headings are thematic labels; protected values belong once in the
-        # body, not duplicated by a generated heading or an enumerated list.
-        if (_PROTECTED_VALUE.search(heading)
-                or _PROTECTED_VALUE.findall(text) != _PROTECTED_VALUE.findall(original)):
-            raise StudyNoteError("protected_content_changed")
+        # Numbers, contacts and inferred wording are content for the owner to
+        # review, not a reason to discard an otherwise complete AI document.
         edits = item["edits"]
         if not isinstance(edits, list) or len(edits) > 16:
             raise StudyNoteError("invalid_response")
@@ -203,9 +202,8 @@ def _validate(document, sources):
             old, new = _text(edit["original"], 256), _text(edit["replacement"], 256)
             if type(edit["uncertain"]) is not bool:
                 raise StudyNoteError("invalid_response")
-            if (old == new or old not in original or new not in text
-                    or _PROTECTED_VALUE.search(old) or _PROTECTED_VALUE.search(new)):
-                raise StudyNoteError("protected_content_changed")
+            if old == new:
+                raise StudyNoteError("invalid_response")
             pair = (old, new)
             if pair in seen_edits:
                 raise StudyNoteError("invalid_response")
@@ -221,7 +219,7 @@ def _validate(document, sources):
 
 
 def validate_study_note_document(document, raw) -> dict[str, Any]:
-    """Strict source coverage/value checks, not a semantic truth guarantee."""
+    """Check structure and complete source coverage, not semantic correctness."""
     return _validate(document, validate_study_note_source(raw))
 
 
@@ -255,7 +253,7 @@ def study_note_markdown(document, raw) -> str:
     sources = validate_study_note_source(raw)
     checked = _validate(document, sources)
     by_id = {row["id"]: row for row in sources}
-    parts = ["# 수업 정리본", "AI가 작성한 별도 정리본입니다. 원문·후보정·번역은 변경하지 않았으며, 불명확한 표현과 용어 복원은 원문을 확인하세요."]
+    parts = ["# 수업 정리본", "AI가 작성한 별도 정리본입니다. 원문·후보정·번역은 변경하지 않았으며, 숫자·연락처·불명확한 표현과 용어 복원은 원문을 확인하세요."]
     for paragraph in checked["paragraphs"]:
         group = [by_id[identifier] for identifier in paragraph["source_ids"]]
         start, end = min(row["start"] for row in group), max(row["end"] for row in group)
@@ -305,6 +303,14 @@ class MindlogicStudyNotes:
         self._interrupted(interrupted)
         sources = _source(segments)
         masked, private, markdown, ranges = _prepare(sources)
+
+        def restore(value):
+            # Restore known masks in every generated text field, even when
+            # reordered/repeated. An invented mask has no recoverable value:
+            # mark that span without losing the rest or guessing private data.
+            # One pass also preserves literal placeholder text in the source.
+            return _PLACEHOLDER.sub(lambda match: private.get(match.group(0), "[가려진 값 확인 필요]"), value)
+
         # The transport JSON-encodes the user JSON string a second time. All
         # source context is identical, aliases are fixed-width, and enum/list
         # lengths increase monotonically with target count. The longest target
@@ -330,7 +336,11 @@ class MindlogicStudyNotes:
             original_ids = {item["id"]: source["id"] for source, item in zip(sources[begin:end], targets, strict=True)}
             for paragraph in checked["paragraphs"]:
                 paragraph["source_ids"] = [original_ids[identifier] for identifier in paragraph["source_ids"]]
-                paragraph["text"] = _PLACEHOLDER.sub(lambda match: private[match.group(0)], paragraph["text"])
+                for field in ("heading", "text"):
+                    paragraph[field] = restore(paragraph[field])
+                for edit in paragraph["edits"]:
+                    for field in ("original", "replacement"):
+                        edit[field] = restore(edit[field])
                 result.append(paragraph)
         self._interrupted(interrupted)
         checked = _validate({"paragraphs": result}, sources)

@@ -329,39 +329,48 @@
             </details>
           </section>
           <div id="correction-panel" class="correction-panel" data-state="idle" hidden>
-            <div class="correction-copy">
-              <span class="correction-symbol" aria-hidden="true">✦</span>
-              <div>
-                <strong id="correction-state">AI 후보정</strong>
-                <p id="correction-detail" role="status" aria-live="polite" aria-atomic="true">받아쓴 원문은 그대로 두고 별도의 후보정본을 만듭니다.</p>
-                <small class="correction-privacy">후보정 시 받아쓴 텍스트만 NOVA(Mindlogic)로 전송하고 오디오는 보내지 않습니다. 모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호는 이 PC에서 먼저 가리지만, 이름 등 다른 정보는 포함될 수 있습니다.</small>
+            <details id="correction-details" class="ai-tool-details">
+              <summary>AI 후보정</summary>
+              <div class="correction-content">
+                <div class="correction-copy">
+                  <span class="correction-symbol" aria-hidden="true">✦</span>
+                  <div>
+                    <strong id="correction-state">AI 후보정</strong>
+                    <p id="correction-detail" role="status" aria-live="polite" aria-atomic="true">받아쓴 원문은 그대로 두고 별도의 후보정본을 만듭니다.</p>
+                    <small class="correction-privacy">후보정 시 받아쓴 텍스트만 NOVA(Mindlogic)로 전송하고 오디오는 보내지 않습니다. 모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호는 이 PC에서 먼저 가리지만, 이름 등 다른 정보는 포함될 수 있습니다.</small>
+                  </div>
+                </div>
+                <button id="correct-transcript" class="secondary-button correction-button" type="button" disabled>AI 후보정 만들기</button>
               </div>
-            </div>
-            <button id="correct-transcript" class="secondary-button correction-button" type="button" disabled>AI 후보정 만들기</button>
+            </details>
           </div>
           <section id="summary-panel" class="lesson-summary" aria-labelledby="summary-title" hidden>
-            <h3 id="summary-title">AI 수업 요약</h3>
-            <p id="summary-state" role="status" aria-live="polite">수업을 종료하고 저장한 뒤 요약할 수 있어요.</p>
-            <p class="summary-privacy">요청할 때 받아쓴 원문 텍스트를 NOVA(Mindlogic)로 보내 요약합니다. 오디오와 수업 제목은 보내지 않으며, 일부 개인정보·숫자는 가린 뒤 처리합니다. 이름 등 다른 정보는 포함될 수 있습니다. AI 요약은 틀리거나 중요한 내용을 빠뜨릴 수 있으니 표시된 원문 시간을 함께 확인하세요.</p>
-            <div class="summary-actions">
-              <button id="summarize-lecture" class="secondary-button" type="button" disabled>수업 요약 만들기</button>
-              <button id="summary-download" class="secondary-button" type="button" disabled>↓ 요약 Markdown</button>
-            </div>
-            <div id="summary-content"></div>
+            <details id="summary-details" class="ai-tool-details">
+              <summary id="summary-title">AI 수업 요약</summary>
+              <p id="summary-state" role="status" aria-live="polite">수업을 종료하고 저장한 뒤 요약할 수 있어요.</p>
+              <p class="summary-privacy">요청할 때 받아쓴 원문 텍스트를 NOVA(Mindlogic)로 보내 요약합니다. 오디오와 수업 제목은 보내지 않으며, 일부 개인정보·숫자는 가린 뒤 처리합니다. 이름 등 다른 정보는 포함될 수 있습니다. AI 요약은 틀리거나 중요한 내용을 빠뜨릴 수 있으니 표시된 원문 시간을 함께 확인하세요.</p>
+              <div class="summary-actions">
+                <button id="summarize-lecture" class="secondary-button" type="button" disabled>수업 요약 만들기</button>
+                <button id="summary-download" class="secondary-button" type="button" disabled>↓ 요약 Markdown</button>
+              </div>
+              <div id="summary-content"></div>
+            </details>
           </section>
           <section id="translation-panel" class="lesson-summary lesson-translation" aria-labelledby="translation-title" hidden>
-            <h3 id="translation-title">영어 수업 한국어 번역</h3>
-            <p id="translation-state" role="status" aria-live="polite">수업을 종료하고 저장한 뒤 번역할 수 있어요.</p>
-            <p class="summary-privacy">수업 전체에서 추린 문맥과 앞뒤 문장을 함께 참고해 원문의 각 구간을 한국어로 번역합니다. 요청할 때 받아쓴 원문 텍스트만 NOVA(Mindlogic)로 보내며, 오디오·수업 제목·계정 ID는 보내지 않습니다. 숫자와 일부 개인정보는 가리지만 이름 등은 포함될 수 있습니다. 원문 인식 오류나 번역의 의미 오류는 원문·녹음과 비교해 확인하세요.</p>
-            <div class="summary-actions">
-              <button id="translate-lecture" class="secondary-button" type="button" disabled>한국어 번역 만들기</button>
-              <button id="translation-download" class="secondary-button" type="button" disabled>↓ 번역 Markdown</button>
-            </div>
-            <div id="translation-views" class="transcript-versions" role="group" aria-label="번역 표시 방식" hidden>
-              <button id="translation-paired" class="active" type="button" aria-pressed="true">원문 · 번역 문장별</button>
-              <button id="translation-full" type="button" aria-pressed="false">한국어 전체 보기</button>
-            </div>
-            <div id="translation-content"></div>
+            <details id="translation-details" class="ai-tool-details">
+              <summary id="translation-title">영어 수업 한국어 번역</summary>
+              <p id="translation-state" role="status" aria-live="polite">수업을 종료하고 저장한 뒤 번역할 수 있어요.</p>
+              <p class="summary-privacy">수업 전체에서 추린 문맥과 앞뒤 문장을 함께 참고해 원문의 각 구간을 한국어로 번역합니다. 요청할 때 받아쓴 원문 텍스트만 NOVA(Mindlogic)로 보내며, 오디오·수업 제목·계정 ID는 보내지 않습니다. 숫자와 일부 개인정보는 가리지만 이름 등은 포함될 수 있습니다. 원문 인식 오류나 번역의 의미 오류는 원문·녹음과 비교해 확인하세요.</p>
+              <div class="summary-actions">
+                <button id="translate-lecture" class="secondary-button" type="button" disabled>한국어 번역 만들기</button>
+                <button id="translation-download" class="secondary-button" type="button" disabled>↓ 번역 Markdown</button>
+              </div>
+              <div id="translation-views" class="transcript-versions" role="group" aria-label="번역 표시 방식" hidden>
+                <button id="translation-paired" class="active" type="button" aria-pressed="true">원문 · 번역 문장별</button>
+                <button id="translation-full" type="button" aria-pressed="false">한국어 전체 보기</button>
+              </div>
+              <div id="translation-content"></div>
+            </details>
           </section>
           <section id="study-note-panel" class="lesson-summary lesson-study-note" aria-label="수업 정리본" hidden>
             <details id="study-note-details">

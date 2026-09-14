@@ -1457,13 +1457,9 @@ button {
 }
 
 .correction-panel {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: block;
   margin-top: 14px;
   padding: 14px 15px;
-  gap: 18px;
-  flex-wrap: wrap;
   border: 1px solid #d9e4de;
   border-radius: 13px;
   background: #f6faf7;
@@ -1471,6 +1467,31 @@ button {
 
 .correction-panel[hidden] {
   display: none;
+}
+
+.correction-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.ai-tool-details > summary {
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.65;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.ai-tool-details > summary:focus-visible {
+  outline: 2px solid var(--forest-700);
+  outline-offset: 4px;
+  border-radius: 4px;
 }
 
 .correction-panel[data-state="failed"],
@@ -2559,7 +2580,7 @@ button {
     padding: 21px 19px 28px;
   }
 
-  .correction-panel {
+  .correction-content {
     align-items: stretch;
     flex-direction: column;
     gap: 12px;

@@ -44,9 +44,10 @@ export function validateStudyNoteDocument(value, lecture) {
     if (chars(paragraph.text) > chars(sourceText) * 3 + 1000) return null;
     const edits = [], pairs = new Set();
     for (const edit of paragraph.edits) {
+      // Restoration notes describe the model's contextual interpretation; their
+      // wording need not be a literal substring of either source or result.
       if (!record(edit) || !text(edit.original,256) || !text(edit.replacement,256)
-          || typeof edit.uncertain !== 'boolean' || edit.original === edit.replacement
-          || !sourceText.includes(edit.original) || !paragraph.text.includes(edit.replacement)) return null;
+          || typeof edit.uncertain !== 'boolean' || edit.original === edit.replacement) return null;
       const pair = JSON.stringify([edit.original,edit.replacement]);
       if (pairs.has(pair) || ++editCount > 512) return null;
       pairs.add(pair);

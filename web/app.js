@@ -2707,6 +2707,7 @@ function clearCorrectionPoll() {
   correctionPollTimer = null;
 }
 function resetCorrectionState(lectureId = '') {
+  $('correction-details').open = false;
   resetStudyNoteView();
   resetQuestionWorkspace();
   resetManualWorkspace();
@@ -4056,6 +4057,7 @@ function resetSummaryView() {
   summaryAbort?.abort(); summaryAbort = null;
   summaryView = {scope:'',row:null,loaded:false,busy:false,configured:false,error:'',polls:0};
   $('summary-content').replaceChildren();
+  $('summary-details').open = false;
   $('summary-panel').hidden = true;
 }
 function summaryEligible() { return !!(user && token && current?.recording_finalized && current?.segments?.length); }
@@ -4342,6 +4344,7 @@ function resetTranslationView() {
   translationAbort?.abort(); translationAbort = null;
   translationView = {scope:'',row:null,loaded:false,busy:false,configured:false,error:'',polls:0,mode:'paired'};
   $('translation-content').replaceChildren();
+  $('translation-details').open = false;
   $('translation-panel').hidden = true;
 }
 function translationEligible() { return !!(user && token && current?.recording_finalized && current?.segments?.length); }

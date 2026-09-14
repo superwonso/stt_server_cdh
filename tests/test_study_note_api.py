@@ -37,6 +37,7 @@ class FakeStudyNotes:
         self.error = None
         self.during = None
         self.invalid = False
+        self.document = None
         self.closed = False
 
     def create(self, *, language, segments, interrupted):
@@ -45,6 +46,8 @@ class FakeStudyNotes:
             self.during(segments, interrupted)
         if self.error:
             raise self.error
+        if self.document is not None:
+            return copy.deepcopy(self.document)
         return StudyNoteDocument([{
             "heading": "핵심 내용", "source_ids": ["outside-source" if self.invalid else segment["id"]],
             "text": segment["text"], "edits": [],
@@ -147,6 +150,100 @@ class StudyNoteApiTests(unittest.TestCase):
         self.assertEqual(self.row(identifier), before)
         self.assertEqual(len(self.engine.calls), 1)
 
+    def test_numbers_contacts_and_restored_terms_are_saved_and_read_back(self):
+        identifier, segment = self.lecture(text="지난 2026년 수업에서 광 합 성을 10번 설명했다.")
+        paragraph = {
+            "heading": "1주차 · 2027년 수업 정리",
+            "source_ids": [segment],
+            "text": "2027년 수업에서는 광합성을 12번 설명했다. 확인 연락처: classroom@example.invalid, 010-0000-0000.",
+            "edits": [
+                {"original": "2026년", "replacement": "2027년", "uncertain": True},
+                {"original": "광 합 성", "replacement": "광합성", "uncertain": False},
+            ],
+        }
+        self.engine.document = StudyNoteDocument([paragraph])
+        source_before = self.snapshot(identifier)
+        self.queued(identifier)
+        self.assertTrue(self.service.process_next())
+        saved = self.row(identifier)
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(json.loads(saved["document_json"]), {"paragraphs": [paragraph]})
+        self.assertIsNone(saved["error_code"])
+        self.assertIsNotNone(saved["completed_at"])
+
+        response = self.get(identifier)
+        self.assertEqual(response.status_code, 200, response.text)
+        note = response.json()["study_note"]
+        self.assertEqual(note["status"], "completed")
+        self.assertEqual(note["document"], {"paragraphs": [paragraph]})
+        self.assertIn("1주차 · 2027년 수업 정리", note["markdown"])
+        self.assertIn("2027년 수업에서는 광합성을 12번 설명했다", note["markdown"])
+        self.assertIn(r"classroom@example\.invalid", note["markdown"])
+        self.assertIn(r"010\-0000\-0000", note["markdown"])
+        self.assertIn("2026년 → 2027년", note["markdown"])
+        self.assertEqual(self.get(identifier).json()["study_note"], note)
+        self.assertEqual(self.post(identifier).json()["study_note"], note)
+        self.assertEqual(self.row(identifier), saved)
+        self.assertEqual(len(self.engine.calls), 1)
+        self.assertEqual(self.snapshot(identifier), source_before)
+        self.assertEqual(self.get(identifier, "user-beta").status_code, 404)
+        self.assertEqual(self.post(identifier, "user-beta").status_code, 404)
+
+    def test_paraphrased_terminology_audit_need_not_match_exact_source_or_output_substrings(self):
+        identifier, segment = self.lecture(text="라이트를 받으면 식물이 양분을 만든다는 설명입니다.")
+        paragraph = {
+            "heading": "광합성과 에너지 전환",
+            "source_ids": [segment],
+            "text": "식물은 빛에너지를 이용해 양분을 만드는 광합성을 수행한다.",
+            "edits": [{
+                "original": "빛을 이용해 양분을 생성하는 과정",
+                "replacement": "광합성(photosynthesis)",
+                "uncertain": True,
+            }],
+        }
+        self.assertNotIn(paragraph["edits"][0]["original"], "라이트를 받으면 식물이 양분을 만든다는 설명입니다.")
+        self.assertNotIn(paragraph["edits"][0]["replacement"], paragraph["text"])
+        self.engine.document = StudyNoteDocument([paragraph])
+        self.queued(identifier)
+        self.assertTrue(self.service.process_next())
+        saved = self.row(identifier)
+        note = self.get(identifier).json()["study_note"]
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(json.loads(saved["document_json"]), {"paragraphs": [paragraph]})
+        self.assertEqual(note["status"], "completed")
+        self.assertEqual(note["document"], {"paragraphs": [paragraph]})
+        self.assertIn(r"광합성\(photosynthesis\)", note["markdown"])
+        self.assertIn("추정 · 확인 필요", note["markdown"])
+        self.assertEqual(self.get(identifier).json()["study_note"], note)
+        self.assertEqual(self.row(identifier), saved)
+
+    def test_previously_rejected_note_can_be_explicitly_retried_and_saved(self):
+        identifier, segment = self.lecture()
+        self.engine.error = StudyNoteError("protected_content_changed")
+        rejected = self.queued(identifier)
+        self.assertTrue(self.service.process_next())
+        failed = self.get(identifier).json()["study_note"]
+        self.assertEqual((failed["status"], failed["error_code"]), ("failed", "protected_content_changed"))
+        self.assertIsNone(failed["document"])
+        self.assertIsNone(failed["markdown"])
+        self.engine.error = None
+        paragraph = {
+            "heading": "1. 광합성",
+            "source_ids": [segment],
+            "text": "광합성은 2가지 단계를 통해 빛에너지를 양분으로 전환한다.",
+            "edits": [{"original": "문맥에서 복원한 설명", "replacement": "광합성의 두 단계", "uncertain": True}],
+        }
+        self.engine.document = StudyNoteDocument([paragraph])
+        retried = self.queued(identifier)
+        self.assertNotEqual(retried["job_id"], rejected["job_id"])
+        self.assertTrue(self.service.process_next())
+        note = self.get(identifier).json()["study_note"]
+        self.assertEqual(note["status"], "completed")
+        self.assertIsNone(note["error_code"])
+        self.assertEqual(note["document"], {"paragraphs": [paragraph]})
+        self.assertIn("2가지 단계", note["markdown"])
+        self.assertEqual(len(self.engine.calls), 2)
+
     def test_original_corrected_translated_and_manual_products_are_untouched(self):
         identifier, segment = self.lecture()
         with self.database.connect() as connection:
@@ -161,6 +258,12 @@ class StudyNoteApiTests(unittest.TestCase):
             connection.execute("INSERT INTO lecture_manual_state VALUES(?,?,1)", (identifier, revision))
             connection.execute("INSERT INTO lecture_manual_edits VALUES(?,?,'보내지 않을 직접 수정','now','now')", (segment, identifier))
             connection.execute("INSERT INTO lecture_metadata VALUES(?,'보내지 않을 표시 이름','분류','학기',1,'now')", (identifier,))
+        self.engine.document = StudyNoteDocument([{
+            "heading": "1주차 광합성",
+            "source_ids": [segment],
+            "text": "식물은 2가지 단계로 광합성을 진행한다.",
+            "edits": [{"original": "빛을 이용한 양분 생성", "replacement": "광합성(photosynthesis)", "uncertain": True}],
+        }])
         before = self.snapshot(identifier)
         self.queued(identifier)
         self.service.process_next()
@@ -378,7 +481,7 @@ class StudyNoteApiTests(unittest.TestCase):
         def mutate(segments, _interrupted):
             with self.database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-            segments[0]["text"] = "원문에 없는 값 98765"
+            segments[0]["id"] = "outside-source"
 
         self.engine.during = mutate
         self.service.process_next()

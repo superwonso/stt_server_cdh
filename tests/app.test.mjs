@@ -1237,6 +1237,43 @@ function openSummaryFixture(app, finalized = true) {
     renderCurrent();`);
 }
 
+test('AI disclosures start closed and keep the user choice during updates without creating work', async () => {
+  const methods = [];
+  const app = setup(async (_url, options) => {
+    methods.push(options.method);
+    return response({configured:true,summary:null});
+  });
+  openSummaryFixture(app);
+  await until(() => app.run('summaryView.loaded'));
+  const details = ['correction-details','summary-details','translation-details'];
+  for (const id of details) {
+    assert.equal(app.element(id).open,false);
+    app.element(id).open = true;
+  }
+  app.run('renderCurrent(); renderCorrection(); renderSummary(); renderTranslation();');
+  for (const id of details) assert.equal(app.element(id).open,true);
+  for (const id of details) app.element(id).open = false;
+  app.run('renderCurrent()');
+  await tick();
+  for (const id of details) assert.equal(app.element(id).open,false);
+  assert.deepEqual(methods,['GET']);
+});
+
+for (const [label,change] of [
+  ['another lesson', "current={...current,id:'next-lesson'}; renderCurrent()"],
+  ['a new lesson', 'current=null; renderCurrent()'],
+  ['logout', "token=''; showLogin(false)"],
+]) {
+  test(`AI disclosures close again on ${label}`, () => {
+    const app = setup(async () => response({configured:false,summary:null}));
+    openSummaryFixture(app,false);
+    const details = ['correction-details','summary-details','translation-details'];
+    for (const id of details) app.element(id).open = true;
+    app.run(change);
+    for (const id of details) assert.equal(app.element(id).open,false);
+  });
+}
+
 test('summary creation is opt-in, waits for final saving, and does not stop a different live lecture', async () => {
   const methods = [];
   let posted = false;
@@ -6856,12 +6893,36 @@ test('study-note late responses are discarded after owner token API lecture raw-
 test('study-note malformed coverage or missing metadata fail closed without a download', async () => {
   for(const mutate of [r=>r.document.paragraphs[0].source_ids.reverse(),r=>r.document.paragraphs[0].source_ids.pop(),
     r=>r.document.paragraphs[0].source_ids=['study-a','foreign'],r=>r.lecture_id='other',r=>delete r.error_code,
-    r=>r.document.paragraphs[0].edits[0].replacement='본문에 없음']){
+    r=>r.document.paragraphs[0].edits[0].replacement=123,
+    r=>r.document.paragraphs[0].edits[0].original=r.document.paragraphs[0].edits[0].replacement]){
     const value=studyNoteEnvelope();mutate(value.study_note);const app=studyNoteApp(()=>response(value));
     openStudyNoteFixture(app);await until(()=>!!app.run('studyNoteView.error'));
     assert.equal(app.run('studyNoteView.row'),null);assert.equal(app.element('study-note-download').hidden,true);
     assert.equal(app.element('study-note-content').children.length,0);
   }
+});
+
+test('study-note inferred numbers contacts and nonliteral restoration notes render with an available Markdown download', async () => {
+  const value=studyNoteEnvelope(),paragraph=value.study_note.document.paragraphs[0];
+  Object.assign(paragraph,{heading:'2. 개념과 조건',
+    text:'**개념**과 표본 250개를 살펴봅니다. 연락처는 010-0000-1234입니다. 문맥에 맞춰 배치 정규화를 설명합니다.',
+    edits:[{original:'이백오십',replacement:'250',uncertain:false},
+      {original:'배치 놀말리제이션',replacement:'batch normalization',uncertain:true}]});
+  value.study_note.markdown='# 수업 정리본\n\n## 2. 개념과 조건\n\n'+paragraph.text
+    +'\n\n- 배치 놀말리제이션 → batch normalization (추정 · 확인 필요)\n';
+  const app=studyNoteApp(()=>response(value));openStudyNoteFixture(app);
+  const raw=app.run('JSON.stringify(current.segments)');
+  await until(()=>app.run('studyNoteView.row?.status')==='completed');
+  assert.equal(app.run('studyNoteView.error'),'');
+  const rendered=app.element('study-note-content').children[0];
+  assert.equal(rendered.children[0].textContent,paragraph.heading);
+  assert.match(rendered.children[2].children.map(node=>node.textContent).join(''),/250개.*010-0000-1234/);
+  assert.match(rendered.children[4].children[1].children[0].textContent,/배치 놀말리제이션 → batch normalization/);
+  const link=app.element('study-note-download');
+  assert.equal(link.hidden,false);assert.match(link.download,/수업 정리본\.md$/);
+  assert.equal(await app.objectUrlBlob(link.href).text(),value.study_note.markdown);
+  let blocked=false;link.onclick({preventDefault(){blocked=true;}});assert.equal(blocked,false);
+  assert.equal(app.run('JSON.stringify(current.segments)'),raw);
 });
 
 test('study-note unsupported disabled and failed services have explicit safe recovery controls', async () => {

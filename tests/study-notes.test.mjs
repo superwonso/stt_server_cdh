@@ -36,9 +36,36 @@ test('validated study-note paragraphs preserve contiguous complete raw coverage 
   }
 });
 
-test('edit markers must exist in their source and note with explicit boolean uncertainty and no duplicates', () => {
-  for (const mutate of [p=>p.edits[0].original='원문에 없음',p=>p.edits[0].replacement='본문에 없음',p=>p.edits[0].uncertain=1,
-    p=>p.edits.push({...p.edits[0]}),p=>p.edits[0].original='x'.repeat(257),p=>p.heading='x'.repeat(121),
+test('study notes accept restored numbers contacts and terms absent from the raw transcript', () => {
+  const doc=documentFixture();
+  Object.assign(doc.paragraphs[0],{
+    text:'**개념과 조건**을 살펴봅니다. 표본 250개를 비교합니다. 연락처는 010-0000-1234입니다. 라그랑주 승수법을 설명합니다.',
+    edits:[
+      {original:'이백오십',replacement:'250',uncertain:true},
+      {original:'연락 가능한 번호',replacement:'010-0000-1234',uncertain:true},
+      {original:'라그랑쥐안',replacement:'라그랑주 승수법',uncertain:true},
+    ],
+  });
+  const checked=validateStudyNoteDocument(doc,lecture());
+  assert.ok(checked);
+  assert.equal(checked.paragraphs[0].text,doc.paragraphs[0].text);
+  assert.deepEqual(checked.paragraphs[0].edits,doc.paragraphs[0].edits);
+  const response=envelope(); response.study_note.document=doc;
+  assert.ok(validateStudyNoteResponse(response,lecture()));
+});
+
+test('restoration annotations do not require literal original or replacement substrings', () => {
+  const doc=documentFixture();
+  doc.paragraphs[0].edits=[{original:'원문에서 나뉘어 인식된 표현',replacement:'문맥에 맞게 복원한 개념',uncertain:false}];
+  const checked=validateStudyNoteDocument(doc,lecture());
+  assert.ok(checked);
+  assert.deepEqual(checked.paragraphs[0].edits,doc.paragraphs[0].edits);
+});
+
+test('edit markers keep bounded nonempty strings explicit boolean uncertainty and no duplicates', () => {
+  for (const mutate of [p=>p.edits[0].uncertain=1,p=>p.edits[0].original=p.edits[0].replacement,
+    p=>p.edits[0].original='',p=>p.edits[0].replacement=' ',p=>p.edits[0]=null,
+    p=>p.edits.push({...p.edits[0]}),p=>p.edits[0].original='x'.repeat(257),p=>p.edits[0].replacement='x'.repeat(257),p=>p.heading='x'.repeat(121),
     p=>p.text='x'.repeat(24001),p=>p.edits=Array(17).fill(p.edits[0])]) {
     const doc=documentFixture(); mutate(doc.paragraphs[0]); assert.equal(validateStudyNoteDocument(doc,lecture()),null);
   }
