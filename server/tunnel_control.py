@@ -613,6 +613,8 @@ def _unavailable(*, accepted: bool | None = None) -> dict[str, object]:
 def tunnel_status() -> dict[str, object]:
     """Default injectable status callable for the FastAPI integration."""
 
+    if os.name == "nt":
+        return _unavailable()
     try:
         return _get_default_controller().status()
     except Exception:
@@ -622,6 +624,8 @@ def tunnel_status() -> dict[str, object]:
 def tunnel_restart() -> dict[str, object]:
     """Default injectable non-blocking restart callable for HTTP 202 handling."""
 
+    if os.name == "nt":
+        return _unavailable(accepted=False)
     try:
         return _get_default_controller().restart()
     except Exception:

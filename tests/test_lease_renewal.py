@@ -45,6 +45,7 @@ class FakeController:
         return {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 
 
+@unittest.skipIf(os.name == "nt", "Linux private lease files, chmod and process-group renewal")
 class LeaseRenewerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -369,6 +370,43 @@ class LeaseRenewerTests(unittest.TestCase):
         worker.check_once()
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(worker.status()["state"], "waiting")
+
+
+class PortableLeaseBoundaryTests(unittest.TestCase):
+    def test_lease_json_is_validated_without_a_platform_file_fixture(self):
+        now = 1700000000.0
+        document = runtime_config(URL, datetime.fromtimestamp(now, timezone.utc))
+        with mock.patch("server.lease_renewal._private_file", return_value=json.dumps(document).encode()):
+            lease = read_desired_lease(Path("unused-synthetic"), now=now)
+        self.assertEqual(lease.api_url, URL)
+        self.assertEqual(lease.expires_at - lease.published_at, 86400)
+        for payload in (b'{"version":1,"version":1}', b'[]', b'null', b'{invalid'):
+            with self.subTest(payload_type=type(payload).__name__), \
+                 mock.patch("server.lease_renewal._private_file", return_value=payload):
+                with self.assertRaises(LeaseStateError):
+                    read_desired_lease(Path("unused-synthetic"), now=now)
+
+    def test_isolated_factory_never_reads_production_or_constructs_control(self):
+        with mock.patch("server.lease_renewal.TunnelController") as controller, \
+             mock.patch("server.lease_renewal._private_file") as reader:
+            worker = create_lease_renewer(data_dir=Path(tempfile.gettempdir()) / "synthetic-isolated")
+            worker.start()
+            worker.check_once()
+            self.assertFalse(worker.status()["enabled"])
+            controller.assert_not_called()
+            reader.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows boundary")
+    def test_windows_factory_is_disabled_even_with_default_data_path(self):
+        from server.lease_renewal import PROJECT_ROOT
+        with mock.patch("server.lease_renewal.TunnelController") as controller, \
+             mock.patch("server.lease_renewal._private_file") as reader:
+            worker = create_lease_renewer(data_dir=PROJECT_ROOT / ".data")
+            worker.start()
+            worker.check_once()
+            self.assertFalse(worker.status()["enabled"])
+            controller.assert_not_called()
+            reader.assert_not_called()
 
 
 if __name__ == "__main__":

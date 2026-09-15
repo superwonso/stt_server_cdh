@@ -160,7 +160,7 @@ class TranslationApiTests(unittest.TestCase):
                          [(first, 0.0, 1.0), (second, 1.25, 2.5)])
         self.assertTrue(all(set(s) == {"id", "start", "end", "text"} for s in translated))
 
-    def test_missing_extra_reordered_or_retimed_rows_fail_without_partial_save(self):
+    def test_mapping_diagnostics_preserve_drafts_or_source_order_and_timing(self):
         mutations = {
             "missing": lambda rows: rows[:-1],
             "extra": lambda rows: rows + [dict(rows[-1])],
@@ -176,9 +176,15 @@ class TranslationApiTests(unittest.TestCase):
                 self.assert_queued(lecture_id)
                 self.service.process_next()
                 row = self.row(lecture_id)
-                self.assertEqual(row["status"], "failed")
-                self.assertIsNone(row["translation_json"])
-                self.assertEqual(self.get(lecture_id).json()["translation"]["segments"], [])
+                self.assertEqual(row['status'], 'completed')
+                saved = self.get(lecture_id).json()['translation']
+                self.assertTrue(saved['document']['warnings'])
+                if name in {'missing', 'extra'}:
+                    self.assertEqual(saved['segments'], [])
+                    self.assertEqual(saved['document']['format'], 'draft')
+                else:
+                    self.assertEqual(saved['document']['format'], 'segments')
+                    self.assertEqual([(row['start'],row['end']) for row in saved['segments']],[(0.0,1.0),(1.25,2.5)])
 
     def test_mutating_engine_cannot_change_the_services_validation_snapshot(self):
         lecture_id, _ = self.lecture()
@@ -188,9 +194,10 @@ class TranslationApiTests(unittest.TestCase):
             return LectureTranslation([{**segments[0], "text": "변경된 숫자 123"}])
         with patch.object(self.engine, "translate", mutate_input):
             self.service.process_next()
-        self.assertEqual(self.row(lecture_id)["status"], "failed")
-        self.assertIsNone(self.row(lecture_id)["translation_json"])
-        self.assertNotIn("123", self.transcript_snapshot(lecture_id)["segments"][0]["text"])
+        self.assertEqual(self.row(lecture_id)['status'], 'completed')
+        saved = self.get(lecture_id).json()['translation']
+        self.assertIn('validation_failed', saved['document']['warnings'])
+        self.assertNotIn('123', self.transcript_snapshot(lecture_id)['segments'][0]['text'])
 
     def test_auto_and_korean_language_tags_do_not_block_mixed_lectures(self):
         for language in (None, "ko"):
@@ -386,14 +393,17 @@ class TranslationApiTests(unittest.TestCase):
                 # Each case is an independent simulated owner's hourly limit.
                 self.service.limiter._events.clear()
 
-    def test_worker_rejects_invalid_citations_without_persisting_document(self):
+    def test_worker_preserves_invalid_mapping_as_draft_without_invented_citations(self):
         lecture_id, _ = self.lecture()
         self.engine.invalid = True
         self.assert_queued(lecture_id)
         self.service.process_next()
-        self.assertEqual(self.row(lecture_id)["status"], "failed")
-        self.assertIsNone(self.row(lecture_id)["translation_json"])
-        self.assertEqual(self.get(lecture_id).json()["translation"]["segments"], [])
+        self.assertEqual(self.row(lecture_id)['status'], 'completed')
+        saved = self.get(lecture_id).json()['translation']
+        self.assertEqual(saved['segments'], [])
+        self.assertEqual(saved['document']['format'], 'draft')
+        self.assertTrue(saved['document']['warnings'])
+        self.assertNotIn('outside-lecture', saved['document']['text'])
 
     def test_each_owner_has_one_active_job_but_different_owners_are_independent(self):
         first, _ = self.lecture()
@@ -625,6 +635,71 @@ class TranslationApiTests(unittest.TestCase):
             connection.execute("UPDATE operational_state SET access_enabled=1 WHERE singleton=1")
         self.assertTrue(self.service.process_next())
         self.assertEqual(self.get(lecture_id).json()["translation"]["status"], "completed")
+
+
+    def test_explicit_draft_is_owner_scoped_cached_and_separate_from_source(self):
+        lecture_id,_=self.lecture()
+        before=self.transcript_snapshot(lecture_id)
+        self.assert_queued(lecture_id)
+        output=LectureTranslation([],draft_text='받은 번역 <script>보기</script> __PRIVATE_999999__',
+                                  warnings=['invalid_response','provider-private-warning'])
+        with patch.object(self.engine,'translate',return_value=output) as translate:
+            self.service.process_next()
+            repeated=self.post(lecture_id)
+        saved=self.get(lecture_id).json()['translation']
+        self.assertEqual(saved['status'],'completed')
+        self.assertEqual(saved['segments'],[])
+        self.assertEqual(saved['document']['format'],'draft')
+        self.assertIn('받은 번역',saved['document']['text'])
+        self.assertNotIn('__PRIVATE_',saved['document']['text'])
+        self.assertNotIn('provider-private',json.dumps(saved))
+        self.assertEqual(repeated.json()['translation']['status'],'completed')
+        self.assertEqual(translate.call_count,1)
+        self.assertEqual(self.get(lecture_id,username='user-beta').status_code,404)
+        self.assertEqual(self.transcript_snapshot(lecture_id),before)
+
+    def test_returning_draft_still_fails_when_source_revision_changes(self):
+        lecture_id,segment_id=self.lecture()
+        self.assert_queued(lecture_id)
+        def translate(**kwargs):
+            with self.database.connect() as connection:
+                connection.execute('UPDATE segments SET text=? WHERE id=?',('Changed original source.',segment_id))
+            return LectureTranslation([],draft_text='받은 번역',warnings=['invalid_response'])
+        with patch.object(self.engine,'translate',side_effect=translate):
+            self.service.process_next()
+        saved=self.get(lecture_id).json()['translation']
+        self.assertEqual(saved['status'],'failed')
+        self.assertEqual(saved['error_code'],'source_changed')
+        self.assertEqual(saved['segments'],[])
+        self.assertNotIn('document',saved)
+
+    def test_invalid_saved_draft_envelope_remains_a_storage_failure(self):
+        lecture_id,_=self.lecture()
+        self.assert_queued(lecture_id)
+        with patch.object(self.engine,'translate',return_value=LectureTranslation([],draft_text='받은 번역',warnings=['invalid_response'])):
+            self.service.process_next()
+        with self.database.connect() as connection:
+            connection.execute('UPDATE lecture_translations SET translation_json=? WHERE lecture_id=?',
+                               (json.dumps({'format':'draft','text':'받은 번역','warnings':['unknown-code']}),lecture_id))
+        saved=self.get(lecture_id).json()['translation']
+        self.assertEqual(saved['status'],'failed')
+        self.assertEqual(saved['error_code'],'invalid_saved_translation')
+        self.assertNotIn('document',saved)
+
+
+    def test_invalid_saved_mapped_warning_envelope_remains_a_storage_failure(self):
+        lecture_id,_=self.lecture()
+        self.assert_queued(lecture_id)
+        self.service.process_next()
+        with self.database.connect() as connection:
+            row=connection.execute('SELECT translation_json FROM lecture_translations WHERE lecture_id=?',(lecture_id,)).fetchone()
+            envelope={'format':'segments','segments':json.loads(row[0]),'warnings':['unknown-code']}
+            connection.execute('UPDATE lecture_translations SET translation_json=? WHERE lecture_id=?',(json.dumps(envelope),lecture_id))
+        saved=self.get(lecture_id).json()['translation']
+        self.assertEqual(saved['status'],'failed')
+        self.assertEqual(saved['error_code'],'invalid_saved_translation')
+        self.assertNotIn('document',saved)
+
 
 
 if __name__ == "__main__":

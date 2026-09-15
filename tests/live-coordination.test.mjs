@@ -277,3 +277,158 @@ test('audio lane acquisition failure releases the already-held ASR transition lo
   refuseAudio = false;
   assert.deepEqual(await coordination.runAllUploaders(OWNER, () => 'recovered'), { supported: true, value: 'recovered' });
 });
+
+test('tryAllUploaders requires Web Locks and never runs the local fallback operation', async t => {
+  environment(t, null);
+  let calls = 0;
+  const result = await new LiveCoordination().tryAllUploaders(OWNER, () => { calls += 1; });
+  assert.deepEqual(result, { supported: false, acquired: false });
+  assert.equal(Object.isFrozen(result), true);
+  assert.equal(calls, 0);
+});
+
+test('tryAllUploaders acquires ASR then audio immediately and holds both throughout work', { timeout: 2000 }, async t => {
+  const manager = new LockManager(), request = manager.request.bind(manager), optionsSeen = [];
+  manager.request = (name, options, callback) => {
+    optionsSeen.push({name, options});
+    return request(name, options, callback);
+  };
+  environment(t, manager);
+  const coordination = new LiveCoordination(), gate = deferred(), events = [];
+  const transition = coordination.tryAllUploaders(OWNER, async () => {
+    assert.equal(manager.active.size, 2);
+    events.push('transition'); await gate.promise; return 'archived';
+  });
+  await turns();
+  assert.deepEqual(optionsSeen.map(item => item.name.split(':')[1]), ['uploader', 'audio-uploader']);
+  assert.ok(optionsSeen.every(item => item.options.mode === 'exclusive' && item.options.ifAvailable === true));
+  const asr = coordination.runUploader(OWNER, () => events.push('asr'));
+  const audio = coordination.runAudioUploader(OWNER, () => events.push('audio'));
+  await turns(); assert.deepEqual(events, ['transition']);
+  gate.resolve();
+  const result = await transition;
+  assert.deepEqual(result, { supported: true, acquired: true, value: 'archived' });
+  assert.equal(Object.isFrozen(result), true);
+  await Promise.all([asr, audio]);
+  assert.deepEqual(new Set(events), new Set(['transition', 'asr', 'audio']));
+  assert.equal(manager.active.size, 0);
+});
+
+test('tryAllUploaders returns while a busy ASR operation remains unresolved without requesting audio', { timeout: 2000 }, async t => {
+  const manager = new LockManager(); environment(t, manager);
+  const coordination = new LiveCoordination(), gate = deferred();
+  const occupied = coordination.runUploader(OWNER, () => gate.promise);
+  await turns(); const previousRequests = manager.requests.length;
+  let calls = 0;
+  try {
+    const result = await coordination.tryAllUploaders(OWNER, () => { calls += 1; });
+    assert.deepEqual(result, { supported: true, acquired: false, value: undefined });
+    assert.equal(Object.isFrozen(result), true);
+    assert.equal(calls, 0);
+    assert.equal(manager.requests.length, previousRequests + 1);
+    assert.equal(manager.active.size, 1);
+    assert.ok([...manager.queues.values()].every(queue => queue.length === 0));
+  } finally { gate.resolve(); await occupied; }
+});
+
+test('tryAllUploaders releases ASR immediately when audio is busy and never queues its work', { timeout: 2000 }, async t => {
+  const manager = new LockManager(); environment(t, manager);
+  const coordination = new LiveCoordination(), gate = deferred();
+  const occupied = coordination.runAudioUploader(OWNER, () => gate.promise);
+  await turns(); const previousRequests = manager.requests.length;
+  let calls = 0;
+  try {
+    assert.deepEqual(await coordination.tryAllUploaders(OWNER, () => { calls += 1; }),
+      { supported: true, acquired: false, value: undefined });
+    assert.equal(calls, 0);
+    assert.deepEqual(manager.requests.slice(previousRequests).map(name => name.split(':')[1]),
+      ['uploader', 'audio-uploader']);
+    assert.equal(manager.active.size, 1);
+    assert.ok([...manager.queues.values()].every(queue => queue.length === 0));
+    assert.equal((await coordination.runUploader(OWNER, () => 'ASR released')).value, 'ASR released');
+  } finally { gate.resolve(); await occupied; }
+  assert.equal(calls, 0, 'releasing the busy lane must not start an earlier refused operation');
+});
+
+test('simultaneous tryAllUploaders calls do not queue the loser and other owners remain independent', { timeout: 2000 }, async t => {
+  const manager = new LockManager(); environment(t, manager);
+  const first = new LiveCoordination(), second = new LiveCoordination(), gate = deferred(), events = [];
+  const held = first.tryAllUploaders(OWNER, async () => { events.push('first'); await gate.promise; return 'first'; });
+  const refused = second.tryAllUploaders(OWNER, () => events.push('second'));
+  assert.deepEqual(await refused, { supported: true, acquired: false, value: undefined });
+  assert.deepEqual(await second.tryAllUploaders('different-owner', () => 'independent'),
+    { supported: true, acquired: true, value: 'independent' });
+  assert.deepEqual(events, ['first']);
+  assert.equal(manager.active.size, 2);
+  gate.resolve(); await held;
+  assert.deepEqual(events, ['first']);
+  assert.ok(manager.requests.every(name => !name.includes(OWNER) && !name.includes('different-owner')));
+  assert.equal(manager.active.size, 0);
+});
+
+test('tryAllUploaders propagates synchronous asynchronous and falsy work failures and releases both locks', async t => {
+  const manager = new LockManager(); environment(t, manager);
+  const coordination = new LiveCoordination();
+  const failures = [new Error('synthetic storage failure'), undefined, null, false, 0, ''];
+  let calls = 0;
+  for (const failure of failures) {
+    for (const asynchronous of [false, true]) {
+      let rejected = false;
+      const work = asynchronous
+        ? async () => { calls += 1; await Promise.resolve(); throw failure; }
+        : () => { calls += 1; throw failure; };
+      try { await coordination.tryAllUploaders(OWNER, work); }
+      catch (error) { rejected = true; assert.equal(error, failure); }
+      assert.equal(rejected, true);
+      assert.equal(manager.active.size, 0);
+    }
+  }
+  assert.equal(calls, failures.length * 2);
+  assert.deepEqual(await coordination.tryAllUploaders(OWNER, () => undefined),
+    { supported: true, acquired: true, value: undefined });
+});
+
+test('tryAllUploaders rejects invalid owners and callbacks before requesting any lock', async t => {
+  const manager = new LockManager(); environment(t, manager);
+  const coordination = new LiveCoordination();
+  let calls = 0;
+  for (const owner of ['', ' owner', 'owner ', 'a'.repeat(33), 'owner\n', null, 7]) {
+    await assert.rejects(coordination.tryAllUploaders(owner, () => { calls += 1; }), LiveCoordinationValidationError);
+  }
+  for (const work of [null, undefined, {}, 4]) {
+    await assert.rejects(coordination.tryAllUploaders(OWNER, work), LiveCoordinationValidationError);
+  }
+  assert.equal(calls, 0);
+  assert.deepEqual(manager.requests, []);
+});
+
+test('tryAllUploaders acquisition errors execute no work and release a partially acquired ASR lock', async t => {
+  const manager = new LockManager(), request = manager.request.bind(manager), failure = new Error('synthetic lock refusal');
+  let refusedLane = 'uploader';
+  manager.request = (name, options, callback) => name.split(':')[1] === refusedLane
+    ? Promise.reject(failure) : request(name, options, callback);
+  environment(t, manager);
+  const coordination = new LiveCoordination();
+  let calls = 0;
+  for (refusedLane of ['uploader', 'audio-uploader']) {
+    await assert.rejects(coordination.tryAllUploaders(OWNER, () => { calls += 1; }), error =>
+      error.code === 'uploader_lock_failed' && error.coordinationRetrySafe === true && error.cause === failure);
+    assert.equal(manager.active.size, 0);
+  }
+  assert.equal(calls, 0);
+  refusedLane = '';
+  assert.equal((await coordination.tryAllUploaders(OWNER, () => 'recovered')).value, 'recovered');
+});
+
+test('tryAllUploaders manager failure after work is not declared safe to replay', async t => {
+  const failure = new Error('synthetic failure after callback');
+  environment(t, {request:async (name, options, callback) => {
+    const value = await callback({name});
+    if (name.includes(':audio-uploader:')) throw failure;
+    return value;
+  }});
+  let calls = 0;
+  await assert.rejects(new LiveCoordination().tryAllUploaders(OWNER, () => { calls += 1; return 'saved'; }), error =>
+    error.code === 'uploader_lock_failed' && error.coordinationRetrySafe === false && error.cause === failure);
+  assert.equal(calls, 1);
+});

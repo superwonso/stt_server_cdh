@@ -17,6 +17,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from server import recordings as recordings_module
+from server import platform_files
 from server.app import DescriptorFileResponse, create_app
 from server.recordings import (
     RecordingCapacityError,
@@ -133,8 +134,8 @@ class RecordingStoreTests(unittest.TestCase):
             metadata, frames = read_wav(store.path("user-alpha", lecture_id).read_bytes())
             self.assertEqual(metadata, (1, 2, 16_000))
             np.testing.assert_array_equal(frames, np.array([1, 2, 3, 4, 5, 6, 0, 0, 7], dtype="<i2"))
-            self.assertEqual(store.path("user-alpha", lecture_id).stat().st_mode & 0o777, 0o600)
-            self.assertEqual((store.root / "user-alpha").stat().st_mode & 0o777, 0o700)
+            platform_files.validate_private_path(store.path("user-alpha", lecture_id))
+            platform_files.validate_private_path(store.root / "user-alpha", directory=True)
 
             store.remove_orphans({"user-alpha": set(), "user-beta": set()})
             self.assertFalse(store.path("user-alpha", lecture_id).exists())
@@ -185,7 +186,8 @@ class RecordingStoreTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as temporary:
             temporary.write(b"test recording bytes")
             temporary.flush()
-            descriptor = os.open(temporary.name, os.O_RDONLY)
+            descriptor = (platform_files.open_file(Path(temporary.name), os.O_RDONLY)
+                          if os.name == "nt" else os.open(temporary.name, os.O_RDONLY))
             response = DescriptorFileResponse(
                 descriptor,
                 media_type="application/octet-stream",
@@ -254,7 +256,12 @@ class RecordingStoreTests(unittest.TestCase):
             outside = directory / "outside-private-file"
             outside.write_bytes(b"must remain unchanged")
             path = store.path("user-alpha", lecture_id)
-            path.symlink_to(outside)
+            try:
+                path.symlink_to(outside)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("Windows file symlink fixture requires Developer Mode or symlink privilege")
+                raise
 
             with self.assertRaises(RecordingCorruptError):
                 store.open_info("user-alpha", lecture_id)

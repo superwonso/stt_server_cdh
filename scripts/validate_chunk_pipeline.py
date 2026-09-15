@@ -7,7 +7,9 @@ import argparse
 import json
 import math
 import re
-import resource
+import os
+if os.name != "nt":
+    import resource
 import sys
 import time
 import unicodedata
@@ -316,6 +318,9 @@ def contract_report(chunks: list[ChunkSpec], source_samples: int, guard_samples:
 
 
 def current_rss_bytes() -> int:
+    if os.name == "nt":
+        import psutil
+        return psutil.Process().memory_info().rss
     try:
         for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
             if line.startswith("VmRSS:"):
@@ -323,6 +328,13 @@ def current_rss_bytes() -> int:
     except (OSError, ValueError, IndexError):
         pass
     return 0
+
+
+def peak_rss_gib() -> float:
+    if os.name == "nt":
+        import psutil
+        return psutil.Process().memory_info().peak_wset / 2**30
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
 
 
 def growth_slope_mib_per_hour(elapsed_audio: list[float], values: list[int]) -> float:
@@ -724,7 +736,7 @@ def main() -> None:
                 "process_rss_slope_mib_per_hour": round(
                     growth_slope_mib_per_hour(elapsed_fresh_audio, rss_samples), 2
                 ),
-                "max_process_rss_gib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3),
+                "max_process_rss_gib": round(peak_rss_gib(), 3),
             },
             ensure_ascii=False,
         ),

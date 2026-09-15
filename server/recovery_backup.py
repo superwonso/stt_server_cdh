@@ -6,7 +6,6 @@ not implement cryptography. Scheduler jobs only need the public recipient.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import io
 import json
@@ -17,7 +16,6 @@ import sqlite3
 import stat
 import subprocess
 import tarfile
-import tempfile
 import threading
 import time
 import uuid
@@ -29,9 +27,12 @@ from urllib.parse import quote
 from dotenv import dotenv_values
 
 from .settings import PROJECT_DIR, Settings, account_usernames
+from . import platform_files
 
-AGE_RELATIVE = Path(".tools/age-1.1.1-ubuntu24.04.3/usr/bin/age")
-POWERSHELL = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+AGE_RELATIVE = (Path(".tools/age/age.exe") if platform_files.IS_WINDOWS
+                else Path(".tools/age-1.1.1-ubuntu24.04.3/usr/bin/age"))
+POWERSHELL = (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+              if platform_files.IS_WINDOWS else Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"))
 MAX_DATABASE_BYTES = 512 * 1024 * 1024
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_PLAINTEXT_BYTES = MAX_DATABASE_BYTES + 8 * MAX_CONFIG_BYTES
@@ -63,6 +64,12 @@ def _check(cancel: threading.Event | None, deadline: float) -> None:
 
 
 def _no_symlinks(path: Path) -> None:
+    if platform_files.IS_WINDOWS:
+        try:
+            platform_files.reject_links(path)
+        except OSError:
+            raise BackupError("unsafe_path") from None
+        return
     current = Path(path.anchor)
     for part in path.absolute().parts[1:]:
         current /= part
@@ -71,6 +78,15 @@ def _no_symlinks(path: Path) -> None:
 
 
 def _private_directory(path: Path, *, create: bool = False) -> None:
+    if platform_files.IS_WINDOWS:
+        try:
+            if create:
+                platform_files.ensure_private_directory(path)
+            else:
+                platform_files.validate_private_path(path, directory=True)
+        except OSError:
+            raise BackupError("unsafe_directory") from None
+        return
     _no_symlinks(path)
     if create:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -79,13 +95,23 @@ def _private_directory(path: Path, *, create: bool = False) -> None:
         raise BackupError("unsafe_directory")
 
 
+@contextmanager
+def _temporary_private_directory(*, prefix: str, directory: Path):
+    temporary = platform_files.make_private_temporary_directory(prefix=prefix, directory=directory)
+    try:
+        yield temporary
+    finally:
+        shutil.rmtree(temporary)
+
+
 def _read_private(path: Path, limit: int = MAX_CONFIG_BYTES) -> bytes:
     _no_symlinks(path)
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    descriptor = (platform_files.open_file(path, os.O_RDONLY, private=True) if platform_files.IS_WINDOWS
+                  else os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK))
     try:
         info = os.fstat(descriptor)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_size > limit):
+        if (not stat.S_ISREG(info.st_mode) or (not platform_files.IS_WINDOWS
+                and (info.st_uid != os.getuid() or info.st_mode & 0o077)) or info.st_size > limit):
             raise BackupError("unsafe_file")
         with os.fdopen(descriptor, "rb", closefd=False) as source:
             content = source.read(limit + 1)
@@ -97,7 +123,7 @@ def _read_private(path: Path, limit: int = MAX_CONFIG_BYTES) -> bytes:
 
 
 def _write_new(path: Path, content: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    descriptor = platform_files.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, private=True)
     with os.fdopen(descriptor, "wb") as output:
         output.write(content)
         output.flush()
@@ -123,6 +149,12 @@ def _json(content: bytes) -> dict:
 
 
 def _replace_private(path: Path, value: dict) -> None:
+    if platform_files.IS_WINDOWS:
+        try:
+            platform_files.atomic_write_private(path, _json_bytes(value))
+        except OSError:
+            raise BackupError("unsafe_file") from None
+        return
     if path.exists() or path.is_symlink():
         _read_private(path)
     temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
@@ -142,7 +174,7 @@ def _hash_file(path: Path, limit: int, cancel=None, deadline=float("inf")) -> tu
     _no_symlinks(path)
     digest = hashlib.sha256()
     count = 0
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    descriptor = platform_files.open_file(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(descriptor, "rb") as source:
         if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
             raise BackupError("unsafe_file")
@@ -186,7 +218,7 @@ def _accounts(env: bytes) -> tuple[str, ...]:
 def _database_info(path: Path, cancel=None, deadline=float("inf")) -> dict:
     if path.stat().st_size > MAX_DATABASE_BYTES:
         raise BackupError("size_limit")
-    uri = f"file:{quote(str(path.absolute()), safe='/')}?mode=ro"
+    uri = f"{path.absolute().as_uri()}?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=2)) as connection:
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA trusted_schema=OFF")
@@ -223,10 +255,17 @@ def _local_wav_count(root: Path, cancel=None, deadline=float("inf")) -> int:
         examined += len(directories) + len(files)
         if examined > 100000:
             raise BackupError("size_limit")
-        directories[:] = [name for name in directories if not (Path(directory) / name).is_symlink()]
+        def regular_entry(path: Path, *, directory: bool = False) -> bool:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return False
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                return False
+            return stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        directories[:] = [name for name in directories if regular_entry(Path(directory) / name, directory=True)]
         for name in files:
-            path = Path(directory) / name
-            if name.lower().endswith(".wav") and not path.is_symlink() and path.is_file():
+            if name.lower().endswith(".wav") and regular_entry(Path(directory) / name):
                 count += 1
     return count
 
@@ -272,10 +311,10 @@ class RecoveryBackupManager:
         recipient_path = self.config_dir / "recipient.txt"
         deadline = time.monotonic() + 30
         for destination, arguments in (
-            (identity, [str(self.age_binary.with_name("age-keygen"))]),
-            (recipient_path, [str(self.age_binary.with_name("age-keygen")), "-y", str(identity)]),
+            (identity, [str(self.age_binary.with_name("age-keygen.exe" if platform_files.IS_WINDOWS else "age-keygen"))]),
+            (recipient_path, [str(self.age_binary.with_name("age-keygen.exe" if platform_files.IS_WINDOWS else "age-keygen")), "-y", str(identity)]),
         ):
-            descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            descriptor = platform_files.open_file(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, private=True)
             with os.fdopen(descriptor, "wb") as output:
                 _run(arguments, output, None, deadline)
                 output.flush(); os.fsync(output.fileno())
@@ -316,7 +355,11 @@ class RecoveryBackupManager:
 
     def _sources(self) -> dict[str, Path]:
         private = self.settings.data_dir / "google-drive"
-        sources = {"settings.env": self.project_dir / "server" / ".env",
+        configured_env = os.environ.get("STT_ENV_FILE")
+        environment = Path(configured_env) if configured_env else self.project_dir / "server" / ".env"
+        if not environment.is_absolute():
+            raise BackupError("unsafe_path")
+        sources = {"settings.env": environment,
                    "drive-identity.key": private / "identity.key",
                    "drive-oauth-client.json": self.settings.google_drive_oauth_client_path or private / "oauth-client.json",
                    "drive-token.json": self.settings.google_drive_token_path or private / "token.json"}
@@ -343,12 +386,15 @@ class RecoveryBackupManager:
         name = f"yeobaek-recovery-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}.age"
         staging = self.config_dir / "staging"
         _private_directory(staging, create=True)
-        with tempfile.TemporaryDirectory(prefix="build-", dir=self.config_dir) as temporary:
+        with _temporary_private_directory(prefix="build-", directory=self.config_dir) as temporary:
             workspace = Path(temporary)
-            workspace.chmod(0o700)
+            if platform_files.IS_WINDOWS:
+                platform_files.validate_private_path(workspace, directory=True)
+            else:
+                workspace.chmod(0o700)
             database = workspace / "database.sqlite3"
             _write_new(database, b"")
-            uri = f"file:{quote(str(source_db), safe='/')}?mode=ro"
+            uri = f"{source_db.as_uri()}?mode=ro"
             with closing(sqlite3.connect(uri, uri=True, timeout=2)) as source, closing(sqlite3.connect(database)) as target:
                 page_size = source.execute("PRAGMA page_size").fetchone()[0]
                 def progress(_status, _remaining, total):
@@ -382,7 +428,7 @@ class RecoveryBackupManager:
             _write_new(workspace / "manifest.json", _json_bytes(manifest))
             archive = workspace / "payload.tar"
             with archive.open("xb") as output:
-                os.fchmod(output.fileno(), 0o600)
+                platform_files.set_private_file(output.fileno())
                 with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as tar:
                     for alias in [*files, "manifest.json"]:
                         _check(cancel, deadline)
@@ -394,7 +440,7 @@ class RecoveryBackupManager:
                             tar.addfile(member, source)
             ciphertext = staging / name
             try:
-                descriptor = os.open(ciphertext, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                descriptor = platform_files.open_file(ciphertext, os.O_WRONLY | os.O_CREAT | os.O_EXCL, private=True)
                 with os.fdopen(descriptor, "wb") as output:
                     _run([str(self.age_binary), "--encrypt", "-r", recipient, str(archive)], output, cancel, deadline)
                     output.flush(); os.fsync(output.fileno())
@@ -411,10 +457,10 @@ class RecoveryBackupManager:
         descriptor = None
         try:
             _private_directory(self.config_dir)
-            descriptor = os.open(self.config_dir / "operation.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._running = True
-            yield
+            descriptor = platform_files.open_file(self.config_dir / "operation.lock", os.O_RDWR | os.O_CREAT, private=True)
+            with platform_files.file_lock(descriptor, blocking=False):
+                self._running = True
+                yield
         except BlockingIOError:
             raise BackupError("already_running") from None
         finally:
@@ -424,12 +470,15 @@ class RecoveryBackupManager:
             self.operation_lock.release()
 
     def _copy_to_windows(self, source: Path, pending: dict, cancel, deadline: float) -> None:
-        with tempfile.TemporaryDirectory(prefix="copy-", dir=self.config_dir) as temporary:
+        with _temporary_private_directory(prefix="copy-", directory=self.config_dir) as temporary:
             output_path = Path(temporary) / "path.txt"
             for linux_path, key in ((source, "source"), (self.project_dir / "scripts" / "copy-backup-to-d.ps1", "script")):
-                with output_path.open("wb") as output:
-                    _run(["wslpath", "-w", str(linux_path)], output, cancel, deadline)
-                value = output_path.read_text().strip()
+                if platform_files.IS_WINDOWS:
+                    value = str(linux_path.absolute())
+                else:
+                    with output_path.open("wb") as output:
+                        _run(["wslpath", "-w", str(linux_path)], output, cancel, deadline)
+                    value = output_path.read_text().strip()
                 if len(value) > 4096 or "\n" in value or "\r" in value:
                     raise BackupError("unsafe_path")
                 if key == "source":
@@ -498,16 +547,16 @@ class RecoveryBackupManager:
 
 def verify_recovery_archive(archive: Path, identity: Path, *, age_binary: Path = PROJECT_DIR / AGE_RELATIVE,
                             cancel_event=None) -> dict:
-    """Authenticate first, then verify/extract ONLY into a new private /tmp dir."""
+    """Authenticate first, then verify/extract only into a new private temporary directory."""
     _read_private(Path(identity), 65536)
     _hash_file(Path(archive), MAX_CIPHERTEXT_BYTES)
-    destination = Path(tempfile.mkdtemp(prefix="stt-recovery-check-", dir="/tmp"))
-    destination.chmod(0o700)
+    destination = platform_files.make_private_temporary_directory(
+        prefix="stt-recovery-check-", directory=None if platform_files.IS_WINDOWS else Path("/tmp"))
     deadline = time.monotonic() + 600
     try:
         payload = destination / "authenticated.tar"
         with payload.open("xb") as output:
-            os.fchmod(output.fileno(), 0o600)
+            platform_files.set_private_file(output.fileno())
             _run([str(age_binary), "--decrypt", "-i", str(identity), str(archive)], output, cancel_event, deadline)
         # age may emit partial plaintext before the final authentication check.
         # No tar parser or database is touched until its successful process exit.
@@ -538,7 +587,7 @@ def verify_recovery_archive(archive: Path, identity: Path, *, age_binary: Path =
                     raise BackupError("unsafe_archive")
                 seen.add(member.name)
                 with (destination / member.name).open("xb") as output:
-                    os.fchmod(output.fileno(), 0o600)
+                    platform_files.set_private_file(output.fileno())
                     remaining = member.size
                     while remaining:
                         _check(cancel_event, deadline)

@@ -39,6 +39,7 @@ class FakeRuntime:
         return 0
 
 
+@unittest.skipIf(os.name == "nt", "Linux executable modes, /proc ownership and Bash lifecycle")
 class TunnelControllerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -355,6 +356,16 @@ class TunnelControllerTests(unittest.TestCase):
             wrong[wrong.index("8765")] = "9999"
             details.return_value = (self.root, wrong, self.root / "python")
             self.assertFalse(controller.renewal_processes_owned(script_check=True))
+
+
+class NativeTunnelBoundaryTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Native Windows boundary")
+    def test_windows_factory_never_constructs_or_runs_linux_tunnel_control(self):
+        from server.tunnel_control import tunnel_status, tunnel_restart
+        with mock.patch("server.tunnel_control._get_default_controller") as factory:
+            self.assertFalse(tunnel_status()["restart_available"])
+            self.assertFalse(tunnel_restart()["accepted"])
+        factory.assert_not_called()
 
 
 if __name__ == "__main__":

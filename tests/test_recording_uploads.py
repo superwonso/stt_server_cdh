@@ -396,7 +396,7 @@ class RecordingUploadTests(unittest.TestCase):
 class RecordingUploadMigrationTests(unittest.TestCase):
     def test_v21_migration_is_additive_and_cascades_only_on_lecture_delete(self):
         with tempfile.TemporaryDirectory() as temporary:
-            db = Database(Path(temporary) / "data.sqlite3", ("synthetic-alpha", "synthetic-beta"))
+            db = Database(Path(temporary) / "data" / "data.sqlite3", ("synthetic-alpha", "synthetic-beta"))
             db.initialize()
             with db.connect() as connection:
                 connection.execute("DROP TABLE recording_chunks")

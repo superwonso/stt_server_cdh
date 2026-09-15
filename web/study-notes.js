@@ -6,6 +6,15 @@ const text = (value, max) => typeof value === 'string' && !!value.trim()
   && value.length <= max * 2 && chars(value) <= max;
 const timestamp = value => typeof value === 'string' && value.length <= 40
   && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value));
+export const STUDY_NOTE_RESULT_WARNING = '일부 내용을 확인하지 못했습니다. 원문과 함께 확인해 주세요.';
+const draftWarningCodes = new Set([
+  'invalid_response','response_truncated','incomplete_batches','gateway_unavailable','authentication_failed',
+  'credit_exhausted','rate_limited','model_refused','interrupted','content_limited','placeholder_unresolved',
+]);
+
+export function studyNoteWarningMessage(code) {
+  return draftWarningCodes.has(code) ? STUDY_NOTE_RESULT_WARNING : null;
+}
 
 export function studyNoteSourceSnapshot(lecture) {
   if (!lecture?.recording_finalized || !Array.isArray(lecture.segments)
@@ -24,9 +33,20 @@ export function studyNoteSourceSnapshot(lecture) {
 }
 
 export function validateStudyNoteDocument(value, lecture) {
-  if (!studyNoteSourceSnapshot(lecture) || !record(value) || !Array.isArray(value.paragraphs)
-      || !value.paragraphs.length || value.paragraphs.length > Math.min(2048,lecture.segments.length)
+  if (!studyNoteSourceSnapshot(lecture) || !record(value)
       || new TextEncoder().encode(JSON.stringify(value)).length > 1024 * 1024) return null;
+  if (value.format === 'draft') {
+    // Only the server's explicit fallback envelope is accepted. This never
+    // reinterprets a malformed legacy paragraph document as valid source maps.
+    if (Object.keys(value).length !== 3 || !text(value.text,500000)
+        || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value.text)
+        || !Array.isArray(value.warnings) || !value.warnings.length || value.warnings.length > 16
+        || value.warnings.some(code => typeof code !== 'string' || !studyNoteWarningMessage(code))
+        || new Set(value.warnings).size !== value.warnings.length) return null;
+    return {format:'draft',text:value.text,warnings:[...value.warnings]};
+  }
+  if (Object.hasOwn(value,'format') || !Array.isArray(value.paragraphs)
+      || !value.paragraphs.length || value.paragraphs.length > Math.min(2048,lecture.segments.length)) return null;
   const paragraphs = [];
   const rawChars = lecture.segments.reduce((total,segment) => total + chars(segment.text),0);
   let offset = 0, totalChars = 0, editCount = 0;

@@ -9,13 +9,14 @@ import copy
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import httpx
 
 from .postprocessor import MindlogicPostprocessor, PostprocessingError, _MODEL_NAME, _NUMBER, _PROTECTED_VALUE
 from .llm_protocol import ProtocolError, gateway_schema, parse_json_document
+from .llm_result import safe_model_content, safe_draft_text, draft_document
 from .settings import Settings, mindlogic_gateway_base_url
 
 
@@ -73,9 +74,26 @@ class TranslationError(PostprocessingError):
 @dataclass(frozen=True, repr=False)
 class LectureTranslation:
     segments: list[dict[str, Any]]
+    draft_text: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"segments": copy.deepcopy(self.segments)}
+        result = {"segments": copy.deepcopy(self.segments)}
+        if self.draft_text is not None:
+            result['draft_text'] = self.draft_text
+        if self.warnings:
+            result['warnings'] = list(self.warnings)
+        return result
+
+
+class _ReceivedDocument(dict):
+    def __init__(self, parsed, content, warnings=()):
+        super().__init__(parsed)
+        self.content = content
+        self.warnings = list(warnings)
+
+    def __repr__(self):
+        return '<received model document>'
 
 
 def _english(text: str) -> bool:
@@ -289,6 +307,7 @@ class MindlogicTranslator:
                 if len(_encode(data)) > MAX_INPUT_BYTES:
                     raise TranslationError("source_too_large")
         calls = 0
+        warnings = []
 
         def request(kind, data):
             nonlocal calls
@@ -298,7 +317,18 @@ class MindlogicTranslator:
             self._interrupted(interrupted)
             output = self._request(kind, data, language, interrupted)
             self._interrupted(interrupted)
+            warnings.extend(output.warnings)
             return output
+
+        def outline(data):
+            received = request('outline', data)
+            try:
+                return self._outline(received, data)
+            except TranslationError:
+                # An internal context failure is diagnostic. Do not present
+                # internal outlines as a final translation or invent context.
+                warnings.append('context_unverified')
+                return ''
 
         # All source batches contribute before any target is translated. The
         # final bounded outline is identical across every translation request.
@@ -309,7 +339,7 @@ class MindlogicTranslator:
             # which correctly fails the no-new-numbers check. Translation
             # requests still carry aliases for exact per-row validation.
             data = {"segments": [{"text": item["text"]} for item in masked[begin:end]]}
-            outlines.append(self._outline(request("outline", data), data))
+            outlines.append(outline(data))
         while len(outlines) > 1:
             combined = []
             for begin in range(0, len(outlines), 4):
@@ -318,60 +348,96 @@ class MindlogicTranslator:
                     combined.extend(group)
                     continue
                 data = {"outlines": group}
-                combined.append(self._outline(request("outline", data), data))
+                combined.append(outline(data))
             outlines = combined
-        translated, total, extra_calls = [], 0, 0
+        translated, pieces, has_draft = [], [], False
         restore = {**private, **korean}
 
-        def translate_range(begin, end, depth=0):
-            nonlocal extra_calls
+        def translate_range(begin, end):
             self._interrupted(interrupted)
             expected = [index for index in range(begin, end) if targets[index]]
-            returned = {}
-            if expected:
-                data = translation_input(begin, end, outlines[0])
-                try:
-                    response = request("translation", data)
-                except TranslationError as error:
-                    # Never repair partial JSON, resend an ambiguous network
-                    # result, or retry refusal/protected-content/ID errors.
-                    # An explicit length stop may be retried as smaller whole
-                    # source-row batches using the same full-course context.
-                    if (error.code != "response_truncated" or len(expected) < 2
-                            or depth >= MAX_ADAPTIVE_DEPTH or extra_calls + 2 > MAX_ADAPTIVE_CALLS):
-                        raise
-                    extra_calls += 2
-                    middle = expected[len(expected) // 2]
-                    left = translate_range(begin, middle, depth + 1)
-                    right = translate_range(middle, end, depth + 1)
-                    return {**left, **right}
-                if not isinstance(response, dict) or set(response) != {"segments"}:
-                    raise TranslationError("invalid_response")
-                items = response["segments"]
+            if not expected:
+                return {}, None
+            response = request('translation', translation_input(begin, end, outlines[0]))
+            def validate():
+                if set(response) != {'segments'}:
+                    raise TranslationError('invalid_response')
+                items = response['segments']
                 if not isinstance(items, list) or len(items) != len(expected):
-                    raise TranslationError("invalid_response")
+                    raise TranslationError('invalid_response')
+                returned = {}
                 for index, item in zip(expected, items, strict=True):
-                    if not isinstance(item, dict) or set(item) != {"id", "text"} or item["id"] != locked[index]["id"]:
-                        raise TranslationError("invalid_response")
-                    text = _text(item["text"], MAX_TRANSLATED_SEGMENT_CHARS * 8)
-                    if (_LOCKED.findall(text) != _LOCKED.findall(locked[index]["text"])
-                            or _MASKABLE.findall(_LOCKED.sub("", text))):
-                        raise TranslationError("protected_content_changed")
-                    text = _LOCKED.sub(lambda match: restore[match.group(0)], text)
-                    returned[index] = text
-            return returned
+                    if not isinstance(item, dict) or set(item) != {'id', 'text'} or item['id'] != locked[index]['id']:
+                        raise TranslationError('invalid_response')
+                    text = _text(item['text'], MAX_TRANSLATED_SEGMENT_CHARS * 8)
+                    if (_LOCKED.findall(text) != _LOCKED.findall(locked[index]['text'])
+                            or _MASKABLE.findall(_LOCKED.sub('', text))):
+                        raise TranslationError('protected_content_changed')
+                    restored_text = _LOCKED.sub(lambda match: restore[match.group(0)], text)
+                    returned[index] = safe_draft_text(restored_text, replacements=None, max_chars=250_000)
+                    if returned[index] != restored_text:
+                        warnings.append('validation_failed')
+                return returned
+            try:
+                return validate(), None
+            except (TranslationError, ValueError):
+                warnings.append('validation_failed')
+                try:
+                    items = response.get('segments')
+                    if not isinstance(items, list) or len(items) != len(expected):
+                        raise ValueError
+                    by_id = {}
+                    for item in items:
+                        if (not isinstance(item, dict) or not isinstance(item.get('id'), str)
+                                or item['id'] in by_id or not isinstance(item.get('text'), str) or not item['text'].strip()):
+                            raise ValueError
+                        by_id[item['id']] = item
+                    if set(by_id) != {locked[index]['id'] for index in expected}:
+                        raise ValueError
+                    returned = {}
+                    for index in expected:
+                        text = by_id[locked[index]['id']]['text']
+                        allowed = _LOCKED.findall(locked[index]['text'])
+                        if _LOCKED.findall(text) != allowed:
+                            warnings.append('placeholder_unresolved')
+                        replacements = {token: restore[token] for token in allowed}
+                        returned[index] = safe_draft_text(text, replacements=replacements, max_chars=250_000)
+                    return returned, None
+                except (ValueError, KeyError, TypeError):
+                    try:
+                        document = draft_document(response.content, warnings=warnings, replacements={}, max_chars=250_000)
+                    except ValueError:
+                        code = next((code for code in response.warnings if code in {'response_truncated', 'model_refused'}), 'invalid_response')
+                        raise TranslationError(code) from None
+                    warnings.extend(document['warnings'])
+                    return {}, document['text']
 
         for begin, end in ranges:
-            returned = translate_range(begin, end)
-            for index in range(begin, end):
-                text = returned.get(index, sources[index]["text"])
-                total += len(text)
-                if len(text) > MAX_TRANSLATED_SEGMENT_CHARS or total > MAX_TRANSLATED_CHARS:
-                    raise TranslationError("invalid_response")
-                translated.append({**sources[index], "text": text})
-        result = validate_translation_segments(translated, sources)
+            returned, draft = translate_range(begin, end)
+            self._interrupted(interrupted)
+            if draft is not None:
+                has_draft = True
+                pieces.append(draft)
+                continue
+            rows = [{**sources[index], 'text': returned.get(index, sources[index]['text'])}
+                    for index in range(begin, end)]
+            translated.extend(rows)
+            pieces.append('\n'.join(row['text'] for row in rows))
+        if has_draft:
+            document = draft_document('\n\n'.join(pieces), warnings=warnings or ['validation_failed'],
+                                      replacements=None, max_chars=MAX_TRANSLATED_CHARS)
+            return LectureTranslation([], document['text'], document['warnings'])
+        try:
+            result = validate_translation_segments(translated, sources)
+        except TranslationError:
+            warnings.append('validation_failed')
+            result = translated  # IDs/times came only from the immutable source.
+        if sum(len(row['text']) for row in result) > MAX_TRANSLATED_CHARS:
+            document = draft_document('\n\n'.join(pieces), warnings=[*warnings, 'content_limited'],
+                                      replacements=None, max_chars=MAX_TRANSLATED_CHARS)
+            return LectureTranslation([], document['text'], document['warnings'])
         self._interrupted(interrupted)
-        return LectureTranslation(result)
+        return LectureTranslation(result, warnings=list(dict.fromkeys(warnings)))
 
     @staticmethod
     def _outline(document, data):
@@ -443,6 +509,19 @@ class MindlogicTranslator:
         except (httpx.HTTPError, OSError):
             raise TranslationError("gateway_unavailable", retryable=True) from None
         try:
-            return parse_json_document(response)
+            content = safe_model_content(response)
+        except ValueError:
+            try:
+                parse_json_document(response)
+            except ProtocolError as error:
+                raise TranslationError(error.code) from None
+            raise TranslationError('invalid_response') from None
+        try:
+            return _ReceivedDocument(parse_json_document(response), content)
         except ProtocolError as error:
-            raise TranslationError(error.code) from None
+            # Diagnostic finish/schema failures cannot erase a received answer.
+            try:
+                parsed = parse_json_document({'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]})
+            except ProtocolError:
+                parsed = {}
+            return _ReceivedDocument(parsed, content, [error.code])

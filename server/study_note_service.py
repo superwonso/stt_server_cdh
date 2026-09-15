@@ -15,7 +15,7 @@ from fastapi import Depends, HTTPException
 
 from .postprocessor import PostprocessingError
 from .study_notes import (
-    StudyNoteError, study_note_markdown, validate_study_note_document,
+    StudyNoteError, coerce_study_note_document, study_note_markdown, validate_study_note_document,
     validate_study_note_source,
 )
 
@@ -257,9 +257,10 @@ class StudyNoteService:
             if not self._interrupted(job):
                 output = self.engine.create(language=job["language"], segments=copy.deepcopy(raw),
                                             interrupted=lambda: self._interrupted(job))
-                document = validate_study_note_document(output.to_dict(), raw)
+                document = coerce_study_note_document(output.to_dict(), raw)
                 # Verify the promised download before publishing completion;
-                # neither a partial document nor a failed rendering is saved.
+                # usable drafts are saved with warnings, but a failed rendering
+                # or missing body must not be advertised as a downloadable note.
                 if not isinstance(study_note_markdown(document, raw), str):
                     raise ValueError("invalid markdown")
         except PostprocessingError as error:

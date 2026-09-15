@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +12,7 @@ from unittest import mock
 from urllib.parse import parse_qs
 
 import httpx
+from server import platform_files
 
 from server.drive_storage import (
     DRIVE_FILE_SCOPE,
@@ -48,6 +48,9 @@ class DriveStorageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        if os.name == "nt":
+            self.root = self.root / "private"
+            platform_files.ensure_private_directory(self.root)
         self.token_path = self.root / "authorized-user.json"
         self.client_id = "test-client.apps.googleusercontent.com"
         self.client_secret = "test-only-client-secret"
@@ -73,8 +76,11 @@ class DriveStorageTests(unittest.TestCase):
 
     def write_token(self, value: dict[str, object], path: Path | None = None) -> Path:
         target = path or self.token_path
-        target.write_text(json.dumps(value), encoding="utf-8")
-        target.chmod(0o600)
+        if os.name == "nt":
+            platform_files.atomic_write_private(target, json.dumps(value).encode("utf-8"))
+        else:
+            target.write_text(json.dumps(value), encoding="utf-8")
+            target.chmod(0o600)
         return target
 
     def token_response(self, request: httpx.Request) -> httpx.Response:
@@ -160,7 +166,7 @@ class DriveStorageTests(unittest.TestCase):
         persisted = json.loads(self.token_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["token"], self.access_token)
         self.assertIn("expiry", persisted)
-        self.assertEqual(stat.S_IMODE(self.token_path.stat().st_mode), 0o600)
+        platform_files.validate_private_path(self.token_path)
         client.close()
 
     def test_account_identity_requests_only_an_opaque_permission_id(self) -> None:
@@ -334,7 +340,8 @@ class DriveStorageTests(unittest.TestCase):
                 descriptor = os.open(self.root / "token.lock", os.O_RDWR)
                 try:
                     with self.assertRaises(BlockingIOError):
-                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        with platform_files.file_lock(descriptor, blocking=False):
+                            pass
                     lock_was_held = True
                 finally:
                     os.close(descriptor)
@@ -345,7 +352,7 @@ class DriveStorageTests(unittest.TestCase):
         storage = GoogleDriveStorage.from_token_file(self.token_path, client=client)
         self.assertTrue(storage.verify_connection())
         self.assertTrue(lock_was_held)
-        self.assertEqual(stat.S_IMODE((self.root / "token.lock").stat().st_mode), 0o600)
+        platform_files.validate_private_path(self.root / "token.lock")
         client.close()
 
     def test_rejected_cached_access_token_is_refreshed_instead_of_reused_from_disk(self) -> None:
@@ -386,6 +393,7 @@ class DriveStorageTests(unittest.TestCase):
         )
         client.close()
 
+    @unittest.skipIf(os.name == "nt", "POSIX modes and symlink fixture; native ACL/junction coverage is in test_windows_files")
     def test_token_parent_scope_and_lock_paths_fail_closed(self) -> None:
         public_parent = self.root / "public-parent"
         public_parent.mkdir(mode=0o755)
@@ -413,7 +421,10 @@ class DriveStorageTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "credential_lock")
 
     def test_owned_http_client_is_closed_when_credential_loading_fails(self) -> None:
-        self.token_path.chmod(0o644)
+        if platform_files.IS_WINDOWS:
+            self.token_path.unlink()
+        else:
+            self.token_path.chmod(0o644)
         owned_client = mock.Mock(spec=httpx.Client)
         with mock.patch("server.drive_storage.httpx.Client", return_value=owned_client):
             with self.assertRaises(DriveConfigurationError):

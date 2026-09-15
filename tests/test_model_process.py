@@ -127,6 +127,7 @@ class ModelEnvironmentTests(unittest.TestCase):
             with self.assertRaises(ModelProcessError):
                 ModelSettings.from_model_env({"STABILITY_GUARD_SECONDS": value}, warmup=True)
 
+    @unittest.skipIf(os.name == "nt", "POSIX symlink fixture; Windows reparse checks have separate native tests")
     def test_env_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory(prefix="model-env-") as tmp:
             path = Path(tmp)
@@ -135,6 +136,7 @@ class ModelEnvironmentTests(unittest.TestCase):
             with self.assertRaises(ModelProcessError):
                 model_environment(path / "linked", {})
 
+    @unittest.skipIf(os.name == "nt", "POSIX Unix socket address limit")
     def test_socket_path_length_matches_the_107_byte_transport_contract(self):
         accepted = Path("/tmp/" + "x" * 91 + "/model.sock")
         self.assertEqual(len(os.fsencode(accepted)), 107)

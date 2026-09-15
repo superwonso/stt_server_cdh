@@ -826,7 +826,7 @@ class ApiTests(unittest.TestCase):
                 rejected_path,
             )
         self.assertFalse(rejected_path.exists())
-        output_path = self.directory / "invitations.txt"
+        output_path = self.database.path.parent / "invitations.txt"
         count = create_invitations(
             self.database,
             "https://student.github.io/classroom/",
@@ -834,7 +834,11 @@ class ApiTests(unittest.TestCase):
             output_path,
         )
         self.assertEqual(count, 1)
-        self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
+        from server.platform_files import IS_WINDOWS, validate_private_path
+        if IS_WINDOWS:
+            validate_private_path(output_path)
+        else:
+            self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
         invitation = next(line for line in output_path.read_text(encoding="utf-8").splitlines() if line.startswith("https://"))
         values = parse_qs(urlsplit(invitation).fragment)
         self.assertEqual(values["username"], ["user-beta"])

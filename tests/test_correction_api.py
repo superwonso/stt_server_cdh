@@ -359,6 +359,113 @@ class CorrectionApiTests(unittest.TestCase):
         self.assertEqual([row[0] for row in live_rows], ["새 수업 받아쓰기입니다."])
         self.assertEqual(correction_count, 1)
 
+    def test_unverified_received_correction_is_saved_and_owner_scoped(self):
+        from types import SimpleNamespace
+        lecture_id, segment_id = self.lecture()
+        self.processor.correct = lambda **kwargs: SimpleNamespace(
+            segments=[], uncertain_terms=[], draft_text="합성 교정 결과", warnings=["validation_failed"])
+        response = self.client.post(f"/lectures/{lecture_id}/correction", headers=self.headers(), json={})
+        self.assertIn(response.status_code, (200, 202))
+        result = self.wait_for(lecture_id, "completed").json()
+        self.assertEqual(result["corrected_text"], "합성 교정 결과")
+        self.assertEqual(result["draft_text"], "합성 교정 결과")
+        self.assertEqual(result["corrected_segments"], [])
+        self.assertEqual(result["validation_warnings"], ["validation_failed"])
+        self.assertEqual(self.client.get(f"/lectures/{lecture_id}/correction",
+                                       headers=self.headers("user-beta")).status_code, 404)
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT text FROM segments WHERE id=?", (segment_id,)).fetchone()[0],
+                             "첫 번재 문장 15개입니다.")
+        again = self.client.get(f"/lectures/{lecture_id}/correction", headers=self.headers()).json()
+        self.assertEqual(again["draft_text"], result["draft_text"])
+
+    def test_engine_cannot_mutate_the_correction_validation_snapshot(self):
+        from types import SimpleNamespace
+        lecture_id, segment_id = self.lecture()
+        def changed(**kwargs):
+            kwargs["segments"][0]["start"] = 9999
+            return SimpleNamespace(segments=kwargs["segments"], uncertain_terms=[], warnings=["validation_failed"])
+        self.processor.correct = changed
+        self.client.post(f"/lectures/{lecture_id}/correction", headers=self.headers(), json={})
+        result = self.wait_for(lecture_id, "completed").json()
+        self.assertEqual(result["corrected_segments"][0]["start"], 0)
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT start FROM segments WHERE id=?", (segment_id,)).fetchone()[0], 0)
+
+    def wait_for_stored_state(self, lecture_id, states, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.database.connect() as connection:
+                row = connection.execute("SELECT * FROM transcript_corrections WHERE lecture_id=?", (lecture_id,)).fetchone()
+            if row is not None and row["status"] in states:
+                return dict(row)
+            time.sleep(.02)
+        self.fail("Synthetic correction did not settle")
+
+    def test_final_guard_settles_changed_permissions_source_and_owner(self):
+        from types import SimpleNamespace
+        for mode in ("finalized", "access", "owner", "raw", "trash", "deleting"):
+            with self.subTest(mode=mode):
+                lecture_id, segment_id = self.lecture()
+                def changed(**kwargs):
+                    with self.database.connect() as connection:
+                        if mode == "access":
+                            connection.execute("UPDATE operational_state SET access_enabled=0")
+                        elif mode == "raw":
+                            connection.execute("UPDATE segments SET text='변경된 원문' WHERE id=?", (segment_id,))
+                        elif mode == "owner":
+                            connection.execute("UPDATE lectures SET username='user-beta' WHERE id=?", (lecture_id,))
+                        elif mode == "finalized":
+                            connection.execute("UPDATE lectures SET recording_finalized=0 WHERE id=?", (lecture_id,))
+                        elif mode == "trash":
+                            connection.execute("UPDATE lectures SET trashed_at='synthetic' WHERE id=?", (lecture_id,))
+                        else:
+                            connection.execute("UPDATE lectures SET deleting=1 WHERE id=?", (lecture_id,))
+                    return SimpleNamespace(segments=[],uncertain_terms=[],draft_text="합성 응답",warnings=["validation_failed"])
+                self.processor.correct = changed
+                self.client.post(f"/lectures/{lecture_id}/correction", headers=self.headers(), json={})
+                row = self.wait_for_stored_state(lecture_id, {"failed"})
+                self.assertEqual(row["error_code"], "invalid_source")
+                self.assertIsNone(row["corrected_text"])
+                with self.database.connect() as connection:
+                    connection.execute("UPDATE operational_state SET access_enabled=1")
+
+    def test_final_guard_requeues_shutdown_without_saving_or_rebilling(self):
+        from types import SimpleNamespace
+        lecture_id, _ = self.lecture()
+        called = threading.Event()
+        def changed(**kwargs):
+            kwargs["interrupted"].__self__.set()
+            called.set()
+            return SimpleNamespace(segments=[],uncertain_terms=[],draft_text="합성 응답",warnings=["validation_failed"])
+        self.processor.correct = changed
+        self.client.post(f"/lectures/{lecture_id}/correction", headers=self.headers(), json={})
+        self.assertTrue(called.wait(2))
+        row = self.wait_for_stored_state(lecture_id, {"queued"})
+        self.assertIsNone(row["corrected_text"])
+        self.assertEqual(row["attempts"], 1)
+        self.app.state.stop_correction_worker(timeout=2)
+
+    def test_returning_result_never_overwrites_a_replacement_claim(self):
+        from types import SimpleNamespace
+        for field, replacement in (("raw_revision", "b" * 64), ("model", "new-synthetic-model"), ("attempts", 99)):
+            with self.subTest(field=field):
+                lecture_id, _ = self.lecture()
+                called = threading.Event()
+                def changed(**kwargs):
+                    with self.database.connect() as connection:
+                        connection.execute(f"UPDATE transcript_corrections SET {field}=? WHERE lecture_id=?", (replacement, lecture_id))
+                    called.set()
+                    return SimpleNamespace(segments=[],uncertain_terms=[],draft_text="old synthetic response",warnings=["validation_failed"])
+                self.processor.correct = changed
+                self.client.post(f"/lectures/{lecture_id}/correction", headers=self.headers(), json={})
+                self.assertTrue(called.wait(2))
+                time.sleep(.05)
+                row = self.wait_for_stored_state(lecture_id, {"processing"})
+                self.assertEqual(row[field], replacement)
+                self.assertIsNone(row["corrected_text"])
+                self.assertIsNone(row["error_code"])
+
     def test_status_reports_configuration_without_disclosing_a_key(self):
         response = self.client.get("/status", headers=self.headers())
         self.assertEqual(response.status_code, 200)

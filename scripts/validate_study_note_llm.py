@@ -54,9 +54,11 @@ def case_segments(case):
 
 def quality_checks(case, document):
     """Transparent lexical smoke checks, not an AI judge or semantic proof."""
-    body = "\n".join(paragraph["text"] for paragraph in document["paragraphs"])
-    edits = [edit for paragraph in document["paragraphs"] for edit in paragraph["edits"]]
-    checks = {"korean_body": any("가" <= char <= "힣" for char in body),
+    paragraphs = document.get("paragraphs", [])
+    body = document["text"] if document.get("format") == "draft" else "\n".join(paragraph["text"] for paragraph in paragraphs)
+    edits = [edit for paragraph in paragraphs for edit in paragraph["edits"]]
+    checks = {"source_mapping_verified": document.get("format") != "draft",
+              "korean_body": any("가" <= char <= "힣" for char in body),
               "negation_retained": any(word in body for word in ("않", "아니", "아닙", "아닌", "아님", "없", "단정할 수"))}
     if case["id"] == "mixed_river_context":
         checks.update(
@@ -139,7 +141,8 @@ def _run_live():
                     checks = quality_checks(case, document)
                     passed = all(checks.values())
                     report.update(status="passed" if passed else "review_needed", checks=checks,
-                                  paragraphs=len(document["paragraphs"]), source_segments=len(raw))
+                                  paragraphs=len(document.get("paragraphs", [])), source_segments=len(raw),
+                                  warning_count=len(document.get("warnings", [])))
                     _write_private(directory / (case["id"] + ".json"), json.dumps(document, ensure_ascii=False, indent=2) + "\n")
                     _write_private(directory / (case["id"] + ".md"), markdown)
                     all_passed = all_passed and passed

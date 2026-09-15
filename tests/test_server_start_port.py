@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux Bash launcher probe; native Windows uses SO_EXCLUSIVEADDRUSE")
 class ServerStartPortTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

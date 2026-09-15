@@ -44,7 +44,7 @@ def _gpu_snapshot(device):
         return unavailable
 
 
-def create_model_app(settings, transcriber=None) -> FastAPI:
+def create_model_app(settings, transcriber=None, *, shutdown=None) -> FastAPI:
     if transcriber is None:
         from .transcriber import LocalTranscriber
         transcriber = LocalTranscriber(settings)
@@ -125,6 +125,15 @@ def create_model_app(settings, transcriber=None) -> FastAPI:
     @app.get("/status")
     async def status():
         return JSONResponse(current_status(), headers={"Cache-Control": "no-store"})
+
+    if shutdown is not None:
+        # Installed only by the authenticated native launcher; never exposed
+        # by the API application or the existing Unix-socket factory default.
+        @app.post("/shutdown")
+        async def request_shutdown():
+            stopping.set()
+            shutdown()
+            return JSONResponse({"status": "stopping"}, headers={"Cache-Control": "no-store"})
 
     async def read_body(request):
         length = request.headers.get("content-length")

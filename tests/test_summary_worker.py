@@ -55,7 +55,7 @@ class SummaryWorkerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.database = Database(Path(self.temporary.name) / "temporary.sqlite3", ("user-alpha", "user-beta"))
+        self.database = Database(Path(self.temporary.name) / "data" / "temporary.sqlite3", ("user-alpha", "user-beta"))
         self.database.initialize()
         self.original_connect = self.database.connect
         self.engine = FakeSummaryEngine()

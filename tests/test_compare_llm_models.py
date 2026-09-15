@@ -304,6 +304,12 @@ class RunCaseTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def output_path(self, directory, name):
+        from server.platform_files import ensure_private_directory
+        parent = Path(directory) / "private"
+        ensure_private_directory(parent)
+        return parent / name
+
     def invoke(self, args):
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch.object(runner.sys, "argv", ["compare_llm_models", *args]), redirect_stdout(stdout), redirect_stderr(stderr):
@@ -335,7 +341,7 @@ class MainTests(unittest.TestCase):
 
     def test_missing_credentials_stops_before_output_and_existing_report_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "report.jsonl"
+            output = self.output_path(directory, "report.jsonl")
             args = ["--live", "--models", "solar-pro4", "--output", str(output)]
             with patch.object(runner.Settings, "from_env", return_value=test_settings(mindlogic_api_key=None)), \
                     patch.object(runner, "run_case") as run:
@@ -352,7 +358,7 @@ class MainTests(unittest.TestCase):
 
     def test_main_writes_private_jsonl_metadata_cases_and_completion_for_named_models(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "report.jsonl"
+            output = self.output_path(directory, "report.jsonl")
             adapters = SyntheticAdapters()
             with patch.object(runner.Settings, "from_env", return_value=test_settings()), adapters.patches(), \
                     patch.object(runner, "get_cases", return_value=get_cases()[:2]), \
@@ -360,7 +366,11 @@ class MainTests(unittest.TestCase):
                 stdout, stderr = self.invoke(["--live", "--models", "solar-pro4", "gpt-5.6-luna", "deepseek-v4-flash",
                                               "--repeats", "2", "--workers", "2", "--max-calls", "12", "--output", str(output)])
             rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(os.stat(output).st_mode & 0o777, 0o600)
+            if os.name == "nt":
+                from server.platform_files import validate_private_path
+                validate_private_path(output)
+            else:
+                self.assertEqual(os.stat(output).st_mode & 0o777, 0o600)
             self.assertEqual(rows[0]["type"], "metadata")
             self.assertEqual(rows[0]["automatic_retries"], 0)
             self.assertEqual(rows[0]["max_calls"], 12)

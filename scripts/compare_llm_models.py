@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.llm_eval_cases import DATASET_VERSION, RUBRIC, evaluate_case, get_cases
+from server.platform_files import ensure_private_directory, open_file
 from server.postprocessor import MindlogicPostprocessor
 from server.question_answerer import QuestionAnswerer, select_evidence
 from server.settings import Settings
@@ -183,7 +184,11 @@ def main():
     started = time.monotonic()
     budget = RequestBudget(args.max_calls, started + 1200)
     lock = threading.Lock()
-    fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if os.name == "nt":
+        ensure_private_directory(args.output.parent)
+        fd = open_file(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, private=True)
+    else:
+        fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as report:
         def write(row):
             with lock:

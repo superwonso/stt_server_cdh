@@ -133,6 +133,19 @@ def real_server(engine, *, warmup=False):
 
 @contextmanager
 def mock_remote(handler):
+    if os.name == "nt":
+        # These tests exercise HTTP response validation independently of the
+        # filesystem transport. Native ACL/loopback integration has its own
+        # tests; do not try to fabricate a POSIX socket on Windows.
+        path = Path(__file__).resolve().parent / "synthetic.sock"
+        remote = RemoteTranscriber(settings(local_model_socket=path))
+        remote._client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://local-model")
+        with patch("server.remote_transcriber.validate_socket_path", return_value=path):
+            try:
+                yield remote
+            finally:
+                remote.close()
+        return
     with tempfile.TemporaryDirectory(prefix="stt-model-mock-") as directory:
         path = Path(directory) / "model.sock"
         path.parent.chmod(0o700)
@@ -314,6 +327,7 @@ class ModelServerTests(unittest.TestCase):
 
 
 class RemoteModelTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX UDS integration; native loopback has separate tests")
     def test_real_uds_exact_pcm_context_and_independent_requests(self):
         engine = FakeEngine()
         with real_server(engine) as (remote, _, path):
@@ -335,6 +349,7 @@ class RemoteModelTests(unittest.TestCase):
             self.assertEqual(engine.calls[-1][5], None)
             self.assertEqual(len(engine.calls), 2)
 
+    @unittest.skipIf(os.name == "nt", "POSIX UDS integration; native loopback has separate tests")
     def test_real_uds_busy_is_serial_and_status_is_nonblocking(self):
         engine = FakeEngine()
         engine.block = True
@@ -357,6 +372,7 @@ class RemoteModelTests(unittest.TestCase):
             self.assertEqual(engine.maximum_active, 1)
             self.assertEqual(len(engine.calls), 1)
 
+    @unittest.skipIf(os.name == "nt", "POSIX UDS integration; native loopback has separate tests")
     def test_real_model_timeout_preserves_output_and_worker_exclusivity(self):
         engine = FakeEngine()
         engine.block = True
@@ -382,6 +398,7 @@ class RemoteModelTests(unittest.TestCase):
             remote.transcribe(np.zeros(16000, np.float32), "ko")
         remote.close()
 
+    @unittest.skipIf(os.name == "nt", "POSIX permissions; Windows ACL/reparse checks have separate tests")
     def test_socket_and_directory_permission_and_symlink_checks_fail_closed(self):
         engine = FakeEngine()
         with real_server(engine) as (_, _, path):
@@ -406,6 +423,7 @@ class RemoteModelTests(unittest.TestCase):
             with self.assertRaises(ModelUnavailableError):
                 validate_socket_path(regular)
 
+    @unittest.skipIf(os.name == "nt", "POSIX UDS integration; native loopback has separate tests")
     def test_closed_adapter_never_reopens_or_uses_gpu(self):
         engine = FakeEngine()
         with real_server(engine) as (remote, _, _):
@@ -415,6 +433,7 @@ class RemoteModelTests(unittest.TestCase):
             self.assertEqual(remote.gpu_resources(), {"available": False})
             self.assertEqual(engine.calls, [])
 
+    @unittest.skipIf(os.name == "nt", "POSIX UDS fixture; native signed error codes have separate tests")
     def test_error_codes_and_malformed_statuses_remain_safe(self):
         with tempfile.TemporaryDirectory(prefix="stt-model-mock-") as directory:
             path = Path(directory) / "model.sock"
@@ -436,6 +455,7 @@ class RemoteModelTests(unittest.TestCase):
             finally:
                 sock.close()
 
+    @unittest.skipIf(os.name == "nt", "POSIX UDS integration; native loopback has separate tests")
     def test_invalid_response_preserves_caller_context_and_emits_no_partial_segments(self):
         engine = FakeEngine()
         engine.invalid = True
@@ -531,6 +551,7 @@ class RemoteModelTests(unittest.TestCase):
             until(lambda: not remote._status_lock.locked())
             self.assertEqual(remote.status()["model_state"], "offline")
 
+    @unittest.skipIf(os.name == "nt", "POSIX UDS integration; native loopback has separate tests")
     def test_replacing_api_adapter_does_not_reload_model_or_lose_model_availability(self):
         engine = FakeEngine()
         with real_server(engine, warmup=True) as (remote, _, path):

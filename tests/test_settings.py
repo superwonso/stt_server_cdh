@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import unittest
+import os
 import tempfile
 from unittest import mock
 from pathlib import Path
 
 from dotenv import dotenv_values
 
+from server.platform_files import ensure_private_directory, validate_private_path
 from server.db import Database
 from server.manage import (
     account_at_position,
@@ -28,6 +30,12 @@ from server.settings import (
 
 
 class UrlValidationTests(unittest.TestCase):
+    def assert_private_file(self, path):
+        if os.name == "nt":
+            validate_private_path(path)
+        else:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_translation_uses_existing_gateway_key_with_independent_bounded_defaults(self):
         with mock.patch("server.settings.load_dotenv"), mock.patch.dict(
             "os.environ", {"ACCOUNT_USERNAMES": "user-alpha,user-beta", "MINDLOGIC_API_KEY": "test-only-gateway-key"},
@@ -152,14 +160,14 @@ class UrlValidationTests(unittest.TestCase):
     def test_managed_env_file_is_private(self):
         with tempfile.TemporaryDirectory() as temporary:
             env_path = Path(temporary) / "server" / ".env"
-            env_path.parent.mkdir(parents=True)
+            ensure_private_directory(env_path.parent)
             env_path.write_text(
                 "API_URL='https://old.trycloudflare.com'\n"
                 "ACCOUNT_USERNAMES='user-alpha,user-beta'\n",
                 encoding="utf-8",
             )
             update_private_env(env_path, "https://student.github.io")
-            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            self.assert_private_file(env_path)
             content = env_path.read_text(encoding="utf-8")
             self.assertIn("SITE_ORIGINS='https://student.github.io'", content)
             self.assertIn("ACCOUNT_USERNAMES='user-alpha,user-beta'", content)
@@ -168,7 +176,7 @@ class UrlValidationTests(unittest.TestCase):
     def test_admin_configuration_uses_only_activated_account_and_private_env(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            database = Database(root / "classroom.sqlite3", ("user-alpha", "user-beta"))
+            database = Database(root / "data" / "classroom.sqlite3", ("user-alpha", "user-beta"))
             database.initialize()
             env_path = root / "server" / ".env"
             with database.connect() as connection:
@@ -176,7 +184,7 @@ class UrlValidationTests(unittest.TestCase):
                     "UPDATE users SET password_hash = 'test-hash' WHERE username = 'user-beta'"
                 )
             configure_admin(database, env_path)
-            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            self.assert_private_file(env_path)
             self.assertIn("ADMIN_USERNAME='user-beta'", env_path.read_text(encoding="utf-8"))
 
             with database.connect() as connection:
@@ -214,7 +222,7 @@ class UrlValidationTests(unittest.TestCase):
             database = Database(root / "data" / "classroom.sqlite3", original_accounts)
             database.initialize()
             env_path = root / "server" / ".env"
-            env_path.parent.mkdir(parents=True)
+            ensure_private_directory(env_path.parent)
             env_path.write_text(
                 "ACCOUNT_USERNAMES='user-alpha,user-beta'\n"
                 "ADMIN_USERNAME='user-alpha'\n"
@@ -261,7 +269,7 @@ class UrlValidationTests(unittest.TestCase):
             add_account(database, env_path, selected_username="user-gamma")
 
             self.assertEqual(database.accounts, expanded_accounts)
-            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            self.assert_private_file(env_path)
             private_env = dotenv_values(env_path, interpolate=False)
             self.assertEqual(
                 private_env["ACCOUNT_USERNAMES"],
@@ -303,7 +311,7 @@ class UrlValidationTests(unittest.TestCase):
             database = Database(root / "data" / "classroom.sqlite3", original_accounts)
             database.initialize()
             env_path = root / "server" / ".env"
-            env_path.parent.mkdir(parents=True)
+            ensure_private_directory(env_path.parent)
             original_env = b"ACCOUNT_USERNAMES='user-alpha,user-beta'\nPRIVATE='preserved'\n"
             env_path.write_bytes(original_env)
 
@@ -316,7 +324,7 @@ class UrlValidationTests(unittest.TestCase):
 
             self.assertEqual(database.accounts, original_accounts)
             self.assertEqual(env_path.read_bytes(), original_env)
-            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            self.assert_private_file(env_path)
             with database.connect() as connection:
                 users = tuple(
                     row[0] for row in connection.execute("SELECT username FROM users ORDER BY username")
@@ -332,7 +340,7 @@ class UrlValidationTests(unittest.TestCase):
             )
             database.initialize()
             env_path = root / "server" / ".env"
-            env_path.parent.mkdir(parents=True)
+            ensure_private_directory(env_path.parent)
             env_path.write_text(
                 "ACCOUNT_USERNAMES='user-beta,user-alpha'\n",
                 encoding="utf-8",
@@ -508,7 +516,7 @@ class UrlValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             env_path = root / "server" / ".env"
-            env_path.parent.mkdir(parents=True)
+            ensure_private_directory(env_path.parent)
             env_path.write_text(
                 "ACCOUNT_USERNAMES='user-alpha,user-beta'\n"
                 "ADMIN_USERNAME='user-alpha'\n"
@@ -518,7 +526,7 @@ class UrlValidationTests(unittest.TestCase):
 
             configure_clova(env_path, secret_key=secret)
 
-            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            self.assert_private_file(env_path)
             private_env = dotenv_values(env_path, interpolate=False)
             self.assertEqual(
                 private_env,
@@ -543,7 +551,7 @@ class UrlValidationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             env_path = Path(temporary) / "server" / ".env"
-            env_path.parent.mkdir(parents=True)
+            ensure_private_directory(env_path.parent)
             original = b"ACCOUNT_USERNAMES='user-alpha,user-beta'\nPRIVATE='preserved'\n"
             env_path.write_bytes(original)
             for invalid in invalid_values:

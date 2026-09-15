@@ -16,23 +16,29 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from contextlib import closing
 from unittest import mock
 
 from server.db import Database
+from server import platform_files
 from server.recovery_backup import (
     AGE_RELATIVE, MAX_DATABASE_BYTES, BackupError, BackupScheduler, RecoveryBackupManager,
     _database_info, _hash_file, _run, verify_recovery_archive,
 )
 from server.settings import PROJECT_DIR, Settings
 
-AGE = PROJECT_DIR / AGE_RELATIVE
+# Explicit test-only override allows an already provisioned native age binary.
+# The default remains the project's pinned Linux/native tool location.
+AGE = Path(os.environ["STT_TEST_AGE_BINARY"]) if os.environ.get("STT_TEST_AGE_BINARY") else PROJECT_DIR / AGE_RELATIVE
+if not AGE.is_absolute():
+    raise ValueError("STT_TEST_AGE_BINARY must be an absolute path")
+RESTORE_TEMP_ROOT = Path(tempfile.gettempdir()) if os.name == "nt" else Path("/tmp")
 ACCOUNTS = ("user-alpha", "user-beta")
 
 
 def private_write(path: Path, content: bytes):
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_bytes(content)
-    path.chmod(0o600)
+    platform_files.ensure_private_directory(path.parent)
+    platform_files.atomic_write_private(path, content)
 
 
 def seed_question_jobs(database):
@@ -105,12 +111,16 @@ class RecoveryQuestionInfoTests(unittest.TestCase):
 class RecoveryBackupTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="stt-backup-test-")
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name) / "private-root"
+        platform_files.ensure_private_directory(self.root)
         self.settings = Settings(data_dir=self.root / "private", model_cache_dir=self.root / "models",
                                  accounts=ACCOUNTS, google_drive_enabled=True)
         self.database = Database(self.settings.database_path, ACCOUNTS)
         self.database.initialize()
         self.environment = self.root / "server" / ".env"
+        environment = mock.patch.dict(os.environ, {"STT_ENV_FILE": str(self.environment)})
+        environment.start()
+        self.addCleanup(environment.stop)
         private_write(self.environment, b"ACCOUNT_USERNAMES=user-alpha,user-beta\nGOOGLE_DRIVE_RECORDINGS=1\nAPI_KEY=synthetic-fixture-only\n")
         drive = self.settings.data_dir / "google-drive"
         private_write(drive / "identity.key", bytes(range(32)))
@@ -176,12 +186,13 @@ class RecoveryBackupTests(unittest.TestCase):
         self.assertEqual(result["file_count"], 6)
         self.assertEqual(result["warnings"]["local_wav_files_omitted"], 1)
         self.assertEqual(result["warnings"]["unfinalized_lectures"], 1)
-        self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+        platform_files.validate_private_path(directory, directory=True)
         self.assertEqual((directory / "settings.env").read_bytes(), self.environment.read_bytes())
         self.assertNotIn(str(self.root), (directory / "manifest.json").read_text())
         self.assertFalse(any(path.suffix == ".wav" for path in directory.iterdir()))
-        self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in directory.iterdir()))
-        with sqlite3.connect(directory / "database.sqlite3") as connection:
+        for path in directory.iterdir():
+            platform_files.validate_private_path(path)
+        with closing(sqlite3.connect(directory / "database.sqlite3")) as connection, connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM lectures").fetchone()[0], 1)
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         self.assertFalse(any(self.manager.config_dir.glob("build-*")))
@@ -189,7 +200,7 @@ class RecoveryBackupTests(unittest.TestCase):
     def test_init_never_overwrites_identity_and_scheduler_never_needs_it(self):
         key = self.manager.config_dir / "identity.txt"
         initial = key.read_bytes()
-        self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
+        platform_files.validate_private_path(key)
         with self.assertRaisesRegex(BackupError, "already_initialized"):
             self.manager.initialize()
         self.assertEqual(key.read_bytes(), initial)
@@ -207,23 +218,23 @@ class RecoveryBackupTests(unittest.TestCase):
         directory = Path(result["directory"])
         manifest_text = (directory / "manifest.json").read_text()
         self.assertNotIn("synthetic private question", manifest_text)
-        with sqlite3.connect(directory / "database.sqlite3") as connection:
+        with closing(sqlite3.connect(directory / "database.sqlite3")) as connection, connection:
             self.assertEqual(connection.execute("SELECT * FROM lecture_questions ORDER BY id").fetchall(), before)
 
     def test_wrong_key_and_tamper_never_expose_a_partially_decrypted_restore(self):
         archive = self.exported()
         wrong = self.root / "wrong-identity.txt"
         with wrong.open("wb") as output:
-            wrong.chmod(0o600)
-            subprocess.run([str(AGE.with_name("age-keygen"))], stdout=output, stderr=subprocess.DEVNULL, check=True)
-        before = set(Path("/tmp").glob("stt-recovery-check-*"))
+            platform_files.set_private_file(output.fileno())
+            subprocess.run([str(AGE.with_name("age-keygen.exe" if os.name == "nt" else "age-keygen"))], stdout=output, stderr=subprocess.DEVNULL, check=True)
+        before = set(RESTORE_TEMP_ROOT.glob("stt-recovery-check-*"))
         with self.assertRaises(BackupError):
             self.verify(archive, wrong)
         changed = bytearray(archive.read_bytes()); changed[-1] ^= 1
         damaged = self.root / "damaged.age"; damaged.write_bytes(changed)
         with self.assertRaises(BackupError):
             self.verify(damaged)
-        self.assertEqual(set(Path("/tmp").glob("stt-recovery-check-*")), before)
+        self.assertEqual(set(RESTORE_TEMP_ROOT.glob("stt-recovery-check-*")), before)
 
     def test_tar_rejects_traversal_absolute_links_duplicate_unknown_and_extended_headers(self):
         cases = [
@@ -278,7 +289,7 @@ class RecoveryBackupTests(unittest.TestCase):
     def test_restore_rechecks_database_foreign_keys_after_manifest_hash_validation(self):
         result = self.verify(self.exported())
         directory = Path(result["directory"])
-        with sqlite3.connect(directory / "database.sqlite3") as connection:
+        with closing(sqlite3.connect(directory / "database.sqlite3")) as connection, connection:
             connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute("INSERT INTO lectures(id,username,title,language,created_at) VALUES ('bad','no-such-user','Synthetic','ko','2026-01-01')")
         manifest = json.loads((directory / "manifest.json").read_bytes())
@@ -305,12 +316,12 @@ class RecoveryBackupTests(unittest.TestCase):
         self.assertEqual(self.copies, [])
 
     def test_database_foreign_key_violation_is_rejected_without_fixing_source(self):
-        with sqlite3.connect(self.settings.database_path) as connection:
+        with closing(sqlite3.connect(self.settings.database_path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute("INSERT INTO lectures(id,username,title,language,created_at) VALUES ('bad','no-such-user','Synthetic','ko','2026-01-01')")
         with self.assertRaisesRegex(BackupError, "database_foreign_keys"):
             self.manager.export()
-        with sqlite3.connect(self.settings.database_path) as connection:
+        with closing(sqlite3.connect(self.settings.database_path)) as connection, connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM lectures").fetchone()[0], 1)
 
     def test_failed_destination_retries_identical_bundle_and_keeps_last_success(self):
@@ -363,10 +374,18 @@ class RecoveryBackupTests(unittest.TestCase):
     def test_symlink_sources_and_changed_pending_ciphertext_are_rejected(self):
         original = self.environment.read_bytes()
         target = self.root / "elsewhere.env"; private_write(target, original)
-        self.environment.unlink(); self.environment.symlink_to(target)
+        self.environment.unlink()
+        try:
+            self.environment.symlink_to(target)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                self.skipTest("Windows file symlink fixture requires Developer Mode or symlink privilege")
+            raise
         with self.assertRaisesRegex(BackupError, "unsafe_path"):
             self.manager.export()
         self.environment.unlink(); private_write(self.environment, original)
+
+    def test_changed_pending_ciphertext_is_rejected(self):
         self.manager.copy_runner = lambda *_: (_ for _ in ()).throw(OSError("fake outage"))
         with mock.patch("server.recovery_backup.time.sleep"), self.assertRaises(BackupError):
             self.manager.export()
@@ -395,7 +414,7 @@ class RecoveryBackupTests(unittest.TestCase):
         built = self.manager._build(self.manager._config()["recipient"], None, time.monotonic() + 30)
         with mock.patch.object(module, "_run", side_effect=fake_run):
             self.manager._copy_to_windows(self.manager.config_dir / "staging" / built["name"], built, None, time.monotonic() + 30)
-        self.assertEqual(len(commands), 3)
+        self.assertEqual(len(commands), 1 if os.name == "nt" else 3)
         self.assertIn("-File", commands[-1]); self.assertIn("-ExpectedSha256", commands[-1])
         command_text = json.dumps(commands)
         self.assertNotIn("identity.txt", command_text); self.assertNotIn("token.json", command_text)

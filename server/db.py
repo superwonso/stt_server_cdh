@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+from .platform_files import ensure_private_directory, open_file
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -92,10 +94,15 @@ class Database:
     def initialize(self):
         # The database contains password hashes and private transcripts.  Keep
         # both it and its SQLite WAL files inaccessible to other local users.
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.path.parent.chmod(0o700)
-        self.path.touch(exist_ok=True, mode=0o600)
-        self.path.chmod(0o600)
+        if os.name == "nt":
+            ensure_private_directory(self.path.parent)
+            fd = open_file(self.path, os.O_RDWR | os.O_CREAT, private=True)
+            os.close(fd)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.path.parent.chmod(0o700)
+            self.path.touch(exist_ok=True, mode=0o600)
+            self.path.chmod(0o600)
         with self.connect() as connection:
             existing_accounts, users_schema = self._inspect_users(connection)
             schema_version = connection.execute("PRAGMA user_version").fetchone()[0]

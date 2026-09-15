@@ -219,6 +219,54 @@ export class LiveCoordination {
     return frozenResult({ supported: outer.supported && outer.value.supported, value: outer.value.value });
   }
 
+  /**
+   * 두 전송 잠금을 즉시 얻을 때만 명시적인 보관 상태 변경을 실행합니다.
+   * 기존 전송과 같은 ASR → 원본 음성 순서를 지키며, 하나라도 사용 중이면
+   * 대기하지 않고 반환합니다. Web Locks가 없을 때는 작업하지 않습니다.
+   */
+  async tryAllUploaders(owner, work) {
+    const clean = cleanOwner(owner);
+    const operation = cleanWork(work, '보관 상태 변경');
+    const manager = browserLockManager();
+    if (typeof manager?.request !== 'function') {
+      return frozenResult({ supported: false, acquired: false });
+    }
+    const ownerKey = await ownerFingerprint(clean);
+    const unavailable = () => frozenResult({ supported: true, acquired: false, value: undefined });
+    let operationStarted = false;
+    let operationFailure;
+    try {
+      return await manager.request(
+        lockName('uploader', ownerKey),
+        { mode: 'exclusive', ifAvailable: true },
+        async (asrLock) => {
+          if (!asrLock) return unavailable();
+          return manager.request(
+            lockName('audio-uploader', ownerKey),
+            { mode: 'exclusive', ifAvailable: true },
+            async (audioLock) => {
+              if (!audioLock) return unavailable();
+              operationStarted = true;
+              try {
+                return frozenResult({ supported: true, acquired: true, value: await operation() });
+              } catch (error) {
+                // undefined 같은 예외도 성공이나 재시도 가능한 잠금 오류로 바꾸지 않습니다.
+                operationFailure = { error };
+                throw error;
+              }
+            },
+          );
+        },
+      );
+    } catch (error) {
+      if (operationFailure) throw operationFailure.error;
+      throw new LiveCoordinationError(
+        '브라우저의 전송 잠금을 확인하지 못했습니다. 보관 상태를 다시 확인해 주세요.',
+        { code: 'uploader_lock_failed', cause: error, retrySafe: !operationStarted },
+      );
+    }
+  }
+
   async #runUploaderLane(owner, work, lane, localTails) {
     const clean = cleanOwner(owner);
     const operation = cleanWork(work, '업로드');

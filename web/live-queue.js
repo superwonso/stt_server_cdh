@@ -311,6 +311,7 @@ function validateSessionRecord(value) {
   ]);
   if (ownObject(value) && Object.hasOwn(value, 'continuationOf')) expected.add('continuationOf');
   if (ownObject(value) && Object.hasOwn(value, 'uploadHeld')) expected.add('uploadHeld');
+  if (ownObject(value) && Object.hasOwn(value, 'recoveryClosedAt')) expected.add('recoveryClosedAt');
   onlyKeys(value, expected, '저장된 녹음 세션');
   if (Object.keys(value).length !== expected.size) {
     throw new LiveQueueValidationError('저장된 녹음 세션에 필요한 값이 없습니다.');
@@ -334,6 +335,10 @@ function validateSessionRecord(value) {
   if (Object.hasOwn(value, 'uploadHeld') && value.uploadHeld !== true) {
     throw new LiveQueueValidationError('저장된 녹음의 전송 보류 표시가 올바르지 않습니다.');
   }
+  if (Object.hasOwn(value, 'recoveryClosedAt')) {
+    finiteInteger(value.recoveryClosedAt, '보관 상태 종료 시각', { min: 1, max: MAX_TIMESTAMP });
+    if (value.uploadHeld !== true) throw new LiveQueueValidationError('종료한 보관 음성은 전송 보류 상태여야 합니다.');
+  }
   finiteInteger(value.nextSequence, '다음 음성 순서');
   finiteInteger(value.capturedSamples, '저장된 음성 길이');
   return value;
@@ -356,6 +361,7 @@ function sessionCopy(value) {
     capturedSamples: value.capturedSamples,
     ...(value.continuationOf != null ? {continuationOf: value.continuationOf} : {}),
     ...(value.uploadHeld === true ? {uploadHeld: true} : {}),
+    ...(value.recoveryClosedAt !== undefined ? {recoveryClosedAt:value.recoveryClosedAt} : {}),
   };
 }
 
@@ -518,6 +524,70 @@ function storedValue(value, validator, label) {
   } catch (error) {
     throw new LiveQueueCorruptError(`${label}을 안전하게 읽을 수 없습니다.`, { cause: error });
   }
+}
+
+/**
+ * A deterministic identity for one held capture's downloaded source records.
+ * This checks metadata only; the export builder checks WAV contents separately.
+ * No Blob reads are allowed here because close rechecks it in an IDB transaction.
+ */
+export function heldRecoveryManifest(snapshot, captureIdValue) {
+  const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
+  if (!ownObject(snapshot) || !Array.isArray(snapshot.sessions)
+      || !Array.isArray(snapshot.chunks) || !Array.isArray(snapshot.snapshots)) {
+    throw new LiveQueueValidationError('보관 음성의 다운로드 확인 정보가 올바르지 않습니다.');
+  }
+  const owner = cleanOwner(snapshot.owner);
+  if (snapshot.sessions.length + snapshot.chunks.length + snapshot.snapshots.length > 50000) {
+    throw new LiveQueueValidationError('한 번에 확인할 보관 음성 항목이 너무 많습니다.');
+  }
+  const sessions = snapshot.sessions.filter(value => value?.id === captureId);
+  if (!sessions.length) throw new LiveQueueNotFoundError('보관한 녹음 세션을 찾을 수 없습니다.');
+  if (sessions.length !== 1) throw new LiveQueueCorruptError('보관한 녹음 세션이 중복되어 있습니다.');
+  const session = storedValue(sessions[0], validateSessionRecord, '보관한 녹음 세션');
+  if (session.owner !== owner) throw new LiveQueueOwnershipError();
+  if (session.uploadHeld !== true || session.state === 'completed') {
+    throw new LiveQueueConflictError('전송 보류 중인 수업만 보관 상태를 종료할 수 있습니다.');
+  }
+  const chunks = snapshot.chunks.filter(value => value?.captureId === captureId)
+    .map(value => storedValue(value, validateChunkRecord, '보관한 음성 조각'));
+  const snapshots = snapshot.snapshots.filter(value => value?.captureId === captureId)
+    .map(value => storedValue(value, validateSnapshotRecord, '보관한 PCM'));
+  if (snapshots.length > 1) throw new LiveQueueCorruptError('보관한 PCM이 중복되어 있습니다.');
+  for (const pcm of snapshots) {
+    if (pcm.owner !== owner) throw new LiveQueueOwnershipError();
+    if (!snapshotMatchesSession(pcm,session)) throw new LiveQueueCorruptError('PCM과 녹음 세션의 연결 정보가 올바르지 않습니다.');
+  }
+  const ids = new Set(), sequences = new Set();
+  let finalCount = 0;
+  for (const chunk of chunks) {
+    if (chunk.owner !== owner) throw new LiveQueueOwnershipError();
+    if (chunk.uploadHeld !== true || chunk.asrProvider !== session.asrProvider
+        || chunk.sessionCreatedAt !== session.createdAt || chunk.sequence >= session.nextSequence
+        || chunk.startSamples + chunk.durationSamples > session.capturedSamples
+        || ids.has(chunk.id) || sequences.has(chunk.sequence)) {
+      throw new LiveQueueCorruptError('음성 조각과 보관 세션의 연결 정보가 올바르지 않습니다.');
+    }
+    ids.add(chunk.id); sequences.add(chunk.sequence);
+    if (chunk.final) {
+      finalCount += 1;
+      if (chunk.sequence !== session.nextSequence - 1
+          || chunk.startSamples + chunk.durationSamples !== session.capturedSamples) {
+        throw new LiveQueueCorruptError('보관 세션의 마지막 음성 위치가 올바르지 않습니다.');
+      }
+    }
+  }
+  if (finalCount > 1 || session.finalQueued !== (finalCount === 1)) {
+    throw new LiveQueueCorruptError('보관 세션의 마지막 음성 상태가 올바르지 않습니다.');
+  }
+  chunks.sort((left,right) => left.sequence - right.sequence || left.id.localeCompare(right.id));
+  return JSON.stringify({
+    version:1, owner, session:sessionCopy(session),
+    chunks:chunks.map(chunk => ({...chunkCopy(chunk,{includeBlob:false}),blobType:chunk.blob.type || ''})),
+    snapshots:snapshots.map(pcm => ({captureId:pcm.captureId,owner:pcm.owner,sequence:pcm.sequence,
+      startSamples:pcm.startSamples,durationSamples:pcm.durationSamples,overlapSamples:pcm.overlapSamples,
+      byteLength:pcm.byteLength,revision:pcm.revision,updatedAt:pcm.updatedAt,blobType:pcm.blob.type || ''})),
+  });
 }
 
 function requestPromise(request) {
@@ -942,6 +1012,9 @@ export class DurableLiveQueue {
       if (held && session.state === 'completed') {
         throw new LiveQueueConflictError('완료된 녹음 세션의 전송을 보류할 수 없습니다.');
       }
+      if (!held && session.recoveryClosedAt !== undefined) {
+        throw new LiveQueueConflictError('종료한 보관 상태를 다시 연 뒤 전송 복구를 선택해 주세요.');
+      }
       // Update one cursor row at a time without reading Blob contents or
       // retaining a list of WAV handles. Session and chunk guards commit or
       // roll back together, including a failed/quota-exceeded last write.
@@ -972,6 +1045,59 @@ export class DurableLiveQueue {
       await requestPromise(stores[SESSION_STORE].put(session));
       return sessionCopy(session);
     }, '녹음의 전송 보류 상태를 기기에 저장하지 못했습니다.');
+  }
+
+  /** Caller holds the owner's idle-capture and both uploader locks. */
+  async closeHeldRecovery(ownerValue, captureIdValue, options) {
+    const owner = cleanOwner(ownerValue);
+    const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
+    onlyKeys(options,new Set(['expectedManifest','filesConfirmed']),'보관 상태 종료 확인');
+    if (options.filesConfirmed !== true || typeof options.expectedManifest !== 'string' || !options.expectedManifest.length) {
+      throw new LiveQueueValidationError('보관 음성 파일을 모두 내려받아 확인한 뒤 상태를 종료해 주세요.');
+    }
+    const now = this._clock();
+    return this._transaction([SESSION_STORE,CHUNK_STORE,SNAPSHOT_STORE],'readwrite',async stores => {
+      const [value,chunks,pcm] = await Promise.all([
+        requestPromise(stores[SESSION_STORE].get(captureId)),
+        cursorValues(stores[CHUNK_STORE].index('captureOrder').openCursor(this._captureRange(owner,captureId)),value => value),
+        requestPromise(stores[SNAPSHOT_STORE].get(captureId)),
+      ]);
+      if (!value) throw new LiveQueueNotFoundError('종료할 보관 세션을 찾을 수 없습니다.');
+      const snapshot = {owner,sessions:[value],chunks,snapshots:pcm ? [pcm] : []};
+      const manifest = heldRecoveryManifest(snapshot,captureId);
+      // The original manifest predates this marker/updatedAt write. Repeating
+      // the same explicit close must not require downloading unchanged audio.
+      if (value.recoveryClosedAt !== undefined) return sessionCopy(value);
+      if (manifest !== options.expectedManifest) {
+        throw new LiveQueueConflictError('다운로드한 뒤 보관 음성이 바뀌었습니다. 최신 음성을 다시 내려받아 확인해 주세요.');
+      }
+      value.recoveryClosedAt = now;
+      value.updatedAt = now;
+      validateSessionRecord(value);
+      await requestPromise(stores[SESSION_STORE].put(value));
+      return sessionCopy(value);
+    },'보관 상태 종료를 기기에 저장하지 못했습니다. 음성은 그대로 보관합니다.');
+  }
+
+  async reopenHeldRecovery(ownerValue, captureIdValue) {
+    const owner = cleanOwner(ownerValue);
+    const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
+    const now = this._clock();
+    return this._transaction([SESSION_STORE],'readwrite',async stores => {
+      const raw = await requestPromise(stores[SESSION_STORE].get(captureId));
+      if (!raw) throw new LiveQueueNotFoundError('다시 열 보관 세션을 찾을 수 없습니다.');
+      const session = storedValue(raw,validateSessionRecord,'보관한 녹음 세션');
+      if (session.owner !== owner) throw new LiveQueueOwnershipError();
+      if (session.uploadHeld !== true || session.state === 'completed') {
+        throw new LiveQueueConflictError('전송 보류 중인 보관 세션만 다시 열 수 있습니다.');
+      }
+      if (session.recoveryClosedAt === undefined) return sessionCopy(session);
+      delete session.recoveryClosedAt;
+      session.updatedAt = now;
+      validateSessionRecord(session);
+      await requestPromise(stores[SESSION_STORE].put(session));
+      return sessionCopy(session);
+    },'보관 상태를 다시 열지 못했습니다. 음성은 그대로 보관합니다.');
   }
 
   async updateSession(ownerValue, captureIdValue, updates) {

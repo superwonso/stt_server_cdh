@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from .db import Database
+from .platform_files import open_file, validate_private_path
 from .settings import url_origin
 
 
@@ -60,7 +61,11 @@ def create_password_reset_file(
             configured, _ = database._inspect_users(connection)
             if configured != set(database.accounts):
                 raise ValueError("Private account configuration does not match the database")
-            descriptor = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            if os.name == "nt":
+                validate_private_path(root, directory=True)
+                descriptor = open_file(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, private=True)
+            else:
+                descriptor = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             created = True
             with os.fdopen(descriptor, "w", encoding="utf-8") as output:
                 reset = issue_password_reset(connection, selected_username)

@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import base64
-import fcntl
 import hashlib
 import json
 import os
+if os.name != "nt":
+    import fcntl
 import secrets
 import shutil
 import stat
@@ -37,6 +38,8 @@ if str(PROJECT_ROOT) not in sys.path:
     # Allow the documented ``.venv/bin/python scripts/google_drive.py`` form.
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from server import platform_files
+
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 AUTHORIZATION_ENDPOINTS = frozenset(
     {
@@ -58,6 +61,12 @@ def _open_browser_without_output(url: str) -> bool:
     """Open an OAuth URL without letting a failed launcher echo the URL."""
 
     commands: list[list[str]] = []
+    if platform_files.IS_WINDOWS:
+        try:
+            os.startfile(url)
+            return True
+        except OSError:
+            return False
     if os.environ.get("WSL_DISTRO_NAME"):
         powershell = Path(
             "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -128,6 +137,13 @@ class ArchiveFunctions:
 def _ensure_private_directory(path: Path) -> None:
     """Create one private leaf, but never chmod an arbitrary existing path."""
 
+    if platform_files.IS_WINDOWS:
+        try:
+            platform_files.ensure_private_directory(path, parents=False)
+        except OSError:
+            raise GoogleDriveSetupError("Google Drive private directory ACL is unsafe") from None
+        return
+
     created = False
     try:
         path.mkdir(mode=0o700)
@@ -166,7 +182,8 @@ def _open_private_regular(path: Path) -> tuple[int, os.stat_result]:
         | getattr(os, "O_CLOEXEC", 0)
     )
     try:
-        descriptor = os.open(path, flags)
+        descriptor = (platform_files.open_file(path, flags, private=True)
+                      if platform_files.IS_WINDOWS else os.open(path, flags))
     except FileNotFoundError as error:
         raise GoogleDriveSetupError(
             "Google OAuth desktop client JSON is missing from the private data directory"
@@ -175,11 +192,11 @@ def _open_private_regular(path: Path) -> tuple[int, os.stat_result]:
         raise GoogleDriveSetupError("Google OAuth desktop client JSON cannot be opened safely") from error
     try:
         details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid():
+        if not stat.S_ISREG(details.st_mode) or (not platform_files.IS_WINDOWS and details.st_uid != os.geteuid()):
             raise GoogleDriveSetupError("Google OAuth desktop client JSON is not a regular file")
         if not 0 < details.st_size <= MAX_PRIVATE_JSON_BYTES:
             raise GoogleDriveSetupError("Google OAuth desktop client JSON has an invalid size")
-        if stat.S_IMODE(details.st_mode) != 0o600:
+        if not platform_files.IS_WINDOWS and stat.S_IMODE(details.st_mode) != 0o600:
             raise GoogleDriveSetupError("Google OAuth desktop client JSON must have mode 0600")
         return descriptor, details
     except BaseException:
@@ -248,6 +265,12 @@ def _atomic_private_write(path: Path, value: bytes) -> None:
     """Atomically replace one secret file with mode 0600."""
 
     _ensure_private_directory(path.parent)
+    if platform_files.IS_WINDOWS:
+        try:
+            platform_files.atomic_write_private(path, value)
+        except OSError:
+            raise GoogleDriveSetupError("Google Drive private file cannot be written safely") from None
+        return
     directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
@@ -318,6 +341,18 @@ def _private_file_lock(lock_path: Path):
     """Hold a private advisory lock without following the lock pathname."""
 
     _ensure_private_directory(lock_path.parent)
+    if platform_files.IS_WINDOWS:
+        descriptor = -1
+        try:
+            descriptor = platform_files.open_file(lock_path, os.O_RDWR | os.O_CREAT, private=True)
+            with platform_files.file_lock(descriptor):
+                yield
+        except OSError:
+            raise GoogleDriveSetupError("Google Drive operation lock is unsafe or unavailable") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return
     directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
@@ -679,8 +714,59 @@ def _is_project_server_process(pid: int, *, process_root: Path) -> bool:
     )
 
 
+def _is_windows_native_api(arguments: list[str], executable: str) -> bool:
+    """Recognize only the native API worker, including lost PID bookkeeping."""
+
+    if len(arguments) not in (4, 6) or arguments[1:4] != ["-m", "server.windows_service", "run"]:
+        return False
+    if len(arguments) == 6 and (
+        arguments[4] != "--launch-id" or len(arguments[5]) != 32
+        or any(character not in "0123456789abcdef" for character in arguments[5])
+    ):
+        return False
+    # Windows venv launchers may expose the base Python as their process image.
+    # Accept only exact configured interpreter paths, never a python-like name.
+    interpreters = {
+        os.path.normcase(os.path.realpath(value))
+        for value in (PROJECT_ROOT / ".venv-win" / "Scripts" / "python.exe",
+                      sys.executable, getattr(sys, "_base_executable", sys.executable))
+    }
+    return (Path(arguments[0]).is_absolute() and Path(executable).is_absolute()
+            and os.path.normcase(os.path.realpath(arguments[0])) in interpreters
+            and os.path.normcase(os.path.realpath(executable)) in interpreters)
+
+
 def server_is_running(settings: Any, *, process_root: Path = Path("/proc")) -> bool:
-    """Find this project's uvicorn even if its managed PID file was lost."""
+    """Find this project's API worker even if its managed PID file was lost."""
+
+    if platform_files.IS_WINDOWS:
+        # Do not use os.kill(pid, 0): on Windows it can terminate a process.
+        # Enumeration failures must refuse credential replacement/migration.
+        try:
+            import psutil
+            expected = PROJECT_ROOT.resolve()
+            for process in psutil.process_iter(["pid", "name"]):
+                if not str(process.info["name"] or "").lower().startswith(("python", "uvicorn")):
+                    continue
+                try:
+                    arguments = process.cmdline()
+                    if Path(process.cwd()).resolve() != expected:
+                        continue
+                    if ("server.app:create_app" in arguments and "--factory" in arguments
+                            and any("uvicorn" == Path(argument).stem for argument in arguments)):
+                        return True
+                    if (arguments[1:4] == ["-m", "server.windows_service", "run"]
+                            and _is_windows_native_api(arguments, process.exe())):
+                        return True
+                except psutil.NoSuchProcess:
+                    continue
+                except (psutil.AccessDenied, OSError):
+                    raise GoogleDriveSetupError("Cannot safely establish whether the API is stopped") from None
+        except ImportError:
+            raise GoogleDriveSetupError("Cannot safely establish whether the API is stopped") from None
+        except (psutil.AccessDenied, OSError):
+            raise GoogleDriveSetupError("Cannot safely establish whether the API is stopped") from None
+        return False
 
     pid_path = Path(settings.data_dir) / "server.pid"
     flags = (

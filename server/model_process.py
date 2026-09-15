@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
-import fcntl
 import hashlib
 import http.client
 import json
@@ -26,6 +25,9 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+
+if os.name != "nt":
+    import fcntl
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_SOCKET = PROJECT_DIR / ".data" / "model-server" / "model.sock"
@@ -70,7 +72,19 @@ def model_environment(env_file: Path | None, inherited: dict | None = None) -> d
     for value in selected.values():
         if not isinstance(value, str) or len(value) > 4096 or any(c in value for c in "\0\r\n$`"):
             raise ModelProcessError("모델 설정에 지원하지 않는 값이 있습니다.")
-    return {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "PYTHONNOUSERSITE": "1",
+    system_environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    if os.name == "nt":
+        # Native Python/DLL lookup requires Windows runtime variables. Copy no
+        # API credentials, user-supplied Python hooks, proxies or dotenv keys.
+        # PyTorch Inductor uses getpass.getuser() for its cache directory; native
+        # Windows needs USERNAME because the fallback pwd module is POSIX-only.
+        system_environment = {key: value for key in ("PATH", "SystemRoot", "SYSTEMROOT", "WINDIR",
+                              "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA", "USERNAME")
+                              if isinstance((value := inherited.get(key)), str)}
+        system_environment.setdefault("SystemRoot", os.environ.get("SystemRoot", r"C:\Windows"))
+        system_environment.setdefault("PATH", os.pathsep.join((str(Path(sys.executable).parent),
+                                               str(Path(system_environment["SystemRoot"]) / "System32"))))
+    return {**system_environment, "PYTHONNOUSERSITE": "1",
             "PYTHONUNBUFFERED": "1", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", **selected}
 
 
@@ -461,6 +475,9 @@ def run_model(path: Path, *, warmup=True):
 
 
 def main(argv=None):
+    if os.name == "nt":
+        from .win_model_process import main as windows_main
+        return windows_main(argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["start", "run", "stop", "status"])
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)

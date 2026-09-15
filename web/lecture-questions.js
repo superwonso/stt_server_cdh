@@ -1,3 +1,5 @@
+import { validResultDraft } from './llm-results.js';
+
 export function validQuestionJob(job, lecture) {
   if (!job || job.lecture_id !== lecture?.id || typeof job.id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(job.id)
       || typeof job.question !== 'string' || !job.question.trim() || Array.from(job.question).length > 1000
@@ -13,8 +15,9 @@ export function validQuestionJob(job, lecture) {
   if (!['full','retrieved','none'].includes(job.scope) || !Number.isSafeInteger(job.selected_count)
       || job.selected_count < 0 || job.selected_count > Math.min(128,source.size) || job.total_segments !== source.size
       || (job.scope === 'full' && job.selected_count !== source.size)
-      || ((job.scope === 'none') !== (job.selected_count === 0))
-      || !doc || Object.keys(doc).sort().join(',') !== 'answerability,paragraphs'
+      || ((job.scope === 'none') !== (job.selected_count === 0))) return false;
+  if (doc?.format === 'draft') return !!validResultDraft(doc);
+  if (!doc || Object.keys(doc).sort().join(',') !== 'answerability,paragraphs'
       || !['answered','insufficient_evidence'].includes(doc.answerability) || !Array.isArray(doc.paragraphs)) return false;
   if (doc.answerability === 'insufficient_evidence') return doc.paragraphs.length === 0;
   if (!(job.selected_count > 0 && doc.paragraphs.length > 0 && doc.paragraphs.length <= 6

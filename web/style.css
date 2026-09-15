@@ -1461,6 +1461,36 @@ button {
   margin-top: 18px;
 }
 
+.closed-held-audio {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.closed-held-audio > summary {
+  min-height: 44px;
+  padding-block: 10px;
+  cursor: pointer;
+  color: var(--forest-700);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.local-audio-finish-panel {
+  margin: 20px 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-muted);
+}
+
+.local-audio-finish-panel h3 { margin: 0 0 10px; font-size: 16px; }
+.local-audio-finish-panel p { font-size: 13px; line-height: 1.7; }
+.local-audio-save-confirm { display: flex; align-items: flex-start; gap: 10px; min-height: 44px; line-height: 1.7; font-size: 14px; }
+.local-audio-save-confirm input { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 4px; }
+.local-audio-save-confirm span { min-width: 0; overflow-wrap: anywhere; }
+.local-audio-finish-panel button { max-width: 100%; white-space: normal; word-break: keep-all; }
+
 .transcript-reader-toolbar {
   display: flex;
   min-width: 0;
@@ -2838,6 +2868,8 @@ button {
 .study-note-text strong { font-weight: 750; }
 .study-note-edits { margin: 12px 0; font-size: .9rem; line-height: 1.7; }
 .study-note-edits li { white-space: pre-wrap; }
+.study-note-issues { border-top: 1px solid var(--line); margin-top: 20px; padding-top: 4px; line-height: 1.7; }
+.study-note-issues li { margin-bottom: 6px; }
 .study-note-download { display: inline-flex; align-items: center; text-decoration: none; }
 .study-note-download[hidden] { display: none; }
 #continuation-links:empty, #continuation-state:empty { display: none; }
@@ -2847,6 +2879,9 @@ button {
 .held-audio-card + .held-audio-card { border-top: 1px solid var(--line); }
 .held-audio-card p { line-height: 1.6; margin: 8px 0; }
 .held-audio-card .study-actions { flex-wrap: wrap; }
+.held-audio-card .study-actions button { min-height: 44px; max-width: 100%; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--forest-700); font-size: 12px; line-height: 1.5; word-break: keep-all; cursor: pointer; }
+.held-audio-card .study-actions button:disabled { opacity: .5; cursor: not-allowed; }
+.held-audio-card .study-actions button:focus-visible { outline: 2px solid var(--forest-600); outline-offset: 3px; }
 #continuation-links { flex-wrap: wrap; margin-bottom: 16px; }
 #recording-download-note, #continuation-state { overflow-wrap: anywhere; line-height: 1.65; }
 @media (max-width: 520px) { .lesson-study-note .summary-actions > * { width: 100%; justify-content: center; } }
@@ -2908,3 +2943,6 @@ button {
     scrollbar-gutter: auto;
   }
 }
+
+.ai-result-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai-result-warning { margin: 20px 0 0; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: .82rem; line-height: 1.6; }

@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import httpx
 
 from .llm_protocol import ProtocolError, gateway_schema, parse_json_document
 from .settings import Settings
+from .llm_result import safe_model_content, safe_draft_text, draft_document
 
 
 _EMAIL = re.compile(
@@ -66,9 +67,13 @@ class PostprocessingError(RuntimeError):
 class CorrectedTranscript:
     segments: list[dict[str, Any]]
     uncertain_terms: list[str]
+    draft_text: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def text(self) -> str:
+        if self.draft_text is not None:
+            return self.draft_text
         return "\n".join(segment["text"] for segment in self.segments if segment["text"])
 
 
@@ -83,8 +88,8 @@ class MindlogicPostprocessor:
     """Bounded OpenAI-compatible client for NOVA transcript correction.
 
     The caller owns persistence and background-job state.  This class only
-    sends final transcript text and validates that every returned item maps to
-    exactly one source segment, so overlap context can never create duplicates.
+    sends final transcript text and diagnoses source correspondence. Clearly
+    mapped rows retain source order; ambiguous answers remain separate drafts.
     """
 
     def __init__(self, settings: Settings, client: httpx.Client | None = None):
@@ -144,72 +149,29 @@ class MindlogicPostprocessor:
                 "source_too_large",
                 "받아쓰기 내용이 후보정 처리 횟수 제한을 초과했습니다.",
             )
-        corrected: list[dict[str, Any]] = []
-        uncertain: list[str] = []
-        seen_uncertain: set[str] = set()
-        corrected_chars = 0
-        source_chars = sum(len(segment["text"]) for segment in normalized)
-        split_calls_remaining = _MAX_SPLIT_EXTRA_CALLS
-
-        def correct_chunk(chunk: _CorrectionChunk, depth: int = 0):
-            nonlocal split_calls_remaining
-            self._check_interrupted(interrupted)
-            try:
-                return self._correct_chunk(
-                    title=title, language=language, chunk=chunk, interrupted=interrupted,
-                )
-            except PostprocessingError as error:
-                # A completed-but-truncated response is known to be unusable.
-                # Never retry malformed IDs, protected edits, refusals or an
-                # uncertain network outcome by silently splitting the request.
-                if (error.code != "response_truncated" or len(chunk.targets) < 2
-                        or depth >= _MAX_SPLIT_DEPTH or split_calls_remaining < 2):
-                    raise
-                self._check_interrupted(interrupted)
-                split_calls_remaining -= 2
-                middle = len(chunk.targets) // 2
-                before, after = chunk.targets[:middle], chunk.targets[middle:]
-                overlap = self.overlap_segments
-                left = _CorrectionChunk(
-                    before, chunk.context_before,
-                    (after + chunk.context_after)[:overlap] if overlap else (),
-                )
-                right = _CorrectionChunk(
-                    after,
-                    (chunk.context_before + before)[-overlap:] if overlap else (),
-                    chunk.context_after,
-                )
-                left_result, left_uncertain = correct_chunk(left, depth + 1)
-                right_result, right_uncertain = correct_chunk(right, depth + 1)
-                return left_result + right_result, left_uncertain + right_uncertain
-
+        corrected, uncertain, warnings, pieces = [], [], [], []
+        has_draft = False
         for chunk in chunks:
             self._check_interrupted(interrupted)
-            result, chunk_uncertain = correct_chunk(chunk)
-            self._check_interrupted(interrupted)
-            corrected.extend(result)
-            corrected_chars += sum(len(segment["text"]) for segment in result)
-            if corrected_chars > min(1_000_000, source_chars * 2 + 10_000):
-                raise PostprocessingError(
-                    "invalid_response",
-                    "후보정 결과가 원문보다 지나치게 길어 저장하지 않았습니다.",
-                )
-            for term in chunk_uncertain:
-                folded = term.casefold()
-                if folded not in seen_uncertain:
-                    seen_uncertain.add(folded)
-                    uncertain.append(term)
-                    if len(uncertain) > 1000 or sum(map(len, uncertain)) > 100_000:
-                        raise PostprocessingError(
-                            "invalid_response",
-                            "후보정 결과가 허용 크기를 넘어 저장하지 않았습니다.",
-                        )
-        if [item["id"] for item in corrected] != [item["id"] for item in normalized]:
-            raise PostprocessingError(
-                "invalid_response",
-                "후보정 결과가 원문 구간과 일치하지 않아 저장하지 않았습니다.",
+            rows, terms, draft, notices = self._correct_chunk(
+                title=title, language=language, chunk=chunk, interrupted=interrupted,
             )
-        return CorrectedTranscript(corrected, uncertain)
+            self._check_interrupted(interrupted)
+            corrected.extend(rows)
+            uncertain.extend(value for value in terms if value.casefold() not in {old.casefold() for old in uncertain})
+            warnings.extend(notices)
+            pieces.append(draft if draft is not None else "\n".join(row["text"] for row in rows))
+            has_draft |= draft is not None
+        if has_draft or [item["id"] for item in corrected] != [item["id"] for item in normalized]:
+            document = draft_document("\n\n".join(pieces), warnings=warnings or ['validation_failed'],
+                                      replacements=None, max_chars=1_000_000)
+            return CorrectedTranscript([], uncertain[:1000], document['text'], document['warnings'])
+        source_chars = sum(len(segment["text"]) for segment in normalized)
+        if sum(len(row["text"]) for row in corrected) > min(1_000_000, source_chars * 2 + 10_000):
+            document = draft_document("\n\n".join(pieces), warnings=[*warnings, 'content_limited'],
+                                      replacements=None, max_chars=1_000_000)
+            return CorrectedTranscript([], uncertain[:1000], document['text'], document['warnings'])
+        return CorrectedTranscript(corrected, uncertain[:1000], warnings=list(dict.fromkeys(warnings)))
 
     @staticmethod
     def _normalize_source_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -303,7 +265,7 @@ class MindlogicPostprocessor:
         language: str | None,
         chunk: _CorrectionChunk,
         interrupted: Callable[[], bool] | None,
-    ) -> tuple[list[dict[str, Any]], list[str]]:
+    ) -> tuple[list[dict[str, Any]], list[str], str | None, list[str]]:
         private_values: dict[str, str] = {}
         counter = 0
 
@@ -376,8 +338,8 @@ class MindlogicPostprocessor:
             ],
             "temperature": 0,
             # Keep room for JSON formatting/uncertainty and provider overhead.
-            # A single long source row remains indivisible and may still hit
-            # the provider limit; it must then fail without saving a partial row.
+            # A single long row stays indivisible. A received partial answer
+            # is retained separately when its source mapping cannot be verified.
             "max_tokens": min(_MAX_OUTPUT_TOKENS, max(8192, expected_output_bytes + 4096)),
             "response_format": {
                 "type": "json_schema",
@@ -411,75 +373,132 @@ class MindlogicPostprocessor:
             },
         }
         response = self._request(payload, interrupted)
-        parsed = self._parse_response(response)
-        returned = parsed.get("segments")
-        uncertain = parsed.get("uncertain_terms")
-        if not isinstance(returned, list) or not isinstance(uncertain, list):
-            raise self._invalid_response()
-        if len(returned) != len(targets):
-            raise self._invalid_response()
+        def validate():
+            parsed = self._parse_response(response)
+            returned = parsed.get("segments")
+            uncertain = parsed.get("uncertain_terms")
+            if not isinstance(returned, list) or not isinstance(uncertain, list):
+                raise self._invalid_response()
+            if len(returned) != len(targets):
+                raise self._invalid_response()
 
-        corrected: list[dict[str, Any]] = []
-        added_number = False
-        for source, masked_source, item, expected_id in zip(chunk.targets, targets, returned, expected_ids, strict=True):
-            if not isinstance(item, dict) or set(item) != {"id", "text"}:
-                raise self._invalid_response()
-            if item.get("id") != expected_id or not isinstance(item.get("text"), str):
-                raise self._invalid_response()
-            text = item["text"].strip()
-            text_length_limit = max(1000, len(source["text"]) * 4 + 500)
-            mask_expansion = max(0, len(masked_source["text"]) - len(source["text"]))
-            # Short numbers can grow eighteen-fold when masked. Account for
-            # that deterministic expansion before validating the real restored
-            # text against exactly the original source-relative length limit.
-            if not text or len(text) > text_length_limit + mask_expansion:
-                raise self._invalid_response()
-            found = _PLACEHOLDER.findall(text)
-            if found != target_placeholders[expected_id]:
-                raise PostprocessingError(
-                    "privacy_placeholder_changed",
-                    "개인정보 보호 표시가 바뀐 후보정 결과는 저장하지 않았습니다.",
-                )
-            if any(text.count(placeholder) != 1 for placeholder in found):
-                raise PostprocessingError(
-                    "privacy_placeholder_changed",
-                    "개인정보 보호 표시가 바뀐 후보정 결과는 저장하지 않았습니다.",
-                )
-            # One substitution pass prevents a restored source string that
-            # happens to resemble another placeholder from being processed a
-            # second time.
-            text = _PLACEHOLDER.sub(lambda match: private_values[match.group(0)], text)
-            if len(text) > text_length_limit:
-                raise self._invalid_response()
-            source_numbers = _NUMBER.findall(source["text"])
-            corrected_numbers = _NUMBER.findall(text)
-            # When a source segment already contains numbers, require its full
-            # numeric token sequence to remain identical. This blocks a model
-            # from changing the semantic value and appending the old one later.
-            if source_numbers and corrected_numbers != source_numbers:
-                raise PostprocessingError(
-                    "protected_content_changed",
-                    "숫자가 바뀐 후보정 결과는 저장하지 않았습니다.",
-                )
-            if not source_numbers and corrected_numbers:
-                added_number = True
-            corrected.append({**source, "text": text})
+            corrected: list[dict[str, Any]] = []
+            added_number = False
+            for source, masked_source, item, expected_id in zip(chunk.targets, targets, returned, expected_ids, strict=True):
+                if not isinstance(item, dict) or set(item) != {"id", "text"}:
+                    raise self._invalid_response()
+                if item.get("id") != expected_id or not isinstance(item.get("text"), str):
+                    raise self._invalid_response()
+                text = item["text"].strip()
+                text_length_limit = max(1000, len(source["text"]) * 4 + 500)
+                mask_expansion = max(0, len(masked_source["text"]) - len(source["text"]))
+                # Short numbers can grow eighteen-fold when masked. Account for
+                # that deterministic expansion before validating the real restored
+                # text against exactly the original source-relative length limit.
+                if not text or len(text) > text_length_limit + mask_expansion:
+                    raise self._invalid_response()
+                found = _PLACEHOLDER.findall(text)
+                if found != target_placeholders[expected_id]:
+                    raise PostprocessingError(
+                        "privacy_placeholder_changed",
+                        "개인정보 보호 표시가 바뀐 후보정 결과는 저장하지 않았습니다.",
+                    )
+                if any(text.count(placeholder) != 1 for placeholder in found):
+                    raise PostprocessingError(
+                        "privacy_placeholder_changed",
+                        "개인정보 보호 표시가 바뀐 후보정 결과는 저장하지 않았습니다.",
+                    )
+                # One substitution pass prevents a restored source string that
+                # happens to resemble another placeholder from being processed a
+                # second time.
+                text = _PLACEHOLDER.sub(lambda match: private_values[match.group(0)], text)
+                if len(text) > text_length_limit:
+                    raise self._invalid_response()
+                source_numbers = _NUMBER.findall(source["text"])
+                corrected_numbers = _NUMBER.findall(text)
+                # When a source segment already contains numbers, require its full
+                # numeric token sequence to remain identical. This blocks a model
+                # from changing the semantic value and appending the old one later.
+                if source_numbers and corrected_numbers != source_numbers:
+                    raise PostprocessingError(
+                        "protected_content_changed",
+                        "숫자가 바뀐 후보정 결과는 저장하지 않았습니다.",
+                    )
+                if not source_numbers and corrected_numbers:
+                    added_number = True
+                corrected.append({**source, "text": text})
 
-        safe_uncertain: list[str] = []
-        if len(uncertain) > 200:
-            raise self._invalid_response()
-        for value in uncertain:
-            if not isinstance(value, str):
+            safe_uncertain: list[str] = []
+            if len(uncertain) > 200:
                 raise self._invalid_response()
-            value = value.strip()
-            if not value:
-                continue
-            if len(value) > 200 or _PLACEHOLDER.search(value):
-                raise self._invalid_response()
-            safe_uncertain.append(value)
-        if added_number and _ADDED_NUMBER_WARNING not in safe_uncertain:
-            safe_uncertain.append(_ADDED_NUMBER_WARNING)
-        return corrected, safe_uncertain
+            for value in uncertain:
+                if not isinstance(value, str):
+                    raise self._invalid_response()
+                value = value.strip()
+                if not value:
+                    continue
+                if len(value) > 200 or _PLACEHOLDER.search(value):
+                    raise self._invalid_response()
+                safe_uncertain.append(value)
+            if added_number and _ADDED_NUMBER_WARNING not in safe_uncertain:
+                safe_uncertain.append(_ADDED_NUMBER_WARNING)
+            return corrected, safe_uncertain
+
+        try:
+            rows, terms = validate()
+            notices = ['validation_failed'] if _ADDED_NUMBER_WARNING in terms else []
+            clean_rows = []
+            for row in rows:
+                text = safe_draft_text(row['text'], replacements=None, max_chars=250_000)
+                if text != row['text']:
+                    notices.append('validation_failed')
+                clean_rows.append({**row, 'text': text})
+            clean_terms = []
+            for term in terms:
+                try:
+                    clean_terms.append(safe_draft_text(term, replacements=None, max_chars=200))
+                except ValueError:
+                    notices.append('validation_failed')
+            return clean_rows, clean_terms, None, list(dict.fromkeys(notices))
+        except (PostprocessingError, ValueError) as error:
+            # Only an actual model message can become a draft. Network/error
+            # bodies, empty results and interruption remain failures.
+            try:
+                content = safe_model_content(response)
+            except ValueError:
+                raise error if isinstance(error, PostprocessingError) else self._invalid_response() from None
+            code = getattr(error, 'code', 'invalid_response')
+            notice = code if code in {'invalid_response', 'response_truncated', 'model_refused'} else 'validation_failed'
+            notices = [notice]
+            try:
+                parsed = parse_json_document({'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]})
+                items = parsed.get('segments')
+                if not isinstance(items, list) or len(items) != len(expected_ids):
+                    raise ValueError
+                by_id = {}
+                for item in items:
+                    if (not isinstance(item, dict) or not isinstance(item.get('id'), str)
+                            or item['id'] in by_id or not isinstance(item.get('text'), str) or not item['text'].strip()):
+                        raise ValueError
+                    by_id[item['id']] = item
+                if set(by_id) != set(expected_ids):
+                    raise ValueError
+                rows = []
+                for source in chunk.targets:
+                    text = by_id[source['id']]['text']
+                    allowed = target_placeholders[source['id']]
+                    if _PLACEHOLDER.findall(text) != allowed:
+                        notices.append('placeholder_unresolved')
+                    replacements = {token: private_values[token] for token in allowed}
+                    text = safe_draft_text(text, replacements=replacements, max_chars=250_000)
+                    rows.append({**source, 'text': text})
+                return rows, [], None, list(dict.fromkeys(notices))
+            except (ProtocolError, ValueError, KeyError, TypeError):
+                try:
+                    document = draft_document(content, warnings=notices, replacements={}, max_chars=250_000)
+                except ValueError:
+                    raise error if isinstance(error, PostprocessingError) else self._invalid_response() from None
+                return [], [], document['text'], document['warnings']
 
     def _request(
         self,

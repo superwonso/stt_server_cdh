@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import struct
 import threading
 import uuid
 from pathlib import Path
+
+from . import platform_files
 
 
 SAMPLE_RATE = 16_000
@@ -93,12 +96,18 @@ class RecordingStore:
         self.max_gap_frames = max_gap_seconds * SAMPLE_RATE
         self.lock = threading.RLock()
         if create_directories:
-            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self.root.chmod(0o700)
+            if platform_files.IS_WINDOWS:
+                platform_files.ensure_private_directory(self.root)
+            else:
+                self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                self.root.chmod(0o700)
             for account in accounts:
                 directory = self.root / account
-                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                directory.chmod(0o700)
+                if platform_files.IS_WINDOWS:
+                    platform_files.ensure_private_directory(directory)
+                else:
+                    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    directory.chmod(0o700)
 
     def path(self, username: str, lecture_id: str) -> Path:
         if username not in self.accounts:
@@ -166,8 +175,11 @@ class RecordingStore:
             raise ValueError("capacity reservations must not be negative")
         if self._used_bytes() + additional_bytes > self.max_total_bytes:
             raise RecordingCapacityError("recording quota exceeded")
-        free = os.statvfs(self.root)
-        free_bytes = free.f_bavail * free.f_frsize
+        if platform_files.IS_WINDOWS:
+            free_bytes = shutil.disk_usage(self.root).free
+        else:
+            free = os.statvfs(self.root)
+            free_bytes = free.f_bavail * free.f_frsize
         if additional_bytes + other_reserved_bytes + self.min_free_bytes > free_bytes:
             raise RecordingCapacityError("recording free-space reserve would be exceeded")
 
@@ -208,7 +220,8 @@ class RecordingStore:
             except FileNotFoundError:
                 existed = False
             try:
-                descriptor = os.open(path, self._open_flags(write=True), 0o600)
+                descriptor = (platform_files.open_file(path, self._open_flags(write=True), private=True)
+                              if platform_files.IS_WINDOWS else os.open(path, self._open_flags(write=True), 0o600))
             except OSError as error:
                 raise RecordingCorruptError("recording cannot be opened safely") from error
             original_size = 0
@@ -272,7 +285,7 @@ class RecordingStore:
                 os.lseek(descriptor, 0, os.SEEK_SET)
                 _write_all(descriptor, _header(data_bytes))
                 os.fsync(descriptor)
-                os.fchmod(descriptor, 0o600)
+                platform_files.set_private_file(descriptor)
             except BaseException:
                 if not existed:
                     try:
@@ -304,7 +317,8 @@ class RecordingStore:
         path = self.path(username, lecture_id)
         with self.lock:
             try:
-                descriptor = os.open(path, self._open_flags())
+                descriptor = (platform_files.open_file(path, self._open_flags(), private=True)
+                              if platform_files.IS_WINDOWS else os.open(path, self._open_flags()))
             except FileNotFoundError:
                 return None
             except OSError as error:
@@ -350,6 +364,11 @@ class RecordingStore:
     def delete(self, username: str, lecture_id: str) -> None:
         path = self.path(username, lecture_id)
         with self.lock:
+            if platform_files.IS_WINDOWS:
+                try:
+                    platform_files.validate_private_path(path.parent, directory=True)
+                except OSError as error:
+                    raise RecordingCorruptError("recording directory is unsafe") from error
             try:
                 details = path.lstat()
             except FileNotFoundError:

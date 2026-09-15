@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import fcntl
 import os
 import re
 import secrets
@@ -33,6 +32,7 @@ from .drive_storage import (
 )
 from .recordings import RecordingCorruptError, RecordingStore
 from .settings import Settings
+from . import platform_files
 
 
 _IDENTITY_BYTES = 32
@@ -88,6 +88,12 @@ def _operation_lock_path(settings: Settings) -> Path:
 
 
 def _ensure_private_directory(path: Path) -> None:
+    if platform_files.IS_WINDOWS:
+        try:
+            platform_files.ensure_private_directory(path)
+        except OSError:
+            raise RuntimeError("Google Drive private directory ACL is unsafe") from None
+        return
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     details = path.lstat()
     if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
@@ -101,7 +107,8 @@ def _load_or_create_identity(path: Path) -> bytes:
     _ensure_private_directory(path.parent)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = (platform_files.open_file(path, flags, private=True)
+                      if platform_files.IS_WINDOWS else os.open(path, flags))
     except FileNotFoundError:
         value = secrets.token_bytes(_IDENTITY_BYTES)
         create_flags = (
@@ -112,7 +119,8 @@ def _load_or_create_identity(path: Path) -> bytes:
             | getattr(os, "O_CLOEXEC", 0)
         )
         try:
-            descriptor = os.open(path, create_flags, 0o600)
+            descriptor = (platform_files.open_file(path, create_flags, private=True)
+                          if platform_files.IS_WINDOWS else os.open(path, create_flags, 0o600))
         except FileExistsError:
             return _load_or_create_identity(path)
         try:
@@ -123,14 +131,10 @@ def _load_or_create_identity(path: Path) -> bytes:
                     raise OSError("short identity write")
                 view = view[written:]
             os.fsync(descriptor)
-            os.fchmod(descriptor, 0o600)
+            platform_files.set_private_file(descriptor)
         finally:
             os.close(descriptor)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        platform_files.sync_directory(path.parent)
         return value
     except OSError as error:
         raise RuntimeError("Google Drive identity key cannot be opened safely") from error
@@ -139,7 +143,7 @@ def _load_or_create_identity(path: Path) -> bytes:
         details = os.fstat(descriptor)
         if (
             not stat.S_ISREG(details.st_mode)
-            or stat.S_IMODE(details.st_mode) & 0o077
+            or (not platform_files.IS_WINDOWS and stat.S_IMODE(details.st_mode) & 0o077)
             or details.st_size != _IDENTITY_BYTES
         ):
             raise RuntimeError("Google Drive identity key is invalid")
@@ -387,19 +391,17 @@ class DriveArchiveManager:
             | getattr(os, "O_CLOEXEC", 0)
         )
         with self.operation_lock:
-            descriptor = os.open(path, flags, 0o600)
+            descriptor = (platform_files.open_file(path, flags, private=True)
+                          if platform_files.IS_WINDOWS else os.open(path, flags, 0o600))
             try:
                 details = os.fstat(descriptor)
                 if not stat.S_ISREG(details.st_mode):
                     raise RuntimeError("Google Drive archive lock is unsafe")
-                os.fchmod(descriptor, 0o600)
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-                yield
+                platform_files.set_private_file(descriptor)
+                with platform_files.file_lock(descriptor):
+                    yield
             finally:
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-                finally:
-                    os.close(descriptor)
+                os.close(descriptor)
 
     def close(self) -> None:
         if self.client is not None and hasattr(self.client, "close"):
@@ -1697,10 +1699,12 @@ def plan_existing_recordings(settings: Settings, *, limit: int | None = None) ->
     if (
         stat.S_ISLNK(details.st_mode)
         or not stat.S_ISREG(details.st_mode)
-        or details.st_uid != os.geteuid()
+        or (not platform_files.IS_WINDOWS and details.st_uid != os.geteuid())
     ):
         raise RuntimeError("Private classroom database is unsafe")
-    uri = f"file:{quote(str(database_path.resolve()), safe='/')}?mode=ro"
+    if platform_files.IS_WINDOWS:
+        platform_files.validate_private_path(database_path)
+    uri = f"{database_path.resolve().as_uri()}?mode=ro"
     try:
         connection = sqlite3.connect(uri, uri=True, timeout=10)
     except sqlite3.Error as error:

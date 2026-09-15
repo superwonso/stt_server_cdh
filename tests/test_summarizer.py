@@ -153,7 +153,7 @@ class SummarizerTests(unittest.TestCase):
             validate_summary_document(summary_document("test-source-b", "Contact invented@example.com."), source)
         self.assertEqual(raised.exception.code, "unsupported_claim")
 
-    def test_foreign_citation_and_numeric_or_privacy_invention_are_rejected(self):
+    def test_unverified_citations_and_claims_are_preserved_as_warned_drafts(self):
         for mutate in (
             lambda value: value.update(overview_source_ids=["other-owner-segment"]),
             lambda value: value.update(overview="결과는 999이다."),
@@ -165,10 +165,11 @@ class SummarizerTests(unittest.TestCase):
                 document = summary_document()
                 mutate(document)
                 engine = self.engine(lambda request: gateway_response(document))
-                with self.assertRaises(SummarizationError) as raised:
-                    engine.summarize(language="ko", segments=self.segments())
-                self.assertIn(raised.exception.code, {"invalid_response", "unsupported_claim"})
-                self.assertNotIn("other-owner", str(raised.exception))
+                result = engine.summarize(language="ko", segments=self.segments()).to_dict()
+                self.assertEqual(result["format"], "draft")
+                self.assertTrue(set(result["warnings"]) & {"invalid_response", "unsupported_claim"})
+                self.assertNotIn("other-owner", result["text"])
+                self.assertNotIn("__PRIVATE_999999__", result["text"])
 
     def test_a_masked_value_must_belong_to_the_cited_source(self):
         source = [{"id": "a", "text": "값은 15이다."}, {"id": "b", "text": "관계를 설명한다."}]
@@ -178,9 +179,11 @@ class SummarizerTests(unittest.TestCase):
             first, second = data["segments"]
             return gateway_response(summary_document(second["id"], first["text"]))
 
-        with self.assertRaises(SummarizationError) as raised:
-            self.engine(handler).summarize(language="ko", segments=source)
-        self.assertEqual(raised.exception.code, "unsupported_claim")
+        result = self.engine(handler).summarize(language="ko", segments=source).to_dict()
+        self.assertEqual(result["format"], "draft")
+        self.assertIn("unsupported_claim", result["warnings"])
+        self.assertIn("15", result["text"])
+        self.assertNotIn("source_ids", result)
 
     def test_constant_temperature_is_not_mistaken_for_a_class_schedule(self):
         # Regression from the opt-in public synthetic photosynthesis fixture:
@@ -222,11 +225,12 @@ class SummarizerTests(unittest.TestCase):
             # combine request never supplied it. Guessing it is not evidence.
             return gateway_response(summary_document("S000001", "값은 __PRIVATE_000001__이다."))
 
-        with self.assertRaises(SummarizationError) as raised:
-            self.engine(handler, summary_chunk_chars=1).summarize(
-                language="ko", segments=[{"id": "a", "text": "값은 15이다."},
-                                         {"id": "b", "text": "핵심 개념을 설명한다."}])
-        self.assertEqual(raised.exception.code, "unsupported_claim")
+        result = self.engine(handler, summary_chunk_chars=1).summarize(
+            language="ko", segments=[{"id": "a", "text": "값은 15이다."},
+                                     {"id": "b", "text": "핵심 개념을 설명한다."}]).to_dict()
+        self.assertEqual(result["format"], "draft")
+        self.assertIn("unsupported_claim", result["warnings"])
+        self.assertIn("15", result["text"])
 
     def test_pure_validator_checks_final_structure_citations_values_and_copy(self):
         source = [{"id": "original", "text": "값은 15이다."}]
@@ -284,12 +288,17 @@ class SummarizerTests(unittest.TestCase):
                         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
                     return gateway_response(summary_document(), finish_reason="length")
 
-                with self.assertRaises(SummarizationError) as raised:
-                    self.engine(handler, correction_max_response_bytes=1024).summarize(
-                        language="ko", segments=self.segments())
+                if mode in {"redirect", "oversize"}:
+                    with self.assertRaises(SummarizationError) as raised:
+                        self.engine(handler, correction_max_response_bytes=1024).summarize(
+                            language="ko", segments=self.segments())
+                    self.assertNotIn("unrelated", str(raised.exception))
+                else:
+                    result = self.engine(handler, correction_max_response_bytes=1024).summarize(
+                        language="ko", segments=self.segments()).to_dict()
+                    self.assertEqual(result["format"], "draft")
+                    self.assertTrue(result["text"])
                 self.assertEqual(len(calls), 1)
-                self.assertNotIn("private", str(raised.exception))
-                self.assertNotIn("unrelated", str(raised.exception))
 
     def test_cancel_between_map_requests_returns_no_partial_summary(self):
         interrupted, calls = False, []
@@ -326,21 +335,95 @@ class SummarizerTests(unittest.TestCase):
                     return httpx.Response(200, json={"choices": [{"finish_reason": finish,
                         "message": {"content": "synthetic-private-partial", "refusal": refusal}}]})
 
-                with self.assertRaises(SummarizationError) as caught:
-                    self.engine(handler).summarize(language="ko", segments=self.segments())
-                self.assertEqual(caught.exception.code, expected)
-                self.assertFalse(caught.exception.retryable)
+                result = self.engine(handler).summarize(language="ko", segments=self.segments()).to_dict()
+                self.assertIn(expected, result["warnings"])
+                self.assertEqual(result["text"], "synthetic-private-partial")
+                self.assertNotIn("synthetic-private-refusal", result["text"])
                 self.assertEqual(len(calls), 1)
-                self.assertNotIn("synthetic-private", str(caught.exception))
 
     def test_protocol_rejects_multiple_choices_and_tool_calls_without_repair(self):
         choice = {"finish_reason": "stop", "message": {"content": json.dumps(summary_document())}}
         for response in ({"choices": [choice, copy.deepcopy(choice)]},
                          {"choices": [{**choice, "message": {**choice["message"], "tool_calls": [{"id": "x"}]}}]}):
-            with self.subTest(response=response), self.assertRaises(SummarizationError) as caught:
-                self.engine(lambda request: httpx.Response(200, json=response)).summarize(
-                    language="ko", segments=self.segments())
-            self.assertEqual(caught.exception.code, "invalid_response")
+            with self.subTest(choice_count=len(response["choices"])):
+                result = self.engine(lambda request: httpx.Response(200, json=response)).summarize(
+                    language="ko", segments=self.segments()).to_dict()
+                self.assertEqual(result["format"], "draft")
+                self.assertIn("invalid_response", result["warnings"])
+                self.assertNotIn("tool_calls", result["text"])
+
+    def test_structured_hidden_reasoning_becomes_visible_warned_draft(self):
+        for tag in ("think", "analysis", "reasoning"):
+            with self.subTest(tag=tag):
+                text=f"<{tag}>synthetic-hidden</{tag}>보이는 요약 내용"
+                result=self.engine(lambda request: gateway_response(summary_document(text=text))).summarize(
+                    language="ko", segments=self.segments()).to_dict()
+                self.assertEqual(result["format"], "draft")
+                self.assertIn("보이는 요약 내용", result["text"])
+                self.assertNotIn("synthetic-hidden", result["text"])
+                self.assertIn("invalid_response", result["warnings"])
+        # Literal source tags are still excluded from the displayed answer,
+        # while the original source itself remains untouched.
+        source=[{"id":"s", "text":"<think>literal source note</think>수업 본문"}]
+        original=copy.deepcopy(source)
+        result=self.engine(lambda request:gateway_response(summary_document(text=source[0]["text"]))).summarize(
+            language="ko", segments=source).to_dict()
+        self.assertEqual(source, original)
+        self.assertNotIn("literal source note", result["text"])
+
+    def test_invalid_map_keeps_every_received_batch_and_skips_combine(self):
+        calls = []
+        source = [{"id": "first-private-id", "text": "첫 범위의 값은 15이다."},
+                  {"id": "second-private-id", "text": "둘째 범위는 조건을 설명한다."},
+                  {"id": "third-private-id", "text": "셋째 범위는 예외를 설명한다."}]
+        def handler(request):
+            data = json.loads(json.loads(request.content)["messages"][1]["content"])
+            self.assertIn("segments", data, "A malformed map must not invent a combine citation mapping")
+            calls.append(data)
+            row = data["segments"][0]
+            if len(calls) == 1:
+                return httpx.Response(200, json={"choices": [{"message": {"content": row["text"]}}]})
+            return gateway_response(summary_document(row["id"], row["text"], questions=False))
+        result = self.engine(handler, summary_chunk_chars=1).summarize(language="ko", segments=source).to_dict()
+        self.assertEqual(result["format"], "draft")
+        self.assertEqual(len(calls), 3)
+        for row in source:
+            self.assertIn(row["text"], result["text"])
+            self.assertNotIn(row["id"], result["text"])
+        self.assertNotIn("__PRIVATE_", result["text"])
+
+    def test_invalid_combine_keeps_other_stage_results_without_another_call(self):
+        calls = []
+        source = [{"id": f"private-{index}", "text": chr(65 + index) + " 범위의 설명이다."} for index in range(5)]
+        def handler(request):
+            data = json.loads(json.loads(request.content)["messages"][1]["content"])
+            calls.append(data)
+            if "segments" in data:
+                row = data["segments"][0]
+                return gateway_response(summary_document(row["id"], row["text"], questions=False))
+            text = "\n".join(part["overview"] for part in data["summaries"])
+            return httpx.Response(200, json={"choices": [{"message": {"content": text}}]})
+        result = self.engine(handler, summary_chunk_chars=1).summarize(language="ko", segments=source).to_dict()
+        self.assertEqual(result["format"], "draft")
+        self.assertEqual(len(calls), 6)
+        for row in source:
+            self.assertIn(row["text"], result["text"])
+        self.assertIn("invalid_response", result["warnings"])
+
+    def test_fenced_and_incomplete_content_keeps_readable_body_without_metadata(self):
+        for content in (
+            "```json\n" + json.dumps(summary_document(), ensure_ascii=False) + "\n```",
+            '{"overview":"받은 첫 문장을 보존한다.","source_ids":["foreign-private-id"],"sections":[',
+        ):
+            with self.subTest(length=len(content)):
+                response = {"choices": [{"message": {"content": content,
+                    "reasoning_content": "synthetic-hidden-reasoning"}}]}
+                result = self.engine(lambda request: httpx.Response(200, json=response)).summarize(
+                    language="ko", segments=self.segments()).to_dict()
+                self.assertEqual(result["format"], "draft")
+                self.assertTrue(result["text"])
+                self.assertNotIn("foreign-private-id", result["text"])
+                self.assertNotIn("synthetic-hidden", result["text"])
 
     def test_enqueue_preflight_and_engine_share_small_segment_batch_limit(self):
         source = [{"id": f"row-{index}", "text": "가"} for index in range(64 * 256)]

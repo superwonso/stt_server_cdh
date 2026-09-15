@@ -1,4 +1,4 @@
-"""Source-complete study notes, separate from raw/corrected/translated text.
+"""Best-effort study notes, separate from raw/corrected/translated text.
 
 Only aliased, masked source Markdown is sent to the existing NOVA gateway.
 Structural validation cannot prove semantic accuracy: numbers, contacts and
@@ -10,7 +10,7 @@ import copy
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import httpx
@@ -36,6 +36,15 @@ MAX_EDITS = 512
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MARKDOWN_PUNCTUATION = re.compile(r"([\\`*_{}\[\]()<>#+.!|:~\-=])")
 _BOLD = re.compile(r"\*\*([^*\n]+)\*\*")
+_NON_BODY_TYPES = {"reasoning", "reasoning_content", "analysis", "thinking", "tool_call", "tool_calls", "tool_result", "function_call", "error", "refusal", "metadata"}
+STUDY_NOTE_RESULT_WARNING = "일부 내용을 확인하지 못했습니다. 원문과 함께 확인해 주세요."
+# Codes remain private structured diagnostics; the reader sees one short footer.
+DRAFT_WARNINGS = dict.fromkeys((
+    "invalid_response", "response_truncated", "incomplete_batches", "gateway_unavailable",
+    "authentication_failed", "credit_exhausted", "rate_limited", "model_refused",
+    "interrupted", "content_limited", "placeholder_unresolved",
+), STUDY_NOTE_RESULT_WARNING)
+
 _MESSAGES = {
     "not_configured": "수업 정리본 API가 설정되지 않았습니다.",
     "authentication_failed": "수업 정리본 API 인증을 확인해 주세요.",
@@ -46,8 +55,8 @@ _MESSAGES = {
     "source_too_large": "원문이 수업 정리본의 안전한 입력·출력 또는 처리 횟수 한도를 초과했습니다.",
     "invalid_source": "정리할 수업 원문 구간을 확인할 수 없습니다.",
     "empty_transcript": "정리할 수업 원문이 없습니다.",
-    "invalid_response": "수업 정리본의 형식이나 원문 대응을 확인하지 못해 저장하지 않았습니다.",
-    "response_truncated": "AI 출력이 길이 한도에서 끊겨 수업 정리본을 저장하지 않았습니다. 원문은 그대로 보관됩니다.",
+    "invalid_response": "AI 응답에서 정리본으로 저장할 본문을 찾지 못했습니다. 원문은 그대로 보관됩니다.",
+    "response_truncated": "AI 응답이 끊겼고 저장할 본문을 받지 못했습니다. 원문은 그대로 보관됩니다.",
     "model_refused": "AI가 수업 정리본 작성을 거절했습니다. 원문은 그대로 보관됩니다.",
     # Kept only to explain previously failed jobs; new results are not rejected
     # for numeric/contact changes or contextual terminology edits.
@@ -64,9 +73,20 @@ class StudyNoteError(PostprocessingError):
 @dataclass(frozen=True, repr=False)
 class StudyNoteDocument:
     paragraphs: list[dict[str, Any]]
+    draft_text: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        if self.draft_text is not None:
+            return {"format": "draft", "text": self.draft_text, "warnings": list(self.warnings)}
         return {"paragraphs": copy.deepcopy(self.paragraphs)}
+
+
+@dataclass(frozen=True, repr=False)
+class _StudyNoteReply:
+    document: Any
+    text: str
+    warning: str | None = None
 
 
 def _encode(value) -> bytes:
@@ -164,6 +184,16 @@ def _text(value, limit):
 
 
 def _validate(document, sources):
+    if isinstance(document, dict) and document.get("format") == "draft":
+        if set(document) != {"format", "text", "warnings"}:
+            raise StudyNoteError("invalid_response")
+        text = _text(document["text"], MAX_DOCUMENT_TEXT_CHARS)
+        warnings = document["warnings"]
+        if (not isinstance(warnings, list) or not 1 <= len(warnings) <= 16
+                or any(not isinstance(code, str) or code not in DRAFT_WARNINGS for code in warnings)
+                or len(set(warnings)) != len(warnings) or len(_encode(document)) > MAX_DOCUMENT_BYTES):
+            raise StudyNoteError("invalid_response")
+        return {"format": "draft", "text": text, "warnings": list(warnings)}
     if not isinstance(document, dict) or set(document) != {"paragraphs"}:
         raise StudyNoteError("invalid_response")
     paragraphs = document["paragraphs"]
@@ -219,8 +249,248 @@ def _validate(document, sources):
 
 
 def validate_study_note_document(document, raw) -> dict[str, Any]:
-    """Check structure and complete source coverage, not semantic correctness."""
+    """Check canonical structure; only mapped notes claim source coverage."""
     return _validate(document, validate_study_note_source(raw))
+
+
+def _partial_json_body(value):
+    """Recover strings from body fields without crossing metadata subtrees.
+
+    This is a bounded lexical reader, not JSON repair: it never makes source
+    mappings, never interprets strings as keys, and stops on ambiguous nesting.
+    Incomplete final strings retain their valid prefix only.
+    """
+    body_keys = {"text", "markdown", "content", "body", "summary", "translation"}
+    metadata_keys = {"heading", "title", "id", "source_ids", "edits", "format", "warnings",
+                     "role", "model", "type", "usage", "finish_reason", "refusal", "tool_calls",
+                     "function_call", "arguments", "reasoning", "reasoning_content", "metadata",
+                     "error", "errors", "error_code", "traceback", "stack", "stack_trace", "debug",
+                     "analysis", "thinking", "reasoning_details"}
+    # The transport already bounds bytes. Also bound this local fallback when
+    # called directly by creation-only coercion or another injected engine.
+    limit = min(len(value), 2_000_000)
+    frames, texts, position, recovered = [], [], 0, 0
+
+    def context():
+        if not frames:
+            return False, False
+        parent = frames[-1]
+        if parent["state"] != "value":
+            return True, False
+        key = parent.get("key")
+        return (parent["blocked"] or (isinstance(key, str) and key.casefold().replace("-", "_") in metadata_keys),
+                parent["body"] or key in body_keys or key == "paragraphs")
+
+    def consumed():
+        if frames:
+            frames[-1]["state"] = "separator"
+            frames[-1]["key"] = None
+
+    def quoted(start):
+        end = start + 1
+        while end < limit:
+            if value[end] == "\\":
+                end += 2
+                continue
+            if value[end] == '"':
+                try:
+                    return json.loads(value[start:end + 1], strict=False), end + 1, True
+                except (ValueError, RecursionError):
+                    return None, end + 1, True
+            end += 1
+        tail = value[start + 1:limit]
+        # At most one terminal escape can be incomplete. Bound repair work;
+        # do not search for an arbitrary suffix that invents a valid document.
+        for trim in range(min(12, len(tail)) + 1):
+            try:
+                text = json.loads('"' + (tail[:-trim] if trim else tail) + '"', strict=False)
+                return text, limit, False
+            except (ValueError, RecursionError):
+                continue
+        return None, limit, False
+
+    while position < limit:
+        char = value[position]
+        if char.isspace():
+            position += 1
+            continue
+        if char in "{[":
+            if frames and frames[-1]["state"] != "value":
+                break
+            blocked, body = context()
+            consumed()
+            if len(frames) >= 64:
+                break
+            frames.append({"kind": char, "state": "key" if char == "{" else "value",
+                           "key": None, "blocked": blocked, "body": body, "text_start": len(texts)})
+            position += 1
+            continue
+        if not frames:
+            break
+        frame = frames[-1]
+        if char in "}]":
+            if (char == "}" and frame["kind"] != "{") or (char == "]" and frame["kind"] != "["):
+                break
+            frames.pop()
+            position += 1
+            continue
+        if char == '"':
+            text, position, complete = quoted(position)
+            if frame["kind"] == "{" and frame["state"] == "key":
+                if not complete or not isinstance(text, str):
+                    break
+                frame["key"], frame["state"] = text, "colon"
+                continue
+            if frame["state"] != "value":
+                break
+            if (isinstance(frame.get("key"), str) and frame["key"].casefold() == "type"
+                    and isinstance(text, str) and text.casefold() in _NON_BODY_TYPES):
+                frame["blocked"] = True
+                # A later type marker also invalidates previously collected
+                # text from this same object, without discarding its siblings.
+                del texts[frame["text_start"]:]
+            blocked, body = context()
+            # In objects, only explicit body fields count. An inherited body
+            # context permits plain string array items, not arbitrary metadata.
+            allowed = body if frame["kind"] == "[" else frame.get("key") in body_keys
+            if not blocked and allowed and isinstance(text, str) and text.strip():
+                texts.append(text.strip())
+                recovered += len(text)
+                if recovered > MAX_DOCUMENT_TEXT_CHARS:
+                    break
+            consumed()
+            continue
+        if char == ":":
+            if frame["kind"] != "{" or frame["state"] != "colon":
+                break
+            frame["state"] = "value"
+            position += 1
+            continue
+        if char == ",":
+            if frame["state"] != "separator":
+                break
+            frame["state"] = "key" if frame["kind"] == "{" else "value"
+            position += 1
+            continue
+        if frame["state"] != "value":
+            break
+        # Ignore scalar values. Quotes/nesting are never swallowed as scalar
+        # content, so malformed syntax cannot reset a metadata boundary.
+        start = position
+        while position < limit and not value[position].isspace() and value[position] not in '{}[],:"':
+            position += 1
+        if position == start:
+            break
+        consumed()
+    return "\n\n".join(texts)
+
+
+def _readable_text(value, depth=0):
+    """Recover model body text, never tool arguments, reasoning or HTTP errors.
+
+    Parsing here only makes a readable draft; it does not repair or validate
+    source correspondence. Unknown reference IDs never become clickable links.
+    """
+    if depth > 8:
+        return ""
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if isinstance(kind, str) and kind.casefold() in _NON_BODY_TYPES:
+            return ""
+        if isinstance(value.get("paragraphs"), list):
+            paragraphs = "\n\n".join(filter(None, (_readable_text(row, depth + 1) for row in value["paragraphs"][:MAX_PARAGRAPHS])))
+            if paragraphs:
+                return paragraphs
+        body = ""
+        for key in ("text", "markdown", "content", "body", "summary", "translation"):
+            if isinstance(value.get(key), (str, list, dict)):
+                body = _readable_text(value[key], depth + 1)
+                if body:
+                    break
+        if not body:
+            metadata = {"paragraphs", "heading", "title", "id", "source_ids", "edits", "format", "warnings",
+                        "role", "model", "type", "usage", "finish_reason", "refusal", "tool_calls", "function_call",
+                        "arguments", "reasoning", "reasoning_content", "metadata",
+                        "error", "errors", "error_code", "traceback", "stack", "stack_trace", "debug",
+                     "analysis", "thinking", "reasoning_details"}
+            body = "\n\n".join(filter(None, (_readable_text(item, depth + 1) for key, item in value.items()
+                                             if key.casefold().replace("-", "_") not in metadata)))
+        if not body:
+            return ""
+        heading = value.get("heading", value.get("title"))
+        if isinstance(heading, str) and heading.strip():
+            body = heading.strip() + "\n\n" + body
+        if isinstance(value.get("edits"), list):
+            for edit in value["edits"][:16]:
+                if isinstance(edit, dict) and isinstance(edit.get("original"), str) and isinstance(edit.get("replacement"), str):
+                    body += f"\n{edit['original']} → {edit['replacement']}"
+        return body
+    if isinstance(value, list):
+        return "\n\n".join(filter(None, (_readable_text(row, depth + 1) for row in value[:MAX_PARAGRAPHS])))
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value:
+        return ""
+    if depth:
+        # Text fields are already the generated body. A lesson may legitimately
+        # contain JSON/code: do not parse it again and discard its examples.
+        return value
+    if value.startswith("```"):
+        value = re.sub(r"^```[^\n]*\n", "", value)
+        value = re.sub(r"\n```\s*$", "", value).strip()
+    if value.startswith(("{", "[")):
+        # A prose marker such as "[불명확] 설명" or "{표기} 설명" is not
+        # a malformed JSON envelope. Recognize only a short, plain prefix;
+        # never turn metadata-shaped JSON into a raw-text fallback.
+        prose_prefix = (r'^\[[^\[\]{}":,\r\n]{1,120}\]\s*\S' if value.startswith("[")
+                        else r'^\{[^{}\[\]":,\r\n]{1,120}\}\s*\S')
+        after_open = value[1:].lstrip()
+        prose_start = value.startswith("{") or (after_open and after_open[0] not in '"{[tfn-0123456789]')
+        if prose_start and re.match(prose_prefix, value):
+            return value
+        try:
+            json_text = '{"paragraphs":' + value + '}' if value.startswith("[") else value
+            parsed = parse_json_document({"choices": [{"message": {"content": json_text}}]})
+            return _readable_text(parsed, depth + 1)
+        except ProtocolError:
+            return _partial_json_body(value)
+    return value
+
+
+def _draft_document(text, warnings):
+    codes = list(dict.fromkeys(code if code in DRAFT_WARNINGS else "invalid_response" for code in warnings))
+    if not codes:
+        codes = ["invalid_response"]
+    safe = _CONTROL.sub("", text).encode("utf-8", errors="replace").decode("utf-8").strip()
+    if safe != text or len(safe) > MAX_DOCUMENT_TEXT_CHARS:
+        codes = list(dict.fromkeys([*codes, "content_limited"]))
+    safe = safe[:MAX_DOCUMENT_TEXT_CHARS]
+    if not safe:
+        raise StudyNoteError("invalid_response")
+    document = {"format": "draft", "text": safe, "warnings": codes}
+    if len(_encode(document)) > MAX_DOCUMENT_BYTES:
+        codes = list(dict.fromkeys([*codes, "content_limited"]))
+        # Bound serialized bytes too (emoji and escaped characters differ).
+        low, high = 0, len(safe)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = {"format": "draft", "text": safe[:middle], "warnings": codes}
+            if len(_encode(candidate)) <= MAX_DOCUMENT_BYTES:
+                low = middle
+            else:
+                high = middle - 1
+        document = {"format": "draft", "text": safe[:low].rstrip(), "warnings": codes}
+    return _validate(document, [])
+
+
+def coerce_study_note_document(document, raw) -> dict[str, Any]:
+    """Creation-only salvage. Saved documents still use strict validation."""
+    sources = validate_study_note_source(raw)
+    try:
+        return _validate(document, sources)
+    except StudyNoteError:
+        return _draft_document(_readable_text(document), ["invalid_response"])
 
 
 def _escape(text):
@@ -253,7 +523,13 @@ def study_note_markdown(document, raw) -> str:
     sources = validate_study_note_source(raw)
     checked = _validate(document, sources)
     by_id = {row["id"]: row for row in sources}
-    parts = ["# 수업 정리본", "AI가 작성한 별도 정리본입니다. 원문·후보정·번역은 변경하지 않았으며, 숫자·연락처·불명확한 표현과 용어 복원은 원문을 확인하세요."]
+    parts = ["# 수업 정리본"]
+    if checked.get("format") == "draft":
+        parts.extend([_body_markdown(checked["text"]), STUDY_NOTE_RESULT_WARNING])
+        markdown = "\n\n".join(parts) + "\n"
+        if len(markdown.encode("utf-8")) > MAX_MARKDOWN_BYTES:
+            raise StudyNoteError("invalid_response")
+        return markdown
     for paragraph in checked["paragraphs"]:
         group = [by_id[identifier] for identifier in paragraph["source_ids"]]
         start, end = min(row["start"] for row in group), max(row["end"] for row in group)
@@ -304,12 +580,19 @@ class MindlogicStudyNotes:
         sources = _source(segments)
         masked, private, markdown, ranges = _prepare(sources)
 
+        warnings = []
+
         def restore(value):
             # Restore known masks in every generated text field, even when
             # reordered/repeated. An invented mask has no recoverable value:
             # mark that span without losing the rest or guessing private data.
             # One pass also preserves literal placeholder text in the source.
-            return _PLACEHOLDER.sub(lambda match: private.get(match.group(0), "[가려진 값 확인 필요]"), value)
+            def replacement(match):
+                if match.group(0) not in private:
+                    warnings.append("placeholder_unresolved")
+                    return "[가려진 값 확인 필요]"
+                return private[match.group(0)]
+            return _PLACEHOLDER.sub(replacement, value)
 
         # The transport JSON-encodes the user JSON string a second time. All
         # source context is identical, aliases are fixed-width, and enum/list
@@ -322,17 +605,37 @@ class MindlogicStudyNotes:
         if len(_encode(largest_payload)) > _MAX_REQUEST_BYTES:
             raise StudyNoteError("source_too_large")
         del largest_payload
-        result = []
+        result, received = [], []
         for begin, end in ranges:
-            self._interrupted(interrupted)
             targets = masked[begin:end]
-            document = self._request(language, markdown, targets, interrupted)
-            self._interrupted(interrupted)
+            try:
+                self._interrupted(interrupted)
+                reply = self._request(language, markdown, targets, interrupted)
+            except PostprocessingError as error:
+                if not received:
+                    raise
+                warnings.extend([error.code, "incomplete_batches"])
+                break
+            if reply.warning:
+                warnings.append(reply.warning)
+            body = _readable_text(reply.document) if reply.document is not None else _readable_text(reply.text)
+            if body:
+                received.append(restore(body))
+            else:
+                warnings.extend(["invalid_response", "incomplete_batches"])
+                continue
             # Validate aliased groups against precisely this target range, not
             # the full context. Then restore original IDs and protected values.
             alias_sources = [{**source, "id": item["id"], "text": item["text"]}
                              for source, item in zip(sources[begin:end], targets, strict=True)]
-            checked = _validate(document, alias_sources)
+            try:
+                checked = _validate(reply.document, alias_sources)
+                if checked.get("format") == "draft":
+                    warnings.extend(checked["warnings"])
+                    continue
+            except StudyNoteError:
+                warnings.append("invalid_response")
+                continue
             original_ids = {item["id"]: source["id"] for source, item in zip(sources[begin:end], targets, strict=True)}
             for paragraph in checked["paragraphs"]:
                 paragraph["source_ids"] = [original_ids[identifier] for identifier in paragraph["source_ids"]]
@@ -342,9 +645,18 @@ class MindlogicStudyNotes:
                     for field in ("original", "replacement"):
                         edit[field] = restore(edit[field])
                 result.append(paragraph)
-        self._interrupted(interrupted)
-        checked = _validate({"paragraphs": result}, sources)
-        return StudyNoteDocument(checked["paragraphs"])
+        if not received:
+            raise StudyNoteError("invalid_response")
+        if interrupted is not None and interrupted():
+            warnings.append("interrupted")
+        if not warnings:
+            try:
+                checked = _validate({"paragraphs": result}, sources)
+                return StudyNoteDocument(checked["paragraphs"])
+            except StudyNoteError:
+                warnings.append("invalid_response")
+        draft = _draft_document("\n\n".join(received), warnings)
+        return StudyNoteDocument([], draft_text=draft["text"], warnings=draft["warnings"])
 
     def _payload(self, language, markdown, targets):
         ids = [row["id"] for row in targets]
@@ -399,6 +711,25 @@ class MindlogicStudyNotes:
         except (httpx.HTTPError, OSError):
             raise StudyNoteError("gateway_unavailable") from None
         try:
-            return parse_json_document(response)
+            document = parse_json_document(response)
+            return _StudyNoteReply(document, "")
         except ProtocolError as error:
-            raise StudyNoteError(error.code) from None
+            # Preserve only explicit generated body text, not raw HTTP errors,
+            # hidden reasoning, tool arguments, refusal metadata or credentials.
+            texts = []
+            choices = response.get("choices") if isinstance(response, dict) else None
+            for choice in choices[:8] if isinstance(choices, list) else []:
+                message = choice.get("message") if isinstance(choice, dict) else None
+                content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    texts.extend(block["text"] for block in content[:64] if isinstance(block, dict)
+                                 and isinstance(block.get("type"), str) and block["type"] in {"text", "output_text"}
+                                 and isinstance(block.get("text"), str))
+            if not texts and isinstance(response, dict) and isinstance(response.get("output_text"), str):
+                texts.append(response["output_text"])
+            text = "\n\n".join(texts)
+            if not _readable_text(text):
+                raise StudyNoteError(error.code) from None
+            return _StudyNoteReply(None, text, error.code)

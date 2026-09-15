@@ -215,11 +215,11 @@ class StudyNoteTests(unittest.TestCase):
                           {"original": "연락처 복원", "replacement": masks[1], "uncertain": True}]}]})
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
             result = MindlogicStudyNotes(self.settings(), client).create(language="ko", segments=raw)
-        paragraph = result.paragraphs[0]
-        self.assertEqual(paragraph["heading"], "1. 값 15")
-        self.assertEqual(paragraph["text"], "010-1234-5678 / fake@example.com / fake@example.com / 새 값 16 / [가려진 값 확인 필요]")
-        self.assertEqual(paragraph["edits"][0]["original"], "15")
-        self.assertEqual(paragraph["edits"][1]["replacement"], "fake@example.com")
+        self.assertIn("placeholder_unresolved", result.warnings)
+        self.assertIn("1. 값 15", result.draft_text)
+        self.assertIn("010-1234-5678 / fake@example.com / fake@example.com / 새 값 16 / [가려진 값 확인 필요]", result.draft_text)
+        self.assertIn("15 → 16", result.draft_text)
+        self.assertIn("연락처 복원 → fake@example.com", result.draft_text)
         self.assertNotIn("__PRIVATE_", study_note_markdown(result.to_dict(), raw))
         for value in ("fake@example.com", "010-1234-5678", "값 15"):
             self.assertNotIn(value, calls[0])
@@ -314,7 +314,7 @@ class StudyNoteTests(unittest.TestCase):
         maximum = [source("범위 끝", "last", 1e12, 1e12)]
         self.assertIn("16666666666:40", study_note_markdown(raw_document(maximum), maximum))
 
-    def test_truncated_refused_malformed_and_transport_errors_never_retry(self):
+    def test_reply_problems_preserve_available_text_but_transport_failures_never_retry(self):
         for kind, expected in (("length", "response_truncated"), ("refusal", "model_refused"),
                                ("bad-id", "invalid_response"), ("duplicate-key", "invalid_response"),
                                ("fence", "invalid_response"), ("network", "gateway_unavailable"),
@@ -333,14 +333,24 @@ class StudyNoteTests(unittest.TestCase):
                         return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
                     return response(document, finish="length" if kind == "length" else "stop", refusal="private-provider-refusal" if kind == "refusal" else None)
                 with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-                    with self.assertRaises(StudyNoteError) as error:
-                        MindlogicStudyNotes(self.settings(correction_max_retries=3), client).create(
+                    engine = MindlogicStudyNotes(self.settings(correction_max_retries=3), client)
+                    raw = [source(identifier="a"), source(identifier="b", start=1)]
+                    if kind in {"length", "refusal", "bad-id", "duplicate-key", "fence"}:
+                        result = engine.create(language="ko", segments=raw)
+                        self.assertEqual(result.to_dict()["format"], "draft")
+                        self.assertIn(expected, result.warnings)
+                        self.assertIn(raw[0]["text"], result.draft_text)
+                        self.assertNotIn("private-provider", json.dumps(result.to_dict()))
+                        self.assertIn(study_notes.STUDY_NOTE_RESULT_WARNING, study_note_markdown(result.to_dict(), raw))
+                    else:
+                        with self.assertRaises(StudyNoteError) as error:
+                            engine.create(
                             language="ko", segments=[source(identifier="a"), source(identifier="b", start=1)])
-                self.assertEqual(error.exception.code, expected)
-                self.assertNotIn("private-provider", str(error.exception))
+                        self.assertEqual(error.exception.code, expected)
+                        self.assertNotIn("private-provider", str(error.exception))
                 self.assertEqual(len(calls), 1)
 
-    def test_second_batch_failure_cannot_return_a_partial_document(self):
+    def test_second_batch_truncation_preserves_all_received_text_as_a_marked_draft(self):
         raw = [source("말", f"local-{index}", index) for index in range(65)]
         before = copy.deepcopy(raw); calls = []
         def handler(request):
@@ -348,9 +358,10 @@ class StudyNoteTests(unittest.TestCase):
             _, data, rows = read_request(request)
             return response(echo_document(data, rows), finish="length" if len(calls) == 2 else "stop")
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-            with self.assertRaises(StudyNoteError) as error:
-                MindlogicStudyNotes(self.settings(), client).create(language="ko", segments=raw)
-        self.assertEqual(error.exception.code, "response_truncated")
+            result = MindlogicStudyNotes(self.settings(), client).create(language="ko", segments=raw)
+        self.assertIn("response_truncated", result.warnings)
+        self.assertEqual(result.to_dict()["format"], "draft")
+        self.assertEqual(result.draft_text.count("말"), 65)
         self.assertEqual(len(calls), 2); self.assertEqual(raw, before)
 
     def test_exactly_32_requests_are_allowed_and_33_are_rejected_preflight(self):
@@ -431,6 +442,11 @@ class StudyNoteTests(unittest.TestCase):
             if case["id"] == "hangul_phonetic_context":
                 document["paragraphs"][0]["edits"] = [{"original": "배치 놀말라이제이션", "replacement": "배치 정규화", "uncertain": True}]
             self.assertTrue(all(validate_study_note_llm.quality_checks(case, document).values()))
+            draft = {"format": "draft", "text": body, "warnings": ["invalid_response"]}
+            draft_checks = validate_study_note_llm.quality_checks(case, draft)
+            self.assertTrue(draft_checks["korean_body"])
+            self.assertFalse(draft_checks["source_mapping_verified"])
+            self.assertFalse(all(draft_checks.values()))
 
     def test_live_smoke_setup_exceptions_are_redacted(self):
         stdout = io.StringIO()

@@ -1,0 +1,7 @@
+# Install the three CUDA wheels from the official cu126 index first.
+-r requirements.txt
+torch==2.11.0+cu126
+torchvision==0.26.0+cu126
+torchaudio==2.11.0+cu126
+psutil==7.2.2
+tzdata==2026.4

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import math
 import os
 import re
@@ -120,6 +121,7 @@ class Settings:
     # None retains the in-process adapter for isolated fixtures/legacy use.
     # The managed launcher explicitly selects the private same-PC UDS.
     local_model_socket: Path | None = field(default=None, repr=False)
+    local_model_runtime: Path | None = field(default=None, repr=False)
     local_model_timeout_seconds: float = 90.0
     session_hours: int = 24
     max_pending_chunks: int = 2
@@ -170,6 +172,13 @@ class Settings:
     correction_max_response_bytes: int = 2 * 1024 * 1024
 
     def __post_init__(self) -> None:
+        if self.local_model_runtime is not None:
+            if (not isinstance(self.local_model_runtime, Path)
+                    or not self.local_model_runtime.is_absolute()
+                    or "\x00" in str(self.local_model_runtime)):
+                raise ValueError("LOCAL_MODEL_RUNTIME must be an absolute private directory")
+            if self.local_model_socket is not None:
+                raise ValueError("Select exactly one local model transport")
         if self.local_model_socket is not None and (
             not isinstance(self.local_model_socket, Path)
             or not self.local_model_socket.is_absolute()
@@ -211,7 +220,29 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        load_dotenv(PROJECT_DIR / "server" / ".env", override=False)
+        explicit_env = os.getenv("STT_ENV_FILE")
+        env_file = Path(explicit_env) if explicit_env else PROJECT_DIR / "server" / ".env"
+        if os.name == "nt":
+            if not env_file.is_absolute():
+                raise ValueError("STT_ENV_FILE must be an absolute private path")
+            if explicit_env or env_file.exists() or env_file.is_symlink():
+                from .platform_files import open_file
+                try:
+                    descriptor = open_file(env_file, os.O_RDONLY, private=True)
+                    with os.fdopen(descriptor, "rb") as source:
+                        content = source.read(1024 * 1024 + 1)
+                    if len(content) > 1024 * 1024:
+                        raise ValueError("The private environment file is too large")
+                    decoded = content.decode("utf-8")
+                except (OSError, UnicodeError):
+                    raise ValueError("The private environment file is missing or unsafe") from None
+                # Parse the already validated handle's content: do not reopen
+                # a replaceable pathname after checking its file and parent ACLs.
+                load_dotenv(stream=io.StringIO(decoded), override=False)
+        else:
+            load_dotenv(env_file, override=False)
+        if os.name == "nt" and os.getenv("LOCAL_MODEL_SOCKET", "").strip():
+            raise ValueError("LOCAL_MODEL_SOCKET is Unix-only; use LOCAL_MODEL_RUNTIME on Windows")
         data_dir = _path(os.getenv("DATA_DIR", ".data"))
         accounts = account_usernames(os.getenv("ACCOUNT_USERNAMES"))
         origins = tuple(
@@ -234,6 +265,8 @@ class Settings:
             model_warmup=os.getenv("MODEL_WARMUP", "0").strip().lower() in {"1", "true", "yes", "on"},
             local_model_socket=_path(os.environ["LOCAL_MODEL_SOCKET"])
             if os.getenv("LOCAL_MODEL_SOCKET", "").strip() else None,
+            local_model_runtime=_path(os.environ["LOCAL_MODEL_RUNTIME"])
+            if os.getenv("LOCAL_MODEL_RUNTIME", "").strip() else None,
             local_model_timeout_seconds=float(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "90")),
             session_hours=max(1, min(int(os.getenv("SESSION_HOURS", "24")), 168)),
             max_pending_chunks=max(1, min(int(os.getenv("MAX_PENDING_CHUNKS", "2")), 8)),

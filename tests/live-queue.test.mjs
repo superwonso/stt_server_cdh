@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { encodeWav } from '../web/audio.js';
 import {
   DurableLiveQueue, LiveQueueConflictError, LiveQueueOwnershipError, LiveQueueValidationError, LiveQueueCorruptError,
-  LIVE_QUEUE_DB_VERSION,
+  LIVE_QUEUE_DB_VERSION, heldRecoveryManifest,
 } from '../web/live-queue.js';
 
 const OWNER = 'test-owner';
@@ -913,4 +913,185 @@ test('malformed chunk guard fails closed while a stray true guard blocks transit
   await assert.rejects(queue.markChunkQueued(OWNER,CHUNK_ID),error=>error.code==='live_queue_upload_held');
   await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
   assert.equal(Object.hasOwn(data.chunks.get(CHUNK_ID),'uploadHeld'),false);
+});
+
+async function closableHeldQueue() {
+  const fixture = await heldQueueFixture();
+  await fixture.queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true);
+  const snapshot = await fixture.queue.readExportSnapshot(OWNER);
+  return {...fixture,snapshot,expectedManifest:heldRecoveryManifest(snapshot,CAPTURE_ID)};
+}
+
+test('held recovery manifest is stable across record ordering and ignores unrelated captures',async () => {
+  const {snapshot,expectedManifest} = await closableHeldQueue();
+  const reordered = structuredClone(snapshot);
+  reordered.chunks.reverse();
+  for (const group of ['sessions','chunks','snapshots']) {
+    reordered[group] = reordered[group].map(row => Object.fromEntries(Object.entries(row).reverse()));
+  }
+  assert.equal(heldRecoveryManifest(reordered,CAPTURE_ID),expectedManifest);
+  reordered.sessions.unshift({id:'30000000-0000-4000-8000-000000000000'});
+  reordered.chunks.push({captureId:'30000000-0000-4000-8000-000000000000'});
+  assert.equal(heldRecoveryManifest(reordered,CAPTURE_ID),expectedManifest);
+  assert.equal(snapshot.sessions[0].recoveryClosedAt,undefined);
+});
+
+test('held recovery closure survives requery and changes only the session marker and update time',async () => {
+  const {queue,data,expectedManifest,ids} = await closableHeldQueue();
+  const before = structuredClone(data), bytes = await audioRowsWithBytes(data);
+  queue.now = () => 1700000001000;
+  const calls = [], transaction = queue._transaction;
+  queue._transaction = (names,mode,operation) => {
+    calls.push({names,mode}); return transaction(names,mode,operation);
+  };
+  const closed = await queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true});
+  assert.deepEqual(calls,[{names:['sessions','chunks','pcmSnapshots'],mode:'readwrite'}]);
+  assert.deepEqual(closed,{...before.sessions.get(CAPTURE_ID),recoveryClosedAt:1700000001000,updatedAt:1700000001000});
+  assert.deepEqual(data.chunks,before.chunks); assert.deepEqual(data.pcmSnapshots,before.pcmSnapshots);
+  assert.deepEqual(await audioRowsWithBytes(data),bytes);
+  const reopenedQueue = new DurableLiveQueue({keyRange:queue.keyRange});
+  reopenedQueue._transaction = transaction;
+  assert.deepEqual(await reopenedQueue.getSession(OWNER,CAPTURE_ID),closed);
+  const recovered = await reopenedQueue.recoverOwner(OWNER);
+  assert.equal(recovered.sessions[0].recoveryClosedAt,closed.recoveryClosedAt);
+  assert.equal(recovered.chunks.length,3); assert.equal(recovered.snapshots.length,1);
+  assert.deepEqual(recovered.chunks.map(row => row.state),['inflight','blocked','queued']);
+  assert.equal((await reopenedQueue.readExportSnapshot(OWNER)).sessions[0].recoveryClosedAt,closed.recoveryClosedAt);
+  for (const id of ids) {
+    await assert.rejects(queue.markChunkQueued(OWNER,id),error => error.code === 'live_queue_upload_held');
+    await assert.rejects(frozenLegacyChunkReader(queue).getChunk(OWNER,id),/legacy_strict_chunk_rejected/);
+  }
+  await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false),LiveQueueConflictError);
+  assert.deepEqual(data.chunks,before.chunks);
+  assert.equal(LIVE_QUEUE_DB_VERSION,2);
+});
+
+test('closure is owner-only and requires explicit file confirmation for the exact downloaded manifest',async () => {
+  const {queue,data,expectedManifest} = await closableHeldQueue();
+  const before = structuredClone(data);
+  for (const options of [undefined,{}, {expectedManifest}, {expectedManifest,filesConfirmed:false},
+    {expectedManifest,filesConfirmed:'true'},{expectedManifest:1,filesConfirmed:true},
+    {expectedManifest:'',filesConfirmed:true},{expectedManifest,filesConfirmed:true,skip:true}]) {
+    await assert.rejects(queue.closeHeldRecovery(OWNER,CAPTURE_ID,options),LiveQueueValidationError);
+  }
+  await assert.rejects(queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest:'wrong',filesConfirmed:true}),LiveQueueConflictError);
+  await assert.rejects(queue.closeHeldRecovery('other-owner',CAPTURE_ID,{expectedManifest,filesConfirmed:true}),LiveQueueOwnershipError);
+  await assert.rejects(queue.reopenHeldRecovery('other-owner',CAPTURE_ID),LiveQueueOwnershipError);
+  await assert.rejects(queue.closeHeldRecovery(OWNER,'30000000-0000-4000-8000-000000000000',{expectedManifest,filesConfirmed:true}),
+    error => error.code === 'live_queue_not_found');
+  assert.deepEqual(data,before);
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  await assert.rejects(queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true}),LiveQueueConflictError);
+  await assert.rejects(queue.reopenHeldRecovery(OWNER,CAPTURE_ID),LiveQueueConflictError);
+});
+
+test('changes to downloaded session chunk or PCM metadata invalidate closure without hiding audio',async () => {
+  for (const change of [
+    data => { data.sessions.get(CAPTURE_ID).updatedAt += 1; },
+    data => { data.sessions.get(CAPTURE_ID).nextSequence += 1; data.pcmSnapshots.get(CAPTURE_ID).sequence += 1; },
+    data => { data.chunks.get(CHUNK_ID).updatedAt += 1; },
+    data => { data.chunks.get(CHUNK_ID).attempts += 1; },
+    data => { data.chunks.get(CHUNK_ID).downloadRequested = true; },
+    data => { data.chunks.get(CHUNK_ID).state = 'blocked'; data.chunks.get(CHUNK_ID).errorKind = 'response_lost'; },
+    data => { data.chunks.delete(CHUNK_ID); },
+    data => { data.pcmSnapshots.get(CAPTURE_ID).revision += 1; },
+    data => { data.pcmSnapshots.get(CAPTURE_ID).updatedAt += 1; },
+  ]) {
+    const {queue,data,expectedManifest} = await closableHeldQueue();
+    change(data);
+    const changed = structuredClone(data);
+    await assert.rejects(queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true}),LiveQueueConflictError);
+    assert.deepEqual(data,changed);
+    assert.equal(Object.hasOwn(data.sessions.get(CAPTURE_ID),'recoveryClosedAt'),false);
+  }
+});
+
+test('manifest rejects malformed or mismatched target records without reading WAV payloads',async () => {
+  const {queue,snapshot,expectedManifest} = await closableHeldQueue();
+  for (const change of [
+    value => { value.sessions.push(value.sessions[0]); },
+    value => { value.chunks.push(value.chunks[0]); },
+    value => { value.snapshots.push(value.snapshots[0]); },
+    value => { value.chunks[0].byteLength = 0; },
+    value => { value.chunks[0].sessionCreatedAt += 1; },
+    value => { value.chunks[0].asrProvider = 'qwen'; },
+    value => { delete value.chunks[0].uploadHeld; },
+    value => { value.snapshots[0].sequence += 1; },
+    value => { value.sessions[0].finalQueued = true; },
+  ]) {
+    const invalid = structuredClone(snapshot); change(invalid);
+    assert.throws(() => heldRecoveryManifest(invalid,CAPTURE_ID),LiveQueueCorruptError);
+  }
+  for (const group of ['sessions','chunks','snapshots']) {
+    const invalid = structuredClone(snapshot); invalid[group][0].owner = 'other-owner';
+    assert.throws(() => heldRecoveryManifest(invalid,CAPTURE_ID),LiveQueueOwnershipError);
+  }
+  for (const value of [null,{}, {...snapshot,chunks:null}]) {
+    assert.throws(() => heldRecoveryManifest(value,CAPTURE_ID),LiveQueueValidationError);
+  }
+  const arrayBuffer = Blob.prototype.arrayBuffer, slice = Blob.prototype.slice;
+  Blob.prototype.arrayBuffer = () => { throw new Error('must not read WAV data'); };
+  Blob.prototype.slice = () => { throw new Error('must not slice WAV data'); };
+  try {
+    assert.equal(heldRecoveryManifest(snapshot,CAPTURE_ID),expectedManifest);
+    await queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true});
+    await queue.reopenHeldRecovery(OWNER,CAPTURE_ID);
+  } finally { Blob.prototype.arrayBuffer = arrayBuffer; Blob.prototype.slice = slice; }
+});
+
+test('reopen changes only the closure marker and update time while keeping uncertainty and upload guards',async () => {
+  const {queue,data,expectedManifest,ids} = await closableHeldQueue();
+  await queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true});
+  const before = structuredClone(data), bytes = await audioRowsWithBytes(data);
+  queue.now = () => 1700000002000;
+  const reopened = await queue.reopenHeldRecovery(OWNER,CAPTURE_ID);
+  const {recoveryClosedAt,...withoutMarker} = before.sessions.get(CAPTURE_ID);
+  assert.ok(recoveryClosedAt);
+  assert.deepEqual(reopened,{...withoutMarker,updatedAt:1700000002000});
+  assert.equal(reopened.uploadHeld,true);
+  assert.deepEqual(data.chunks,before.chunks); assert.deepEqual(data.pcmSnapshots,before.pcmSnapshots);
+  assert.deepEqual(await audioRowsWithBytes(data),bytes);
+  for (const id of ids) await assert.rejects(queue.markChunkQueued(OWNER,id),error => error.code === 'live_queue_upload_held');
+  await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false);
+  assert.equal(Object.hasOwn(await queue.getSession(OWNER,CAPTURE_ID),'recoveryClosedAt'),false);
+  assert.deepEqual([...data.chunks.values()].map(row => row.state),['inflight','blocked','queued']);
+});
+
+test('closure and reopen roll back failed writes and repeated decisions remain idempotent',async () => {
+  const {queue,data,failures,expectedManifest} = await closableHeldQueue();
+  const before = structuredClone(data);
+  failures.add('sessions');
+  await assert.rejects(queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true}),/fake write failure/);
+  assert.deepEqual(data,before);
+  failures.clear();
+  const closed = await queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true});
+  const after = structuredClone(data);
+  queue.now = () => 1700000003000;
+  failures.add('sessions');
+  assert.deepEqual(await queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true}),closed);
+  await assert.rejects(queue.reopenHeldRecovery(OWNER,CAPTURE_ID),/fake write failure/);
+  assert.deepEqual(data,after);
+  failures.clear();
+  const reopened = await queue.reopenHeldRecovery(OWNER,CAPTURE_ID);
+  failures.add('sessions');
+  assert.deepEqual(await queue.reopenHeldRecovery(OWNER,CAPTURE_ID),reopened);
+});
+
+test('malformed closure markers fail closed and ordinary creates or updates cannot clear a closure',async () => {
+  for (const value of [undefined,null,false,true,0,-1,1.5,'1700000000000',Infinity,8640000000000001]) {
+    const {queue,data} = await closableHeldQueue();
+    data.sessions.get(CAPTURE_ID).recoveryClosedAt = value;
+    await assert.rejects(queue.getSession(OWNER,CAPTURE_ID),LiveQueueCorruptError);
+    await assert.rejects(queue.recoverOwner(OWNER),LiveQueueCorruptError);
+    await assert.rejects(queue.reopenHeldRecovery(OWNER,CAPTURE_ID),LiveQueueCorruptError);
+  }
+  const {queue,data,expectedManifest} = await closableHeldQueue();
+  await queue.closeHeldRecovery(OWNER,CAPTURE_ID,{expectedManifest,filesConfirmed:true});
+  const closedAt = data.sessions.get(CAPTURE_ID).recoveryClosedAt;
+  assert.equal((await queue.updateSession(OWNER,CAPTURE_ID,{state:'stopped'})).recoveryClosedAt,closedAt);
+  assert.equal((await queue.createSession({id:CAPTURE_ID,owner:OWNER,title:'보관할 합성 수업',
+    source:'microphone',asrProvider:'clova',language:'ko'})).recoveryClosedAt,closedAt);
+  await assert.rejects(queue.updateSession(OWNER,CAPTURE_ID,{recoveryClosedAt:null}),LiveQueueValidationError);
+  delete data.sessions.get(CAPTURE_ID).uploadHeld;
+  await assert.rejects(queue.getSession(OWNER,CAPTURE_ID),LiveQueueCorruptError);
 });

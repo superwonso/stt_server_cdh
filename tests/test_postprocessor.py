@@ -76,7 +76,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
         self.assertNotIn("3.14", transmitted)
         self.assertNotIn("v1.2.3", transmitted)
 
-    def test_sentence_final_email_cannot_be_replaced_with_another_contact(self):
+    def test_changed_contact_is_received_with_diagnostic_warning(self):
         def handler(request):
             data = json.loads(json.loads(request.content)["messages"][1]["content"])
             target = data["segments"][0]
@@ -86,10 +86,10 @@ class MindlogicPostprocessorTests(unittest.TestCase):
             return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(result)}}]})
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
             processor = MindlogicPostprocessor(self.settings(), client)
-            with self.assertRaises(PostprocessingError) as raised:
-                processor.correct(title="", language="en", segments=[{
-                    "id": "test-segment", "start": 0, "end": 1, "text": "Contact fake.user@example.com."}])
-        self.assertEqual(raised.exception.code, "privacy_placeholder_changed")
+            result = processor.correct(title="", language="en", segments=[{
+                "id": "test-segment", "start": 0, "end": 1, "text": "Contact fake.user@example.com."}])
+        self.assertIn('other@example.org', result.text)
+        self.assertIn('validation_failed', result.warnings)
 
     def test_strict_json_chunks_use_overlap_without_duplicate_output_and_restore_masked_values(self):
         requests: list[dict] = []
@@ -190,7 +190,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
         self.assertEqual(credit_calls, 1)
         credit_client.close()
 
-    def test_changed_ids_numbers_placeholders_and_oversized_sources_fail_closed(self):
+    def test_changed_result_is_warned_but_oversized_sources_still_fail(self):
         cases = ("id", "number", "placeholder")
         for case in cases:
             with self.subTest(case=case):
@@ -212,8 +212,14 @@ class MindlogicPostprocessorTests(unittest.TestCase):
                 segment = self.source_segments()[1:2] if case == "placeholder" else self.source_segments()[:1]
                 client = httpx.Client(transport=httpx.MockTransport(handler))
                 processor = MindlogicPostprocessor(self.settings(), client)
-                with self.assertRaises(PostprocessingError):
-                    processor.correct(title="", language="ko", segments=segment)
+                result = processor.correct(title="", language="ko", segments=segment)
+                self.assertTrue(result.text)
+                self.assertTrue(result.warnings)
+                if case == 'id':
+                    self.assertEqual(result.segments, [])
+                    self.assertIsNotNone(result.draft_text)
+                else:
+                    self.assertEqual(result.segments[0]['id'], segment[0]['id'])
                 client.close()
 
         client = httpx.Client(
@@ -259,7 +265,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
                 self.assertEqual(result.uncertain_terms, [warning])
                 client.close()
 
-    def test_existing_number_cannot_be_changed_and_appended_elsewhere(self):
+    def test_changed_and_appended_number_is_preserved_with_warning(self):
         def handler(request: httpx.Request) -> httpx.Response:
             user_data = json.loads(json.loads(request.content)["messages"][1]["content"])
             target = user_data["segments"][0]
@@ -280,16 +286,16 @@ class MindlogicPostprocessorTests(unittest.TestCase):
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         processor = MindlogicPostprocessor(self.settings(), client)
-        with self.assertRaises(PostprocessingError) as raised:
-            processor.correct(
-                title="",
-                language="ko",
-                segments=[{"id": "s1", "start": 0, "end": 1, "text": "온도는 15도입니다."}],
-            )
-        self.assertEqual(raised.exception.code, "protected_content_changed")
+        result = processor.correct(
+            title="", language="ko",
+            segments=[{"id": "s1", "start": 0, "end": 1, "text": "온도는 15도입니다."}],
+        )
+        self.assertIn('16도', result.text)
+        self.assertIn('15', result.text)
+        self.assertIn('validation_failed', result.warnings)
         client.close()
 
-    def test_incomplete_refused_and_multiple_choice_responses_fail_closed(self):
+    def test_received_body_survives_protocol_diagnostics_but_absent_body_fails(self):
         content = json.dumps({"segments": [{"id": "s1", "text": "정상 문장입니다."}], "uncertain_terms": []})
         valid = {"finish_reason": "stop", "message": {"content": content}}
         cases = {
@@ -314,17 +320,19 @@ class MindlogicPostprocessorTests(unittest.TestCase):
                 source = [{"id": "s1", "start": 0, "end": 1, "text": "정상 문장입니다."}]
                 with httpx.Client(transport=httpx.MockTransport(handler)) as client:
                     processor = MindlogicPostprocessor(self.settings(correction_max_retries=3), client)
-                    with self.assertRaises(PostprocessingError) as raised:
-                        processor.correct(title="", language="ko", segments=source)
-                expected_code = ("response_truncated" if name == "length"
-                                 else "model_refused" if name in {"refusal", "content_filter"}
-                                 else "invalid_response")
-                self.assertEqual(raised.exception.code, expected_code)
-                self.assertNotIn("provider-private", str(raised.exception))
+                    if name in {'length', 'content_filter', 'tool_calls', 'refusal', 'multiple_choices'}:
+                        result = processor.correct(title="", language="ko", segments=source)
+                        self.assertIn('정상 문장입니다.', result.text)
+                        self.assertTrue(result.warnings)
+                        self.assertNotIn('provider-private-refusal', result.text)
+                    else:
+                        with self.assertRaises(PostprocessingError) as raised:
+                            processor.correct(title="", language="ko", segments=source)
+                        self.assertEqual(raised.exception.code, 'invalid_response')
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(source[0]["text"], "정상 문장입니다.")
 
-    def test_duplicate_json_keys_and_nonstandard_constants_fail_closed(self):
+    def test_duplicate_keys_and_nonstandard_constants_keep_unmapped_body(self):
         # Each duplicate has a valid last value, so ordinary json.loads would
         # silently discard the earlier value and accept the correction.
         item = '{"id":"s1","text":"정상 문장입니다."}'
@@ -346,11 +354,13 @@ class MindlogicPostprocessorTests(unittest.TestCase):
 
                 with httpx.Client(transport=httpx.MockTransport(handler)) as client:
                     processor = MindlogicPostprocessor(self.settings(), client)
-                    with self.assertRaises(PostprocessingError) as raised:
-                        processor.correct(title="", language="ko", segments=[{
-                            "id": "s1", "start": 0, "end": 1, "text": "정상 문장입니다."}])
-                self.assertEqual(raised.exception.code, "invalid_response")
-                self.assertNotIn("provider-private", str(raised.exception))
+                    result = processor.correct(title="", language="ko", segments=[{
+                        "id": "s1", "start": 0, "end": 1, "text": "정상 문장입니다."}])
+                self.assertEqual(result.segments, [])
+                self.assertIn('정상 문장입니다.', result.draft_text)
+                self.assertIn('invalid_response', result.warnings)
+                if name == 'uncertain_terms':
+                    self.assertNotIn('provider-private-text', result.draft_text)
                 self.assertEqual(len(calls), 1)
 
     def test_stop_and_legacy_missing_finish_reason_preserve_valid_corrections(self):
@@ -445,7 +455,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
         self.assertGreater(len(calls), 2, "raw 6k char batches miss most placeholder output cost")
         self.assertEqual(result.segments, source)
 
-    def test_masked_text_growth_does_not_weaken_the_restored_source_length_limit(self):
+    def test_long_received_text_is_retained_with_length_diagnostic(self):
         source = [{"id": "numeric-source", "start": 0, "end": 1, "text": "값 " + "1 " * 80 + "끝"}]
         original = copy.deepcopy(source)
         calls = []
@@ -463,9 +473,9 @@ class MindlogicPostprocessorTests(unittest.TestCase):
                 {"segments": [target], "uncertain_terms": []}, ensure_ascii=False)}}]})
 
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-            with self.assertRaises(PostprocessingError) as raised:
-                MindlogicPostprocessor(self.settings(), client).correct(title="", language="ko", segments=source)
-        self.assertEqual(raised.exception.code, "invalid_response")
+            result = MindlogicPostprocessor(self.settings(), client).correct(title="", language="ko", segments=source)
+        self.assertTrue(result.text)
+        self.assertIn('invalid_response', result.warnings)
         self.assertEqual(len(calls), 1)
         self.assertEqual(source, original)
 
@@ -485,29 +495,21 @@ class MindlogicPostprocessorTests(unittest.TestCase):
         self.assertTrue(all(8192 <= value <= 16384 for value in calls))
         self.assertEqual(result.segments, source)
 
-    def test_only_confirmed_truncation_splits_targets_and_preserves_ids_times_and_context(self):
-        source = [{"id": f"source-{index}", "start": index / 2, "end": index / 2 + 0.5,
-                   "text": f"값은 {index + 10}이며 조건은 유지합니다."} for index in range(8)]
-        original = copy.deepcopy(source)
+    def test_received_truncated_body_is_retained_without_split_rebilling(self):
+        source = self.source_segments()
+        before = copy.deepcopy(source)
         calls = []
-
         def handler(request):
-            body = json.loads(request.content)
-            data = json.loads(body["messages"][1]["content"])
-            calls.append(data)
-            if len(data["segments"]) > 4:
-                return httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {"content": '{"segments":['}}]})
-            return self.echo_response(body)
-
+            calls.append(request)
+            return httpx.Response(200, json={'choices': [{'finish_reason': 'length', 'message': {
+                'content': '{"segments":[{"id":"s1","text":"받은 후보정 내용"'}}]})
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-            result = MindlogicPostprocessor(self.settings(), client).correct(title="", language="ko", segments=source)
-        self.assertEqual([len(data["segments"]) for data in calls], [8, 4, 4])
-        self.assertEqual(result.segments, original)
-        self.assertEqual(source, original)
-        self.assertTrue(calls[1]["readonly_context"]["after"])
-        self.assertTrue(calls[2]["readonly_context"]["before"])
-        self.assertEqual([row["id"] for row in calls[1]["segments"] + calls[2]["segments"]],
-                         [row["id"] for row in source])
+            result = MindlogicPostprocessor(self.settings(), client).correct(title='', language='ko', segments=source)
+        self.assertEqual(result.segments, [])
+        self.assertEqual(result.draft_text, '받은 후보정 내용')
+        self.assertIn('response_truncated', result.warnings)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(source, before)
 
     def test_truncated_large_single_segment_is_not_split_or_saved_and_tokens_are_capped(self):
         source = [{"id": "large-single", "start": 0, "end": 1, "text": "가" * 24_000}]
@@ -527,7 +529,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(source, original)
 
-    def test_truncation_split_depth_is_bounded(self):
+    def test_empty_truncation_does_not_start_split_requests(self):
         source = [{"id": f"source-{index}", "start": index, "end": index + 1, "text": "말"}
                   for index in range(64)]
         calls = []
@@ -541,29 +543,27 @@ class MindlogicPostprocessorTests(unittest.TestCase):
             with self.assertRaises(PostprocessingError) as raised:
                 MindlogicPostprocessor(self.settings(), client).correct(title="", language="ko", segments=source)
         self.assertEqual(raised.exception.code, "response_truncated")
-        self.assertEqual(calls, [64, 32, 16, 8, 4])
+        self.assertEqual(calls, [64])
 
-    def test_total_split_budget_is_shared_across_chunks_and_capped_at_80_logical_calls(self):
-        source = [{"id": f"source-{index}", "start": index, "end": index + 1, "text": "말"}
-                  for index in range(128)]
+    def test_received_draft_batches_keep_base_budget_and_later_answers(self):
+        source = [{'id':f's-{i}','start':i,'end':i+1,'text':'말'} for i in range(128)]
         calls = []
-
         def handler(request):
             body = json.loads(request.content)
-            data = json.loads(body["messages"][1]["content"])
-            calls.append(data)
-            index = int(data["segments"][0]["id"].split("-")[-1])
-            if len(data["segments"]) == 2 and index < 16:
-                return httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {"content": "{"}}]})
+            calls.append(body)
+            if len(calls) == 1:
+                return httpx.Response(200, json={'choices':[{'finish_reason':'length','message':{
+                    'content':'{"segments":[{"text":"처음 받은 내용"'}}]})
             return self.echo_response(body)
-
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-            result = MindlogicPostprocessor(self.settings(correction_chunk_chars=2), client).correct(
-                title="", language="ko", segments=source)
-        self.assertEqual(len(calls), 80)
-        self.assertEqual(result.segments, source)
+            result = MindlogicPostprocessor(self.settings(correction_chunk_chars=2),client).correct(title='',language='ko',segments=source)
+        self.assertEqual(len(calls),64)
+        self.assertEqual(result.segments,[])
+        self.assertTrue(result.draft_text.startswith('처음 받은 내용'))
+        self.assertTrue(result.draft_text.endswith('말'))
+        self.assertIn('response_truncated',result.warnings)
 
-    def test_exhausted_split_budget_fails_without_returning_preceding_partial_corrections(self):
+    def test_empty_response_fails_once_without_success_or_rebilling(self):
         source = [{"id": f"source-{index}", "start": index, "end": index + 1, "text": "말"}
                   for index in range(18)]
         before = copy.deepcopy(source)
@@ -581,7 +581,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
             with self.assertRaises(PostprocessingError) as raised:
                 MindlogicPostprocessor(self.settings(correction_chunk_chars=2), client).correct(title="", language="ko", segments=source)
         self.assertEqual(raised.exception.code, "response_truncated")
-        self.assertEqual(len(calls), 25)  # Nine planned calls + sixteen extra.
+        self.assertEqual(len(calls), 1)  # Empty output never triggers split rebilling.
         self.assertEqual(source, before)
 
     def test_interruption_after_truncation_does_not_start_split_requests(self):
@@ -620,12 +620,54 @@ class MindlogicPostprocessorTests(unittest.TestCase):
                     return httpx.Response(200, json={"choices": [{"finish_reason": "length" if mode == "refused_length" else "stop", "message": message}]})
 
                 with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-                    with self.assertRaises(PostprocessingError) as raised:
-                        MindlogicPostprocessor(self.settings(correction_max_retries=3), client).correct(
-                            title="", language="ko", segments=self.source_segments())
-                self.assertEqual(raised.exception.code, "model_refused" if mode == "refused_length" else "invalid_response")
+                    result = MindlogicPostprocessor(self.settings(correction_max_retries=3), client).correct(
+                        title="", language="ko", segments=self.source_segments())
+                self.assertTrue(result.text)
+                self.assertIn('model_refused' if mode == 'refused_length' else 'invalid_response', result.warnings)
+                if mode in {'reordered', 'missing_uncertainty', 'refused_length'}:
+                    self.assertEqual(result.segments, self.source_segments())
+                else:
+                    self.assertEqual(result.segments, [])
                 self.assertEqual(len(calls), 1)
-                self.assertNotIn("provider-private", str(raised.exception))
+                self.assertNotIn('provider-private-refusal', result.text)
+
+
+    def test_plain_draft_keeps_body_but_excludes_reasoning_and_unknown_markers(self):
+        body = '받은 후보정 본문. <think>hidden-model-reasoning</think> __PRIVATE_999999__'
+        envelope = {'choices': [{'finish_reason':'length','message': {
+            'content': body, 'reasoning_content':'hidden-envelope-reasoning'}}], 'error': {'message':'private-error-body'}}
+        with httpx.Client(transport=httpx.MockTransport(lambda request:httpx.Response(200,json=envelope))) as client:
+            result = MindlogicPostprocessor(self.settings(),client).correct(title='',language='ko',segments=self.source_segments())
+        self.assertEqual(result.segments, [])
+        self.assertIn('받은 후보정 본문.',result.draft_text)
+        for private in ('hidden-model-reasoning','hidden-envelope-reasoning','private-error-body','__PRIVATE_999999__'):
+            self.assertNotIn(private,result.draft_text)
+        self.assertIn('placeholder_unresolved',result.warnings)
+
+    def test_cross_row_placeholder_is_not_restored_into_another_source_segment(self):
+        raw=[{'id':'one','start':0,'end':1,'text':'첫 값은 15입니다.'},
+             {'id':'two','start':1,'end':2,'text':'둘째 값은 20입니다.'}]
+        def handler(request):
+            targets=json.loads(json.loads(request.content)['messages'][1]['content'])['segments']
+            targets[0]['text']='받은 문장 __PRIVATE_000002__'
+            return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'segments':targets,'uncertain_terms':[]})}}]})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result=MindlogicPostprocessor(self.settings(),client).correct(title='',language='ko',segments=raw)
+        self.assertEqual([row['id'] for row in result.segments],['one','two'])
+        self.assertNotIn('20',result.segments[0]['text'])
+        self.assertIn('[보호된 내용]',result.segments[0]['text'])
+        self.assertIn('20',result.segments[1]['text'])
+        self.assertIn('placeholder_unresolved',result.warnings)
+
+    def test_otherwise_valid_mapped_result_never_displays_hidden_reasoning(self):
+        def handler(request):
+            targets=json.loads(json.loads(request.content)['messages'][1]['content'])['segments']
+            targets[0]['text']='<think>hidden-thought</think>'+targets[0]['text']
+            return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'segments':targets,'uncertain_terms':[]})}}]})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result=MindlogicPostprocessor(self.settings(),client).correct(title='',language='ko',segments=self.source_segments())
+        self.assertNotIn('hidden-thought',result.text)
+        self.assertIn('validation_failed',result.warnings)
 
 
 if __name__ == "__main__":

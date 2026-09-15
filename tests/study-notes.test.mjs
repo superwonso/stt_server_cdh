@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { studyNoteSourceSnapshot, validateStudyNoteDocument, validateStudyNoteResponse, appendStudyNoteText } from '../web/study-notes.js';
+import { studyNoteSourceSnapshot, validateStudyNoteDocument, validateStudyNoteResponse, appendStudyNoteText, studyNoteWarningMessage, STUDY_NOTE_RESULT_WARNING } from '../web/study-notes.js';
 
 const lecture = () => ({id:'lesson-fixture',recording_finalized:true,segments:[
   {id:'raw-one',start:1.25,end:7,text:'개념을 살펴봅시다.'},
@@ -13,6 +13,8 @@ const documentFixture = () => ({paragraphs:[{heading:'개념과 조건',source_i
 const envelope = () => ({configured:true,model:'synthetic-model',study_note:{lecture_id:'lesson-fixture',
   status:'completed',model:'synthetic-model',error_code:null,error:null,created_at:'2026-01-01T00:00:00Z',
   updated_at:'2026-01-01T00:00:01Z',completed_at:'2026-01-01T00:00:01Z',document:documentFixture(),markdown:'# 수업 정리본\n\n본문'}});
+const draftFixture = () => ({format:'draft',text:'# 수업 정리본\n\n**수업 내용**입니다.\n원문 대응을 확인하지 못한 결과도 보관합니다.',
+  warnings:['invalid_response','response_truncated']});
 
 test('study-note source snapshot binds every raw ID time text and finalization', () => {
   const source = lecture(), snapshot = studyNoteSourceSnapshot(source);
@@ -52,6 +54,53 @@ test('study notes accept restored numbers contacts and terms absent from the raw
   assert.deepEqual(checked.paragraphs[0].edits,doc.paragraphs[0].edits);
   const response=envelope(); response.study_note.document=doc;
   assert.ok(validateStudyNoteResponse(response,lecture()));
+});
+
+test('canonical saved drafts accept returned prose without inventing source mappings and clone warnings', () => {
+  const draft=draftFixture(),checked=validateStudyNoteDocument(draft,lecture());
+  assert.deepEqual(checked,draft);
+  assert.equal(Object.hasOwn(checked,'paragraphs'),false);
+  assert.equal(Object.hasOwn(checked,'start'),false);
+  checked.warnings.push('interrupted');assert.equal(draft.warnings.length,2);
+  const value=envelope();value.study_note.document=draft;
+  assert.deepEqual(validateStudyNoteResponse(value,lecture()).study_note.document,draft);
+  assert.equal(validateStudyNoteDocument(draft,{...lecture(),recording_finalized:false}),null);
+});
+
+test('saved draft envelopes reject unknown formats keys empty prose control characters and untrusted warnings', () => {
+  for (const mutate of [d=>d.format='raw',d=>delete d.format,d=>d.text='',d=>d.text=' \n\t',d=>d.text=123,
+    d=>d.text+='\u0000',d=>d.text+='\u000b',d=>d.text+='\u000c',d=>d.text+='\u001f',d=>d.text+='\u007f',
+    d=>d.paragraphs=[],d=>d.source_ids=['foreign'],d=>d.warnings=[],d=>d.warnings=['future_warning'],
+    d=>d.warnings=['<script>alert(1)</script>'],d=>d.warnings=['__proto__'],d=>d.warnings=[123],
+    d=>d.warnings.push(d.warnings[0]),d=>d.warnings='invalid_response',d=>d.warnings=Array(17).fill('invalid_response')]) {
+    const draft=draftFixture();mutate(draft);assert.equal(validateStudyNoteDocument(draft,lecture()),null);
+  }
+  const draft=draftFixture();draft.text+='\n\r\t허용하는 공백';assert.ok(validateStudyNoteDocument(draft,lecture()));
+});
+
+test('saved drafts enforce independent code-point and serialized UTF-8 size bounds', () => {
+  const draft=draftFixture();draft.text='x'.repeat(500000);assert.ok(validateStudyNoteDocument(draft,lecture()));
+  draft.text+='x';assert.equal(validateStudyNoteDocument(draft,lecture()),null);
+  draft.text='😀'.repeat(200000);assert.ok(validateStudyNoteDocument(draft,lecture()));
+  draft.text='😀'.repeat(262144);assert.equal(validateStudyNoteDocument(draft,lecture()),null);
+});
+
+test('all saved draft warning codes use one short footer message rather than provider diagnostics', () => {
+  const codes=['invalid_response','response_truncated','incomplete_batches','gateway_unavailable','authentication_failed',
+    'credit_exhausted','rate_limited','model_refused','interrupted','content_limited','placeholder_unresolved'];
+  const draft=draftFixture();draft.warnings=codes;assert.ok(validateStudyNoteDocument(draft,lecture()));
+  for (const code of codes) assert.equal(studyNoteWarningMessage(code),STUDY_NOTE_RESULT_WARNING);
+  assert.equal(STUDY_NOTE_RESULT_WARNING,'일부 내용을 확인하지 못했습니다. 원문과 함께 확인해 주세요.');
+  assert.equal(studyNoteWarningMessage('unexpected provider text'),null);
+  assert.equal(studyNoteWarningMessage('constructor'),null);
+});
+
+test('draft completion retains job identity metadata and completed-only artifact requirements', () => {
+  for (const mutate of [r=>r.lecture_id='foreign',r=>r.status='failed',r=>r.status='processing',r=>r.created_at='bad',
+    r=>r.completed_at=null,r=>delete r.error_code,r=>r.markdown='']) {
+    const value=envelope();value.study_note.document=draftFixture();mutate(value.study_note);
+    assert.equal(validateStudyNoteResponse(value,lecture()),null);
+  }
 });
 
 test('restoration annotations do not require literal original or replacement substrings', () => {

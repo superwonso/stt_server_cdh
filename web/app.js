@@ -7,13 +7,15 @@ import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './reco
 import { lectureTitle, libraryOptions, validMetadata, validLibrarySearch } from './lecture-library.js';
 import { validManualState, manualSegments, validManualHistory } from './manual-notes.js';
 import { validQuestionJob, validQuestionPage } from './lecture-questions.js';
-import { studyNoteSourceSnapshot, validateStudyNoteResponse, appendStudyNoteText } from './study-notes.js';
+import { studyNoteSourceSnapshot, validateStudyNoteResponse, appendStudyNoteText, STUDY_NOTE_RESULT_WARNING } from './study-notes.js';
+import { RESULT_WARNING, validResultDraft, validResultWarnings } from './llm-results.js';
 import { groupTranscriptSentences } from './transcript-sentences.js';
 import { TranscriptFollow } from './transcript-follow.js';
 import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';
 import { liveCoordination } from './live-coordination.js';
 import { TabAuthSessionStore } from './auth-session.js';
 import {
+  heldRecoveryManifest,
   DurableLiveQueue,
   estimateStorage,
   isLiveQueueUnavailableError,
@@ -52,6 +54,7 @@ let captureCoordinationLease = null;
 let connectionRecoveryPromise = null, lastConnectionRecoveryAt = 0;
 const liveSessions = new Map();
 let localAudioExportSequence = 0, localAudioExportBusy = false, localAudioExportController = null;
+let localAudioExportCaptureId = null, heldRecoveryEvidence = null, heldRecoveryMessage = '';
 const localAudioExportUrls = new Set(), failedAudioDownloadUrls = new Set();
 let fileUploader = null, importJob = null, importProgress = null, importError = '';
 let selectedRecordingFile = null, selectedRecordingOwner = '', recordingSelectionSequence = 0;
@@ -166,19 +169,20 @@ function exportText(lecture, format) {
   const segments = lecture?.segments || [];
   const corrected = lecture?.transcript_version === 'corrected', manual = lecture?.transcript_version === 'manual';
   const versionName = manual ? '직접 수정본' : corrected ? 'AI 후보정본' : '받아쓴 원문';
+  const warning = corrected && validResultWarnings(lecture?.validation_warnings) ? `\n${RESULT_WARNING}\n` : '';
   const versionLine = corrected || manual ? `${versionName} · 받아쓴 원문은 서버에 별도 보관\n` : '';
   if (format === 'text') {
     const body = segments.map(segment => hasSegmentStart(segment)
       ? `[${fmt(segment.start)}] ${segment.text}` : segment.text).join('\n\n');
     const snapshot = lecture.export_snapshot ? `내보낸 시점: ${lecture.export_snapshot} · 부분 기록이며 이후 받아쓴 내용은 포함하지 않습니다.\n` : '';
-    return `${lectureTitle(lecture)}\n${dateLabel(lecture.created_at)}\n${versionLine}${snapshot}\n${body}\n`;
+    return `${lectureTitle(lecture)}\n${dateLabel(lecture.created_at)}\n${versionLine}${snapshot}\n${body}\n${warning}`;
   }
   const language = ({ko:'한국어',en:'영어'})[lecture.language] || '자동 감지';
   const body = segments.map(segment => hasSegmentStart(segment)
     ? `**\\[${fmt(segment.start)}\\]** ${escapeMarkdown(segment.text)}` : escapeMarkdown(segment.text)).join('\n\n');
   const version = corrected || manual ? `\n- 버전: ${versionName} (받아쓴 원문 별도 보관)` : '';
   const snapshot = lecture.export_snapshot ? `\n- 내보낸 시점: ${lecture.export_snapshot}\n- 부분 기록: 이후 받아쓴 내용은 포함하지 않습니다.` : '';
-  return `# ${escapeMarkdown(lectureTitle(lecture))}\n\n- 날짜: ${dateLabel(lecture.created_at)}\n- 언어: ${language}${version}${snapshot}\n\n## ${versionName}\n\n${body}\n`;
+  return `# ${escapeMarkdown(lectureTitle(lecture))}\n\n- 날짜: ${dateLabel(lecture.created_at)}\n- 언어: ${language}${version}${snapshot}\n\n## ${versionName}\n\n${body}\n${warning}`;
 }
 function clearTextExports() {
   for (const url of textExportUrls) URL.revokeObjectURL(url);
@@ -856,6 +860,7 @@ function runtimeSessionFromStored(stored) {
     continuationOf:stored.continuationOf || null,
     uploadHeld:stored.uploadHeld === true,
     heldDurable:stored.uploadHeld === true,
+    recoveryClosedAt:stored.recoveryClosedAt || null,
     continuationVerified:!!stored.continuationOf && !!lecture,
     continuationVerificationOrigin:stored.continuationOf && lecture ? apiUrl : '',
     cancelled:true,
@@ -911,6 +916,7 @@ async function performDurableLiveAudioRecovery(owner) {
       // has not yet been made durable; only the explicit restore action may.
       session.uploadHeld = session.uploadHeld === true || stored.uploadHeld === true;
       if (stored.uploadHeld === true) session.heldDurable = true;
+      session.recoveryClosedAt = stored.recoveryClosedAt || null;
       const candidate = lectures.find(item => item.id === stored.id) || null;
       session.lecture = lectureForStoredProvider(session,candidate);
       session.providerMismatch = !!candidate && !session.lecture && !continuationNeedsVerification(session,candidate);
@@ -1691,6 +1697,8 @@ function showLogin(clear = true) {
   $('auth-local-audio-open').hidden = !mayExportLocalAudio();
   $('auth-local-audio-open').disabled = localAudioExportBusy;
   heldAudioRenderSignature='';$('held-audio-list').replaceChildren();$('held-audio-state').textContent='';$('held-audio-panel').hidden=true;
+  $('closed-held-audio-list').replaceChildren();$('closed-held-audio').hidden=true;$('closed-held-audio').open=false;
+  $('closed-held-audio-count').textContent='0';
 }
 $('auth-toggle').onclick = () => setActivation(passwordReset ? false : !activation);
 function openConnectionDialog() {
@@ -2169,7 +2177,7 @@ async function recoverFileImport() {
 function isHeldCapture(id) { return liveSessions.get(id)?.uploadHeld === true; }
 function nextPendingChunk() { return pending.find(chunk => !isHeldCapture(chunk.captureId)) || null; }
 function activePendingCount() { return pending.reduce((count,chunk)=>count+(isHeldCapture(chunk.captureId)?0:1),0); }
-function queuedCount() { return pending.length; }
+function queuedCount() { return pending.filter(chunk=>!liveSessions.get(chunk.captureId)?.recoveryClosedAt).length; }
 function clovaManualRetryRequired() {
   return !!sendError && (draft?.asrProvider === 'clova'
     || pending.some(chunk => !isHeldCapture(chunk.captureId) && chunk.asrProvider === 'clova'));
@@ -2721,6 +2729,14 @@ function resetCorrectionState(lectureId = '') {
   correction = null; correctionView = 'raw'; correctionLectureId = lectureId;
   correctionLoading = false; correctionStarting = false; correctionError = ''; correctionCreditExhausted = false;
 }
+function appendResultWarning(parent, message = RESULT_WARNING) {
+  const footer = document.createElement('p'); footer.className = 'ai-result-warning';
+  footer.textContent = message; parent.append(footer); return footer;
+}
+function appendResultDraft(parent, value) {
+  const body = document.createElement('p'); body.className = 'ai-result-text';
+  body.textContent = value.text; parent.append(body); appendResultWarning(parent);
+}
 function correctionPayload(value) {
   const payload = value?.correction && typeof value.correction === 'object' ? value.correction : value;
   if (!payload || typeof payload !== 'object') return null;
@@ -2730,7 +2746,8 @@ function correctionPayload(value) {
     ...payload,
     status: ['queued','processing','completed','failed'].includes(status) ? status : 'failed',
     corrected_text: typeof payload.corrected_text === 'string' ? payload.corrected_text
-      : typeof payload.result?.corrected_text === 'string' ? payload.result.corrected_text : '',
+      : typeof payload.result?.corrected_text === 'string' ? payload.result.corrected_text
+        : typeof payload.draft_text === 'string' ? payload.draft_text : '',
     corrected_segments: Array.isArray(payload.corrected_segments) ? payload.corrected_segments
       : Array.isArray(payload.result?.corrected_segments) ? payload.result.corrected_segments : [],
     error: typeof payload.error === 'string' ? payload.error
@@ -2752,7 +2769,7 @@ function normalizedCorrectedSegments(value = correction) {
     }];
   });
   if (segments.length) return segments;
-  const text = String(value?.corrected_text || '').trim();
+  const text = String(value?.corrected_text || value?.draft_text || '').trim();
   return text ? [{id:'corrected-text',start:null,end:null,text}] : [];
 }
 function correctionIsReady() {
@@ -2769,6 +2786,8 @@ function selectedTranscriptLecture() {
   return {
     ...current,
     segments:displayedTranscriptSegments(),
+    validation_warnings:correctionView === 'corrected' && correctionIsReady() && validResultWarnings(correction?.validation_warnings)
+      ? [...correction.validation_warnings] : [],
     transcript_version:correctionView === 'manual' && manualIsCurrent(manualView) && manualView.loaded ? 'manual'
       : correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw',
   };
@@ -2854,7 +2873,7 @@ function renderCorrection() {
   const allUncertain = Array.isArray(correction?.uncertain_terms)
     ? correction.uncertain_terms.filter(term => typeof term === 'string' && term.trim()) : [];
   const uncertain = allUncertain.slice(0,5);
-  if (status === 'completed' && uncertain.length) {
+  if (status === 'completed' && uncertain.length && !validResultWarnings(correction?.validation_warnings)) {
     const remaining = allUncertain.length - uncertain.length;
     detail += ` 확인이 필요한 표현: ${uncertain.join(', ')}${remaining ? ` 외 ${remaining}개` : ''}`;
   }
@@ -4172,6 +4191,7 @@ function summaryEligible() { return !!(user && token && current?.recording_final
 function summaryIsCurrent(view) { return summaryView === view && view.scope === summaryScope(); }
 function summaryPending(row = summaryView.row) { return ['queued','processing'].includes(row?.status); }
 function summaryDocument(value) {
+  if (value?.format === 'draft') return validResultDraft(value);
   const ids = new Set((current?.segments || []).map(s => s.id));
   const text = (s,limit) => typeof s === 'string' && !!s.trim() && s.length <= limit;
   const sources = (s,limit = 12) => Array.isArray(s) && s.length > 0 && s.length <= limit
@@ -4222,10 +4242,11 @@ function renderQuestions() {
       scopeLabel.textContent = job.scope === 'full' ? `전체 원문 ${job.total_segments}개 구간 참고`
         : job.scope === 'retrieved' ? `일부 원문만 참고: 전체 ${job.total_segments}개 중 질문과 관련된 ${job.selected_count}개 구간 · 전체 수업을 검토한 답변이 아닙니다.` : '관련 원문을 찾지 못해 AI에 요청하지 않았어요.';
       row.append(scopeLabel);
+      if (job.document.format === 'draft') appendResultDraft(row,job.document);
       if (job.document.answerability === 'insufficient_evidence') {
         const empty = document.createElement('p'); empty.textContent = '참고한 수업 원문에서 답할 근거가 부족해요. 질문을 더 구체적으로 적거나 원문을 확인해 주세요.'; row.append(empty);
       }
-      for (const paragraph of job.document.paragraphs) {
+      for (const paragraph of job.document.paragraphs || []) {
         const text = document.createElement('p'); text.className = 'manual-note-text'; text.textContent = paragraph.text; row.append(text);
         const links = document.createElement('div'); links.className = 'study-actions';
         for (const id of paragraph.source_ids) {
@@ -4332,6 +4353,7 @@ function summarySources(ids) {
 function renderSummaryDocument(documentValue) {
   const target = $('summary-content'); target.replaceChildren();
   if (!documentValue) return;
+  if (documentValue.format === 'draft') { appendResultDraft(target,documentValue); return; }
   const appendPoint = (parent, tag, text, ids) => {
     const node = document.createElement(tag); node.textContent = text;
     const sources = document.createElement('small'); sources.className = 'summary-sources';
@@ -4363,7 +4385,8 @@ function renderSummary() {
     ? '수업을 종료하고 받아쓰기 저장이 끝나면 원문을 바탕으로 요약할 수 있어요.'
     : view.busy ? '요약 상태를 확인하고 있어요…'
       : pendingSummary ? (view.polls >= 200 ? '요약은 서버에서 계속 진행 중입니다. 상태 확인 버튼으로 다시 확인하세요.' : '서버에서 수업을 요약하고 있어요. 다른 수업을 녹음하거나 살펴봐도 됩니다.')
-        : documentValue ? '핵심 내용과 복습 질문을 정리했어요. 원문과 비교해 확인해 주세요.'
+        : documentValue ? (documentValue.format === 'draft' ? '요약 결과를 저장했어요. 아래에서 읽거나 내려받을 수 있습니다.'
+          : '핵심 내용과 복습 질문을 정리했어요. 원문과 비교해 확인해 주세요.')
           : !view.loaded ? '저장된 요약을 확인하고 있어요…'
             : !view.configured ? '운영자의 수업 요약 API 설정이 필요해요.'
               : view.row?.status === 'failed' ? (view.row.error || '요약하지 못했어요. 다시 요청할 수 있습니다.')
@@ -4426,17 +4449,22 @@ $('summary-download').onclick = () => {
   const plain = value => String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/([\\`*_{}\[\]()#+.!|~\-])/g,'\\$1').replace(/[\r\n]+/g,' ');
   const point = (text,ids) => `${plain(text)} (원문 ${summarySources(ids)})`;
-  const lines = [`# ${plain(lectureTitle(current))} · AI 수업 요약`,'',
-    'AI가 만든 요약입니다. 원문과 비교해 확인하세요.','',
-    point(documentValue.overview,documentValue.overview_source_ids),''];
-  for (const section of documentValue.sections) {
-    lines.push(`## ${plain(section.heading)}`,'');
-    for (const bullet of section.bullets) lines.push(`- ${point(bullet.text,bullet.source_ids)}`);
-    lines.push('');
-  }
-  if (documentValue.review_questions.length) {
-    lines.push('## 복습 질문','');
-    for (const item of documentValue.review_questions) lines.push(`- ${point(item.question,item.source_ids)}`);
+  let lines;
+  if (documentValue.format === 'draft') {
+    lines = [`# ${plain(lectureTitle(current))} · AI 수업 요약`,'',escapeMarkdown(documentValue.text),'',RESULT_WARNING];
+  } else {
+    lines = [`# ${plain(lectureTitle(current))} · AI 수업 요약`,'',
+      'AI가 만든 요약입니다. 원문과 비교해 확인하세요.','',
+      point(documentValue.overview,documentValue.overview_source_ids),''];
+    for (const section of documentValue.sections) {
+      lines.push(`## ${plain(section.heading)}`,'');
+      for (const bullet of section.bullets) lines.push(`- ${point(bullet.text,bullet.source_ids)}`);
+      lines.push('');
+    }
+    if (documentValue.review_questions.length) {
+      lines.push('## 복습 질문','');
+      for (const item of documentValue.review_questions) lines.push(`- ${point(item.question,item.source_ids)}`);
+    }
   }
   const url = URL.createObjectURL(new Blob(['\uFEFF',lines.join('\n')],{type:'text/markdown;charset=utf-8'}));
   const link = document.createElement('a'); link.href = url; link.download = `${safeFilename(lectureTitle(current))}_수업요약.md`;
@@ -4475,12 +4503,20 @@ function translatedSegments(row = translationView.row) {
   }
   return segments;
 }
+function translationDraft(row = translationView.row) {
+  return row?.status === 'completed' ? validResultDraft(row.document) : null;
+}
+function translationHasWarnings(row = translationView.row) {
+  return row?.document?.format === 'segments' && validResultWarnings(row.document.warnings);
+}
 function renderTranslationContent(segments) {
-  const view = translationView, target = $('translation-content');
+  const view = translationView, target = $('translation-content'), draft = translationDraft();
   if (view.renderedSegments === segments && view.renderedMode === view.mode
-      && view.renderedRaw === current?.segments) return;
+      && view.renderedRaw === current?.segments && view.renderedDocument === view.row?.document) return;
   view.renderedSegments = segments; view.renderedMode = view.mode; view.renderedRaw = current?.segments;
+  view.renderedDocument = view.row?.document;
   target.replaceChildren();
+  if (draft) { appendResultDraft(target,draft); return; }
   if (!segments) return;
   for (let index = 0; index < segments.length; index += 1) {
     const translated = segments[index];
@@ -4495,26 +4531,28 @@ function renderTranslationContent(segments) {
     const text = document.createElement('p'); text.className = 'translation-target'; text.lang = 'ko';
     text.textContent = translated.text; row.append(text); target.append(row);
   }
+  if (translationHasWarnings()) appendResultWarning(target);
 }
 function renderTranslation() {
   const scope = translationScope();
   if (translationView.scope !== scope) { resetTranslationView(); translationView.scope = scope; }
   const view = translationView, eligible = translationEligible(), pendingTranslation = translationPending();
-  const segments = translatedSegments();
+  const segments = translatedSegments(), draft = translationDraft(), completed = !!(segments || draft);
   $('translation-panel').hidden = !current || !token;
   $('translation-state').textContent = view.error || (!eligible
     ? '수업을 종료하고 마지막 받아쓰기 저장이 끝나면 영어 원문을 한국어로 번역할 수 있어요.'
     : view.busy ? '번역 상태를 확인하고 있어요…'
       : pendingTranslation ? (view.polls >= 200 ? '번역은 서버에서 계속 진행 중입니다. 상태 확인 버튼으로 다시 확인하세요.' : '수업 전체 문맥을 참고해 문장별로 번역하고 있어요. 다른 수업 녹음은 계속할 수 있습니다.')
-        : segments ? '문장별 원문 대조 또는 한국어 전체 보기로 읽을 수 있어요. 두 보기는 같은 문맥 기반 번역입니다.'
+        : draft ? '번역 결과를 저장했어요. 아래에서 읽거나 내려받을 수 있습니다.'
+          : segments ? '문장별 원문 대조 또는 한국어 전체 보기로 읽을 수 있어요. 두 보기는 같은 문맥 기반 번역입니다.'
           : !view.loaded ? '저장된 번역을 확인하고 있어요…'
             : !view.configured ? '운영자의 번역 API 설정이 필요해요.'
               : view.row?.status === 'failed' ? (view.row.error || '번역하지 못했어요. 다시 요청할 수 있습니다.')
                 : '영어 수업을 문맥에 맞게 한국어로 번역합니다. 원문은 유지하며 긴 수업은 시간이 걸릴 수 있어요.');
-  $('translate-lecture').disabled = !eligible || view.busy || !!segments || (view.loaded && !view.configured);
+  $('translate-lecture').disabled = !eligible || view.busy || completed || (view.loaded && !view.configured);
   $('translate-lecture').textContent = pendingTranslation || view.error || !view.loaded ? '번역 상태 확인'
-    : segments ? '번역 완료' : view.row?.status === 'failed' ? '번역 다시 요청' : '한국어 번역 만들기';
-  $('translation-download').disabled = !segments;
+    : completed ? '번역 완료' : view.row?.status === 'failed' ? '번역 다시 요청' : '한국어 번역 만들기';
+  $('translation-download').disabled = !completed;
   $('translation-views').hidden = !segments;
   for (const mode of ['paired','full']) {
     $(`translation-${mode}`).classList.toggle('active',view.mode === mode);
@@ -4541,7 +4579,7 @@ async function fetchTranslation(create = false) {
     }
     view.configured = result.configured === true;
     view.loaded = true; view.row = result.translation;
-    if (view.row?.status === 'completed' && !translatedSegments()) {
+    if (view.row?.status === 'completed' && !translatedSegments() && !translationDraft()) {
       view.row = null;
       throw new Error('번역과 원문의 문장 연결을 확인하지 못했습니다. 상태를 다시 확인해 주세요.');
     }
@@ -4573,16 +4611,22 @@ for (const mode of ['paired','full']) {
 }
 $('translation-download').onclick = () => {
   if (!translationIsCurrent(translationView) || !translationEligible()) return;
-  const segments = translatedSegments(); if (!segments) return;
+  const segments = translatedSegments(), draft = translationDraft(); if (!segments && !draft) return;
   const plain = value => String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/([\\`*_{}\[\]()#+.!|~\-])/g,'\\$1').replace(/[\r\n]+/g,' ');
-  const paired = translationView.mode === 'paired';
-  const lines = [`# ${plain(lectureTitle(current))} · 한국어 번역`,'',
-    '전체 수업에서 추린 문맥을 참고한 AI 번역입니다. 원문·녹음과 비교해 확인하세요.',''];
-  for (let i = 0; i < segments.length; i += 1) {
-    lines.push(`## ${fmt(segments[i].start)}`,'');
-    if (paired) lines.push(`원문: ${plain(current.segments[i].text)}`,'');
-    lines.push(`${paired ? '번역: ' : ''}${plain(segments[i].text)}`,'');
+  const paired = !draft && translationView.mode === 'paired';
+  let lines;
+  if (draft) {
+    lines = [`# ${plain(lectureTitle(current))} · 한국어 번역`,'',escapeMarkdown(draft.text),'',RESULT_WARNING];
+  } else {
+    lines = [`# ${plain(lectureTitle(current))} · 한국어 번역`,'',
+      '전체 수업에서 추린 문맥을 참고한 AI 번역입니다. 원문·녹음과 비교해 확인하세요.',''];
+    for (let i = 0; i < segments.length; i += 1) {
+      lines.push(`## ${fmt(segments[i].start)}`,'');
+      if (paired) lines.push(`원문: ${plain(current.segments[i].text)}`,'');
+      lines.push(`${paired ? '번역: ' : ''}${plain(segments[i].text)}`,'');
+    }
+    if (translationHasWarnings()) lines.push(RESULT_WARNING);
   }
   const url = URL.createObjectURL(new Blob(['\uFEFF',lines.join('\n')],{type:'text/markdown;charset=utf-8'}));
   const link = document.createElement('a'); link.href = url;
@@ -4622,6 +4666,15 @@ function renderStudyNoteDocument(view) {
   if (view.rendered === doc) return;
   view.rendered = doc;
   const container = $('study-note-content'); container.replaceChildren();
+  if (doc?.format === 'draft') {
+    const section = document.createElement('section'); section.className = 'study-note-paragraph';
+    const body = document.createElement('p'); body.className = 'study-note-text';
+    appendStudyNoteText(body,doc.text,document); section.append(body); container.append(section);
+    // No invented timestamps/source buttons: fallback prose has no verified
+    // paragraph-to-transcript mapping. Keep the issues after all generated text.
+    appendResultWarning(container,STUDY_NOTE_RESULT_WARNING);
+    return;
+  }
   for (const paragraph of doc?.paragraphs || []) {
     const section = document.createElement('section'); section.className = 'study-note-paragraph';
     const heading = document.createElement('h4'); heading.textContent = paragraph.heading;
@@ -4669,7 +4722,9 @@ function renderStudyNote() {
       : studyNotePending(view) ? (view.polls >= 200
         ? '자동 상태 확인을 마쳤지만 서버의 작업은 계속 진행됩니다. 상태 새로고침으로 다시 확인하세요.'
         : '서버에서 수업 정리본을 만들고 있어요. 다른 수업의 녹음은 계속할 수 있습니다.')
-        : completed ? '정리본을 만들었어요. 원문 시간과 불명확한 부분을 확인한 뒤 Markdown으로 저장하세요.'
+        : completed ? (view.row.document?.format === 'draft'
+          ? '정리본을 저장했어요. 아래에서 읽거나 Markdown으로 내려받을 수 있습니다.'
+          : '정리본을 만들었어요. 원문 시간과 불명확한 부분을 확인한 뒤 Markdown으로 저장하세요.')
           : !view.loaded ? '정리본 상태를 불러오면 생성할 수 있어요. 아직 생성 요청을 보내지 않았습니다.'
             : !view.configured ? '운영자의 수업 정리본 API 설정이 필요해요.'
               : view.row?.status === 'failed' ? (view.row.error || '정리본을 만들지 못했어요. 상태 확인 후 명시적으로 다시 요청할 수 있습니다.')
@@ -4801,6 +4856,12 @@ function renderCurrent() {
         : current ? '이 수업에는 표시할 받아쓰기 문장이 없어요.' : '수업 이름을 적고 받아쓰기를 시작해 보세요.';
     empty.append(mark,heading,text); transcript.append(empty);
   }
+  for (const child of [...transcript.children]) {
+    if (child.dataset?.resultWarning === 'correction') transcript.removeChild(child);
+  }
+  if (transcriptVersion === 'corrected' && validResultWarnings(correction?.validation_warnings)) {
+    appendResultWarning(transcript).dataset.resultWarning = 'correction';
+  }
   $('segment-count').textContent = reviewView.query ? `${segments.length} / ${allSegments.length}` : segments.length;
   $('segment-count-unit').textContent = transcriptPresentation === 'sentences' ? '개 문장' : '개 구간';
   for (const [id,mode] of [['transcript-sentences','sentences'],['transcript-chunks','chunks']]) {
@@ -4894,7 +4955,10 @@ function newLessonBlockReason() {
   return capture || recording || paused || inputUnavailable ? '현재 녹음은 종료하거나 “기존 음성 보관 · 새 수업”을 사용하세요.' : holdAudioBlockReason();
 }
 function heldAudioSessions() {
-  return [...liveSessions.values()].filter(session=>session.owner===user && session.uploadHeld);
+  return [...liveSessions.values()].filter(session=>session.owner===user && session.uploadHeld && !session.recoveryClosedAt);
+}
+function closedHeldAudioSessions() {
+  return [...liveSessions.values()].filter(session=>session.owner===user && session.uploadHeld && !!session.recoveryClosedAt);
 }
 function heldRestoreBlockReason() {
   return holdAudioBlockReason() || (capture || recording || paused || inputUnavailable || draft || activePendingCount()
@@ -4902,31 +4966,140 @@ function heldRestoreBlockReason() {
 }
 function renderHeldAudio() {
   const rows=user && token && !$('workspace').hidden ? heldAudioSessions() : [],target=$('held-audio-list');
-  $('held-audio-panel').hidden=!rows.length;
+  const closed=user && token && !$('workspace').hidden ? closedHeldAudioSessions() : [];
+  $('held-audio-panel').hidden=!(rows.length || closed.length);
+  $('closed-held-audio').hidden=!closed.length;
+  $('closed-held-audio-count').textContent=closed.length;
   $('held-audio-state').textContent=rows.length ? `${rows.length}개 수업은 새 수업과 별도로 보관하며 자동 전송하지 않습니다. `
-    + (heldRestoreBlockReason() || '전송 복구는 수업별로 직접 선택하세요. CLOVA의 처리 여부가 불명확하면 먼저 서버 결과만 확인합니다.') : '';
-  const signature=JSON.stringify([user,token,apiUrl,!!heldRestoreBlockReason(),historyNavigationBusy(),rows.map(session=>[session.id,session.title,session.heldError,
-    session.heldDurable,!!session.lecture,pending.filter(chunk=>chunk.captureId===session.id).length])]);
+    + (heldRestoreBlockReason() || '음성 다운로드 후 파일 저장을 확인하면 보류를 종료할 수 있습니다. 전송 복구는 별도로 선택하세요.')
+    : closed.length ? '복구를 기다리는 보류 수업이 없습니다. 종료한 수업의 기기 음성은 아래 보관함에 남아 있습니다.' : '';
+  const signature=JSON.stringify([user,token,apiUrl,!!heldRestoreBlockReason(),historyNavigationBusy(),[...rows,...closed].map(session=>[session.id,session.title,session.heldError,
+    session.heldDurable,session.recoveryClosedAt,heldRecoveryBlockReason(session.id),!!session.lecture,pending.filter(chunk=>chunk.captureId===session.id).length])]);
   if(heldAudioRenderSignature===signature)return;
-  heldAudioRenderSignature=signature;target.replaceChildren();
+  heldAudioRenderSignature=signature;target.replaceChildren();$('closed-held-audio-list').replaceChildren();
+  if(!closed.length)$('closed-held-audio').open=false;
   const owner=user,sessionToken=token,server=apiUrl;
   const sameAccount=()=>owner===user && sessionToken===token && server===apiUrl;
-  for(const session of rows.slice(0,100)){
+  for(const session of [...rows.slice(0,100),...closed.slice(0,100)]){
+    const isClosed=!!session.recoveryClosedAt;
     const card=document.createElement('article');card.className='held-audio-card';card.dataset.captureId=session.id;
     const title=document.createElement('strong');title.textContent=session.title || '보관한 수업';
     const detail=document.createElement('p');detail.textContent=`${pending.filter(chunk=>chunk.captureId===session.id).length}개 음성 조각 · `
       + (session.lecture ? '서버 수업 연결됨' : '서버 미등록 · 기기 원본 보관') + (session.heldDurable ? ' · 기기 저장 확인' : ' · 저장 확인 필요, 탭을 닫지 마세요.');
-    const reason=document.createElement('p');reason.textContent=session.heldError || '이 수업의 음성은 직접 복구하기 전까지 전송하지 않습니다.';
+    const reason=document.createElement('p');reason.textContent=isClosed
+      ? '보류 처리 종료 · 기기 음성은 유지하며 자동 전송하지 않습니다. 서버의 전사 완료 상태와는 다릅니다.'
+      : session.heldError || '이 수업의 음성은 직접 복구하기 전까지 전송하지 않습니다.';
     const actions=document.createElement('div');actions.className='study-actions';
     const view=document.createElement('button');view.type='button';view.textContent='수업 보기';view.disabled=!session.lecture || historyNavigationBusy();
     view.onclick=()=>{if(sameAccount()&&session.lecture)void selectLecture({id:session.id});};
     const download=document.createElement('button');download.type='button';download.textContent='보관 음성 다운로드';
-    download.onclick=()=>{if(sameAccount())void prepareLocalAudioExport();};
+    download.onclick=()=>{if(sameAccount())void prepareLocalAudioExport({captureId:session.id});};
     const restore=document.createElement('button');restore.type='button';restore.textContent='선택한 수업 전송 복구';restore.dataset.action='restore-held';
     restore.disabled=!!heldRestoreBlockReason();restore.onclick=()=>{if(sameAccount())void restoreHeldAudio(session.id);};
-    actions.append(view,download,restore);card.append(title,detail,reason,actions);target.append(card);
+    if(isClosed){
+      const reopen=document.createElement('button');reopen.type='button';reopen.textContent='보류 목록으로 되돌리기';reopen.dataset.action='reopen-held';
+      reopen.disabled=!!heldRecoveryBlockReason(session.id);reopen.onclick=()=>{if(sameAccount())void reopenHeldAudio(session.id);};
+      actions.append(view,download,reopen);
+    }else actions.append(view,download,restore);
+    card.append(title,detail,reason,actions);(isClosed ? $('closed-held-audio-list') : target).append(card);
   }
 }
+
+function heldRecoveryBlockReason(captureId) {
+  if(!user || !token || authenticating || loggingOut)return '같은 계정으로 로그인한 뒤 보류 상태를 변경해 주세요.';
+  if(holdingAudio || starting || pausing || resuming || stopping || liveQueueRecoveryPromise || localAudioExportBusy)
+    return '진행 중인 기기 저장 작업을 마친 뒤 다시 선택해 주세요.';
+  if(capture || recording || paused || inputUnavailable)return '현재 녹음을 종료한 뒤 보류 상태를 변경할 수 있습니다. 음성 다운로드는 지금도 가능합니다.';
+  const session=liveSessions.get(captureId);
+  if(!session || session.owner!==user || !session.uploadHeld)return '이 수업의 전송 보류 상태를 다시 확인해 주세요.';
+  if(!session.heldDurable || session.storageFailed || hasVolatilePendingAudio(session)
+      || pending.some(chunk=>chunk.captureId===captureId && !chunk.durable))
+    return '기기에 안전하게 저장되지 않은 음성이 있어 보류를 종료하지 않았습니다. 저장을 다시 시도하고 음성을 내려받아 주세요.';
+  return '';
+}
+function heldRecoveryEvidenceIsCurrent(evidence=heldRecoveryEvidence) {
+  return !!evidence && evidence===heldRecoveryEvidence && evidence.owner===user && evidence.token===token
+    && evidence.server===apiUrl && !!token && localAudioExportCaptureId===evidence.captureId && $('local-audio-dialog').open;
+}
+function renderHeldRecoveryConfirmation() {
+  const session=liveSessions.get(localAudioExportCaptureId);
+  const visible=!!localAudioExportCaptureId && session?.owner===user && session.uploadHeld && !session.recoveryClosedAt;
+  $('local-audio-finish-panel').hidden=!visible;
+  const evidence=heldRecoveryEvidence;
+  const downloaded=heldRecoveryEvidenceIsCurrent(evidence) && evidence.partCount>0 && evidence.downloaded.size===evidence.partCount;
+  $('local-audio-saved-confirm').disabled=!downloaded || holdingAudio;
+  if(!downloaded)$('local-audio-saved-confirm').checked=false;
+  const blocked=visible ? heldRecoveryBlockReason(session.id) : '';
+  $('local-audio-finish').disabled=!visible || !downloaded || !$('local-audio-saved-confirm').checked || !!blocked;
+  $('local-audio-finish-state').textContent=visible ? heldRecoveryMessage || blocked
+    || (downloaded ? '모든 파일의 저장·재생을 확인한 뒤 아래 확인란을 선택하세요.'
+      : evidence ? `준비한 WAV ${evidence.partCount}개를 모두 내려받아 주세요. (${evidence.downloaded.size}/${evidence.partCount})`
+        : '이 수업의 음성을 빠짐없이 읽고 파일을 준비한 뒤에만 보류를 종료할 수 있습니다.') : '';
+}
+async function changeHeldRecovery(captureId,{reopen=false}={}) {
+  if(expireActiveAuthSession())return false;
+  const blocked=heldRecoveryBlockReason(captureId);if(blocked){notice(blocked);return false;}
+  const session=liveSessions.get(captureId),evidence=heldRecoveryEvidence;
+  if(reopen ? !session.recoveryClosedAt : session.recoveryClosedAt || !heldRecoveryEvidenceIsCurrent(evidence)
+      || evidence.captureId!==captureId || evidence.downloaded.size!==evidence.partCount || !evidence.partCount
+      || !$('local-audio-saved-confirm').checked)return false;
+  const owner=user,sessionToken=token,server=apiUrl,sequence=++holdAudioSequence,exportSequence=localAudioExportSequence;
+  const sameOperation=()=>owner===user && sessionToken===token && server===apiUrl && sequence===holdAudioSequence
+    && liveSessions.get(captureId)===session;
+  const isCurrent=()=>sameOperation() && (reopen || heldRecoveryEvidenceIsCurrent(evidence));
+  let lease=null;holdingAudio=true;heldRecoveryMessage='';updateControls();
+  try{
+    await session.persistChain?.catch(()=>{});
+    if(!isCurrent())return false;
+    if(session.storageFailed || hasVolatilePendingAudio(session))throw new Error('음성 저장 상태가 달라졌습니다. 기기 저장을 확인하고 파일을 다시 내려받아 주세요.');
+    lease=await liveCoordination.acquireLiveCapture(owner);
+    if(!isCurrent())return false;
+    if(!lease?.acquired || !lease.supported)throw new Error('다른 탭의 녹음이 끝난 뒤 다시 선택해 주세요. 음성과 보류 상태는 그대로입니다.');
+    // Do not queue behind an abandoned uploader lock. Neither closing nor
+    // reopening changes held=true, settles audio, or contacts the server.
+    const result=await liveCoordination.tryAllUploaders(owner,async()=>{
+      const queue=await openLiveQueue();if(!isCurrent())return null;
+      if(!queue)throw new Error('기기 저장소를 확인하지 못해 보류 상태를 바꾸지 않았습니다.');
+      return reopen ? queue.reopenHeldRecovery(owner,captureId)
+        : queue.closeHeldRecovery(owner,captureId,{expectedManifest:evidence.manifest,filesConfirmed:true});
+    });
+    // Closing/refreshing the download dialog cannot undo an IDB commit that
+    // already happened. Reflect that result for the same account/session,
+    // without closing or resetting a newer download dialog.
+    if(!sameOperation())return false;
+    if(!result.supported || !result.acquired)throw new Error('다른 탭이 음성을 전송 중입니다. 잠시 후 다시 선택해 주세요. 기다리는 작업을 추가하지 않았습니다.');
+    const saved=result.value;
+    if(!saved || saved.id!==captureId || saved.owner!==owner || saved.uploadHeld!==true
+        || (reopen ? !!saved.recoveryClosedAt : !Number.isSafeInteger(saved.recoveryClosedAt)))
+      throw new Error('저장한 보류 상태를 확인하지 못했습니다. 음성은 그대로 유지합니다.');
+    session.recoveryClosedAt=saved.recoveryClosedAt || null;session.uploadHeld=true;session.heldDurable=true;
+    if(!reopen)recoveryFinalizationRequired.delete(captureId);
+    if(exportSequence===localAudioExportSequence)clearLocalAudioExports();
+    notice(reopen ? '보류 목록으로 되돌렸습니다. 전송은 재개하지 않았으며 전송 복구는 별도로 선택해야 합니다.'
+      : '보류 처리를 종료했습니다. 기기 음성은 종료한 보관 수업에 남아 있으며 다시 내려받을 수 있습니다.');
+    return true;
+  }catch(error){
+    if(isCurrent()){
+      heldRecoveryMessage=`${errorText(error)} 음성은 삭제하지 않았습니다.`;
+      notice(heldRecoveryMessage);
+    }
+    return false;
+  }finally{
+    if(lease?.acquired)await lease.release?.().catch(()=>{});
+    // Clear the operation's busy flag even if its login/view changed midway.
+    if(sequence===holdAudioSequence){
+      holdingAudio=false;updateControls();
+      if(sameOperation()){
+        // A different lesson's uploader may have yielded while the metadata
+        // transition held its gate. Resume normal scheduling, never unhold or
+        // approve retries for this archived capture.
+        void drainRecordingAudio();if(!sendError)void drain();
+      }
+    }
+  }
+}
+async function closeHeldAudio(captureId){return changeHeldRecovery(captureId);}
+async function reopenHeldAudio(captureId){return changeHeldRecovery(captureId,{reopen:true});}
 async function holdPreviousAudio() {
   const blocked=holdAudioBlockReason();if(blocked){notice(blocked);return false;}
   const owner=user,sessionToken=token,server=apiUrl,generation=requestGeneration,sequence=++holdAudioSequence;
@@ -4992,7 +5165,7 @@ async function restoreHeldAudio(captureId) {
   if(expireActiveAuthSession())return;
   const reason=heldRestoreBlockReason();if(reason){notice(reason);return;}
   const session=liveSessions.get(captureId);
-  if(!session || session.owner!==user || !session.uploadHeld)return;
+  if(!session || session.owner!==user || !session.uploadHeld || session.recoveryClosedAt)return;
   const owner=user,sessionToken=token,server=apiUrl,generation=requestGeneration,sequence=++holdAudioSequence;
   const isCurrent=()=>owner===user&&sessionToken===token&&server===apiUrl&&generation===requestGeneration&&sequence===holdAudioSequence;
   let lease=null;holdingAudio=true;updateControls();
@@ -5103,6 +5276,9 @@ function mayExportLocalAudio() {
 
 function clearLocalAudioExports() {
   ++localAudioExportSequence;
+  localAudioExportCaptureId=null;heldRecoveryEvidence=null;heldRecoveryMessage='';
+  $('local-audio-saved-confirm').checked=false;
+  $('local-audio-finish-panel').hidden=true;
   localAudioExportController?.abort(); localAudioExportController = null;
   localAudioExportBusy = false;
   for (const url of localAudioExportUrls) URL.revokeObjectURL(url);
@@ -5134,10 +5310,12 @@ function pinLocalAudioMemory(owner) {
   return {chunks,snapshots,titles};
 }
 
-async function prepareLocalAudioExport() {
+async function prepareLocalAudioExport({captureId=null}={}) {
   if (!mayExportLocalAudio() || localAudioExportBusy) return;
-  const owner = user;
+  const owner = user, exportToken=token, exportServer=apiUrl;
+  if(captureId!==null && (liveSessions.get(captureId)?.owner!==owner || !liveSessions.get(captureId)?.uploadHeld))return;
   clearLocalAudioExports();
+  localAudioExportCaptureId=captureId;
   const sequence = ++localAudioExportSequence;
   const controller = new AbortController(); localAudioExportController = controller;
   const isCurrent = () => sequence === localAudioExportSequence && user === owner
@@ -5164,8 +5342,23 @@ async function prepareLocalAudioExport() {
       throw new Error('음성의 계정 정보를 확인하지 못해 내려받기를 중단했습니다.');
     }
     for (const session of stored.sessions) if (!memory.titles.has(session.id)) memory.titles.set(session.id,session.title || '수업');
-    const result = await buildRecoverableLocalAudioExports({owner,chunks:[...stored.chunks,...memory.chunks],snapshots:[...stored.snapshots,...memory.snapshots],signal:controller.signal});
+    const matching=rows=>captureId===null ? rows : rows.filter(row=>row.captureId===captureId);
+    const result = await buildRecoverableLocalAudioExports({owner,chunks:matching([...stored.chunks,...memory.chunks]),snapshots:matching([...stored.snapshots,...memory.snapshots]),signal:controller.signal});
     if (!isCurrent()) return;
+    const group=captureId && result.groups.find(item=>item.captureId===captureId);
+    if(group?.parts.length && !storageWarning && !result.warnings.length && !liveSessions.get(captureId)?.recoveryClosedAt){
+      try{
+        // A download click is only a request. Keep this evidence separate from
+        // chunk.downloadRequested, which permits destructive per-chunk skips.
+        heldRecoveryEvidence={owner,token:exportToken,server:exportServer,captureId,manifest:heldRecoveryManifest(stored,captureId),
+          partCount:group.parts.length,downloaded:new Set()};
+      }catch{
+        heldRecoveryMessage='기기 원본 목록을 확인하지 못해 보류 종료는 잠겨 있습니다. 다운로드한 파일과 기기 저장 상태를 확인해 주세요.';
+      }
+    }else if(captureId && !liveSessions.get(captureId)?.recoveryClosedAt){
+      heldRecoveryMessage='음성 일부를 읽지 못했거나 파일이 없어 보류를 종료할 수 없습니다. 원래 탭과 기기 데이터를 유지하고 저장 상태를 확인해 주세요.';
+    }
+    const downloadEvidence=heldRecoveryEvidence;
     let partCount = 0;
     for (const [groupIndex,group] of result.groups.entries()) {
       for (const [partIndex,part] of group.parts.entries()) {
@@ -5178,6 +5371,9 @@ async function prepareLocalAudioExport() {
         link.download = `${safeFilename(title.textContent)}_기기보관_${groupIndex + 1}_${partIndex + 1}_${fmt(part.startSamples / 16000).replace(':','-')}.wav`;
         link.textContent = `구간 ${partIndex + 1} WAV 내려받기`;
         link.onclick = event => { if (!isCurrent()) { event.preventDefault(); return; }
+          if(heldRecoveryEvidenceIsCurrent(downloadEvidence) && group.captureId===downloadEvidence.captureId){
+            downloadEvidence.downloaded.add(partIndex);heldRecoveryMessage='';renderHeldRecoveryConfirmation();
+          }
           notice('다운로드가 실제로 완료됐는지 파일 크기와 재생으로 확인해 주세요. 원본 음성과 전송 상태는 그대로 유지합니다.'); };
         wrapper.append(title,detail,link); $('local-audio-files').append(wrapper); partCount += 1;
       }
@@ -5200,7 +5396,9 @@ async function prepareLocalAudioExport() {
 }
 $('local-audio-open').onclick = () => { void prepareLocalAudioExport(); };
 $('auth-local-audio-open').onclick = () => { void prepareLocalAudioExport(); };
-$('local-audio-refresh').onclick = () => { void prepareLocalAudioExport(); };
+$('local-audio-refresh').onclick = () => { void prepareLocalAudioExport({captureId:localAudioExportCaptureId}); };
+$('local-audio-saved-confirm').onchange = renderHeldRecoveryConfirmation;
+$('local-audio-finish').onclick = () => { if(!$('local-audio-finish').disabled)void closeHeldAudio(localAudioExportCaptureId); };
 $('local-audio-close').onclick = clearLocalAudioExports;
 $('local-audio-dialog').onclose = () => { if (!$('local-audio-dialog').open) clearLocalAudioExports(); };
 
@@ -5301,6 +5499,9 @@ function updateControls() {
     $('save-state').textContent = `${recordingStorageLabel(current)} · 받아쓰기 미완료 · 기기 사본 유지`
       + (volatileDetail ? ` · ${volatileDetail}` : '');
   }
+  const closedCount=closedHeldAudioSessions().length;
+  if(closedCount && !queued && !liveSession && !liveQueuePersisting && !recoveryFinalizationRequired.size)
+    $('save-state').textContent += ` · 종료한 기기 보관 수업 ${closedCount}개`;
   $('processing').hidden = !recording && !starting && !pausing && !resuming && !inputUnavailable && !activeQueued && !sending;
   $('processing-text').textContent = inputBlocked
     ? '새 음성을 받지 못하고 있습니다. 입력 복구 버튼으로 마이크를 확인해 주세요. 이미 받은 음성은 내려받을 수 있습니다.'
@@ -5341,6 +5542,7 @@ function updateControls() {
   for (const button of $('lecture-list').querySelectorAll('button')) button.disabled = historyNavigationBusy();
   updateCorrectionControls(noteToolsBusy);
   renderHeldAudio();
+  renderHeldRecoveryConfirmation();
   renderImportStatus();
   notePresenceStateChange();
 }

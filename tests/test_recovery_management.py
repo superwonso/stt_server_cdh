@@ -48,8 +48,12 @@ class RecoveryManagementTests(unittest.TestCase):
             result = self.issue()
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(set(result), {"output_path", "expires_at"})
-        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
-        link = next(line for line in self.output.read_text().splitlines() if line.startswith("https://"))
+        if os.name == "nt":
+            from server.platform_files import validate_private_path
+            validate_private_path(self.output)
+        else:
+            self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
+        link = next(line for line in self.output.read_text(encoding="utf-8").splitlines() if line.startswith("https://"))
         url = urlsplit(link); values = parse_qs(url.fragment)
         self.assertEqual((url.scheme, url.netloc, url.path, url.query), ("https", "student.github.io", "/classroom/", ""))
         self.assertEqual(set(values), {"username", "reset_code"})
@@ -84,7 +88,16 @@ class RecoveryManagementTests(unittest.TestCase):
         ):
             with self.subTest(updates=updates), self.assertRaises(ValueError):
                 self.issue(**updates)
-        self.output.symlink_to(outside)
+        self.assertEqual(self.rows("account_password_resets"), [])
+
+    def test_symlink_output_does_not_issue_tokens(self):
+        outside = self.root / "outside.txt"
+        try:
+            self.output.symlink_to(outside)
+        except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                self.skipTest("Windows symlink privilege is unavailable")
+            raise
         with self.assertRaises(ValueError):
             self.issue()
         self.assertFalse(outside.exists())

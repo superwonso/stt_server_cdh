@@ -1,4 +1,4 @@
-"""API-side adapter for one private Unix-socket Qwen process."""
+"""API-side adapter for one private Unix-socket or authenticated loopback model."""
 from __future__ import annotations
 
 import os
@@ -59,6 +59,9 @@ class RemoteTranscriber:
 
     def __init__(self, settings):
         self._path = getattr(settings, "local_model_socket", None)
+        self._runtime = getattr(settings, "local_model_runtime", None)
+        if self._path is not None and self._runtime is not None:
+            raise ValueError("Choose one private local model transport")
         timeout = getattr(settings, "local_model_timeout_seconds", 90)
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 600:
             raise ValueError("Invalid local model timeout")
@@ -77,11 +80,19 @@ class RemoteTranscriber:
                 "gpu": {"available": False}}
 
     def _get_client(self):
-        path = validate_socket_path(self._path)
+        path = validate_socket_path(self._path) if self._runtime is None else None
         with self._client_lock:
             if self._closed:
                 raise ModelUnavailableError()
             if self._client is None:
+                if self._runtime is not None:
+                    self._client = httpx.Client(
+                        transport=httpx.HTTPTransport(trust_env=False, retries=0,
+                            limits=httpx.Limits(max_connections=2, max_keepalive_connections=0)),
+                        timeout=httpx.Timeout(self._timeout, connect=1),
+                        trust_env=False, follow_redirects=False,
+                    )
+                    return self._client
                 self._client = httpx.Client(
                     transport=httpx.HTTPTransport(uds=str(path), trust_env=False, retries=0,
                                                   limits=httpx.Limits(max_connections=2, max_keepalive_connections=0)),
@@ -95,8 +106,15 @@ class RemoteTranscriber:
             deadline = time.monotonic() + (0.8 if status else self._timeout)
             client = self._get_client()
             timeout = httpx.Timeout(0.8) if status else httpx.Timeout(self._timeout, connect=1)
-            with client.stream(method, path, content=body, timeout=timeout,
-                               headers={"Content-Type": "application/json", "Accept-Encoding": "identity"}) as response:
+            headers = {"Content-Type": "application/json", "Accept-Encoding": "identity"}
+            target = path
+            if self._runtime is not None:
+                from .win_model_transport import AUTH_HEADER, read_endpoint, request_auth, verify_response
+                endpoint, token = read_endpoint(self._runtime)
+                auth, nonce = request_auth(token, endpoint["instance"], method, path, body)
+                headers[AUTH_HEADER] = auth
+                target = f'http://127.0.0.1:{endpoint["port"]}{path}'
+            with client.stream(method, target, content=body, timeout=timeout, headers=headers) as response:
                 if response.headers.get("content-encoding", "identity").lower() not in {"identity", ""}:
                     raise ProtocolError()
                 content_length = response.headers.get("content-length")
@@ -109,6 +127,8 @@ class RemoteTranscriber:
                     if len(payload) + len(part) > maximum:
                         raise ProtocolError()
                     payload.extend(part)
+                if self._runtime is not None:
+                    verify_response(token, endpoint, nonce, response, bytes(payload))
                 if response.status_code != 200:
                     code = "model_busy" if response.status_code == 429 else "model_unavailable"
                     try:

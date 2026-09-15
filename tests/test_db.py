@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+from contextlib import closing
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
 
 from server.db import Database
+from server import platform_files
 
 TEST_ACCOUNTS = ("user-alpha", "user-beta")
 
@@ -40,7 +43,7 @@ class DatabaseTests(unittest.TestCase):
 
     def test_continuations_parent_purge_unlinks_child_and_child_purge_cascades_link(self):
         with tempfile.TemporaryDirectory() as temporary:
-            database = Database(Path(temporary) / "classroom.sqlite3", TEST_ACCOUNTS)
+            database = Database(Path(temporary) / "data" / "classroom.sqlite3", TEST_ACCOUNTS)
             database.initialize()
             parent, child = str(uuid.uuid4()), str(uuid.uuid4())
             with database.connect() as connection:
@@ -90,7 +93,7 @@ class DatabaseTests(unittest.TestCase):
 
     def test_study_note_owner_queue_constraints_and_purge_cascade(self):
         with tempfile.TemporaryDirectory() as temporary:
-            database = Database(Path(temporary) / "classroom.sqlite3", TEST_ACCOUNTS)
+            database = Database(Path(temporary) / "data" / "classroom.sqlite3", TEST_ACCOUNTS)
             database.initialize()
             first, second, other = [str(uuid.uuid4()) for _ in range(3)]
             with database.connect() as connection:
@@ -420,8 +423,11 @@ class DatabaseTests(unittest.TestCase):
     def test_pre_fingerprint_import_table_migrates_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "data" / "classroom.sqlite3"
-            path.parent.mkdir()
-            with sqlite3.connect(path) as connection:
+            if os.name == "nt":
+                platform_files.ensure_private_directory(path.parent)
+            else:
+                path.parent.mkdir()
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute("""
                     CREATE TABLE imports (
                         id TEXT PRIMARY KEY, username TEXT NOT NULL, lecture_id TEXT,
@@ -438,7 +444,7 @@ class DatabaseTests(unittest.TestCase):
                     "'old.wav', 1, 0, 'failed', 0, 0, NULL, NULL, '2026-01-01Z', '2026-01-01Z')"
                 )
             Database(path, TEST_ACCOUNTS).initialize()
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 row = connection.execute(
                     "SELECT file_fingerprint, raw_deleted FROM imports "
                     "WHERE id = '11111111-1111-4111-8111-111111111111'"
@@ -448,10 +454,13 @@ class DatabaseTests(unittest.TestCase):
     def test_legacy_chunks_migrate_as_final_and_keep_retry_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "private" / "classroom.sqlite3"
-            path.parent.mkdir()
+            if os.name == "nt":
+                platform_files.ensure_private_directory(path.parent)
+            else:
+                path.parent.mkdir()
             lecture_id = str(uuid.uuid4())
             chunk_id = str(uuid.uuid4())
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.executescript("""
                     CREATE TABLE users (
                         username TEXT PRIMARY KEY,
@@ -505,8 +514,8 @@ class DatabaseTests(unittest.TestCase):
                     "asr_provider": "qwen",
                 },
             )
-            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            platform_files.validate_private_path(path.parent, directory=True)
+            platform_files.validate_private_path(path)
 
     def test_reinitializing_does_not_change_a_nonfinal_chunk(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -701,7 +710,7 @@ class DatabaseTests(unittest.TestCase):
             accounts = ("user-alpha", "user-beta", "user-gamma")
             Database(path, accounts).initialize()
             Database(path, accounts).initialize()
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 users = tuple(
                     row[0] for row in connection.execute("SELECT username FROM users ORDER BY username")
                 )
@@ -723,8 +732,11 @@ class DatabaseTests(unittest.TestCase):
     def test_legacy_account_check_is_removed_without_losing_private_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "data" / "classroom.sqlite3"
-            path.parent.mkdir()
-            with sqlite3.connect(path) as connection:
+            if os.name == "nt":
+                platform_files.ensure_private_directory(path.parent)
+            else:
+                path.parent.mkdir()
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.executescript("""
                     CREATE TABLE users (
                         username TEXT PRIMARY KEY

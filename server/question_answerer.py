@@ -18,6 +18,7 @@ from typing import Any, Callable
 import httpx
 
 from .llm_protocol import ProtocolError, gateway_schema, parse_json_document
+from .llm_result import draft_document, draft_from_response, validate_draft_document, safe_draft_text
 from .postprocessor import (
     MindlogicPostprocessor, PostprocessingError, _MODEL_NAME, _PLACEHOLDER,
     _PROTECTED_VALUE,
@@ -216,6 +217,11 @@ def _validate(document: Any, source: dict[str, str]) -> dict[str, Any]:
                    for match in _PROTECTED_VALUE.finditer(source[identifier])}
         if any(match.group(0) not in allowed for match in _PROTECTED_VALUE.finditer(text)):
             raise QuestionAnsweringError("unsupported_claim")
+        try:
+            if safe_draft_text(text) != text.strip():
+                raise QuestionAnsweringError("invalid_response")
+        except ValueError:
+            raise QuestionAnsweringError("invalid_response") from None
         paragraphs.append({"text": text.strip(), "source_ids": list(ids)})
     return {"answerability": "answered", "paragraphs": paragraphs}
 
@@ -227,6 +233,26 @@ def validate_answer_document(document: Any, selected_segments: list[dict[str, An
     """
     source = _source(selected_segments, evidence=True)
     return copy.deepcopy(_validate(document, {item["id"]: item["text"] for item in source}))
+
+
+
+def answer_result_document(document: Any, selected_segments: list[dict[str, Any]]) -> dict[str, Any]:
+    """Canonical storage accepts a strict answer or an explicitly warned draft."""
+    _source(selected_segments, evidence=True)
+    if isinstance(document, dict) and document.get("format") == "draft":
+        return validate_draft_document(document)
+    try:
+        return validate_answer_document(document, selected_segments)
+    except QuestionAnsweringError as error:
+        return draft_document(document, warnings=(error.code,))
+
+
+def validate_answer_result_document(document: Any, selected_segments: list[dict[str, Any]]) -> dict[str, Any]:
+    """Stored structured results and warned drafts each retain their own schema."""
+    _source(selected_segments, evidence=True)
+    if isinstance(document, dict) and document.get("format") == "draft":
+        return validate_draft_document(document)
+    return validate_answer_document(document, selected_segments)
 
 
 # The worker-facing name describes a question job; both use the same validator.
@@ -347,12 +373,15 @@ class QuestionAnswerer:
         self._interrupted(interrupted)
         try:
             result = parse_json_document(response)
-        except ProtocolError as error:
-            raise QuestionAnsweringError(error.code) from None
-        checked = _validate(result, {item["id"]: item["text"] for item in masked})
-        for paragraph in checked["paragraphs"]:
-            paragraph["text"] = _PLACEHOLDER.sub(lambda match: private[match.group(0)], paragraph["text"])
-            paragraph["source_ids"] = [aliases[identifier] for identifier in paragraph["source_ids"]]
-        final = validate_answer_document(checked, source)
+            checked = _validate(result, {item["id"]: item["text"] for item in masked})
+            for paragraph in checked["paragraphs"]:
+                paragraph["text"] = _PLACEHOLDER.sub(lambda match: private[match.group(0)], paragraph["text"])
+                paragraph["source_ids"] = [aliases[identifier] for identifier in paragraph["source_ids"]]
+            final = validate_answer_document(checked, source)
+        except (ProtocolError, QuestionAnsweringError) as error:
+            try:
+                final = draft_from_response(response, warning=error.code, replacements=private)
+            except ValueError:
+                raise QuestionAnsweringError(error.code) from None
         self._interrupted(interrupted)
         return final

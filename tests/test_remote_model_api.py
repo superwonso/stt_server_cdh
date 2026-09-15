@@ -381,7 +381,8 @@ class RemoteModelSettingsTests(unittest.TestCase):
         default = self.settings()
         self.assertIsNone(default.local_model_socket)
         self.assertEqual(default.local_model_timeout_seconds, 90)
-        private_path = Path("/tmp/synthetic-private-model.sock")
+        # /tmp is drive-relative on Windows; this value is inert in Settings.
+        private_path = Path(tempfile.gettempdir()) / "synthetic-model.sock"
         remote = self.settings(local_model_socket=private_path)
         self.assertEqual(remote.local_model_socket, private_path)
         self.assertNotIn(str(private_path), repr(remote))
@@ -404,10 +405,27 @@ class RemoteModelSettingsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {
             "ACCOUNT_USERNAMES": "user-alpha,user-beta", "LOCAL_MODEL_SOCKET": ".data/model/model.sock",
             "LOCAL_MODEL_TIMEOUT_SECONDS": "125.5",
-        }, clear=True), mock.patch("server.settings.load_dotenv"):
+        }, clear=True), mock.patch("server.settings.load_dotenv"), \
+             mock.patch("server.settings.Path.exists", return_value=False), \
+             mock.patch("server.settings.Path.is_symlink", return_value=False):
+            if os.name == "nt":
+                with self.assertRaises(ValueError):
+                    Settings.from_env()
+                return
             settings = Settings.from_env()
         self.assertEqual(settings.local_model_socket, PROJECT_DIR / ".data/model/model.sock")
         self.assertEqual(settings.local_model_timeout_seconds, 125.5)
+
+    def test_private_runtime_environment_uses_loopback_and_hides_path(self):
+        with mock.patch.dict(os.environ, {
+            "ACCOUNT_USERNAMES": "user-alpha,user-beta", "LOCAL_MODEL_RUNTIME": ".data/model-runtime",
+        }, clear=True), mock.patch("server.settings.load_dotenv"), \
+             mock.patch("server.settings.Path.exists", return_value=False), \
+             mock.patch("server.settings.Path.is_symlink", return_value=False):
+            settings = Settings.from_env()
+        self.assertEqual(settings.local_model_runtime, PROJECT_DIR / ".data/model-runtime")
+        self.assertIsNone(settings.local_model_socket)
+        self.assertNotIn(str(settings.local_model_runtime), repr(settings))
 
 
 if __name__ == "__main__":

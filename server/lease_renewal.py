@@ -108,7 +108,8 @@ class LeaseRenewer:
                  clock: Callable[[], float] = time.time,
                  monotonic: Callable[[], float] = time.monotonic,
                  controller: TunnelController | None = None,
-                 runner: RenewRunner | None = None):
+                 runner: RenewRunner | None = None,
+                 lease_reader: Callable[..., DesiredLease] | None = None):
         if type(enabled) is not bool:
             raise ValueError("enabled must be boolean")
         for value, low, high in ((renew_before_seconds, 3600, 12 * 3600),
@@ -127,6 +128,7 @@ class LeaseRenewer:
         self._clock, self._monotonic = clock, monotonic
         self._controller = controller
         self._runner = runner or self._run_script
+        self._lease_reader = lease_reader or current_online_lease
         self._shutdown = threading.Event()
         self._state_lock = threading.Lock()
         self._run_lock = threading.Lock()
@@ -227,7 +229,7 @@ class LeaseRenewer:
 
     def _check_once(self) -> None:
         now = self._clock()
-        lease = current_online_lease(self.data_dir, now=now)
+        lease = self._lease_reader(self.data_dir, now=now)
         if self._unconfirmed_url != lease.api_url:
             self._unconfirmed_url = None
         if self._controller is None or not self._controller.renewal_processes_owned():
@@ -253,7 +255,7 @@ class LeaseRenewer:
             return
         # Success requires the real publisher's new desired lease, not merely
         # an exit code or a locally stretched expiration timestamp.
-        refreshed = current_online_lease(self.data_dir, now=self._clock())
+        refreshed = self._lease_reader(self.data_dir, now=self._clock())
         if refreshed.api_url != lease.api_url or not self._controller.renewal_processes_owned():
             raise LeaseStateError("url_or_process_changed")
         if result != 0 or refreshed.published_at <= lease.published_at:
@@ -325,6 +327,9 @@ class LeaseRenewer:
 
 def create_lease_renewer(*, data_dir: Path, enabled: bool = True, port: int = 8765) -> LeaseRenewer:
     """Production-only default; an isolated API factory never reads live state."""
+    if os.name == "nt":
+        from .windows_lease_renewal import create_windows_lease_renewer
+        return create_windows_lease_renewer(data_dir=data_dir, enabled=enabled, port=port)
     safe = Path(data_dir).absolute() == PROJECT_ROOT / ".data"
     return LeaseRenewer(data_dir=data_dir, enabled=enabled and safe, port=port)
 

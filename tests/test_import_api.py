@@ -15,6 +15,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from server.app import create_app
+from server import platform_files
 from server.security import digest
 from server.settings import Settings
 
@@ -172,7 +173,7 @@ class ImportApiTests(unittest.TestCase):
         })
         self.assertEqual(too_large.status_code, 422)
         path = self.settings.data_dir / "imports" / "user-alpha" / f"{import_id}.upload"
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        platform_files.validate_private_path(path)
         self.assertEqual(self.client.get(f"/imports/{import_id}", headers=self.headers("user-beta")).status_code, 404)
         self.assertEqual(self.put(import_id, payload[:100], 0, username="user-beta").status_code, 404)
         self.assertEqual(self.put(import_id, payload[:100], 0).status_code, 422)
@@ -226,7 +227,7 @@ class ImportApiTests(unittest.TestCase):
             / f"{completed['lecture_id']}.wav"
         )
         self.assertTrue(recording.is_file())
-        self.assertEqual(recording.stat().st_mode & 0o777, 0o600)
+        platform_files.validate_private_path(recording)
         ticket = self.client.post(
             f"/lectures/{completed['lecture_id']}/recording-download-ticket",
             headers=self.headers(),

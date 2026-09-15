@@ -1,6 +1,7 @@
 """Owner-scoped, restart-safe lecture summaries; no audio/inference locks."""
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import uuid
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import Depends, HTTPException
 
 from .postprocessor import PostprocessingError
-from .summarizer import SummarizationError, validate_summary_document, validate_summary_source
+from .summarizer import SummarizationError, summary_result_document, validate_summary_result_document, validate_summary_source
 
 
 def _now():
@@ -124,7 +125,7 @@ class SummaryService:
                 if self.revision(segments) != row["raw_revision"]:
                     raise ValueError("stale")
                 document = json.loads(row["summary_json"])
-                result["document"] = validate_summary_document(document, segments)
+                result["document"] = validate_summary_result_document(document, segments)
             except Exception:
                 result.update(status="failed", error_code="invalid_saved_summary",
                               error="저장된 요약을 확인하지 못했습니다.")
@@ -180,10 +181,10 @@ class SummaryService:
             if (not job["recording_finalized"] or self.revision(segments) != job["raw_revision"]
                     or job["model"] != self.settings.summary_model):
                 raise ValueError("stale")
-            output = self.engine.summarize(language=job["language"], segments=segments,
+            output = self.engine.summarize(language=job["language"], segments=copy.deepcopy(segments),
                                            interrupted=self.shutdown.is_set)
-            document = output.to_dict()
-            document = validate_summary_document(document, segments)
+            document = output.to_dict() if hasattr(output, "to_dict") else output
+            document = summary_result_document(document, segments)
         except PostprocessingError as error:
             # Reconstruct from a closed code set, never from provider-supplied
             # exception text (even if a typed exception was modified).

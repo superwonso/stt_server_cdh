@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import uuid
 from copy import deepcopy
@@ -9,12 +10,64 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException
 
-from .translator import TranslationError, validate_translation_segments
+from .translator import TranslationError, validate_translation_segments, _raw_segments, MAX_TRANSLATED_CHARS
 from .postprocessor import PostprocessingError
+from .llm_result import WARNING_CODES, draft_document, safe_draft_text, validate_draft_document
 
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _warning_codes(values):
+    if not isinstance(values, (list, tuple)):
+        return ['validation_failed']
+    return list(dict.fromkeys(value if value in WARNING_CODES else 'validation_failed'
+                              for value in values if isinstance(value, str)))
+
+
+def translation_document(rows, raw, warnings=()):
+    """Keep provenance exact while treating result-quality checks as diagnostics."""
+    sources = _raw_segments(raw)
+    notices = _warning_codes(warnings)
+    try:
+        validated = validate_translation_segments(rows, sources)
+    except TranslationError:
+        notices.append('validation_failed')
+        validated = None
+    if validated is None:
+        try:
+            if not isinstance(rows, list) or len(rows) != len(sources):
+                raise ValueError
+            by_id = {}
+            for row in rows:
+                if (not isinstance(row, dict) or not isinstance(row.get('id'), str) or row['id'] in by_id
+                        or not isinstance(row.get('text'), str) or not row['text'].strip()):
+                    raise ValueError
+                by_id[row['id']] = row
+            if set(by_id) != {source['id'] for source in sources}:
+                raise ValueError
+            validated = [{**source, 'text': by_id[source['id']]['text']} for source in sources]
+        except (ValueError, TypeError, KeyError):
+            return draft_document(rows, warnings=notices, replacements={}, max_chars=MAX_TRANSLATED_CHARS)
+    source_by_id = {source['id']: source for source in sources}
+    cleaned = []
+    try:
+        for row in validated:
+            # Known restored values were already resolved by the provider.
+            # A literal source marker is allowed only if it occurs in that row.
+            source = source_by_id[row['id']]
+            allowed = {token: token for token in re.findall(r'__(?:PRIVATE|KOREAN)_[0-9]{6}__', source['text'])}
+            text = safe_draft_text(row['text'], replacements=allowed, max_chars=250_000)
+            if text != row['text']:
+                notices.append('validation_failed')
+            cleaned.append({**source, 'text': text})
+    except ValueError:
+        return draft_document(rows, warnings=[*notices, 'validation_failed'], replacements={}, max_chars=MAX_TRANSLATED_CHARS)
+    if sum(len(row['text']) for row in cleaned) > MAX_TRANSLATED_CHARS:
+        return draft_document(cleaned, warnings=[*notices, 'content_limited'], replacements={}, max_chars=MAX_TRANSLATED_CHARS)
+    notices = list(dict.fromkeys(notices))
+    return {'format': 'segments', 'segments': cleaned, 'warnings': notices} if notices else cleaned
 
 
 class TranslationService:
@@ -119,7 +172,25 @@ class TranslationService:
                 if self.revision(segments) != row["raw_revision"]:
                     raise ValueError("stale")
                 document = json.loads(row["translation_json"])
-                result["segments"] = validate_translation_segments(document, segments)
+                if isinstance(document, dict) and document.get('format') == 'draft':
+                    result['document'] = validate_draft_document(document, max_chars=MAX_TRANSLATED_CHARS)
+                else:
+                    warnings = ()
+                    if isinstance(document, dict):
+                        if set(document) != {'format', 'segments', 'warnings'} or document['format'] != 'segments':
+                            raise ValueError('invalid saved envelope')
+                        warnings = document['warnings']
+                        if (not isinstance(warnings, list) or not 1 <= len(warnings) <= 16
+                                or any(not isinstance(code, str) or code not in WARNING_CODES for code in warnings)
+                                or len(set(warnings)) != len(warnings)):
+                            raise ValueError('invalid saved warnings')
+                        document = document['segments']
+                    restored = translation_document(document, segments, warnings)
+                    if isinstance(restored, dict):
+                        result['document'] = restored
+                        result['segments'] = restored.get('segments', [])
+                    else:
+                        result['segments'] = restored
             except Exception:
                 result.update(status="failed", error_code="invalid_saved_translation",
                               error="저장된 번역을 확인하지 못했습니다.")
@@ -176,8 +247,12 @@ class TranslationService:
             # an injected engine mutates the list it receives.
             output = self.engine.translate(language=job["language"], segments=deepcopy(segments),
                                            interrupted=self.shutdown.is_set)
-            document = output.segments
-            document = validate_translation_segments(document, segments)
+            draft = getattr(output, 'draft_text', None)
+            warnings = getattr(output, 'warnings', ())
+            if draft is not None:
+                document = draft_document(draft, warnings=warnings, replacements={}, max_chars=MAX_TRANSLATED_CHARS)
+            else:
+                document = translation_document(output.segments, segments, warnings)
         except PostprocessingError as error:
             # Rebuild a known code from fixed messages. Never persist a
             # provider-controlled exception string, even on this typed path.

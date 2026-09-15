@@ -20,12 +20,23 @@ from server.app import create_app
 from server.postprocessor import PostprocessingError
 from server.security import digest
 from server.settings import Settings
+from server import study_notes
 from server.study_notes import StudyNoteDocument, StudyNoteError
 
 
 class FakeTranscriber:
     def status(self):
         return {"model_state": "ready", "model": "test-local", "device": "cpu"}
+
+
+class FakeStudyNoteOutput:
+    """Allow noncanonical engine outputs without bypassing service coercion."""
+
+    def __init__(self, document):
+        self.document = document
+
+    def to_dict(self):
+        return copy.deepcopy(self.document)
 
 
 class FakeStudyNotes:
@@ -260,14 +271,17 @@ class StudyNoteApiTests(unittest.TestCase):
             connection.execute("INSERT INTO lecture_metadata VALUES(?,'보내지 않을 표시 이름','분류','학기',1,'now')", (identifier,))
         self.engine.document = StudyNoteDocument([{
             "heading": "1주차 광합성",
-            "source_ids": [segment],
+            "source_ids": ["outside-source"],
             "text": "식물은 2가지 단계로 광합성을 진행한다.",
             "edits": [{"original": "빛을 이용한 양분 생성", "replacement": "광합성(photosynthesis)", "uncertain": True}],
         }])
         before = self.snapshot(identifier)
         self.queued(identifier)
         self.service.process_next()
-        self.assertEqual(self.get(identifier).json()["study_note"]["status"], "completed")
+        note = self.get(identifier).json()["study_note"]
+        self.assertEqual(note["status"], "completed")
+        self.assertEqual(note["document"]["format"], "draft")
+        self.assertEqual(note["document"]["warnings"], ["invalid_response"])
         self.assertEqual(self.snapshot(identifier), before)
         self.assertEqual(self.engine.calls, [{"language": "ko", "segments": raw}])
 
@@ -373,7 +387,8 @@ class StudyNoteApiTests(unittest.TestCase):
 
     def test_known_provider_errors_are_fixed_and_unknown_exceptions_are_redacted(self):
         with patch.object(self.service.limiter, "allow", return_value=True):
-            for code in ("credit_exhausted", "authentication_failed", "response_truncated", "model_refused", "synthetic-private-code", None):
+            for code in ("credit_exhausted", "authentication_failed", "gateway_unavailable", "rate_limited",
+                         "response_truncated", "model_refused", "synthetic-private-code", None):
                 identifier, _ = self.lecture()
                 self.queued(identifier)
                 self.engine.error = (PostprocessingError(code, "synthetic-private-provider-message")
@@ -388,15 +403,93 @@ class StudyNoteApiTests(unittest.TestCase):
                 self.service.recover()
                 self.assertFalse(self.service.process_next())
 
-    def test_invalid_document_or_markdown_failure_cannot_persist_a_partial_result(self):
+    def test_unknown_source_ids_save_unmapped_draft_and_preserve_all_source_products(self):
         identifier, _ = self.lecture()
+        before = self.snapshot(identifier)
         self.queued(identifier)
         self.engine.invalid = True
         self.service.process_next()
-        self.assertIsNone(self.row(identifier)["document_json"])
-        self.assertEqual(self.row(identifier)["status"], "failed")
-        self.engine.invalid = False
+        saved = self.row(identifier)
+        self.assertEqual(saved["status"], "completed")
+        draft = json.loads(saved["document_json"])
+        self.assertEqual(set(draft), {"format", "text", "warnings"})
+        self.assertEqual(draft["format"], "draft")
+        self.assertIn("식물은 빛을 이용해 양분을 만든다.", draft["text"])
+        self.assertEqual(draft["warnings"], ["invalid_response"])
+        self.assertNotIn("outside-source", draft["text"])
+        self.assertEqual(self.snapshot(identifier), before)
+        note = self.get(identifier).json()["study_note"]
+        self.assertEqual(note["status"], "completed")
+        self.assertEqual(note["document"], draft)
+        self.assertIn("식물은 빛을 이용해 양분을 만든다", note["markdown"])
+        self.assertNotIn("outside-source", note["markdown"])
+        self.assertIn(study_notes.STUDY_NOTE_RESULT_WARNING, note["markdown"])
+        self.assertGreater(note["markdown"].rindex(study_notes.STUDY_NOTE_RESULT_WARNING),
+                           note["markdown"].index("식물은 빛을 이용해 양분을 만든다"))
+        self.assertEqual(self.post(identifier).json()["study_note"], note)
+        self.assertEqual(self.row(identifier), saved)
+        self.assertEqual(len(self.engine.calls), 1)
+        self.assertEqual(self.get(identifier, "user-beta").status_code, 404)
+        self.assertEqual(self.post(identifier, "user-beta").status_code, 404)
+
+    def test_canonical_partial_draft_persists_warnings_download_cache_and_owner_scope(self):
+        identifier, _ = self.lecture()
+        before = self.snapshot(identifier)
+        draft = {
+            "format": "draft",
+            "text": "# 광합성 정리\n\n식물은 빛에너지를 이용해 양분을 만든다.\n\n생성된 부분까지만 보관한다.",
+            "warnings": ["response_truncated", "incomplete_batches", "gateway_unavailable"],
+        }
+        self.engine.document = FakeStudyNoteOutput(draft)
         self.queued(identifier)
+        self.assertTrue(self.service.process_next())
+        saved = self.row(identifier)
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(json.loads(saved["document_json"]), draft)
+        self.assertIsNone(saved["error"])
+        self.assertIsNone(saved["error_code"])
+        self.assertIsNotNone(saved["completed_at"])
+        note = self.get(identifier).json()["study_note"]
+        self.assertEqual(note["status"], "completed")
+        self.assertEqual(note["document"], draft)
+        self.assertIn("생성된 부분까지만 보관한다", note["markdown"])
+        body, footer = note["markdown"].rsplit(study_notes.STUDY_NOTE_RESULT_WARNING, 1)
+        self.assertIn("생성된 부분까지만 보관한다", body)
+        self.assertEqual(footer.strip(), "")
+        self.assertTrue(note["markdown"].rstrip().endswith(study_notes.STUDY_NOTE_RESULT_WARNING))
+        self.assertEqual(note["markdown"].count(study_notes.STUDY_NOTE_RESULT_WARNING), 1)
+        self.assertNotIn("생성 중 확인된 문제", note["markdown"])
+        self.assertNotIn("AI 서버 연결 문제", note["markdown"])
+        self.assertEqual(self.get(identifier).json()["study_note"], note)
+        self.assertEqual(self.post(identifier).json()["study_note"], note)
+        self.assertEqual(self.row(identifier), saved)
+        self.assertEqual(self.snapshot(identifier), before)
+        self.assertEqual(len(self.engine.calls), 1)
+        self.assertEqual(self.get(identifier, "user-beta").status_code, 404)
+        self.assertEqual(self.post(identifier, "user-beta").status_code, 404)
+
+    def test_no_usable_engine_body_still_fails_without_inventing_a_result(self):
+        with patch.object(self.service.limiter, "allow", return_value=True):
+            for document in ({}, {"paragraphs": []}, {"format": "draft", "text": " ", "warnings": ["invalid_response"]}):
+                with self.subTest(document=document):
+                    identifier, _ = self.lecture()
+                    before = self.snapshot(identifier)
+                    self.engine.document = FakeStudyNoteOutput(document)
+                    self.queued(identifier)
+                    self.assertTrue(self.service.process_next())
+                    self.assertEqual(self.row(identifier)["status"], "failed")
+                    self.assertIsNone(self.row(identifier)["document_json"])
+                    note = self.get(identifier).json()["study_note"]
+                    self.assertEqual(note["status"], "failed")
+                    self.assertIsNone(note["document"])
+                    self.assertIsNone(note["markdown"])
+                    self.assertEqual(self.snapshot(identifier), before)
+                    self.assertFalse(self.service.process_next())
+
+    def test_markdown_render_failure_cannot_advertise_a_downloadable_result(self):
+        identifier, _ = self.lecture()
+        self.queued(identifier)
+        self.engine.invalid = True
         with patch("server.study_note_service.study_note_markdown", side_effect=RuntimeError("synthetic-private-renderer")):
             self.service.process_next()
         self.assertIsNone(self.row(identifier)["document_json"])
@@ -431,6 +524,75 @@ class StudyNoteApiTests(unittest.TestCase):
             self.assertIsNone(result["document"])
             self.assertIsNone(result["markdown"])
             self.assertEqual(self.row(identifier), before)
+
+    def test_saved_draft_is_not_repaired_on_read_and_requires_unchanged_owned_source(self):
+        draft = {"format": "draft", "text": "AI가 생성한 일부 수업 정리입니다.", "warnings": ["invalid_response"]}
+        with patch.object(self.service.limiter, "allow", return_value=True):
+            for mutation in ("unknown_warning", "extra_field", "empty_text", "source"):
+                with self.subTest(mutation=mutation):
+                    identifier, segment = self.lecture()
+                    self.engine.document = FakeStudyNoteOutput(draft)
+                    self.queued(identifier)
+                    self.service.process_next()
+                    with self.database.connect() as connection:
+                        if mutation == "source":
+                            connection.execute("UPDATE segments SET text='원문이 달라졌다.' WHERE id=?", (segment,))
+                        else:
+                            damaged = copy.deepcopy(draft)
+                            if mutation == "unknown_warning":
+                                damaged["warnings"] = ["synthetic-private-provider-message"]
+                            elif mutation == "extra_field":
+                                damaged["private_metadata"] = "synthetic-private-value"
+                            else:
+                                damaged["text"] = " "
+                            connection.execute("UPDATE lecture_study_notes SET document_json=? WHERE lecture_id=?",
+                                               (json.dumps(damaged), identifier))
+                    before = self.row(identifier)
+                    result = self.get(identifier).json()["study_note"]
+                    self.assertEqual((result["status"], result["error_code"]), ("failed", "invalid_saved_study_note"))
+                    self.assertIsNone(result["document"])
+                    self.assertIsNone(result["markdown"])
+                    self.assertNotIn("synthetic-private", json.dumps(result))
+                    self.assertEqual(self.row(identifier), before)
+
+    def test_usable_warning_draft_never_bypasses_final_source_ownership_or_shutdown_checks(self):
+        with patch.object(self.service.limiter, "allow", return_value=True):
+            for mutation in ("source", "owner", "trash", "unfinished", "access_pause", "shutdown"):
+                with self.subTest(mutation=mutation):
+                    identifier, segment = self.lecture()
+                    self.engine.document = FakeStudyNoteOutput({
+                        "format": "draft", "text": "생성할 수 있었던 수업 정리 내용입니다.",
+                        "warnings": ["invalid_response", "incomplete_batches"],
+                    })
+                    self.queued(identifier)
+
+                    def change(*_):
+                        if mutation == "shutdown":
+                            self.service.request_shutdown()
+                            return
+                        with self.database.connect() as connection:
+                            if mutation == "source":
+                                connection.execute("UPDATE segments SET text='원문이 달라졌다.' WHERE id=?", (segment,))
+                            elif mutation == "owner":
+                                connection.execute("UPDATE lectures SET username='user-beta' WHERE id=?", (identifier,))
+                            elif mutation == "trash":
+                                connection.execute("UPDATE lectures SET trashed_at='synthetic-trash-time' WHERE id=?", (identifier,))
+                            elif mutation == "unfinished":
+                                connection.execute("UPDATE lectures SET recording_finalized=0 WHERE id=?", (identifier,))
+                            else:
+                                connection.execute("UPDATE operational_state SET access_enabled=0")
+
+                    self.engine.during = change
+                    self.assertTrue(self.service.process_next())
+                    row = self.row(identifier)
+                    self.assertEqual(row["status"], "failed")
+                    self.assertEqual(row["error_code"], "interrupted" if mutation in ("access_pause", "shutdown") else "source_changed")
+                    self.assertIsNone(row["document_json"])
+                    self.assertIsNone(row["completed_at"])
+                    self.engine.during = None
+                    self.service.shutdown.clear()
+                    with self.database.connect() as connection:
+                        connection.execute("UPDATE operational_state SET access_enabled=1")
 
     def test_source_change_before_claim_prevents_call_and_during_call_discards_result(self):
         for during in (False, True):
@@ -485,7 +647,11 @@ class StudyNoteApiTests(unittest.TestCase):
 
         self.engine.during = mutate
         self.service.process_next()
-        self.assertEqual(self.row(identifier)["status"], "failed")
+        self.assertEqual(self.row(identifier)["status"], "completed")
+        note = self.get(identifier).json()["study_note"]
+        self.assertEqual(note["document"]["format"], "draft")
+        self.assertEqual(note["document"]["warnings"], ["invalid_response"])
+        self.assertNotIn("outside-source", note["markdown"])
         self.assertEqual(self.snapshot(identifier), before)
 
     def test_processing_shutdown_never_replays_but_unclaimed_queue_can_resume(self):

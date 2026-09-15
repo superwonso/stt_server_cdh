@@ -104,12 +104,13 @@ class LocalTranscriber:
             try:
                 # PyTorch's ROCm API intentionally uses CUDA-style device names.
                 # This unlocks the gfx1151 SDPA kernel measured on the target PC.
-                os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
                 import torch
+                if torch.version.hip:
+                    os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
                 from qwen_asr import Qwen3ASRModel
 
                 if not torch.cuda.is_available():
-                    raise RuntimeError("ROCm GPU is not visible to PyTorch")
+                    raise RuntimeError("GPU is not visible to PyTorch")
                 if self.settings.compute_type != "bfloat16":
                     raise RuntimeError("This deployment is validated only with ASR_DTYPE=bfloat16")
                 model_path = self.settings.model_path

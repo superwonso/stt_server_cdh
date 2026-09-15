@@ -16,6 +16,7 @@ from starlette.requests import Request
 
 from server.app import CloseableStreamingResponse, create_app
 from server.recording_snapshot import READ_BLOCK_BYTES, RecordingSnapshot, SnapshotStream
+from server import platform_files
 from server.recordings import RecordingCorruptError, _header
 from server.security import digest
 from server.settings import Settings
@@ -312,12 +313,22 @@ class RecordingSnapshotTests(unittest.TestCase):
             path.write_bytes(payload)
             self.assertEqual(self.ticket(identifier).status_code, status)
             self.assertEqual(path.read_bytes(), payload)
-        path.unlink()
         other, _ = self.lecture()
-        path.symlink_to(self.store.path("user-alpha", other))
-        self.assertEqual(self.ticket(identifier).status_code, 503)
         with patch.object(self.store, "max_frames", 1):
             self.assertEqual(self.ticket(other).status_code, 503)
+
+    def test_symlink_fails_closed(self):
+        identifier, _ = self.lecture(seconds=0)
+        other, _ = self.lecture()
+        path = self.store.path("user-alpha", identifier)
+        path.unlink(missing_ok=True)
+        try:
+            path.symlink_to(self.store.path("user-alpha", other))
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                self.skipTest("Windows file symlink fixture requires Developer Mode or symlink privilege")
+            raise
+        self.assertEqual(self.ticket(identifier).status_code, 503)
 
     def test_replacement_truncation_and_missing_prefix_cannot_fall_back_to_drive(self):
         for change in ("replace", "truncate", "missing"):
@@ -403,13 +414,14 @@ class RecordingSnapshotTests(unittest.TestCase):
         self.assertTrue(finished.wait(2), "Snapshot streaming must release the writer lock")
         thread.join(2)
         self.assertEqual(errors, [])
-        original_pread, reads = os.pread, []
+        original_pread, reads = (platform_files.read_at if os.name == "nt" else os.pread), []
         def read_bounded(fd, count, offset):
             self.assertLessEqual(count, READ_BLOCK_BYTES)
             self.assertGreaterEqual(offset, 44)
             reads.append((count, offset))
             return original_pread(fd, count, offset)
-        with patch("server.recording_snapshot.os.pread", side_effect=read_bounded):
+        read_target = "server.recording_snapshot.platform_files.read_at" if os.name == "nt" else "server.recording_snapshot.os.pread"
+        with patch(read_target, side_effect=read_bounded):
             result = header + b"".join(iterator)
         self.assertGreater(len(reads), 1)
         self.assertEqual(result, _header(len(pcm)) + pcm)
@@ -420,7 +432,8 @@ class RecordingSnapshotTests(unittest.TestCase):
         identifier, _ = self.lecture()
         stream = self.snapshot_stream(identifier)
         descriptor = stream.descriptor
-        with patch("server.recording_snapshot.os.pread", return_value=b"x"):
+        read_target = "server.recording_snapshot.platform_files.read_at" if os.name == "nt" else "server.recording_snapshot.os.pread"
+        with patch(read_target, return_value=b"x"):
             with self.assertRaises(RecordingCorruptError):
                 list(stream.iter_bytes(44, stream.snapshot.total_bytes))
         with self.assertRaises(OSError):

@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import io
+import os
 import secrets
 import sys
 import time
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit
+from contextlib import contextmanager, nullcontext
 
 from dotenv import dotenv_values, set_key, unset_key
+from dotenv.parser import parse_stream
+from . import platform_files
 
 from .db import Database
 from .security import digest, new_secret
@@ -40,6 +45,16 @@ POSITION_NAMES = (
 )
 
 
+def _management_env_path() -> Path:
+    configured = os.environ.get("STT_ENV_FILE", "")
+    if platform_files.IS_WINDOWS and not configured:
+        raise ValueError("Windows account management requires an explicit absolute STT_ENV_FILE in a private directory")
+    path = Path(configured) if configured else PROJECT_DIR / "server" / ".env"
+    if not path.is_absolute():
+        raise ValueError("STT_ENV_FILE must be an absolute private path")
+    return path
+
+
 def account_at_position(accounts: tuple[str, ...], position: str) -> str:
     """Resolve a private allowlist position without reflecting invalid input."""
     normalized = position.strip().lower()
@@ -57,6 +72,15 @@ def account_at_position(accounts: tuple[str, ...], position: str) -> str:
 
 
 def _ensure_private_env(env_path: Path) -> None:
+    if platform_files.IS_WINDOWS:
+        platform_files.ensure_private_directory(env_path.parent)
+        try:
+            descriptor = platform_files.open_file(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, private=True)
+        except FileExistsError:
+            platform_files.validate_private_path(env_path)
+        else:
+            os.close(descriptor)
+        return
     if env_path.is_symlink():
         raise OSError("The private environment file must not be a symbolic link")
     env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -64,7 +88,58 @@ def _ensure_private_env(env_path: Path) -> None:
     env_path.chmod(0o600)
 
 
-def _set_private_env_key(env_path: Path, key: str, value: str) -> None:
+@contextmanager
+def _private_env_lock(env_path: Path):
+    _ensure_private_env(env_path)
+    descriptor = platform_files.open_file(env_path.with_name(env_path.name + ".lock"), os.O_RDWR | os.O_CREAT, private=True)
+    try:
+        with platform_files.file_lock(descriptor):
+            yield
+    finally:
+        os.close(descriptor)
+
+
+def _render_env_changes(content: str, changes: dict[str, str | None]) -> str:
+    """Preserve comments/multiline values while updating only selected keys."""
+    remaining = dict(changes)
+    lines = []
+    for binding in parse_stream(io.StringIO(content)):
+        if binding.error:
+            raise ValueError("The private environment file is malformed")
+        if binding.key not in changes:
+            lines.append(binding.original.string)
+            continue
+        value = changes[binding.key]
+        remaining.pop(binding.key, None)
+        if value is not None:
+            escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+            lines.append(f"{binding.key}='{escaped}'\n")
+    result = "".join(lines)
+    for key, value in remaining.items():
+        if value is None:
+            continue
+        if result and not result.endswith("\n"):
+            result += "\n"
+        escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+        result += f"{key}='{escaped}'\n"
+    return result
+
+
+def _edit_windows_env(env_path: Path, changes: dict[str, str | None], *, locked=False) -> None:
+    with nullcontext() if locked else _private_env_lock(env_path):
+        descriptor = platform_files.open_file(env_path, os.O_RDONLY, private=True)
+        with os.fdopen(descriptor, "rb") as source:
+            content = source.read(1024 * 1024 + 1)
+        if len(content) > 1024 * 1024:
+            raise ValueError("The private environment file is too large")
+        value = _render_env_changes(content.decode("utf-8"), changes)
+        platform_files.atomic_write_private(env_path, value.encode("utf-8"))
+
+
+def _set_private_env_key(env_path: Path, key: str, value: str, *, _locked=False) -> None:
+    if platform_files.IS_WINDOWS:
+        _edit_windows_env(env_path, {key: value}, locked=_locked)
+        return
     result = set_key(str(env_path), key, value)
     if not result[0]:
         raise OSError("Could not update the private environment file")
@@ -73,6 +148,9 @@ def _set_private_env_key(env_path: Path, key: str, value: str) -> None:
 
 
 def update_private_env(env_path: Path, site_origin: str) -> None:
+    if platform_files.IS_WINDOWS:
+        _edit_windows_env(env_path, {"SITE_ORIGINS": site_origin, "API_URL": None})
+        return
     _ensure_private_env(env_path)
     _set_private_env_key(env_path, "SITE_ORIGINS", site_origin)
     # Older builds stored the ephemeral tunnel here even though the API never
@@ -140,6 +218,13 @@ def add_account(
     *,
     selected_username: str,
 ) -> None:
+    if platform_files.IS_WINDOWS:
+        with _private_env_lock(env_path):
+            return _add_account_locked(database, env_path, selected_username=selected_username)
+    return _add_account_locked(database, env_path, selected_username=selected_username)
+
+
+def _add_account_locked(database: Database, env_path: Path, *, selected_username: str) -> None:
     """Add exactly one inactive account and extend the private allowlist.
 
     Normal startup still requires an exact set match between the environment
@@ -192,12 +277,16 @@ def add_account(
                 env_path,
                 "ACCOUNT_USERNAMES",
                 ",".join(validated_accounts),
+                _locked=platform_files.IS_WINDOWS,
             )
     except BaseException:
         if env_updated:
             try:
-                env_path.write_bytes(original_env)
-                env_path.chmod(0o600)
+                if platform_files.IS_WINDOWS:
+                    platform_files.atomic_write_private(env_path, original_env)
+                else:
+                    env_path.write_bytes(original_env)
+                    env_path.chmod(0o600)
             except OSError as restore_error:
                 raise RuntimeError(
                     "Account setup could not restore the private environment; "
@@ -282,13 +371,17 @@ def create_invitations(
             fragment = urlencode({"username": username, "setup_code": code})
             lines.extend([username, f"{site_url}#{fragment}", ""])
             count += 1
-        output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        output_path.parent.chmod(0o700)
-        output_path.touch(exist_ok=True, mode=0o600)
-        output_path.chmod(0o600)
         # Never print tokens or invitation URLs to terminal output.
-        output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        output_path.chmod(0o600)
+        if platform_files.IS_WINDOWS:
+            platform_files.ensure_private_directory(output_path.parent)
+            platform_files.atomic_write_private(output_path, ("\n".join(lines) + "\n").encode("utf-8"))
+        else:
+            output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            output_path.parent.chmod(0o700)
+            output_path.touch(exist_ok=True, mode=0o600)
+            output_path.chmod(0o600)
+            output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            output_path.chmod(0o600)
     return count
 
 
@@ -326,15 +419,20 @@ def main():
     )
     arguments = parser.parse_args()
     try:
+        if platform_files.IS_WINDOWS and arguments.command in {"init", "add-account", "configure-admin", "configure-clova"}:
+            _management_env_path()
+            from scripts.google_drive import server_is_running
+            if server_is_running(None):
+                raise ValueError("Stop this project's API before changing its private configuration")
         if arguments.command == "configure-clova":
             if not sys.stdin.isatty():
                 raise ValueError(
-                    "CLOVA setup requires an interactive WSL terminal so the Secret Key "
+                    "CLOVA setup requires an interactive terminal so the Secret Key "
                     "can be entered with echo disabled"
                 )
             secret_key = getpass.getpass("CLOVA Speech 도메인 Secret Key (입력 내용은 보이지 않음): ")
             configure_clova(
-                PROJECT_DIR / "server" / ".env",
+                _management_env_path(),
                 secret_key=secret_key,
             )
             print(
@@ -364,13 +462,13 @@ def main():
         if arguments.command == "add-account":
             if not sys.stdin.isatty():
                 raise ValueError(
-                    "Account addition requires an interactive WSL terminal so the new ID "
+                    "Account addition requires an interactive terminal so the new ID "
                     "can be entered with echo disabled"
                 )
             selected = getpass.getpass("새 계정 ID (입력 내용은 보이지 않음): ")
             add_account(
                 database,
-                PROJECT_DIR / "server" / ".env",
+                _management_env_path(),
                 selected_username=selected,
             )
             print(
@@ -383,23 +481,23 @@ def main():
                 selected = account_at_position(settings.accounts, arguments.position)
                 configure_admin(
                     database,
-                    PROJECT_DIR / "server" / ".env",
+                    _management_env_path(),
                     selected_username=selected,
                 )
             else:
                 try:
-                    configure_admin(database, PROJECT_DIR / "server" / ".env")
+                    configure_admin(database, _management_env_path())
                 except AdminSelectionRequired:
                     if not sys.stdin.isatty():
                         raise ValueError(
                             "Multiple accounts are activated; run this command in an interactive "
-                            "WSL terminal to select the administrator without echo, or pass "
+                            "terminal to select the administrator without echo, or pass "
                             "--position with its private ACCOUNT_USERNAMES position"
                         ) from None
                     selected = getpass.getpass("관리자로 지정할 활성 계정 ID (입력 내용은 보이지 않음): ")
                     configure_admin(
                         database,
-                        PROJECT_DIR / "server" / ".env",
+                        _management_env_path(),
                         selected_username=selected,
                     )
             print("Configured the administrator in private server/.env. Restart the local server to apply it.")
@@ -416,7 +514,7 @@ def main():
             validated_api_origin,
             settings.data_dir / "invitations.txt",
         )
-        env_path = PROJECT_DIR / "server" / ".env"
+        env_path = _management_env_path()
         update_private_env(env_path, origin)
     except (ValueError, OSError, RuntimeError) as error:
         parser.error(str(error))

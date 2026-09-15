@@ -16,7 +16,7 @@ from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 
 from .postprocessor import PostprocessingError
-from .question_answerer import QuestionAnsweringError, select_evidence, validate_answer_document
+from .question_answerer import QuestionAnsweringError, select_evidence, answer_result_document, validate_answer_result_document
 
 HISTORY_LIMIT = 100
 OWNER_QUEUE_LIMIT = 3
@@ -262,7 +262,7 @@ class QuestionService:
                 raw = raw if raw is not None else self.raw_segments(connection, row["lecture_id"])
                 selected = self._evidence(row, raw)
                 document = json.loads(row["document_json"])
-                result["document"] = validate_answer_document(document, selected)
+                result["document"] = validate_answer_result_document(document, selected)
             except Exception:
                 result.update(status="failed", error_code="invalid_saved_answer", error=_ERRORS["invalid_saved_answer"])
         return result
@@ -367,7 +367,7 @@ class QuestionService:
         try:
             if not self._interrupted(job):
                 output = self.engine.answer(job["question"], copy.deepcopy(selected), lambda: self._interrupted(job))
-                document = validate_answer_document(output, selected)
+                document = answer_result_document(output, selected)
         except PostprocessingError as error:
             # The code is normalized now and its message reconstructed at the
             # terminal write. This never adds a retry of the paid request.

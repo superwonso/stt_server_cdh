@@ -777,3 +777,8 @@ Git에서 제외한 FLEURS 한국어 샘플이 있을 때 모델과 실제 3초 
 실제 Chrome/Edge와 Quick Tunnel에서 새 터널 재로그인, AudioContext 중단과 track 종료 뒤 입력 재연결을 장시간 반복했을 때의 경계 음절·중복·마지막 청크·저장공간 증가도 별도 확인 대상입니다. 브라우저·OS가 백그라운드에서 캡처 자체를 중단한 동안의 소리는 복구할 수 없고, 첫 입력이 50ms도 쌓이기 전에 페이지 프로세스가 사라진 극히 짧은 PCM도 서버나 IndexedDB에 없을 수 있습니다. 중요한 수업 전에는 사용할 기기와 네트워크에서 짧은 중단·재개·종료 시험을 먼저 하세요.
 
 현재 모델 선택 근거와 수치의 자세한 조건은 [HANDOFF.md](./HANDOFF.md)에 기록되어 있습니다. 공식 자료는 [Qwen3-ASR 모델 카드](https://huggingface.co/Qwen/Qwen3-ASR-1.7B), [Qwen 공식 저장소](https://github.com/QwenLM/Qwen3-ASR), [VibeVoice 모델 카드](https://huggingface.co/microsoft/VibeVoice-ASR-Streaming-7B), [Voxtral Realtime 모델 카드](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602), [OpenAI Whisper 저장소](https://github.com/openai/whisper)를 기준으로 했습니다.
+
+
+## Windows 네이티브 독립 시험
+
+Windows PowerShell 설치·시작·종료와 별도 가상 계정/DB 안내는 [WINDOWS.md](WINDOWS.md)를 참고하세요. 기존 Linux/ROCm 실행 절차는 유지합니다. Windows 통합 검증은 현재 Codex 샌드박스 복구 후 이어가야 하며 운영 전환 완료를 의미하지 않습니다.

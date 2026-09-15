@@ -220,14 +220,55 @@ class SummaryApiTests(unittest.TestCase):
         self.assertEqual(len(self.engine.calls), 2)
         self.assertEqual(self.transcript_snapshot(lecture_id), before)
 
-    def test_worker_rejects_invalid_citations_without_persisting_document(self):
+    def test_worker_preserves_unverified_citations_as_warned_draft(self):
         lecture_id, _ = self.lecture()
         self.engine.invalid = True
         self.assert_queued(lecture_id)
         self.service.process_next()
-        self.assertEqual(self.row(lecture_id)["status"], "failed")
-        self.assertIsNone(self.row(lecture_id)["summary_json"])
-        self.assertIsNone(self.get(lecture_id).json()["summary"]["document"])
+        self.assertEqual(self.row(lecture_id)["status"], "completed")
+        result = self.get(lecture_id).json()["summary"]["document"]
+        self.assertEqual(result["format"], "draft")
+        self.assertIn("invalid_response", result["warnings"])
+        self.assertIn("빛을 이용해", result["text"])
+        self.assertNotIn("outside-lecture", result["text"])
+        self.assertEqual(json.loads(self.row(lecture_id)["summary_json"]), result)
+        self.assertEqual(self.post(lecture_id).json()["summary"]["document"], result)
+        self.assertEqual(self.get(lecture_id, "user-beta").status_code, 404)
+        self.assertEqual(len(self.engine.calls), 1)
+
+    def test_saved_draft_still_checks_raw_revision_and_its_exact_envelope(self):
+        lecture_id, segment_id = self.lecture()
+        self.engine.invalid = True
+        self.assert_queued(lecture_id)
+        self.service.process_next()
+        draft = self.get(lecture_id).json()["summary"]["document"]
+        self.assertEqual(draft["format"], "draft")
+        with self.database.connect() as connection:
+            connection.execute("UPDATE lecture_summaries SET summary_json=? WHERE lecture_id=?",
+                               (json.dumps({**draft, "warnings": ["untrusted-private-warning"]}), lecture_id))
+        self.assertEqual(self.get(lecture_id).json()["summary"]["error_code"], "invalid_saved_summary")
+        with self.database.connect() as connection:
+            connection.execute("UPDATE lecture_summaries SET summary_json=? WHERE lecture_id=?",
+                               (json.dumps(draft), lecture_id))
+            connection.execute("UPDATE segments SET text='새 원문이다.' WHERE id=?", (segment_id,))
+        self.assertEqual(self.get(lecture_id).json()["summary"]["error_code"], "invalid_saved_summary")
+        self.assertEqual(len(self.engine.calls), 1)
+
+    def test_engine_cannot_expand_grounding_by_mutating_its_input_copy(self):
+        lecture_id, _ = self.lecture()
+        before = self.transcript_snapshot(lecture_id)
+        self.assert_queued(lecture_id)
+        def summarize(*, language, segments, interrupted):
+            segments[0]["text"] = "invented 982173"
+            identifier = segments[0]["id"]
+            return LectureSummary("invented 982173", [identifier],
+                [{"heading": "핵심", "bullets": [{"text": "invented 982173", "source_ids": [identifier]}]}], [])
+        with patch.object(self.engine, "summarize", summarize):
+            self.service.process_next()
+        result = self.get(lecture_id).json()["summary"]["document"]
+        self.assertEqual(result["format"], "draft")
+        self.assertIn("unsupported_claim", result["warnings"])
+        self.assertEqual(self.transcript_snapshot(lecture_id), before)
 
     def test_typed_provider_failure_preserves_only_known_fixed_code_and_message(self):
         with patch.object(self.service.limiter, "allow", return_value=True):

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -81,7 +82,7 @@ class RuntimeConfigTests(unittest.TestCase):
             environment["ACCOUNT_USERNAMES"] = "must-not-appear,also-private"
             environment["PASSWORD"] = "must-not-appear"
             subprocess.run(
-                [str(SCRIPT), "render", str(output)],
+                [sys.executable, str(SCRIPT), "render", str(output)],
                 cwd=ROOT,
                 env=environment,
                 check=True,
@@ -115,7 +116,7 @@ class RuntimeConfigTests(unittest.TestCase):
             environment["CLASSROOM_API_CONFIG"] = json.dumps(desired)
             for output in (first, second):
                 subprocess.run(
-                    [str(SCRIPT), "render", str(output)],
+                    [sys.executable, str(SCRIPT), "render", str(output)],
                     cwd=ROOT,
                     env=environment,
                     check=True,

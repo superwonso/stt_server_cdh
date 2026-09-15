@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import io
 import json
 import logging
@@ -47,6 +48,8 @@ from .recordings import (
     WAV_HEADER_BYTES,
 )
 from .postprocessor import MindlogicPostprocessor, PostprocessingError
+from .correction_result import completed_correction_result
+from .llm_result import RESULT_WARNING
 from .recording_snapshot import RecordingSnapshot, SnapshotStream
 from .recording_uploads import RecordingUploadStore, require_asr_receipt, stored_seconds
 from .summarizer import MindlogicSummarizer
@@ -59,6 +62,7 @@ from .study_notes import MindlogicStudyNotes
 from .study_note_service import StudyNoteService
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
 from .settings import Settings
+from .platform_files import ensure_private_directory, open_file, validate_private_path
 from .transcriber import LocalTranscriber
 from .remote_transcriber import RemoteTranscriber
 from .model_protocol import ModelUnavailableError
@@ -200,6 +204,10 @@ class DescriptorFileResponse(FileResponse):
                     os.close(descriptor)
                 except OSError:
                     pass
+
+
+if os.name == "nt":
+    from .windows_response import DescriptorFileResponse
 
 
 class CloseableStreamingResponse(StreamingResponse):
@@ -369,7 +377,7 @@ def create_app(
     database = Database(settings.database_path, settings.accounts)
     database.initialize()
     engine = transcriber or (
-        RemoteTranscriber(settings) if settings.local_model_socket else LocalTranscriber(settings)
+        RemoteTranscriber(settings) if (settings.local_model_socket or settings.local_model_runtime) else LocalTranscriber(settings)
     )
     clova_engine = clova_transcriber or ClovaStreamingTranscriber(settings)
     correction_engine = postprocessor or MindlogicPostprocessor(settings)
@@ -384,8 +392,11 @@ def create_app(
     active_chunk_lectures: set[tuple[str, str]] = set()
     dummy_password = PASSWORD_HASHER.hash(new_secret())
     import_directory = settings.data_dir / "imports"
-    import_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    import_directory.chmod(0o700)
+    if os.name == "nt":
+        ensure_private_directory(import_directory)
+    else:
+        import_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        import_directory.chmod(0o700)
     recording_store = RecordingStore(
         settings.data_dir / "recordings",
         settings.accounts,
@@ -409,7 +420,7 @@ def create_app(
     # renew a live Pages address. Explicit Settings fixtures stay isolated.
     lease_renewer = create_lease_renewer(
         data_dir=settings.data_dir,
-        enabled=production_factory and os.getenv("AUTO_RENEW_API_URL", "1").strip().lower() in {"1", "true", "yes"},
+        enabled=production_factory and os.getenv("AUTO_RENEW_API_URL", "0" if os.name == "nt" else "1").strip().lower() in {"1", "true", "yes"},
     )
     backup_scheduler = BackupScheduler(RecoveryBackupManager(settings)) if production_factory else None
     download_ticket_lock = threading.Lock()
@@ -454,7 +465,7 @@ def create_app(
         translation_service.recover()
         question_service.recover()
         study_note_service.recover()
-        if settings.model_warmup and not settings.local_model_socket and hasattr(engine, "warmup"):
+        if settings.model_warmup and not (settings.local_model_socket or settings.local_model_runtime) and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
         try:
             # Even a partially failed startup must stop workers already started.
@@ -701,6 +712,9 @@ def create_app(
             return fallback
 
     def memory_resources() -> dict | None:
+        if os.name == "nt":
+            from .windows_resources import memory_resources as windows_memory
+            return windows_memory()
         try:
             values = {}
             with open("/proc/meminfo", "r", encoding="ascii") as source:
@@ -1400,7 +1414,9 @@ def create_app(
                 {
                     "corrected_segments": corrected_segments,
                     "corrected_text": row["corrected_text"],
-                    "uncertain_terms": uncertain_terms,
+                    "uncertain_terms": [term for term in uncertain_terms if term != RESULT_WARNING],
+                    "validation_warnings": ["validation_failed"] if RESULT_WARNING in uncertain_terms else [],
+                    "draft_text": row["corrected_text"] if not corrected_segments and RESULT_WARNING in uncertain_terms else None,
                     "completed_at": row["completed_at"],
                 }
             )
@@ -2664,8 +2680,11 @@ def create_app(
             raise RuntimeError("Unknown import owner")
         account_directory = import_directory / username
         if create_parent:
-            account_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            account_directory.chmod(0o700)
+            if os.name == "nt":
+                ensure_private_directory(account_directory)
+            else:
+                account_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                account_directory.chmod(0o700)
         return account_directory / f"{import_id}.upload"
 
     def fetch_import(import_id: str, username: str | None = None):
@@ -3090,7 +3109,10 @@ def create_app(
                         finalize_deletion=False,
                     )
                     continue
-                path.chmod(0o600)
+                if os.name == "nt":
+                    validate_private_path(path)
+                else:
+                    path.chmod(0o600)
                 size = path.stat().st_size
                 if job["status"] == "uploading" and size > job["uploaded_bytes"]:
                     # The bytes reached disk before a crash, but the SQLite
@@ -3372,7 +3394,8 @@ def create_app(
                     ("후보정 API 키가 서버에 설정되지 않았습니다.", now_text()),
                 )
 
-    def fail_correction(lecture_id: str, attempt: int, error: PostprocessingError) -> None:
+    def fail_correction(lecture_id: str, attempt: int, error: PostprocessingError, *,
+                        raw_revision: str, model: str) -> None:
         allowed_codes = {
             "authentication_failed",
             "credit_exhausted",
@@ -3408,8 +3431,8 @@ def create_app(
             connection.execute(
                 "UPDATE transcript_corrections SET status = 'failed', error_code = ?, error = ?, "
                 "updated_at = ? WHERE lecture_id = ? AND status = 'processing' AND attempts = ? "
-                "AND lecture_id IN (SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)",
-                (code, messages[code], now_text(), lecture_id, attempt),
+                "AND raw_revision = ? AND model = ?",
+                (code, messages[code], now_text(), lecture_id, attempt, raw_revision, model),
             )
 
     def run_correction_job(job: dict) -> None:
@@ -3438,62 +3461,47 @@ def create_app(
             corrected = correction_engine.correct(
                 title=lecture["title"],
                 language=lecture["language"],
-                segments=segments,
+                segments=copy.deepcopy(segments),
                 interrupted=correction_worker_shutdown.is_set,
             )
-            corrected_segments = corrected.segments
-            uncertain_terms = corrected.uncertain_terms
-            if (
-                not isinstance(corrected_segments, list)
-                or any(not isinstance(segment, dict) for segment in corrected_segments)
-                or [segment.get("id") for segment in corrected_segments]
-                != [segment["id"] for segment in segments]
-                or not isinstance(uncertain_terms, list)
-            ):
-                raise PostprocessingError(
-                    "invalid_response",
-                    "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
-                )
-            clean_segments: list[dict] = []
-            for source, result in zip(segments, corrected_segments, strict=True):
-                if not isinstance(result, dict) or not isinstance(result.get("text"), str):
-                    raise PostprocessingError(
-                        "invalid_response",
-                        "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
-                    )
-                text = result["text"].strip()
-                if not text or len(text) > max(1000, len(source["text"]) * 4 + 500):
-                    raise PostprocessingError(
-                        "invalid_response",
-                        "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
-                    )
-                clean_segments.append(
-                    {
-                        "id": source["id"],
-                        "start": source["start"],
-                        "end": source["end"],
-                        "text": text,
-                    }
-                )
-            if (
-                len(uncertain_terms) > 1000
-                or any(not isinstance(term, str) or len(term) > 200 for term in uncertain_terms)
-            ):
-                raise PostprocessingError(
-                    "invalid_response",
-                    "후보정 결과 형식을 확인할 수 없어 저장하지 않았습니다.",
-                )
-            clean_uncertain = [term.strip() for term in uncertain_terms if term.strip()]
-            corrected_text = "\n".join(segment["text"] for segment in clean_segments)
+            result = completed_correction_result(corrected, segments)
+            clean_segments = result["segments"]
+            clean_uncertain = result["uncertain_terms"]
+            corrected_text = result["text"]
             finished = now_text()
             with database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                # A returning response may only settle its exact original
+                # claim. A replacement job must never be completed or failed.
+                current = connection.execute(
+                    "SELECT status, attempts, raw_revision, model FROM transcript_corrections WHERE lecture_id=?",
+                    (lecture_id,),
+                ).fetchone()
+                if current is None or current["status"] != "processing" or any(
+                    current[key] != job[key] for key in ("attempts", "raw_revision", "model")
+                ):
+                    return
+                current_lecture = connection.execute(
+                    "SELECT username,recording_finalized,deleting,trashed_at FROM lectures WHERE id=?",
+                    (lecture_id,),
+                ).fetchone()
+                access = connection.execute(
+                    "SELECT access_enabled FROM operational_state WHERE singleton=1"
+                ).fetchone()
+                if (current_lecture is None or current_lecture["username"] != lecture["username"]
+                        or not current_lecture["recording_finalized"] or current_lecture["deleting"]
+                        or current_lecture["trashed_at"] is not None or access is None or not access[0]
+                        or transcript_revision(raw_segments(connection, lecture_id)) != job["raw_revision"]):
+                    raise PostprocessingError("invalid_source", "원문 또는 접근 상태가 바뀌어 결과를 저장하지 못했습니다.")
+                if correction_worker_shutdown.is_set():
+                    raise PostprocessingError("interrupted", "서버 종료로 결과 저장을 중단했습니다.")
                 changed = connection.execute(
                     "UPDATE transcript_corrections SET status = 'completed', corrected_text = ?, "
                     "corrected_segments = ?, uncertain_terms = ?, error_code = NULL, error = NULL, "
                     "updated_at = ?, completed_at = ? "
-                    "WHERE lecture_id = ? AND raw_revision = ? AND status = 'processing' AND attempts = ? "
+                    "WHERE lecture_id = ? AND raw_revision = ? AND status = 'processing' AND attempts = ? AND model = ? "
                     "AND EXISTS (SELECT 1 FROM lectures l WHERE l.id=transcript_corrections.lecture_id "
-                    "AND l.username=? AND l.deleting=0 AND l.trashed_at IS NULL)",
+                    "AND l.username=? AND l.deleting=0 AND l.trashed_at IS NULL AND l.recording_finalized=1)",
                     (
                         corrected_text,
                         json.dumps(clean_segments, ensure_ascii=False, separators=(",", ":")),
@@ -3503,9 +3511,12 @@ def create_app(
                         lecture_id,
                         job["raw_revision"],
                         job["attempts"],
+                        job["model"],
                         lecture["username"],
                     ),
                 ).rowcount
+                if correction_worker_shutdown.is_set():
+                    raise PostprocessingError("interrupted", "서버 종료로 결과 저장을 중단했습니다.")
             if changed != 1:
                 log.warning("Discarded a stale correction result for lecture %s", lecture_id)
         except PostprocessingError as error:
@@ -3514,11 +3525,12 @@ def create_app(
                     connection.execute(
                         "UPDATE transcript_corrections SET status = 'queued', updated_at = ? "
                         "WHERE lecture_id = ? AND status = 'processing' AND attempts = ? "
+                        "AND raw_revision = ? AND model = ? "
                         "AND lecture_id IN (SELECT id FROM lectures WHERE deleting=0 AND trashed_at IS NULL)",
-                        (now_text(), lecture_id, job["attempts"]),
+                        (now_text(), lecture_id, job["attempts"], job["raw_revision"], job["model"]),
                     )
             else:
-                fail_correction(lecture_id, job["attempts"], error)
+                fail_correction(lecture_id, job["attempts"], error, raw_revision=job["raw_revision"], model=job["model"])
         except Exception:
             # Do not include exception text or a traceback here: third-party
             # client errors can embed request data, including private transcript
@@ -3531,6 +3543,7 @@ def create_app(
                     "gateway_unavailable",
                     "후보정 서버에 연결하지 못했습니다.",
                 ),
+                raw_revision=job["raw_revision"], model=job["model"],
             )
 
     def correction_worker_main() -> None:
@@ -3667,7 +3680,9 @@ def create_app(
                 except RecordingCapacityError as error:
                     raise HTTPException(507, "녹음과 변환 파일을 보관할 서버 저장 공간이 부족합니다.") from error
                 try:
-                    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    descriptor = (open_file(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, private=True)
+                                  if os.name == "nt" else
+                                  os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
                     os.close(descriptor)
                     made_file = True
                     connection.execute(

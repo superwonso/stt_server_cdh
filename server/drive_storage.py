@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import hmac
 import json
 import os
+if os.name != "nt":
+    import fcntl
 import re
 import secrets
 import stat
@@ -19,6 +20,8 @@ from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
+
+from . import platform_files
 
 
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
@@ -155,6 +158,18 @@ def _private_token_file_lock(token_path: Path) -> Iterator[None]:
         raise DriveConfigurationError(
             "credential_path", "Google Drive OAuth token path is invalid."
         )
+    if platform_files.IS_WINDOWS:
+        descriptor = -1
+        try:
+            descriptor = platform_files.open_file(token_path.parent / "token.lock", os.O_RDWR | os.O_CREAT, private=True)
+            with platform_files.file_lock(descriptor):
+                yield
+        except OSError:
+            raise DriveConfigurationError("credential_lock", "Google Drive OAuth token lock is unsafe or unavailable.") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return
     directory_descriptor = _open_private_directory(token_path.parent)
     flags = (
         os.O_RDWR
@@ -435,7 +450,7 @@ class _AuthorizedUserToken:
             self._set_cached_data(self._read_locked())
 
     def _read_locked(self) -> dict[str, Any]:
-        directory_descriptor = _open_private_directory(self.path.parent)
+        directory_descriptor = -1 if platform_files.IS_WINDOWS else _open_private_directory(self.path.parent)
         flags = (
             os.O_RDONLY
             | getattr(os, "O_NONBLOCK", 0)
@@ -444,24 +459,26 @@ class _AuthorizedUserToken:
         )
         try:
             try:
-                descriptor = os.open(self.path.name, flags, dir_fd=directory_descriptor)
+                descriptor = (platform_files.open_file(self.path, flags, private=True)
+                              if platform_files.IS_WINDOWS else os.open(self.path.name, flags, dir_fd=directory_descriptor))
             except OSError:
                 raise DriveConfigurationError(
                     "credential_unavailable", "Google Drive OAuth token file cannot be opened."
                 ) from None
         finally:
-            os.close(directory_descriptor)
+            if directory_descriptor >= 0:
+                os.close(directory_descriptor)
         try:
             details = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(details.st_mode)
-                or details.st_uid != os.geteuid()
+                or (not platform_files.IS_WINDOWS and details.st_uid != os.geteuid())
                 or not 0 < details.st_size <= _MAX_TOKEN_JSON_BYTES
             ):
                 raise DriveConfigurationError(
                     "credential_invalid", "Google Drive OAuth token file is invalid."
                 )
-            if stat.S_IMODE(details.st_mode) != 0o600:
+            if not platform_files.IS_WINDOWS and stat.S_IMODE(details.st_mode) != 0o600:
                 raise DriveConfigurationError(
                     "credential_permissions",
                     "Google Drive OAuth token file must have mode 0600.",
@@ -683,6 +700,13 @@ class _AuthorizedUserToken:
             raise DriveConfigurationError(
                 "credential_invalid", "Google Drive OAuth token file is too large."
             )
+        if platform_files.IS_WINDOWS:
+            try:
+                platform_files.validate_private_path(self.path)
+                platform_files.atomic_write_private(self.path, encoded)
+            except OSError:
+                raise DriveConfigurationError("credential_write_failed", "Refreshed Google OAuth token could not be saved safely.") from None
+            return
         directory_descriptor = _open_private_directory(self.path.parent)
         try:
             try:
@@ -1295,7 +1319,7 @@ class GoogleDriveStorage:
     @staticmethod
     def _open_source(path: Path) -> int:
         try:
-            descriptor = os.open(
+            descriptor = (platform_files.open_file if platform_files.IS_WINDOWS else os.open)(
                 path,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
             )

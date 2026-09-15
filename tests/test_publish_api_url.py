@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PUBLISH = ROOT / "scripts" / "publish-api-url.sh"
 
 
+@unittest.skipIf(os.name == "nt", "POSIX Bash publication process tests; Windows local mode does not publish URLs")
 class PublishApiUrlTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

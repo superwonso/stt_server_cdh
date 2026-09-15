@@ -69,3 +69,13 @@ test('empty-source abstention and terminal jobs remain displayable without fabri
     assert.equal(validQuestionJob({...job,status},lecture),false);
   }
 });
+
+
+test('received question drafts preserve job owner and evidence scope without inventing citation links',()=>{
+  const draft={format:'draft',text:'받은 답변을 보존합니다.',warnings:['validation_failed']};
+  assert.equal(validQuestionJob({...job,document:draft},lecture),true);
+  for(const change of [{lecture_id:'foreign'}, {scope:'full',selected_count:0}, {total_segments:2},
+    {document:{...draft,source_ids:['source']}}, {document:{...draft,warnings:['untrusted diagnostic']}}]){
+    assert.equal(validQuestionJob({...job,document:draft,...change},lecture),false);
+  }
+});

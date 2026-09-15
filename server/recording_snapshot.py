@@ -10,6 +10,8 @@ import os
 import threading
 from dataclasses import dataclass
 
+from . import platform_files
+
 from .recordings import BYTES_PER_FRAME, SAMPLE_RATE, WAV_HEADER_BYTES, RecordingCorruptError, _header
 
 READ_BLOCK_BYTES = 64 * 1024
@@ -79,7 +81,9 @@ class SnapshotStream:
                         value = self.header[position:next_position]
                     else:
                         next_position = min(end, position + READ_BLOCK_BYTES)
-                        value = os.pread(self.descriptor, next_position - position, position)
+                        # The per-stream lock also serializes Windows seek/read.
+                        value = (platform_files.read_at(self.descriptor, next_position - position, position)
+                                 if platform_files.IS_WINDOWS else os.pread(self.descriptor, next_position - position, position))
                         if len(value) != next_position - position:
                             raise RecordingCorruptError("recording snapshot read was short")
                 position = next_position

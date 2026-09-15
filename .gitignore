@@ -59,3 +59,9 @@ node_modules/
 # Local editor / agent state
 .agents/
 .codex/
+
+# Independent Windows environments and local test state
+.venv-win/
+.venv-vllm/
+.windows-local/
+/work/

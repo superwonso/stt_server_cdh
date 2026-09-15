@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 URL = "https://fake-renewal-test.trycloudflare.com"
 
 
+@unittest.skipIf(os.name == "nt", "Linux Bash/flock renewal integration; Windows publishing is disabled")
 class TunnelRenewalScriptTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

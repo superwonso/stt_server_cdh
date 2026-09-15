@@ -161,15 +161,39 @@ class QuestionServiceTests(QuestionFixture, unittest.TestCase):
         self.assertEqual(self.row(retry["id"])["status"], "completed")
         self.assertEqual(len(self.engine.calls), 2)
 
-    def test_invalid_provider_document_is_never_saved(self):
+    def test_unverified_provider_document_is_saved_as_warned_draft(self):
         lecture_id, _ = self.lecture()
         job = self.queued(lecture_id)
         self.engine.invalid = True
         self.service.process_next()
         row = self.row(job["id"])
-        self.assertEqual(row["status"], "failed")
-        self.assertIsNone(row["document_json"])
+        self.assertEqual(row["status"], "completed")
+        result = self.get(lecture_id, job["id"]).json()["question"]["document"]
+        self.assertEqual(result["format"], "draft")
+        self.assertIn("invalid_response", result["warnings"])
+        self.assertIn("빛을 이용해", result["text"])
+        self.assertNotIn("outside-source", result["text"])
+        self.assertEqual(json.loads(row["document_json"]), result)
+        self.assertEqual(self.post(lecture_id, identifier=job["id"]).json()["question"]["document"], result)
+        self.assertEqual(self.get(lecture_id, job["id"], username="user-beta").status_code, 404)
         self.assertFalse(self.service.process_next())
+        self.assertEqual(len(self.engine.calls), 1)
+
+    def test_saved_draft_preserves_sealed_source_and_strict_warning_envelope(self):
+        lecture_id, segment_id = self.lecture()
+        job = self.queued(lecture_id)
+        self.engine.invalid = True
+        self.service.process_next()
+        draft = self.get(lecture_id, job["id"]).json()["question"]["document"]
+        self.assertEqual(draft["format"], "draft")
+        with self.database.connect() as connection:
+            connection.execute("UPDATE lecture_questions SET document_json=? WHERE id=?",
+                               (json.dumps({**draft, "warnings": ["untrusted-private-warning"]}), job["id"]))
+        self.assertEqual(self.get(lecture_id, job["id"]).json()["question"]["error_code"], "invalid_saved_answer")
+        with self.database.connect() as connection:
+            connection.execute("UPDATE lecture_questions SET document_json=? WHERE id=?", (json.dumps(draft), job["id"]))
+            connection.execute("UPDATE segments SET text='새 원문이다.' WHERE id=?", (segment_id,))
+        self.assertEqual(self.get(lecture_id, job["id"]).json()["question"]["error_code"], "invalid_saved_answer")
         self.assertEqual(len(self.engine.calls), 1)
 
     def test_typed_provider_failure_is_fixed_terminal_and_never_replayed(self):
@@ -338,7 +362,16 @@ class QuestionServiceTests(QuestionFixture, unittest.TestCase):
             return {"answerability": "answered", "paragraphs": [{"text": "invented 982173", "source_ids": [segments[0]["id"]]}]}
         with patch.object(self.engine, "answer", answer):
             self.service.process_next()
-        self.assertEqual(self.row(job["id"])["status"], "failed")
+        row = self.row(job["id"])
+        self.assertEqual(row["status"], "completed")
+        document = json.loads(row["document_json"])
+        self.assertEqual(document["format"], "draft")
+        self.assertIn("unsupported_claim", document["warnings"])
+        self.assertIn("invented 982173", document["text"])
+        self.assertNotIn("source_ids", document)
+        with self.database.connect() as connection:
+            raw = self.service.raw_segments(connection, lecture_id)
+        self.assertNotIn("982173", str(raw))
 
     def test_start_failure_and_shutdown_are_safe_and_engine_closes_only_after_thread_stops(self):
         self.start_patch.stop()

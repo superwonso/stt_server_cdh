@@ -37,6 +37,7 @@ from server.drive_archive import plan_existing_recordings
 from server.db import Database
 from server.recordings import RecordingStore
 from server.settings import Settings
+from server import platform_files
 
 
 CLIENT_ID = "test-public-client-id.apps.googleusercontent.com"
@@ -58,6 +59,7 @@ def client_document() -> dict[str, object]:
     }
 
 
+@unittest.skipIf(os.name == "nt", "Linux /proc process fixtures; native process identity has separate tests")
 class ServerProcessDetectionTests(unittest.TestCase):
     @staticmethod
     def _seed_project_server(process_root: Path, pid: int) -> None:
@@ -139,6 +141,7 @@ class OAuthSetupTests(unittest.TestCase):
         private_url = "https://accounts.google.com/o/oauth2/auth?state=private-state"
         completed = SimpleNamespace(returncode=1)
         with (
+            mock.patch("scripts.google_drive.platform_files.IS_WINDOWS", False),
             mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "test-wsl"}),
             mock.patch("scripts.google_drive.Path.is_file", return_value=True),
             mock.patch("scripts.google_drive.subprocess.run", return_value=completed) as run,
@@ -154,16 +157,20 @@ class OAuthSetupTests(unittest.TestCase):
     def test_desktop_client_is_private_and_secret_repr_is_redacted(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "google-drive"
-            directory.mkdir(mode=0o755)
             path = directory / "oauth-client.json"
-            path.write_text(json.dumps(client_document()), encoding="utf-8")
-            path.chmod(0o600)
+            if os.name == "nt":
+                platform_files.ensure_private_directory(directory)
+                platform_files.atomic_write_private(path, json.dumps(client_document()).encode("utf-8"))
+            else:
+                directory.mkdir(mode=0o755)
+                path.write_text(json.dumps(client_document()), encoding="utf-8")
+                path.chmod(0o600)
 
             configuration = load_oauth_client(path)
 
             self.assertEqual(configuration.client_id, CLIENT_ID)
             self.assertEqual(configuration.client_secret, CLIENT_SECRET)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            platform_files.validate_private_path(path)
             self.assertNotIn(CLIENT_ID, repr(configuration))
             self.assertNotIn(CLIENT_SECRET, repr(configuration))
 
@@ -173,15 +180,23 @@ class OAuthSetupTests(unittest.TestCase):
             secret_path = root / "outside.json"
             secret_path.write_text(json.dumps(client_document()), encoding="utf-8")
             symlink = root / "oauth-client.json"
-            symlink.symlink_to(secret_path)
+            try:
+                symlink.symlink_to(secret_path)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("Windows file symlink fixture requires Developer Mode or symlink privilege")
+                raise
             with self.assertRaises(GoogleDriveSetupError) as raised:
                 load_oauth_client(symlink)
             self.assertNotIn(CLIENT_SECRET, str(raised.exception))
 
+    def test_web_client_is_rejected_without_reflecting_secrets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "private"
+            platform_files.ensure_private_directory(root)
             web_path = root / "web.json"
-            web_path.write_text(
-                json.dumps({"web": client_document()["installed"]}),
-                encoding="utf-8",
+            platform_files.atomic_write_private(
+                web_path, json.dumps({"web": client_document()["installed"]}).encode("utf-8"),
             )
             with self.assertRaises(GoogleDriveSetupError) as raised:
                 load_oauth_client(web_path)
@@ -252,11 +267,10 @@ class OAuthSetupTests(unittest.TestCase):
     def test_authorize_atomically_stores_token_with_private_modes(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "google-drive"
-            directory.mkdir(mode=0o700)
+            platform_files.ensure_private_directory(directory)
             client_path = directory / "oauth-client.json"
             token_path = directory / "token.json"
-            client_path.write_text(json.dumps(client_document()), encoding="utf-8")
-            client_path.chmod(0o600)
+            platform_files.atomic_write_private(client_path, json.dumps(client_document()).encode("utf-8"))
 
             grant = AuthorizationGrant(
                 code="private-code",
@@ -281,10 +295,9 @@ class OAuthSetupTests(unittest.TestCase):
                 exchange_grant=exchange,
             )
 
-            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
-            self.assertEqual(client_path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(token_path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual((directory / "token.lock").stat().st_mode & 0o777, 0o600)
+            platform_files.validate_private_path(directory, directory=True)
+            for private_path in (client_path, token_path, directory / "token.lock"):
+                platform_files.validate_private_path(private_path)
             self.assertEqual(json.loads(token_path.read_text())["refresh_token"], REFRESH_TOKEN)
             self.assertFalse(tuple(directory.glob("*.tmp")))
             # The archive backend must be able to consume the CLI's token
@@ -300,11 +313,17 @@ class OAuthSetupTests(unittest.TestCase):
             outside = root / "outside"
             outside.write_bytes(b"preserve")
             target = private / "token.json"
-            target.symlink_to(outside)
+            try:
+                target.symlink_to(outside)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("Windows file symlink fixture requires Developer Mode or symlink privilege")
+                raise
             with self.assertRaises(GoogleDriveSetupError):
                 _atomic_private_write(target, b"new-secret")
             self.assertEqual(outside.read_bytes(), b"preserve")
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode test; native unsafe ACL refusal is covered separately")
     def test_existing_nonprivate_directory_is_rejected_without_chmod(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "google-drive"
@@ -745,7 +764,7 @@ class ArchiveCliIntegrationTests(unittest.TestCase):
                 overlap_seconds=0,
                 pcm=b"\0\0" * 160,
             )
-            with sqlite3.connect(settings.database_path) as connection:
+            with contextlib.closing(sqlite3.connect(settings.database_path)) as connection, connection:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             database_before = settings.database_path.read_bytes()
 
@@ -760,7 +779,7 @@ class ArchiveCliIntegrationTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertIn("migration candidates: 1", stdout.getvalue())
             self.assertEqual(settings.database_path.read_bytes(), database_before)
-            with sqlite3.connect(settings.database_path) as connection:
+            with contextlib.closing(sqlite3.connect(settings.database_path)) as connection, connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
                 tables = {
                     row[0]
