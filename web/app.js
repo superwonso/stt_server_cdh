@@ -8,6 +8,8 @@ import { lectureTitle, libraryOptions, validMetadata, validLibrarySearch } from 
 import { validManualState, manualSegments, validManualHistory } from './manual-notes.js';
 import { validQuestionJob, validQuestionPage } from './lecture-questions.js';
 import { studyNoteSourceSnapshot, validateStudyNoteResponse, appendStudyNoteText } from './study-notes.js';
+import { groupTranscriptSentences } from './transcript-sentences.js';
+import { TranscriptFollow } from './transcript-follow.js';
 import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';
 import { liveCoordination } from './live-coordination.js';
 import { TabAuthSessionStore } from './auth-session.js';
@@ -85,7 +87,9 @@ let presenceLastSent = '', presenceQueued = '', lastPresenceInteraction = Date.n
 let connectionState = 'unverified', verifiedApiUrl = '', verifiedApiExpiresAt = 0;
 let connectionGeneration = 0, connectionController = null, connectionLeaseTimer = null, leaseRefreshPromise = null;
 let transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
-let transcriptRenderState = {scope:'',rows:new Map()};
+let transcriptRenderState = {scope:'',rows:new Map(),sourceRows:new Map()};
+let transcriptPresentation = 'sentences', transcriptReadingScope = '', transcriptFollowResetOverride = null;
+let transcriptFollower = null;
 const textExportUrls = new Set();
 const loadedLectureOwners = new WeakMap();
 let textExportIdentity = '', continuationCapability = '', partialRecordingCapability = '';
@@ -2453,8 +2457,7 @@ async function openLibraryResult(item, scope) {
   if (scope !== libraryAuthScope() || current?.id !== item.lecture_id) return;
   correctionView = item.source === 'corrected' && correctionIsReady() ? 'corrected' : 'raw';
   reviewView.query = ''; $('transcript-search').value = ''; renderCurrent();
-  const entry = transcriptRenderState.rows.get(JSON.stringify([`id:${item.segment_id}`,0]));
-  entry?.row.scrollIntoView?.({block:'center',behavior:'smooth'});
+  revealTranscriptSegment(item.segment_id);
   if (item.source !== 'title' && canPlayRecording()) await playRecordingClip(item.start);
 }
 $('library-search-form').onsubmit = event => { event.preventDefault(); void searchLibrary(); };
@@ -3843,7 +3846,7 @@ function renderRecordingReview() {
   $('playback-next').disabled = !playable || !reviewPlayer?.clip || reviewPlayer.clip.durationSeconds < 60
     || (Number(current?.recording_seconds) > 0 && end >= Number(current.recording_seconds));
   if (!reviewPlayer) $('playback-state').textContent = playable
-    ? '문장 시각을 누르거나 처음부터 재생해 주세요. 한 번에 최대 60초를 불러옵니다.'
+    ? '원문 구간 보기에서 시각을 누르거나 처음부터 재생해 주세요. 한 번에 최대 60초를 불러옵니다.'
     : '녹음 WAV를 마무리한 뒤 구간을 재생할 수 있어요.';
   $('bookmark-add').disabled = !(user && token && current) || view.busy || view.loading;
   $('bookmark-add').textContent = view.pending ? '★ 같은 책갈피 저장 재시도'
@@ -3960,7 +3963,10 @@ async function playRecordingClip(start) {
   });
   await reviewPlayer.play(start);
 }
-$('transcript-search').oninput = () => { reviewView.query = $('transcript-search').value.slice(0,120); renderCurrent(); };
+$('transcript-search').oninput = () => {
+  transcriptFollowResetOverride = false;
+  reviewView.query = $('transcript-search').value.slice(0,120); renderCurrent();
+};
 $('review-details').ontoggle = () => { if ($('review-details').open && !reviewView.loaded) void loadBookmarks(); };
 $('bookmark-refresh').onclick = () => void loadBookmarks();
 $('bookmark-add').onclick = () => void addBookmark();
@@ -3968,15 +3974,112 @@ $('playback-start').onclick = () => void playRecordingClip(0);
 $('playback-previous').onclick = () => { if (reviewPlayer?.clip) void playRecordingClip(Math.max(0,reviewPlayer.clip.startSeconds - 60)); };
 $('playback-next').onclick = () => { if (reviewPlayer?.clip) void playRecordingClip(reviewPlayer.clip.startSeconds + reviewPlayer.clip.durationSeconds); };
 
-function renderTranscriptSegments(transcript, segments, scope) {
-  if (transcriptRenderState.scope !== scope || !segments.length) {
+function transcriptFollowController() {
+  if (!transcriptFollower) transcriptFollower = new TranscriptFollow($('transcript-scroll'),{
+    getSelection: () => globalThis.getSelection?.() || document.getSelection?.() || null,
+    onChange: () => renderTranscriptFollowControls(),
+  });
+  return transcriptFollower;
+}
+function renderTranscriptFollowControls() {
+  const following = transcriptFollower?.following === true;
+  $('transcript-follow-toggle').setAttribute('aria-pressed',String(following));
+  $('transcript-follow-toggle').classList.toggle('active',following);
+  $('transcript-follow-toggle').textContent = following ? '자동 따라가기 켜짐' : '↓ 최신 문장 따라가기';
+  $('transcript-follow-state').textContent = following
+    ? '새 문장을 자동으로 따라갑니다. 위로 스크롤하면 멈춥니다.'
+    : '읽는 위치를 유지합니다. 최신 문장을 보려면 따라가기를 켜세요.';
+}
+function setTranscriptPresentation(value) {
+  if (!['sentences','chunks'].includes(value) || transcriptPresentation === value) return;
+  transcriptPresentation = value;
+  transcriptFollowResetOverride = false;
+  renderCurrent();
+}
+$('transcript-sentences').onclick = () => setTranscriptPresentation('sentences');
+$('transcript-chunks').onclick = () => setTranscriptPresentation('chunks');
+$('transcript-follow-toggle').onclick = () => {
+  const follower = transcriptFollowController();
+  if (follower.following) follower.pause(); else follower.resume();
+  renderTranscriptFollowControls();
+};
+function revealTranscriptSegment(id, {original = false} = {}) {
+  if (original) setTranscriptPresentation('chunks');
+  const entry = transcriptRenderState.sourceRows?.get(id)
+    || transcriptRenderState.rows.get(JSON.stringify([`id:${id}`,0]));
+  if (!entry) return;
+  const viewport = $('transcript-scroll');
+  transcriptFollowController().pause();
+  if (viewport.getBoundingClientRect && entry.row.getBoundingClientRect) {
+    const outer = viewport.getBoundingClientRect(), inner = entry.row.getBoundingClientRect();
+    viewport.scrollTop += inner.top - outer.top - Math.max(0,(viewport.clientHeight - inner.height) / 2);
+    // Only an explicit source-navigation click may reveal the reader in the
+    // outer page. Automatic following never calls scrollIntoView().
+    viewport.scrollIntoView?.({block:'nearest',behavior:'smooth'});
+  } else entry.row.scrollIntoView?.({block:'center',behavior:'smooth'});
+}
+function renderSentenceTranscript(transcript, sentences, scope) {
+  let changed = false;
+  if (transcriptRenderState.scope !== scope || !sentences.length) {
+    changed = transcriptRenderState.scope !== scope || transcriptRenderState.rows.size > 0;
     transcript.replaceChildren();
-    transcriptRenderState = {scope,rows:new Map()};
+    transcriptRenderState = {scope,rows:new Map(),sourceRows:new Map()};
   }
-  if (!segments.length) return;
+  if (!sentences.length) return changed;
+  const previous = transcriptRenderState.rows, next = new Map(), sourceRows = new Map();
+  if (!previous.size) transcript.replaceChildren();
+  for (const sentence of sentences) {
+    const key = sentence.id;
+    let entry = previous.get(key);
+    if (!entry) {
+      entry = {row:document.createElement('div'),text:document.createElement('p'),textValue:null,
+        tools:document.createElement('div'),source:document.createElement('button')};
+      entry.row.className = 'segment sentence-row';
+      entry.tools.className = 'sentence-tools';
+      entry.source.type = 'button'; entry.source.textContent = '원문 구간 보기';
+      entry.tools.append(entry.source); entry.row.append(entry.text,entry.tools);
+      changed = true;
+    }
+    if (entry.textValue !== sentence.text) {
+      const textNode = entry.text.firstChild;
+      if (typeof entry.textValue === 'string' && sentence.text.startsWith(entry.textValue)
+          && entry.text.childNodes?.length === 1 && textNode?.nodeType === 3 && textNode.appendData) {
+        // Extending an unfinished sentence must not destroy the text node
+        // holding a student's selection of its already received prefix.
+        textNode.appendData(sentence.text.slice(entry.textValue.length));
+      } else entry.text.textContent = sentence.text;
+      entry.textValue = sentence.text; changed = true;
+    }
+    const sourceId = sentence.sourceIds[0];
+    entry.tools.hidden = sentence.sourceIds.length === 0;
+    entry.source.onclick = () => {
+      if (scope === transcriptRenderState.scope) revealTranscriptSegment(sourceId,{original:true});
+    };
+    for (const id of sentence.sourceIds) if (!sourceRows.has(id)) sourceRows.set(id,entry);
+    next.set(key,entry);
+  }
+  for (const [key,entry] of previous) if (!next.has(key)) { transcript.removeChild(entry.row); changed = true; }
+  let index = 0;
+  for (const entry of next.values()) {
+    const at = transcript.children[index] || null;
+    if (at !== entry.row) { transcript.insertBefore(entry.row,at); changed = true; }
+    index += 1;
+  }
+  transcriptRenderState = {scope,rows:next,sourceRows};
+  return changed;
+}
+function renderTranscriptSegments(transcript, segments, scope) {
+  if (transcriptPresentation === 'sentences') return renderSentenceTranscript(transcript,segments,scope);
+  let changed = false;
+  if (transcriptRenderState.scope !== scope || !segments.length) {
+    changed = transcriptRenderState.scope !== scope || transcriptRenderState.rows.size > 0;
+    transcript.replaceChildren();
+    transcriptRenderState = {scope,rows:new Map(),sourceRows:new Map()};
+  }
+  if (!segments.length) return changed;
   const previous = transcriptRenderState.rows;
   if (!previous.size) transcript.replaceChildren();
-  const next = new Map(), occurrences = new Map();
+  const next = new Map(), occurrences = new Map(), sourceRows = new Map();
   const editableIds = current?.recording_finalized ? new Set((current.segments || []).map(item => item.id)) : new Set();
   for (let index = 0; index < segments.length; index += 1) {
     const segment = segments[index];
@@ -3987,11 +4090,13 @@ function renderTranscriptSegments(transcript, segments, scope) {
     const key = JSON.stringify([base,occurrence]);
     let entry = previous.get(key);
     if (!entry) {
+      changed = true;
       entry = {row:document.createElement('div'),text:document.createElement('p'),time:null,
         textValue:null,timeValue:null,timed:null};
     }
     const timed = hasSegmentStart(segment);
     if (entry.timed !== timed) {
+      changed = true;
       entry.row.className = `segment${timed ? '' : ' without-time'}`;
       entry.time = timed ? document.createElement('time') : null;
       entry.row.replaceChildren(...(timed ? [entry.time,entry.text] : [entry.text]));
@@ -4002,6 +4107,7 @@ function renderTranscriptSegments(transcript, segments, scope) {
     if (entry.textValue !== text) {
       entry.text.textContent = text;
       entry.textValue = text;
+      changed = true;
     }
     const time = timed ? fmt(segment.start) : null;
     if (entry.time) {
@@ -4031,19 +4137,21 @@ function renderTranscriptSegments(transcript, segments, scope) {
       entry.note.onclick = () => { if (scope === transcriptRenderState.scope) void addNoteForSegment(segment.id); };
     } else if (entry.tools?.parentNode === entry.row) entry.row.removeChild(entry.tools);
     next.set(key,entry);
+    if (!sourceRows.has(segment.id)) sourceRows.set(segment.id,entry);
   }
   for (const [key,entry] of previous) {
-    if (!next.has(key)) transcript.removeChild(entry.row);
+    if (!next.has(key)) { transcript.removeChild(entry.row); changed = true; }
   }
   let index = 0;
   for (const entry of next.values()) {
     const at = transcript.children[index] || null;
     // Appended live text must not detach existing rows or replace their text
     // nodes: both would disturb a student's selection and reading position.
-    if (at !== entry.row) transcript.insertBefore(entry.row,at);
+    if (at !== entry.row) { transcript.insertBefore(entry.row,at); changed = true; }
     index += 1;
   }
-  transcriptRenderState = {scope,rows:next};
+  transcriptRenderState = {scope,rows:next,sourceRows};
+  return changed;
 }
 
 // Summary state is tied to the exact login, server and selected lecture. The
@@ -4125,7 +4233,7 @@ function renderQuestions() {
           link.onclick = () => {
             if (!questionIsCurrent(view)) return;
             correctionView = 'raw'; reviewView.query = ''; $('transcript-search').value = ''; renderCurrent();
-            transcriptRenderState.rows.get(JSON.stringify([`id:${id}`,0]))?.row?.scrollIntoView?.({block:'center',behavior:'smooth'});
+            revealTranscriptSegment(id);
             if (canPlayRecording()) void playRecordingClip(source.start);
           }; links.append(link);
         }
@@ -4525,7 +4633,7 @@ function renderStudyNoteDocument(view) {
       if (!studyNoteIsCurrent(view)) return;
       correctionView = 'raw'; reviewView.query = ''; $('transcript-search').value = ''; renderCurrent();
       const id = paragraph.source_ids[0];
-      transcriptRenderState.rows.get(JSON.stringify([`id:${id}`,0]))?.row?.scrollIntoView?.({block:'center',behavior:'smooth'});
+      revealTranscriptSegment(id);
       if (canPlayRecording()) void playRecordingClip(paragraph.start);
     };
     const body = document.createElement('p'); body.className = 'study-note-text';
@@ -4664,13 +4772,24 @@ function renderCurrent() {
   renderStudyNote();
   renderContinuationLinks();
   renderRecordingReview();
-  const allSegments = displayedTranscriptSegments();
+  const sourceSegments = displayedTranscriptSegments();
+  const allSegments = transcriptPresentation === 'sentences' ? groupTranscriptSentences(sourceSegments) : sourceSegments;
   const segments = filterTranscript(allSegments,reviewView.query);
   const transcript = $('transcript');
   const transcriptVersion = correctionView === 'manual' && manualIsCurrent(manualView) && manualView.loaded ? 'manual'
     : correctionView === 'corrected' && correctionIsReady() ? 'corrected' : 'raw';
-  const transcriptScope = JSON.stringify([user,apiUrl,lectureId,current?.asr_provider || 'qwen',transcriptVersion]);
-  renderTranscriptSegments(transcript,segments,transcriptScope);
+  const transcriptScope = JSON.stringify([user,token,apiUrl,lectureId,current?.asr_provider || 'qwen',transcriptVersion,transcriptPresentation]);
+  const readingScope = JSON.stringify([transcriptScope,reviewView.query]);
+  const follower = transcriptFollowController();
+  const scopeChanged = transcriptReadingScope !== readingScope;
+  if (scopeChanged) {
+    transcriptReadingScope = readingScope;
+    follower.reset({follow:transcriptFollowResetOverride ?? (!reviewView.query && !current?.recording_finalized)});
+    $('transcript-scroll').scrollTop = 0;
+  }
+  transcriptFollowResetOverride = null;
+  follower.beforeUpdate();
+  const transcriptChanged = renderTranscriptSegments(transcript,segments,transcriptScope);
   if (!segments.length) {
     const activeCaptureView = hasLiveCaptureSession() && current?.id === activeCaptureLectureId();
     const empty = document.createElement('div'); empty.className = 'empty-note';
@@ -4683,6 +4802,13 @@ function renderCurrent() {
     empty.append(mark,heading,text); transcript.append(empty);
   }
   $('segment-count').textContent = reviewView.query ? `${segments.length} / ${allSegments.length}` : segments.length;
+  $('segment-count-unit').textContent = transcriptPresentation === 'sentences' ? '개 문장' : '개 구간';
+  for (const [id,mode] of [['transcript-sentences','sentences'],['transcript-chunks','chunks']]) {
+    const active = transcriptPresentation === mode;
+    $(id).setAttribute('aria-pressed',String(active)); $(id).classList.toggle('active',active);
+  }
+  follower.afterUpdate({changed:scopeChanged || transcriptChanged});
+  renderTranscriptFollowControls();
   $('transcript-title').textContent = transcriptVersion === 'manual' ? '직접 수정본'
     : correctionView === 'corrected' && correctionIsReady() ? 'AI 후보정본' : '받아쓴 원문';
   updateControls();

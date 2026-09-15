@@ -1456,6 +1456,110 @@ button {
   opacity: 0.48;
 }
 
+.transcript-reader {
+  min-width: 0;
+  margin-top: 18px;
+}
+
+.transcript-reader-toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.transcript-display-modes {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-muted);
+}
+
+.transcript-display-modes button,
+.transcript-follow-toggle {
+  flex: 1 0 auto;
+  min-height: 44px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  word-break: keep-all;
+}
+
+.transcript-display-modes button.active,
+.transcript-display-modes button[aria-pressed="true"] {
+  color: var(--forest-800);
+  background: var(--surface);
+  box-shadow: 0 1px 5px rgba(26, 43, 36, 0.09);
+}
+
+.transcript-follow-toggle {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  color: var(--forest-700);
+}
+
+.transcript-follow-toggle[aria-pressed="true"] {
+  border-color: #c6d9cd;
+  background: var(--forest-100);
+}
+
+.transcript-reader-toolbar button:hover:not(:disabled),
+.sentence-tools button:hover:not(:disabled) {
+  color: var(--forest-950);
+  background: var(--forest-100);
+}
+
+.transcript-follow-state,
+.transcript-view-help {
+  flex: 1 0 100%;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.transcript-follow-state {
+  color: var(--forest-700);
+}
+
+.transcript-scroll {
+  min-width: 0;
+  max-width: 100%;
+  height: clamp(260px, 60vh, 680px);
+  height: clamp(260px, 60dvh, 680px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.transcript-scroll:focus-visible,
+.transcript-reader-toolbar button:focus-visible,
+.sentence-tools button:focus-visible {
+  outline: 2px solid var(--forest-600);
+  outline-offset: 3px;
+}
+
 .correction-panel {
   display: block;
   margin-top: 14px;
@@ -1635,6 +1739,40 @@ button {
   font-size: 16px;
   line-height: 1.78;
   overflow-wrap: anywhere;
+  word-break: keep-all;
+}
+
+.segment.sentence-row {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 18px 0;
+}
+
+.segment.sentence-row p {
+  font-size: 17px;
+  line-height: 1.85;
+  white-space: pre-wrap;
+}
+
+.sentence-tools {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.sentence-tools button {
+  min-height: 36px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--forest-700);
+  background: transparent;
+  font-size: 12px;
+  white-space: nowrap;
   word-break: keep-all;
 }
 
@@ -2580,6 +2718,14 @@ button {
     padding: 21px 19px 28px;
   }
 
+  .transcript-display-modes {
+    width: 100%;
+  }
+
+  .transcript-scroll {
+    padding-inline: 12px;
+  }
+
   .correction-content {
     align-items: stretch;
     flex-direction: column;
@@ -2732,6 +2878,8 @@ button {
   .recorder,
   .note-actions,
   .transcript-versions,
+  .transcript-reader-toolbar,
+  .sentence-tools,
   .correction-panel,
   .admin-dialog,
   .view-meta,
@@ -2749,5 +2897,14 @@ button {
   .transcript-section {
     border: 0;
     box-shadow: none;
+  }
+
+  .transcript-scroll {
+    height: auto;
+    max-height: none;
+    overflow: visible;
+    padding: 0;
+    border: 0;
+    scrollbar-gutter: auto;
   }
 }

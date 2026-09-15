@@ -285,15 +285,15 @@
               <p class="eyebrow">LIVE NOTES</p>
               <h2 id="transcript-title">받아쓴 내용</h2>
             </div>
-            <span><strong id="segment-count">0</strong>개 문장</span>
+            <span><strong id="segment-count">0</strong><span id="segment-count-unit">개 문장</span></span>
           </header>
           <section id="recording-review" class="recording-review" aria-label="수업 복습 도구" hidden>
             <label class="review-search">본문 검색 <input id="transcript-search" type="search" maxlength="120" placeholder="현재 수업의 단어나 문장" autocomplete="off"></label>
             <details id="review-details">
               <summary>녹음 재생 · 책갈피</summary>
-              <p>완료된 수업의 문장 시각을 누르면 해당 위치부터 최대 60초씩 듣습니다. 마이크 녹음 중에는 이어폰을 사용하세요.</p>
+              <p>완료된 수업은 원문 구간 보기에서 시각을 누르면 해당 위치부터 최대 60초씩 듣습니다. 마이크 녹음 중에는 이어폰을 사용하세요.</p>
               <audio id="recording-player" controls preload="none" aria-label="선택한 수업 녹음 구간"></audio>
-              <p id="playback-state" role="status" aria-live="polite">문장 시각을 누르거나 처음부터 들어보세요.</p>
+              <p id="playback-state" role="status" aria-live="polite">원문 구간 보기에서 시각을 누르거나 처음부터 들어보세요.</p>
               <div class="review-actions">
                 <button id="playback-start" class="secondary-button" type="button" disabled>처음부터 듣기</button>
                 <button id="playback-previous" class="secondary-button" type="button" disabled>이전 60초</button>
@@ -313,10 +313,24 @@
             <button id="transcript-corrected" type="button" aria-pressed="false" disabled>AI 후보정본</button>
             <button id="transcript-manual" type="button" aria-pressed="false" disabled>직접 수정본</button>
           </div>
+          <div class="transcript-reader">
+            <div class="transcript-reader-toolbar">
+              <div class="transcript-display-modes" role="group" aria-label="받아쓴 내용 표시 방식">
+                <button id="transcript-sentences" class="active" type="button" aria-pressed="true" aria-controls="transcript">문장 보기</button>
+                <button id="transcript-chunks" type="button" aria-pressed="false" aria-controls="transcript">원문 구간 보기</button>
+              </div>
+              <button id="transcript-follow-toggle" class="transcript-follow-toggle" type="button" aria-pressed="true" aria-controls="transcript-scroll">최신 문장 따라가기</button>
+              <p id="transcript-follow-state" class="transcript-follow-state" role="status" aria-live="polite">새 문장을 자동으로 따라갑니다.</p>
+              <p id="transcript-view-help" class="transcript-view-help">문장으로 이어 읽고, 원문 구간 보기에서 시각·직접 수정을 확인하세요.</p>
+            </div>
+            <div id="transcript-scroll" class="transcript-scroll" tabindex="0" role="region" aria-label="받아쓴 내용 읽기" aria-describedby="transcript-view-help">
+              <div id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text"></div>
+            </div>
+          </div>
           <section id="manual-panel" class="lesson-summary" aria-label="내 필기와 직접 수정" hidden>
             <details id="manual-details">
               <summary>내 필기 · 직접 수정</summary>
-              <p class="summary-privacy">원문·AI 후보정본은 그대로 보존합니다. 필기와 직접 수정본은 이 서버에만 저장되며 AI 요약·번역·수업 질문은 받아쓴 원문을 기준으로 합니다. 각 문장의 직접 수정 버튼으로 내용을 고칠 수 있어요.</p>
+              <p class="summary-privacy">원문·AI 후보정본은 그대로 보존합니다. 필기와 직접 수정본은 이 서버에만 저장되며 AI 요약·번역·수업 질문은 받아쓴 원문을 기준으로 합니다. 원문 구간 보기에서 각 구간의 직접 수정 버튼으로 내용을 고칠 수 있어요.</p>
               <div class="summary-actions"><button id="manual-refresh" class="secondary-button" type="button">필기 · 수정본 불러오기</button><button id="manual-history-all" class="secondary-button" type="button" disabled>수정 이력</button><button id="manual-download" class="secondary-button" type="button" disabled>↓ 필기 Markdown</button></div>
               <p id="manual-state" role="status" aria-live="polite"></p>
               <form id="manual-note-form" class="manual-note-form">
@@ -399,7 +413,6 @@
               <div class="study-actions"><button id="question-prev" class="secondary-button" type="button" disabled>이전 질문</button><button id="question-next" class="secondary-button" type="button" disabled>다음 질문</button></div>
             </details>
           </section>
-          <div id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text"></div>
         </section>
       </div>
     </main>

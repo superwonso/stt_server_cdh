@@ -15,6 +15,8 @@ import * as TestLectureLibrary from '../web/lecture-library.js';
 import * as TestManualNotes from '../web/manual-notes.js';
 import * as TestLectureQuestions from '../web/lecture-questions.js';
 import * as TestStudyNotes from '../web/study-notes.js';
+import { groupTranscriptSentences } from '../web/transcript-sentences.js';
+import { TranscriptFollow } from '../web/transcript-follow.js';
 import { AUTH_SESSION_STORAGE_KEY, TabAuthSessionStore } from '../web/auth-session.js';
 
 const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'))
@@ -28,6 +30,8 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
   .replace("import { validManualState, manualSegments, validManualHistory } from './manual-notes.js';", 'const { validManualState, manualSegments, validManualHistory } = TestManualNotes;')
   .replace("import { validQuestionJob, validQuestionPage } from './lecture-questions.js';", 'const { validQuestionJob, validQuestionPage } = TestLectureQuestions;')
   .replace("import { studyNoteSourceSnapshot, validateStudyNoteResponse, appendStudyNoteText } from './study-notes.js';", 'const { studyNoteSourceSnapshot, validateStudyNoteResponse, appendStudyNoteText } = TestStudyNotes;')
+  .replace("import { groupTranscriptSentences } from './transcript-sentences.js';", 'const groupTranscriptSentences = TestGroupTranscriptSentences;')
+  .replace("import { TranscriptFollow } from './transcript-follow.js';", 'const TranscriptFollow = TestTranscriptFollow;')
   .replace("import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';", `
     const FileImportCancelledError = class extends Error {};
     const RecordingFileUploader = TestFileUploader;
@@ -48,6 +52,7 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
   `)
   .replace('void init();', '');
 const tick = () => new Promise(resolve => setImmediate(resolve));
+const transcriptText = (app,index = 0) => app.element('transcript').children[index]?.children.find(child => child.tagName === 'P')?.textContent;
 async function until(predicate, label = 'asynchronous operation', {timeoutMs = 5000} = {}) {
   // WebCrypto/Blob work may finish on another thread. Two hundred immediate
   // turns can elapse in under 10 ms on CI without that work completing. Use a
@@ -91,6 +96,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     setItem:(key,value) => { storageWrites.push([key,String(value)]); sessionItems.set(key,String(value)); },removeItem:key => sessionItems.delete(key)};
   let id = 0, mic, lastLiveQueue;
   const makeElement = (name, value = '') => {
+    const listeners = new Map();
     const node = {
     name,tagName:name.toUpperCase(),value,style:{},dataset:{},children:[],open:false,
     classList:{values:new Set(),toggle(className,force){
@@ -138,6 +144,10 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     removeAttribute(attribute){ delete this[attribute]; },
     setAttribute(attribute,value){ this[attribute] = String(value); },
     click(){ this.clicked = true; },
+    addEventListener(type,listener){ const group=listeners.get(type)||new Set();group.add(listener);listeners.set(type,group); },
+    removeEventListener(type,listener){ listeners.get(type)?.delete(listener); },
+    dispatchEvent(event){ for(const listener of listeners.get(event.type)||[])listener(event); },
+    contains(target){ for(let node=target;node;node=node.parentNode)if(node===this)return true;return false; },
     };
     let textValue, textNode = null;
     Object.defineProperties(node,{
@@ -261,6 +271,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     TestLectureLibrary,
     TestManualNotes,
     TestLectureQuestions, TestStudyNotes,
+    TestGroupTranscriptSentences:groupTranscriptSentences, TestTranscriptFollow:TranscriptFollow,
     TestLocalAudioExport, TestRecordingFileSelection, TestEncodeWav:encodeWav,
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },
     clearTimeout:value => timeouts.delete(value),
@@ -645,7 +656,7 @@ test('review search filters the display only and bookmark loading is explicit',a
   assert.equal(requests.length,0);
   app.element('transcript-search').value='beta'; app.element('transcript-search').oninput();
   assert.equal(app.element('transcript').children.length,1);
-  assert.equal(app.element('segment-count').textContent,'1 / 2');
+  assert.equal(app.element('segment-count').textContent,'1 / 1');
   assert.ok(app.run("exportText(current,'text')").includes('Alpha'));
   await app.run('loadBookmarks()');
   assert.equal(requests.length,1); assert.match(requests[0][0],/\/bookmarks$/);
@@ -982,7 +993,7 @@ test('question citations return to immutable raw text and stale citation buttons
   app.run("current.recording_available=false; capture={capturedSeconds:12}; captureSession={id:'live-lesson',lecture:{id:'live-lesson'}}; recording=true;");
   await app.run('loadQuestions()');
   const link=app.element('question-list').querySelectorAll('button')[0];
-  const row=app.run("transcriptRenderState.rows.get(JSON.stringify(['id:s2',0])).row");
+  const row=app.run("transcriptRenderState.sourceRows.get('s2').row");
   let scrolled=0; row.scrollIntoView=()=>scrolled++;
   app.run("correctionView='manual'; reviewView.query='hidden';");
   link.onclick();
@@ -1098,6 +1109,7 @@ test('lecture status refresh updates timestamp playback and discards audio if no
     : new Response(wav,{headers:{'Content-Type':'audio/wav','Content-Length':String(wav.size),
       'X-Clip-Start-Seconds':'0','X-Clip-Duration-Seconds':'1'}}));
   openReviewFixture(app);
+  app.element('transcript-chunks').onclick();
   app.run('current.recording_available=false; current.recording_finalized=false; renderCurrent()');
   assert.equal(app.element('playback-start').disabled,true);
   await app.run('refreshLectures()');
@@ -2033,8 +2045,111 @@ test('Markdown and plain-text exports preserve content safely independently of a
   assert.equal(app.element('delete-lecture').disabled,true);
 });
 
+function sentenceReaderFixture(app, {finished = false, count = 20} = {}) {
+  const viewport = app.element('transcript-scroll');
+  viewport.append(app.element('transcript'));
+  viewport.clientHeight = 160;
+  Object.defineProperty(viewport,'scrollHeight',{configurable:true,get:() => 40 + app.element('transcript').children.length * 60});
+  app.run(`current={id:'sentence-lesson',title:'합성 문장 수업',asr_provider:'clova',created_at:'2026-01-01T00:00:00Z',
+    recording_finalized:${finished},segments:Array.from({length:${count}},(_,i)=>({id:'s'+i,start:i,end:i+1,text:'완성된 문장 '+i+'입니다.'}))};renderCurrent()`);
+  return viewport;
+}
+
+test('sentence view is the real default and joins Korean fragments without mutating raw sources or sending requests', () => {
+  const calls=[],app=setup((url,options)=>{calls.push({url,options});return response({});});
+  assert.equal(app.run('transcriptPresentation'),'sentences');
+  app.run(`current={id:'sentence-example',title:'예시',asr_provider:'clova',created_at:'2026-01-01T00:00:00Z',recording_finalized:false,
+    segments:['오늘 찍은 사진이라','이라면 어제 전송이 처음 멈춘 문제','와 오늘 복구 버튼이 잠긴 문제를 구분해야 합니','다.']
+      .map((text,i)=>({id:'s'+i,text,start:i,end:i+1}))};`);
+  const original=app.run('JSON.stringify(current.segments)');
+  app.run('renderCurrent()');
+  assert.equal(app.element('transcript').children.length,1);
+  assert.equal(transcriptText(app),'오늘 찍은 사진이라면 어제 전송이 처음 멈춘 문제와 오늘 복구 버튼이 잠긴 문제를 구분해야 합니다.');
+  assert.equal(app.element('segment-count').textContent,1);
+  assert.equal(app.element('segment-count-unit').textContent,'개 문장');
+  assert.equal(app.element('transcript').children[0].children.some(node=>node.tagName==='TIME'),false);
+  for(const id of ['s0','s1','s2','s3'])assert.equal(app.run(`transcriptRenderState.sourceRows.get('${id}').row`),app.element('transcript').children[0]);
+  app.element('transcript').children[0].children[1].children[0].onclick();
+  assert.equal(app.run('transcriptPresentation'),'chunks');
+  assert.equal(app.element('transcript').children.length,4);
+  assert.equal(app.element('segment-count-unit').textContent,'개 구간');
+  assert.equal(app.element('transcript').children[0].children[0].tagName,'TIME');
+  assert.equal(app.run('transcriptFollower.following'),false);
+  app.element('transcript-sentences').onclick();
+  assert.equal(app.element('transcript').children.length,1);
+  assert.equal(app.run('JSON.stringify(current.segments)'),original);
+  assert.equal(calls.length,0);
+});
+
+test('sentence search works across raw chunk boundaries and an unfinished final fragment is visible', () => {
+  const app=setup(()=>response({}));
+  app.run(`current={id:'search-sentence',title:'합성',created_at:'2026-01-01T00:00:00Z',segments:[
+    {id:'a',start:0,end:1,text:'앞 문제'},{id:'b',start:1,end:2,text:'와 뒤 문제를 구분합니다. 다음 설명은'}]};renderCurrent()`);
+  assert.equal(app.element('transcript').children.length,2);
+  assert.equal(transcriptText(app,1),'다음 설명은');
+  app.element('transcript-search').value='문제와 뒤';app.element('transcript-search').oninput();
+  assert.equal(app.element('transcript').children.length,1);
+  assert.equal(transcriptText(app),'앞 문제와 뒤 문제를 구분합니다.');
+  assert.equal(app.element('segment-count').textContent,'1 / 2');
+  assert.equal(app.run('transcriptFollower.following'),false);
+});
+
+test('live reader follows only its own viewport and pauses when the user reads earlier sentences', () => {
+  const app=setup(()=>response({})),viewport=sentenceReaderFixture(app);
+  assert.equal(viewport.scrollTop,viewport.scrollHeight-viewport.clientHeight);
+  assert.equal(app.run('transcriptFollower.following'),true);
+  const row=app.element('transcript').children[3],textNode=row.children[0].firstChild;
+  app.run(`current.segments.push({id:'s20',start:20,end:21,text:'새 문장입니다.'});renderCurrent()`);
+  assert.equal(viewport.scrollTop,viewport.scrollHeight-viewport.clientHeight);
+  viewport.scrollTop=120;viewport.dispatchEvent({type:'scroll'});
+  assert.equal(app.run('transcriptFollower.following'),false);
+  app.run(`current.segments.push({id:'s21',start:21,end:22,text:'읽는 동안 추가된 문장입니다.'});renderCurrent()`);
+  assert.equal(viewport.scrollTop,120);
+  assert.equal(app.element('transcript').children[3],row);
+  assert.equal(row.children[0].firstChild,textNode);
+  app.element('transcript-follow-toggle').onclick();
+  assert.equal(app.run('transcriptFollower.following'),true);
+  assert.equal(viewport.scrollTop,viewport.scrollHeight-viewport.clientHeight);
+  viewport.dispatchEvent({type:'scroll'});
+  assert.equal(app.run('transcriptFollower.following'),true);
+  assert.equal(app.element('transcript-follow-toggle')['aria-pressed'],'true');
+});
+
+test('past lectures start at the top and source jumps preserve paused reading mode', () => {
+  const app=setup(()=>response({})),viewport=sentenceReaderFixture(app,{finished:true});
+  assert.equal(viewport.scrollTop,0);
+  assert.equal(app.run('transcriptFollower.following'),false);
+  app.element('transcript-follow-toggle').onclick();
+  const row=app.run("transcriptRenderState.sourceRows.get('s4').row");
+  let revealed=0;row.scrollIntoView=()=>revealed++;
+  app.run("revealTranscriptSegment('s4')");
+  assert.equal(revealed,1);assert.equal(app.run('transcriptFollower.following'),false);
+  viewport.scrollTop=77;app.run('renderCurrent()');assert.equal(viewport.scrollTop,77);
+  app.run("current={...current,id:'another-past-lesson'};renderCurrent()");
+  assert.equal(viewport.scrollTop,0);
+});
+
+test('selection in the reader pauses following without replacing unchanged text nodes', () => {
+  const app=setup(()=>response({})),viewport=sentenceReaderFixture(app);
+  const paragraph=app.element('transcript').children[4].children[0],textNode=paragraph.firstChild;
+  app.document.getSelection=()=>({isCollapsed:false,anchorNode:paragraph,focusNode:paragraph});
+  const top=viewport.scrollTop;
+  app.run(`current.segments.push({id:'selected-new',start:21,end:22,text:'선택 중인 글은 그대로입니다.'});renderCurrent()`);
+  assert.equal(app.run('transcriptFollower.following'),false);
+  assert.equal(viewport.scrollTop,top);assert.equal(paragraph.firstChild,textNode);
+});
+
+test('sentence body stays inert and no source control is invented for missing IDs', () => {
+  const app=setup(()=>response({}));
+  app.run(`current={id:'inert-sentence',title:'합성',created_at:'2026-01-01T00:00:00Z',segments:[{text:'<script>alert(1)</script> & **원문**'}]};renderCurrent()`);
+  assert.equal(transcriptText(app),'<script>alert(1)</script> & **원문**');
+  assert.equal(app.element('transcript').children[0].children[1].hidden,true);
+  assert.equal(app.createdAll('script').length,0);
+});
+
 test('live transcript updates reuse unchanged rows and text nodes without changing the reading position', () => {
   const app = setup(async () => response({}));
+  app.run("transcriptPresentation='chunks'");
   app.run(`
     current={id:'long-lecture',title:'긴 수업',created_at:'2026-01-01T00:00:00Z',asr_provider:'qwen',
       segments:Array.from({length:1000},(_,index) => ({id:'s'+index,start:index * 8,end:index * 8+4,text:'문장 '+index}))};
@@ -2067,6 +2182,7 @@ test('live transcript updates reuse unchanged rows and text nodes without changi
 
 test('transcript keys are isolated by lecture, account, provider, origin, and raw versus corrected view', () => {
   const app = setup(async () => response({}));
+  app.run("transcriptPresentation='chunks'");
   app.run(`
     current={id:'lesson',title:'수업',created_at:'2026-01-01T00:00:00Z',asr_provider:'qwen',
       recording_finalized:true,segments:[{id:'shared-id',start:0,end:1,text:'받아쓴 원문'}]}; renderCurrent();
@@ -2130,7 +2246,7 @@ test('confirmed text is visible before slow local acknowledgement and remains vi
   app.microphone().callbacks.onChunk(chunk(0));
   await tick(); await tick();
   assert.equal(cleanupAttempts,1);
-  assert.equal(app.element('transcript').children[0].children[1].textContent,'이미 서버에 저장된 문장');
+  assert.equal(transcriptText(app),'이미 서버에 저장된 문장');
   assert.equal(app.run('pending.length'),1,'cleanup must retain the durable chunk until its ACK path completes');
   assert.equal(queue.chunks.size,1);
   localAck.resolve();
@@ -2141,7 +2257,7 @@ test('confirmed text is visible before slow local acknowledgement and remains vi
   assert.equal(queue.chunks.size,1,'failed local deletion retains the recoverable WAV');
   assert.equal(uploads,1);
   assert.equal(app.run('recording'),true);
-  assert.equal(app.element('transcript').children[0].children[1].textContent,'이미 서버에 저장된 문장');
+  assert.equal(transcriptText(app),'이미 서버에 저장된 문장');
 });
 
 for (const scenario of ['account','token','origin','provider']) {
@@ -2224,7 +2340,7 @@ test('AI correction stays raw by default, polls to completion, and exports only 
   assert.equal(app.run('correction.status'), 'queued');
   assert.equal(app.run('correctionView'), 'raw');
   assert.match(app.element('correction-state').textContent, /대기/);
-  assert.equal(app.element('transcript').children[0].children[1].textContent, '원문 첫 문장');
+  assert.equal(transcriptText(app), '원문 첫 문장 원문 둘째 문장');
 
   await app.runTimeout(2500);
   assert.equal(app.run('correction.status'), 'processing');
@@ -2236,12 +2352,12 @@ test('AI correction stays raw by default, polls to completion, and exports only 
   assert.match(app.element('notice').textContent, /후보정본을 만들었어요/);
   assert.equal(app.element('transcript-corrected').disabled, false);
   assert.match(app.element('correction-detail').textContent, /확인이 필요한 표현: 전문용어/);
-  assert.equal(app.element('transcript').children[0].children[1].textContent, '원문 첫 문장');
+  assert.equal(transcriptText(app), '원문 첫 문장 원문 둘째 문장');
 
   app.element('transcript-corrected').onclick();
   assert.equal(app.run('correctionView'), 'corrected');
   assert.equal(app.element('transcript-corrected')['aria-pressed'], 'true');
-  assert.equal(app.element('transcript').children[0].children[1].textContent, '교정된 첫 문장입니다.');
+  assert.equal(transcriptText(app), '교정된 첫 문장입니다.');
   assert.equal(app.element('segment-count').textContent, 2);
 
   app.element('export-format').value = 'markdown';
@@ -2292,7 +2408,7 @@ test('AI correction is blocked until the lecture is finalized and reports exhaus
   assert.equal(app.element('correction-panel')['data-state'], 'credit-exhausted');
   assert.match(app.element('correction-state').textContent, /크레딧/);
   assert.equal(app.run('correctionView'), 'raw');
-  assert.equal(app.element('transcript').children[0].children[1].textContent, '보존할 원문');
+  assert.equal(transcriptText(app), '보존할 원문');
 });
 
 test('a live lecture schedules exactly one correction after its final chunk without stopping capture', async () => {
@@ -2640,7 +2756,7 @@ test('late AI correction responses and polling timers cannot cross lecture bound
   assert.equal(app.run('current.id'), 'new');
   assert.equal(app.run('correction'), null);
   assert.equal(app.run('correctionView'), 'raw');
-  assert.equal(app.element('transcript').children[0].children[1].textContent, '새 원문');
+  assert.equal(transcriptText(app), '새 원문');
 
   app.run(`
     correction={status:'processing',corrected_text:'',corrected_segments:[]};
@@ -2678,7 +2794,7 @@ test('a late automatically scheduled correction cannot alter another account', a
   assert.equal(app.run('scheduledCorrections.size'),0);
   assert.equal(app.run('current.id'),'next-lesson');
   assert.equal(app.run('correction'),null);
-  assert.equal(app.element('transcript').children[0].children[1].textContent,'다음 원문');
+  assert.equal(transcriptText(app),'다음 원문');
 });
 
 test('an in-flight reserved correction keeps logout and navigation protected until acknowledged', async () => {
@@ -4286,7 +4402,7 @@ test('only an explicit not-started CLOVA 429 retries its POST with the same chun
   assert.equal(sentIds[0],sentIds[1]);
   assert.equal(lookups,0);
   assert.equal(app.run('pending.length'),0);
-  assert.equal(app.element('transcript').children[0].children[1].textContent,'중복 없는 문장');
+  assert.equal(transcriptText(app),'중복 없는 문장');
 });
 
 test('a lost CLOVA response is recovered by hash-checked GET without another audio POST', async () => {
@@ -4322,7 +4438,7 @@ test('a lost CLOVA response is recovered by hash-checked GET without another aud
   assert.equal(uploads,1);
   assert.equal(lookups,1);
   assert.equal(app.run('liveQueue.chunks.size'),0);
-  assert.equal(app.element('transcript').children[0].children[1].textContent,'서버에서 회수한 문장');
+  assert.equal(transcriptText(app),'서버에서 회수한 문장');
   assert.equal(app.run('recording'),true);
 });
 
@@ -4362,7 +4478,7 @@ test('pending CLOVA recovery polls GET only and continues through an explicit mi
   assert.equal(lookups,3);
   assert.equal(app.run('current.segments.length'),1);
   assert.equal(app.run('current.recording_finalized'),true);
-  assert.equal(app.element('transcript').children[0].children[1].textContent,'회수한 마지막 문장');
+  assert.equal(transcriptText(app),'회수한 마지막 문장');
 });
 
 test('pending CLOVA lookups have a finite retry budget and preserve an unresolved WAV', async () => {
@@ -4417,7 +4533,7 @@ test('restored blocked CLOVA audio is acknowledged directly after GET confirmati
   assert.equal(uploads,1);
   assert.equal(lookups,2);
   assert.equal(queue.chunks.size,0);
-  assert.equal(app.element('transcript').children[0].children[1].textContent,'복구 문장');
+  assert.equal(transcriptText(app),'복구 문장');
 });
 
 test('untrusted retry flags and unavailable or malformed CLOVA lookup responses never authorize another POST', async () => {
