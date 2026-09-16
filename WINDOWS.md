@@ -96,6 +96,14 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\start-wi
 
 터널이 실행됐다는 사실만으로 기존 웹사이트의 API 연결 설정이 게시·갱신됐다고 판단하지 않습니다. GitHub 인증, Pages 게시, 공개 주소 전환과 갱신은 별도 운영 절차에서 승인 범위와 완료 여부를 확인합니다. `start-tunnel.sh`를 Windows 시험용으로 실행하지 않습니다.
 
+### 터널 시작이나 게시가 실패하는 경우
+
+시작 명령이 실패하면 다음 게시 명령으로 넘어가지 않습니다. API와 모델이 `ready`여도 터널의 공개 상태 확인은 별도입니다. 터널 시작에 실패하면 현재 소유한 정상 터널 후보가 없으므로 게시 명령의 `candidate must match` 검사가 거부할 수 있습니다.
+
+터널 오류에는 `startup_timeout; public_dns_lookup_failed`처럼 고정된 원인 코드가 표시됩니다. `public_tls_failed`는 HTTPS 인증서 확인 실패, `public_http_status_502`는 공개 연결의 502 응답, `startup_no_url`은 제한 시간 내 주소 미발견, `process_exited`는 터널 프로세스 종료를 뜻합니다. 비공개 로그와 자격 증명은 공개 이슈나 채팅에 붙이지 않습니다.
+
+Windows에서 새 터널을 시작할 때 실제 DNS 조회 오류가 확인되면 공식 `ipconfig /flushdns`로 일시적인 시스템 DNS 캐시를 첫 DNS 오류 후 10·30·60초에 해당 시작 시도당 최대 세 번 비우고 다시 확인합니다. 이 작업은 모든 이름의 캐시를 비우지만 DNS 서버 설정이나 이미 연결된 세션은 변경하지 않습니다. 실행 중인 터널의 상태 확인·게시·자동 갱신에서는 캐시를 비우지 않습니다. 관리자 권한으로 자동 승격하지 않습니다. 캐시 초기화 성공만으로 준비 완료로 판단하지 않으며, 원래 HTTPS 인증서·정확한 API 상태 확인이 성공해야 정상 시작으로 취급합니다. 제한 시간 내 준비되지 않으면 이번에 시작한 터널만 종료하고 게시를 진행하지 않습니다.
+
 ## 고정 모델과 승인 음성 검증
 
 | 모델 | Revision |

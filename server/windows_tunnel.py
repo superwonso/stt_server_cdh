@@ -15,11 +15,14 @@ import re
 import sys
 import time
 import secrets
+import socket
+import ssl
 
 from scripts.runtime_config import runtime_config, validate_document, validate_value, parse_timestamp
 from .model_process import PROJECT_DIR, ModelProcessError, command_hash
 from .platform_files import atomic_write_private, current_user_sid, ensure_private_directory, open_file
 from .win_model_launch import OwnedLaunch
+from .windows_dns import clear_startup_dns_cache
 from .win_model_process import ProcessHandle, process_identity, process_lock, runtime_path
 
 SERVICE_DIR = PROJECT_DIR.parent
@@ -28,6 +31,64 @@ DEFAULT_BINARY = SERVICE_DIR / 'tools' / 'cloudflared' / 'cloudflared.exe'
 TARGET = 'http://127.0.0.1:8765'
 HEX32 = re.compile(r'[0-9a-f]{32}\Z')
 HEX64 = re.compile(r'[0-9a-f]{64}\Z')
+DNS_CACHE_RETRY_DELAYS = (10.0, 30.0, 60.0)
+
+
+START_CODES = frozenset({
+    'operation_failed', 'local_health_failed', 'existing_tunnel_unhealthy',
+    'startup_no_url', 'startup_timeout', 'process_exited', 'multiple_tunnel_origins',
+})
+HEALTH_CODES = frozenset({
+    'ok', 'dns_lookup_failed', 'tls_failed', 'network_failed', 'health_timeout',
+    'invalid_health', 'health_body_too_large', 'health_failed',
+})
+
+
+def safe_health_code(value):
+    # Only local classifications and bounded HTTP status numbers may reach UI.
+    if isinstance(value, str) and (value in HEALTH_CODES
+            or re.fullmatch(r'http_status_[1-5][0-9]{2}', value)):
+        return value
+    return 'health_failed'
+
+
+def safe_diagnostic_code(value):
+    if isinstance(value, str):
+        for prefix in ('local_', 'public_'):
+            if value.startswith(prefix) and safe_health_code(value[len(prefix):]) == value[len(prefix):]:
+                return value
+    return None
+
+
+class TunnelStartError(ModelProcessError):
+    def __init__(self, code, diagnostic=None):
+        self.code = code if isinstance(code, str) and code in START_CODES else 'operation_failed'
+        self.diagnostic = safe_diagnostic_code(diagnostic)
+        super().__init__('Windows tunnel startup failed [' + self.code + '].')
+
+
+def health_exception_code(error):
+    """Inspect bounded exception types, never provider/DNS exception text."""
+    import httpx
+    pending, seen, kinds = [error], set(), set()
+    while pending and len(seen) < 16:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror):
+            kinds.add('dns_lookup_failed')
+        if isinstance(current, ssl.SSLError):
+            kinds.add('tls_failed')
+        if isinstance(current, (httpx.TimeoutException, TimeoutError)):
+            kinds.add('health_timeout')
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    for code in ('dns_lookup_failed', 'tls_failed', 'health_timeout'):
+        if code in kinds:
+            return code
+    return 'network_failed'
 
 
 def read_private(path, limit=8192):
@@ -50,30 +111,50 @@ def quick_url(log):
         if state == 'online' and candidate == origin:
             candidates.add(origin)
     if len(candidates) > 1:
-        raise ModelProcessError('This launch reported more than one tunnel origin.')
+        raise TunnelStartError('multiple_tunnel_origins')
     return next(iter(candidates), None)
 
 
-def check_health(origin):
+def _health_attempt(origin, deadline):
     import httpx
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return 'health_timeout'
+    try:
+        with httpx.Client(trust_env=False, follow_redirects=False, timeout=min(3, remaining)) as client:
+            with client.stream('GET', origin + '/health', headers={'Accept-Encoding': 'identity', 'Cache-Control': 'no-cache'}) as response:
+                if response.status_code != 200:
+                    return safe_health_code('http_status_' + str(response.status_code))
+                body = bytearray()
+                for piece in response.iter_raw():
+                    body.extend(piece)
+                    if len(body) > 4096:
+                        return 'health_body_too_large'
+                    if time.monotonic() > deadline:
+                        return 'health_timeout'
+                return 'ok' if json.loads(body) == {'status': 'ok'} else 'invalid_health'
+    except (httpx.HTTPError, OSError) as error:
+        return health_exception_code(error)
+    except (ValueError, RecursionError):
+        return 'invalid_health'
+
+
+def check_health_result(origin):
+    """Return fixed diagnostics after normal TLS and exact health validation."""
     if origin != TARGET:
         state, normalized = validate_value(origin)
         if state != 'online' or normalized != origin:
             raise ModelProcessError('The public health origin is not canonical.')
-    try:
-        deadline = time.monotonic() + 5
-        with httpx.Client(trust_env=False, follow_redirects=False, timeout=3) as client:
-            with client.stream('GET', origin + '/health', headers={'Accept-Encoding': 'identity', 'Cache-Control': 'no-cache'}) as response:
-                if response.status_code != 200:
-                    return False
-                body = bytearray()
-                for piece in response.iter_raw():
-                    body.extend(piece)
-                    if len(body) > 4096 or time.monotonic() > deadline:
-                        return False
-                return json.loads(body) == {'status': 'ok'}
-    except (httpx.HTTPError, OSError, ValueError):
-        return False
+    return _health_attempt(origin, time.monotonic() + 5)
+
+
+def check_health(origin, *, diagnostics=None):
+    # Existing status/publication callers retain the bool contract. Startup can
+    # collect the exact result of its own probe without a second network call.
+    code = check_health_result(origin)
+    if diagnostics is not None:
+        diagnostics['code'] = code
+    return code == 'ok'
 
 
 def clean_environment(directory):
@@ -208,19 +289,30 @@ class WindowsTunnelController:
         if not 1 <= timeout <= 300:
             raise ModelProcessError('Tunnel timeout must be 1 to 300 seconds.')
         runtime_path(self.directory, create=True)
+        last_failure = None
+
+        def probe(origin):
+            nonlocal last_failure
+            diagnostics = {}
+            healthy = check_health(origin, diagnostics=diagnostics)
+            if not healthy:
+                scope = 'local_' if origin == TARGET else 'public_'
+                last_failure = scope + safe_health_code(diagnostics.get('code'))
+            return healthy
+
         with process_lock(self.lock_file):
             record = self.read_record()
             if record is not None:
                 if self.running(record):
                     self.status()
-                    if not check_health(TARGET) or not check_health(record['api_url']):
-                        raise ModelProcessError('Existing tunnel is unhealthy; preserved for explicit stop/review.')
+                    if not probe(TARGET) or not probe(record['api_url']):
+                        raise TunnelStartError('existing_tunnel_unhealthy', last_failure)
                     atomic_write_private(self.config_file, json.dumps(runtime_config(record['api_url'])).encode())
                     return self.status()
                 self._retire(record)
             self.status()
-            if not check_health(TARGET):
-                raise ModelProcessError('Production API health on 127.0.0.1:8765 is not ready; no tunnel started.')
+            if not probe(TARGET):
+                raise TunnelStartError('local_health_failed', last_failure)
             digest = self._binary_digest()
             instance = secrets.token_hex(16)
             log_file = self.directory / f'cloudflared-{instance}.log'
@@ -234,20 +326,48 @@ class WindowsTunnelController:
                     with OwnedLaunch(self.command(instance), cwd=PROJECT_DIR, env=environment, stdout=fd) as launch:
                         identity = process_identity(launch.process.pid)
                         if identity is None:
-                            raise ModelProcessError('Cloudflared exited before ownership verification.')
+                            raise TunnelStartError('process_exited')
                         deadline = time.monotonic() + timeout
+                        saw_url = False
+                        dns_cache_clear_attempts = 0
+                        first_dns_failure_at = None
                         while time.monotonic() < deadline:
                             if launch.process.poll() is not None:
-                                raise ModelProcessError('Cloudflared exited before public health verification; private log retained.')
+                                raise TunnelStartError('process_exited', last_failure)
                             url = quick_url(read_private(log_file, 2 * 1024 * 1024).decode('utf-8', errors='replace'))
-                            if url and check_health(url) and check_health(TARGET):
+                            if url:
+                                saw_url = True
+                            public_healthy = False
+                            if url and time.monotonic() < deadline:
+                                public_healthy = probe(url)
+                                if (not public_healthy and os.name == 'nt'
+                                        and last_failure == 'public_dns_lookup_failed'):
+                                    observed = time.monotonic()
+                                    if first_dns_failure_at is None:
+                                        first_dns_failure_at = observed
+                                    # Retry only at bounded offsets from the first
+                                    # genuine DNS failure while ordinary HTTPS
+                                    # probes continue. Existing tunnels never enter
+                                    # here; no blocking grace-period sleep is used.
+                                    if (dns_cache_clear_attempts < len(DNS_CACHE_RETRY_DELAYS)
+                                            and observed - first_dns_failure_at >= DNS_CACHE_RETRY_DELAYS[dns_cache_clear_attempts]):
+                                        # Consume the attempt before calling even
+                                        # when the helper fails or times out.
+                                        dns_cache_clear_attempts += 1
+                                        budget = min(2.0, deadline - observed)
+                                        if budget > 0:
+                                            clear_startup_dns_cache(timeout=budget)
+                                        # Cache clearing is never readiness proof.
+                                        # The next loop must verify normal TLS and
+                                        # exact health JSON from the same origin.
+                            if public_healthy and probe(TARGET):
                                 registered = {'version': 1, **identity, 'sid': current_user_sid(),
                                     'project': str(PROJECT_DIR), 'runtime': str(self.directory), 'instance': instance,
                                     'command_hash': command_hash(self.command(instance)), 'binary_sha256': digest,
                                     'target': TARGET, 'api_url': url}
                                 with ProcessHandle(identity['pid']) as handle:
                                     if not self.verify_handle(handle, registered):
-                                        raise ModelProcessError('Cloudflared exited during public health verification.')
+                                        raise TunnelStartError('process_exited', last_failure)
                                 atomic_write_private(self.record_file, json.dumps(registered).encode())
                                 atomic_write_private(self.config_file, json.dumps(runtime_config(url)).encode())
                                 launch.commit(registered)
@@ -255,7 +375,7 @@ class WindowsTunnelController:
                                 break
                             time.sleep(.2)
                         else:
-                            raise ModelProcessError('Tunnel startup deadline expired; only this launch was stopped.')
+                            raise TunnelStartError('startup_timeout' if saw_url else 'startup_no_url', last_failure)
                 except BaseException:
                     # The armed job has already stopped only the failed launch.
                     # If registration was partially written, retire only that exact record.
@@ -318,8 +438,15 @@ def main(argv=None):
                 print(result['api_url'])
             print('GitHub/Pages publication was not performed.')
         return 0
+    except TunnelStartError as error:
+        # Even typed errors are normalized again here; never reflect str(error).
+        code = error.code if isinstance(error.code, str) and error.code in START_CODES else 'operation_failed'
+        diagnostic = safe_diagnostic_code(error.diagnostic)
+        codes = code + ('; ' + diagnostic if diagnostic else '')
+        print('Windows tunnel operation failed [' + codes + ']. Private state and logs were preserved; unrelated processes and publication were not changed.', file=sys.stderr)
+        return 1
     except (OSError, ValueError, RuntimeError):
-        print('Windows tunnel operation failed. Private state and logs were preserved; unrelated processes and publication were not changed.', file=sys.stderr)
+        print('Windows tunnel operation failed [operation_failed]. Private state and logs were preserved; unrelated processes and publication were not changed.', file=sys.stderr)
         return 1
 
 
