@@ -7665,6 +7665,155 @@ async function openHeldImport(fixture) {
   return localImportButtons(app);
 }
 
+async function failedAudioImportFixture({active=true,previousHeld=false,FileUploader}={}) {
+  const network=[];
+  const app=setup(async(url,options={})=>{
+    network.push({url,method:options.method || 'GET'});
+    if(url.endsWith('/lectures')&&options.method==='POST'){
+      const body=JSON.parse(options.body);
+      return response({id:options.headers.get('X-Lecture-Id'),title:body.title,language:body.language,asr_provider:body.asr_provider,
+        created_at:'2026-01-01T00:00:00Z',segments:[],recording_available:false,recording_finalized:false},201);
+    }
+    if(url.endsWith('/chunks'))return response({detail:'합성 CLOVA 응답을 확정하지 못했습니다.'},424);
+    if(url.endsWith('/result'))return response({state:'unknown'});
+    return response({});
+  },{FileUploader});
+  let oldId=null;
+  if(previousHeld){oldId=await seedHeldScenario(app);await app.run('prepareIndependentLesson()');}
+  app.run('transcriptionProviders.clova.configured=true');app.element('asr-provider').value='clova';
+  app.element('lecture-title').value='합성 변환 대상';app.element('language').value='en';
+  await app.run('startRecording()');
+  const id=app.run('captureSession.id'),queue=app.run('liveQueue'),mic=app.microphone();
+  const readSnapshot=queue.readExportSnapshot.bind(queue);
+  queue.readExportSnapshot=async owner=>{
+    const snapshot=await readSnapshot(owner);
+    // Match the real IndexedDB reader; the older VM map has getChunk-only fields.
+    for(const session of snapshot.sessions)session.updatedAt ??= session.createdAt;
+    for(const row of snapshot.chunks){delete row.lectureId;delete row.inflightAt;row.createdAt ??= row.sessionCreatedAt;row.updatedAt ??= row.sessionCreatedAt;}
+    return snapshot;
+  };
+  const first=chunk(0,.1),tail={...chunk(.1,.05,0,true),blob:encodeWav(new Float32Array(800).fill(.5))};
+  mic.callbacks.onChunk(first);
+  await until(()=>app.run('!!sendError&&!sending&&pending.every(row=>row.durable)'),'synthetic CLOVA unknown result');
+  mic.tail=tail;
+  if(!active)await app.run('stopRecording()');
+  app.run('updateControls()');
+  return {app,id,oldId,queue,mic,network,first,tail};
+}
+
+test('failed CLOVA conversion shortcut stops once and includes the final microphone tail before staging without uploading',async()=>{
+  const starts=[];
+  const fixture=await failedAudioImportFixture({FileUploader:class{
+    constructor(){this.running=false;}
+    detach(){}
+    start(file,options){starts.push({file,options});this.running=true;return new Promise(()=>{});}
+  }});
+  const {app,id,queue,mic,network,first,tail}=fixture;
+  const original=app.run('pending[0]'),blob=queue.chunks.get(original.id).blob,requestCount=network.length;
+  assert.equal(app.element('convert-failed').hidden,false);assert.equal(app.element('convert-failed').disabled,false);
+  assert.match(app.element('convert-failed').textContent,/녹음 종료.*파일 변환/);
+  app.element('convert-failed').onclick();
+  await until(()=>app.element('local-audio-dialog').open&&!app.run('localAudioExportBusy')&&!app.run('failedAudioImportBusy'));
+  assert.equal(mic.stopCalls,1);assert.equal(app.run('recording'),false);assert.equal(app.run('capture'),null);
+  assert.equal(app.run('pending.length'),2);assert.equal(app.run('pending[1].final'),true);
+  assert.equal(app.run('localAudioExportCaptureId'),id);assert.equal(app.run('localAudioExportForImport'),true);
+  assert.equal(queue.sessions.get(id).uploadHeld,true);assert.equal(queue.chunks.get(original.id).blob,blob);
+  assert.ok([...queue.chunks.values()].every(row=>row.uploadHeld===true));assert.equal(starts.length,0);
+  const buttons=localImportButtons(app);assert.equal(buttons.length,1);buttons[0].onclick();
+  const file=app.run('currentRecordingFile()');assert.ok(file instanceof File);assert.equal(file.size,44+(1600+800)*2);
+  const bytes=new Uint8Array(await file.arrayBuffer());
+  assert.deepEqual(bytes.slice(44,44+1600*2),new Uint8Array(await first.blob.arrayBuffer()).slice(44));
+  assert.deepEqual(bytes.slice(44+1600*2),new Uint8Array(await tail.blob.arrayBuffer()).slice(44));
+  assert.equal(app.element('language').value,'en');assert.equal(starts.length,0);assert.equal(network.length,requestCount);
+  assert.equal(app.run('pending.some(row=>row.downloadRequested)'),false);assert.equal(app.run('manualRetryApprovedIds.size'),0);
+  app.element('import-button').onclick();await until(()=>starts.length===1);
+  assert.equal(starts[0].file,file);assert.equal(starts[0].options.language,'en');
+  assert.equal(queue.chunks.size,2);assert.equal(queue.sessions.get(id).uploadHeld,true);
+});
+
+test('failed conversion shortcut works after stopping and selects the failed capture behind older held audio',async()=>{
+  for(const previousHeld of [false,true]){
+    const {app,id,oldId,queue,mic,network}=await failedAudioImportFixture({active:false,previousHeld});
+    const before=[...queue.chunks.values()].map(row=>({...row})),requestCount=network.length;
+    assert.match(app.element('convert-failed').textContent,/보관 후 파일 변환/);
+    assert.doesNotMatch(app.element('convert-failed').textContent,/녹음 종료/);
+    await app.run('prepareFailedAudioImport()');
+    assert.equal(mic.stopCalls,1);assert.equal(app.run('localAudioExportCaptureId'),id);
+    assert.equal(localImportButtons(app).length,1);assert.equal(app.objectUrlBlob(localRecoveryLinks(app)[0].href).size,44+2400*2);
+    assert.ok([...queue.chunks.values()].every(row=>row.uploadHeld===true));
+    for(const row of before)assert.equal(queue.chunks.get(row.id).blob,row.blob);
+    if(oldId)assert.notEqual(app.run('localAudioExportCaptureId'),oldId);
+    assert.equal(network.length,requestCount);assert.equal(app.run('manualRetryApprovedIds.size'),0);
+  }
+});
+
+test('failed conversion shortcut serializes repeated clicks while the durable hold is pending',async()=>{
+  const {app,id,queue,mic,network}=await failedAudioImportFixture();
+  const original=queue.setSessionUploadHeld.bind(queue),gate=deferred();let entered=false,writes=0;
+  queue.setSessionUploadHeld=async(...args)=>{writes++;entered=true;await gate.promise;return original(...args);};
+  const requestCount=network.length,first=app.run('prepareFailedAudioImport()');await until(()=>entered);
+  assert.equal(app.run('failedAudioImportBusy'),true);assert.equal(app.element('convert-failed').disabled,true);
+  await app.run('prepareFailedAudioImport()');assert.equal(writes,1);assert.equal(mic.stopCalls,1);
+  gate.resolve();await first;
+  assert.equal(app.run('failedAudioImportBusy'),false);assert.equal(app.run('localAudioExportCaptureId'),id);
+  assert.equal(localImportButtons(app).length,1);assert.equal(queue.chunks.size,2);assert.equal(network.length,requestCount);
+});
+
+test('failed conversion shortcut retains all audio and its error when the durable hold cannot be saved',async()=>{
+  const {app,id,queue,mic,network}=await failedAudioImportFixture();
+  const before=app.run('pending[0]'),blob=queue.chunks.get(before.id).blob,error=app.run('sendError'),requestCount=network.length;
+  queue.setSessionUploadHeld=async()=>{throw new Error('synthetic durable hold failure');};
+  await app.run('prepareFailedAudioImport()');
+  assert.equal(mic.stopCalls,1);assert.equal(app.run('failedAudioImportBusy'),false);assert.equal(app.run('holdingAudio'),false);
+  assert.equal(app.element('local-audio-dialog').open,false);assert.equal(localImportButtons(app).length,0);
+  assert.equal(queue.sessions.get(id).uploadHeld,undefined);assert.equal(queue.chunks.get(before.id).blob,blob);
+  assert.equal(queue.chunks.size,2);assert.equal(app.run('pending[1].final'),true);assert.equal(app.run('sendError'),error);
+  assert.equal(network.length,requestCount);assert.equal(app.run('currentRecordingFile()'),null);
+});
+
+test('failed conversion shortcut discards late hold results after login server or request scope changes',async()=>{
+  for(const change of ["user='another-owner';token='new-token'","token='replacement-token'","apiUrl='https://different.example'",'requestGeneration++','localAudioExportSequence++','recordingSelectionSequence++','noteActionSequence++',
+      'liveSessions.set(nextPendingChunk().captureId,{...liveSessions.get(nextPendingChunk().captureId)})']){
+    const {app,id,queue,network}=await failedAudioImportFixture();
+    const original=queue.setSessionUploadHeld.bind(queue),gate=deferred();let entered=false;
+    queue.setSessionUploadHeld=async(...args)=>{entered=true;await gate.promise;return original(...args);};
+    const requestCount=network.length,work=app.run('prepareFailedAudioImport()');await until(()=>entered);
+    app.run(`${change};current={id:'other-current',segments:[]}`);gate.resolve();await work;
+    assert.equal(app.run('current.id'),'other-current',change);assert.equal(app.element('local-audio-dialog').open,false,change);
+    assert.equal(localImportButtons(app).length,0,change);assert.equal(app.run('currentRecordingFile()'),null,change);
+    assert.equal(app.run('failedAudioImportBusy'),false);assert.equal(queue.chunks.size,2);assert.ok(queue.sessions.has(id));
+    assert.equal(network.length,requestCount);
+  }
+});
+
+test('failed conversion preparation cannot stage audio after login server selection or dialog changes during the snapshot read',async()=>{
+  for(const change of ["user='another-owner';token='new-token'","token='replacement-token'","apiUrl='https://different.example'",
+      'recordingSelectionSequence++','clearLocalAudioExports()','requestGeneration++','noteActionSequence++',
+      'liveSessions.set(localAudioExportCaptureId,{...liveSessions.get(localAudioExportCaptureId)})']){
+    const {app,id,queue,network}=await failedAudioImportFixture();
+    const original=queue.readExportSnapshot.bind(queue),gate=deferred();let entered=false;
+    queue.readExportSnapshot=async(...args)=>{entered=true;await gate.promise;return original(...args);};
+    const requestCount=network.length,work=app.run('prepareFailedAudioImport()');await until(()=>entered);
+    app.run(change);gate.resolve();await work;
+    assert.equal(localImportButtons(app).length,0,change);assert.equal(app.run('currentRecordingFile()'),null,change);
+    assert.equal(queue.sessions.get(id).uploadHeld,true);assert.equal(queue.chunks.size,2);
+    assert.equal(app.run('failedAudioImportBusy'),false);assert.equal(network.length,requestCount);
+  }
+});
+
+test('failed conversion shortcut does not stop the microphone while entry is blocked by other work or missing authorization',async()=>{
+  for(const change of ['sending=true','importStarting=true','localAudioExportBusy=true','recordingSelectionLoading=true',"sendError=''","token=''"]){
+    const {app,id,queue,mic,network}=await failedAudioImportFixture();
+    const before=[...queue.chunks.values()].map(row=>({...row})),requestCount=network.length;
+    app.run(`${change};updateControls()`);
+    assert.ok(app.element('convert-failed').disabled || app.element('convert-failed').hidden,change);
+    await app.run('prepareFailedAudioImport()');
+    assert.equal(mic.stopCalls,undefined,change);assert.equal(app.run('recording'),true,change);
+    assert.equal(queue.sessions.get(id).uploadHeld,undefined);assert.deepEqual([...queue.chunks.values()],before);
+    assert.equal(app.element('local-audio-dialog').open,false);assert.equal(network.length,requestCount);
+  }
+});
+
 test('held import stages the validated immutable WAV and starts only after the existing import button',async()=>{
   const starts=[],operation=deferred();
   const fixture=await heldRecoveryFixture({FileUploader:class{

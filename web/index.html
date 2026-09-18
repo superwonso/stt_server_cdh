@@ -267,10 +267,12 @@
           <div id="queue-warning" class="queue-warning" role="alert" hidden>
             <p id="queue-message"></p>
             <div class="queue-actions">
+              <button id="convert-failed" type="button" hidden>보관 후 파일 변환</button>
               <button id="save-failed" type="button">첫 실패 조각만 WAV 내려받기</button>
               <button id="skip-failed" type="button" hidden>파일 저장 확인 · 건너뛰기</button>
               <button id="retry" type="button">다시 전송</button>
             </div>
+            <p id="convert-failed-help" class="panel-help" hidden>파일 변환을 선택하면 현재 녹음을 마지막 음성까지 종료하고 전송 대기 음성을 보관합니다. 이 오류가 난 수업의 기기에 남은 음성을 Qwen-3 파일 변환으로 보낼 수 있어요. 원본은 유지하며, 파일을 선택한 뒤 “파일 올려 변환”을 눌러야 업로드합니다.</p>
           </div>
           <section id="held-audio-panel" class="held-audio-panel" aria-labelledby="held-audio-title" hidden>
             <h3 id="held-audio-title">보관 중 · 전송 보류한 수업</h3>

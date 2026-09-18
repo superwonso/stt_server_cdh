@@ -35,7 +35,7 @@ let authSessionExpiresAt = 0, authSessionExpiryTimer = null;
 let authRestoreSequence = 0, authRestoreController = null, authRestorePromise = null;
 let capture = null, recording = false, paused = false, starting = false, pausing = false, resuming = false, stopping = false, sending = false, authenticating = false, loggingOut = false;
 let pending = [], sendError = '', sampleSeconds = 0, timer = null, requestGeneration = 0;
-let holdingAudio = false, holdAudioSequence = 0;
+let holdingAudio = false, holdAudioSequence = 0, failedAudioImportBusy = false;
 let heldAudioRenderSignature = '';
 let draft = null, captureSession = null, pausePromise = null, resumePromise = null, stopPromise = null;
 let elapsedActiveMs = 0, elapsedStartedAt = 0;
@@ -4958,6 +4958,15 @@ function holdAudioBlockReason() {
   if (pending.some(chunk=>chunk.owner!==user)) return '다른 계정의 음성을 변경하지 않았어요. 원래 계정에서 확인해 주세요.';
   return '';
 }
+function failedAudioImportBlockReason() {
+  if(failedAudioImportBusy)return '변환할 음성을 안전하게 보관하고 있어요.';
+  const blocked=holdAudioBlockReason();if(blocked)return blocked;
+  if(localAudioExportBusy || recordingSelectionLoading)return '음성 파일 준비가 끝날 때까지 기다려 주세요.';
+  const chunk=nextPendingChunk(),session=liveSessions.get(chunk?.captureId);
+  if(!sendError || !chunk || chunk.owner!==user || !session || session.owner!==user || session.uploadHeld)
+    return '변환할 전송 보류 음성을 확인할 수 없어요.';
+  return '';
+}
 function newLessonBlockReason() {
   return capture || recording || paused || inputUnavailable ? '현재 녹음은 종료하거나 “기존 음성 보관 · 새 수업”을 사용하세요.' : holdAudioBlockReason();
 }
@@ -5216,6 +5225,24 @@ async function holdPreviousAudio() {
     if(sequence===holdAudioSequence){holdingAudio=false;updateControls();}
   }
 }
+async function prepareFailedAudioImport() {
+  if(expireActiveAuthSession())return;
+  const blocked=failedAudioImportBlockReason();if(blocked){notice(blocked);return;}
+  // Hold before exporting, but pin the failed capture first: holding removes it
+  // from nextPendingChunk and may also stop a different active capture.
+  const captureId=nextPendingChunk().captureId,session=liveSessions.get(captureId);
+  const owner=user,sessionToken=token,server=apiUrl,generation=requestGeneration;
+  const exportSequence=localAudioExportSequence,selectionSequence=recordingSelectionSequence,actionSequence=noteActionSequence;
+  const isCurrent=()=>owner===user && sessionToken===token && server===apiUrl && generation===requestGeneration
+    && exportSequence===localAudioExportSequence && selectionSequence===recordingSelectionSequence
+    && actionSequence===noteActionSequence && liveSessions.get(captureId)===session;
+  failedAudioImportBusy=true;updateControls();
+  try{
+    if(!await holdPreviousAudio() || !isCurrent() || !session.uploadHeld)return;
+    const reason=heldImportBlockReason();if(reason){notice(reason);return;}
+    await prepareLocalAudioExport({captureId,forImport:true});
+  }finally{failedAudioImportBusy=false;updateControls();}
+}
 async function prepareIndependentLesson() {
   if(expireActiveAuthSession())return;
   if(await holdPreviousAudio()){
@@ -5375,6 +5402,7 @@ function pinLocalAudioMemory(owner) {
 async function prepareLocalAudioExport({captureId=null,forImport=false,checkConversion=false}={}) {
   if (!mayExportLocalAudio() || localAudioExportBusy) return;
   const owner = user, exportToken=token, exportServer=apiUrl, selectionSequence=recordingSelectionSequence;
+  const generation=requestGeneration,actionSequence=noteActionSequence,sourceSession=liveSessions.get(captureId);
   if(forImport && (captureId===null || heldImportBlockReason()))return;
   if(captureId!==null && (liveSessions.get(captureId)?.owner!==owner || !liveSessions.get(captureId)?.uploadHeld))return;
   clearLocalAudioExports();
@@ -5390,7 +5418,8 @@ async function prepareLocalAudioExport({captureId=null,forImport=false,checkConv
   const controller = new AbortController(); localAudioExportController = controller;
   const isCurrent = () => sequence === localAudioExportSequence && user === owner
     && mayExportLocalAudio() && $('local-audio-dialog').open
-    && (!forImport || (token===exportToken && apiUrl===exportServer && selectionSequence===recordingSelectionSequence));
+    && (!forImport || (token===exportToken && apiUrl===exportServer && selectionSequence===recordingSelectionSequence
+      && generation===requestGeneration && actionSequence===noteActionSequence && sourceSession===liveSessions.get(captureId)));
   localAudioExportBusy = true;
   $('local-audio-dialog').showModal();
   $('local-audio-status').textContent = '기기에 남은 음성을 읽는 중입니다. 원본은 삭제하지 않습니다.';
@@ -5627,6 +5656,11 @@ function updateControls() {
   $('retry').disabled = !sendError || sending || holdingAudio || starting || pausing || resuming || stopping;
   $('retry').textContent = failedChunk?.storageBlocked ? '임시 저장 다시 시도'
     : sendError && failedChunk?.asrProvider === 'clova' ? '위험 이해 · 수동 재전송' : '다시 전송';
+  $('convert-failed').hidden = !sendError || !failedChunk;
+  $('convert-failed').disabled = !!failedAudioImportBlockReason();
+  $('convert-failed').textContent = failedAudioImportBusy ? '음성을 보관하고 파일 준비 중…'
+    : capture || recording || paused || inputUnavailable ? '녹음 종료 · 보관 후 파일 변환' : '보관 후 파일 변환';
+  $('convert-failed-help').hidden = !sendError || !failedChunk;
   $('save-failed').hidden = !sendError || !failedChunk;
   $('save-failed').disabled = sending || holdingAudio || starting || pausing || resuming || stopping || !failedChunk;
   $('skip-failed').hidden = !sendError || !failedChunk?.downloadRequested;
@@ -7087,6 +7121,7 @@ async function saveFailedChunk() {
   }
 }
 $('save-failed').onclick = () => { void saveFailedChunk(); };
+$('convert-failed').onclick = () => { void prepareFailedAudioImport(); };
 function applyRecordingFlags(lectureId, result) {
   // A manual recording finalization can recover the recognizer's withheld
   // stability tail from the already stored WAV. Merge that additive response
