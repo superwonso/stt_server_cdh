@@ -107,7 +107,7 @@ class LocalTranscriber:
                 import torch
                 if torch.version.hip:
                     os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-                from qwen_asr import Qwen3ASRModel
+                from .qwen_language import load_korean_english_asr
 
                 if not torch.cuda.is_available():
                     raise RuntimeError("GPU is not visible to PyTorch")
@@ -119,7 +119,7 @@ class LocalTranscriber:
                 aligner_path = self.settings.aligner_path
                 if not (aligner_path / "model.safetensors").is_file():
                     raise RuntimeError(f"ASR aligner is incomplete: {aligner_path}")
-                self._model = Qwen3ASRModel.from_pretrained(
+                self._model = load_korean_english_asr(
                     str(model_path),
                     dtype=torch.bfloat16,
                     device_map=self.settings.device,

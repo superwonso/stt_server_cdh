@@ -4908,7 +4908,9 @@ function updateProviderGuidance() {
   } else if (clova) {
     $('provider-guidance').textContent = '이 수업의 마이크 음성을 사이트 운영자가 설정한 NAVER CLOVA Speech로 처리합니다.';
   } else {
-    $('provider-guidance').textContent = '마이크 음성을 Qwen-3으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.';
+    $('provider-guidance').textContent = $('language').value === 'auto'
+      ? 'Qwen-3이 한국어와 영어 중에서 언어를 감지합니다. 외부 음성 인식 서비스로 보내지 않습니다.'
+      : '마이크 음성을 Qwen-3으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.';
   }
 }
 function updateSourceGuidance() {
