@@ -966,6 +966,70 @@ test('held recovery closure survives requery and changes only the session marker
   assert.equal(LIVE_QUEUE_DB_VERSION,2);
 });
 
+test('confirmed conversion closes held recovery atomically without asserting a download or altering audio',async () => {
+  const {queue,data,failures,expectedManifest,ids} = await closableHeldQueue();
+  const before = structuredClone(data), bytes = await audioRowsWithBytes(data);
+  const options = {expectedManifest,conversionConfirmed:true,filesConfirmed:false};
+  failures.add('sessions');
+  await assert.rejects(queue.closeHeldRecovery(OWNER,CAPTURE_ID,options),/fake write failure/);
+  assert.deepEqual(data,before);
+  failures.clear();
+  queue.now = () => 1700000001000;
+  const closed = await queue.closeHeldRecovery(OWNER,CAPTURE_ID,options);
+  assert.deepEqual(closed,{...before.sessions.get(CAPTURE_ID),recoveryClosedAt:1700000001000,updatedAt:1700000001000});
+  assert.deepEqual(data.chunks,before.chunks);
+  assert.deepEqual(data.pcmSnapshots,before.pcmSnapshots);
+  assert.deepEqual(await audioRowsWithBytes(data),bytes);
+  for (const id of ids) {
+    assert.equal(data.chunks.get(id).downloadRequested,before.chunks.get(id).downloadRequested);
+    await assert.rejects(queue.markChunkQueued(OWNER,id),error => error.code === 'live_queue_upload_held');
+  }
+  assert.deepEqual(await queue.closeHeldRecovery(OWNER,CAPTURE_ID,options),closed);
+  assert.equal((await queue.readExportSnapshot(OWNER)).sessions[0].recoveryClosedAt,closed.recoveryClosedAt);
+});
+
+test('conversion confirmation rejects missing false or malformed options and foreign owners without writes',async () => {
+  const {queue,data,expectedManifest} = await closableHeldQueue();
+  const before = structuredClone(data), bytes = await audioRowsWithBytes(data);
+  for (const options of [undefined,{}, {expectedManifest},
+    {expectedManifest,conversionConfirmed:false},
+    {expectedManifest,conversionConfirmed:false,filesConfirmed:false},
+    {expectedManifest,conversionConfirmed:'true'},
+    {expectedManifest,conversionConfirmed:1},
+    {expectedManifest,conversionConfirmed:null},
+    {expectedManifest,conversionConfirmed:undefined},
+    {expectedManifest,conversionConfirmed:true,filesConfirmed:'false'},
+    {expectedManifest,conversionConfirmed:'true',filesConfirmed:true},
+    {expectedManifest:'',conversionConfirmed:true},
+    {expectedManifest:1,conversionConfirmed:true},
+    {expectedManifest,conversionConfirmed:true,skip:true}]) {
+    await assert.rejects(queue.closeHeldRecovery(OWNER,CAPTURE_ID,options),LiveQueueValidationError);
+  }
+  await assert.rejects(queue.closeHeldRecovery('other-owner',CAPTURE_ID,
+    {expectedManifest,conversionConfirmed:true}),LiveQueueOwnershipError);
+  assert.deepEqual(data,before);
+  assert.deepEqual(await audioRowsWithBytes(data),bytes);
+});
+
+test('conversion confirmation cannot close an altered manifest and preserves every remaining audio byte',async () => {
+  for (const change of [
+    data => { data.sessions.get(CAPTURE_ID).updatedAt += 1; },
+    data => { data.chunks.get(CHUNK_ID).updatedAt += 1; },
+    data => { data.chunks.get(CHUNK_ID).downloadRequested = true; },
+    data => { data.chunks.delete(CHUNK_ID); },
+    data => { data.pcmSnapshots.get(CAPTURE_ID).revision += 1; },
+  ]) {
+    const {queue,data,expectedManifest} = await closableHeldQueue();
+    change(data);
+    const changed = structuredClone(data), bytes = await audioRowsWithBytes(data);
+    await assert.rejects(queue.closeHeldRecovery(OWNER,CAPTURE_ID,
+      {expectedManifest,conversionConfirmed:true}),LiveQueueConflictError);
+    assert.deepEqual(data,changed);
+    assert.deepEqual(await audioRowsWithBytes(data),bytes);
+    assert.equal(Object.hasOwn(data.sessions.get(CAPTURE_ID),'recoveryClosedAt'),false);
+  }
+});
+
 test('closure is owner-only and requires explicit file confirmation for the exact downloaded manifest',async () => {
   const {queue,data,expectedManifest} = await closableHeldQueue();
   const before = structuredClone(data);

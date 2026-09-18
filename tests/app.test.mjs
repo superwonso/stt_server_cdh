@@ -7,6 +7,8 @@ import { performance as hostPerformance } from 'node:perf_hooks';
 import { setTimeout as hostDelay } from 'node:timers/promises';
 import { encodeWav } from '../web/audio.js';
 import * as TestLocalAudioExport from '../web/local-audio-export.js';
+import * as TestHeldImportRecovery from '../web/held-import-recovery.js';
+import { recordingFileFingerprint } from '../web/file-import.js';
 import * as TestRecordingFileSelection from '../web/recording-file-selection.js';
 import { renderDriveStatus } from '../web/admin-storage.js';
 import { renderMaintenanceStatus } from '../web/admin-maintenance.js';
@@ -26,6 +28,7 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
   .replace("import { validateRecordingSelection, isFileDrag, recordingFileFromDrop } from './recording-file-selection.js';", 'const { validateRecordingSelection, isFileDrag, recordingFileFromDrop } = TestRecordingFileSelection;')
   .replace("import { buildRecoverableLocalAudioExports, validateLocalWav } from './local-audio-export.js';", 'const { buildRecoverableLocalAudioExports, validateLocalWav } = TestLocalAudioExport;')
   .replace("import { buildRecoverableLocalAudioExports, mergeLocalAudioExportParts, validateLocalWav } from './local-audio-export.js';", 'const { buildRecoverableLocalAudioExports, mergeLocalAudioExportParts, validateLocalWav } = TestLocalAudioExport;')
+  .replace(/import \{[^;]+\} from '\.\/held-import-recovery\.js';/, 'const { HeldImportReceiptStore, verifyHeldImportCompletion, recheckHeldImportCompletion } = TestHeldImportRecovery;')
   .replace("import { renderDriveStatus } from './admin-storage.js';", 'const renderDriveStatus = TestRenderDriveStatus;')
   .replace("import { renderMaintenanceStatus } from './admin-maintenance.js';", 'const renderMaintenanceStatus = TestRenderMaintenanceStatus;')
   .replace("import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';", 'const { readRecordingClip, RecordingClipPlayer, filterTranscript } = TestRecordingReview;')
@@ -86,7 +89,7 @@ function runtimeConfig({state = 'online', apiUrl = 'https://fresh-tunnel.tryclou
   return {version:1,state,apiUrl,publishedAt:isoSeconds(publishedMs),expiresAt:isoSeconds(expiresMs)};
 }
 function deferred() { let resolve, reject; const promise = new Promise((yes,no) => { resolve = yes; reject = no; }); return {promise,resolve,reject}; }
-function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '', sessionItems = new Map(), translationApi = false, cryptoImplementation = webcrypto } = {}) {
+function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '', sessionItems = new Map(), translationApi = false, cryptoImplementation = webcrypto, heldImportRecovery = TestHeldImportRecovery, localItems = new Map() } = {}) {
   const elements = new Map(), createdElements = new Map(), intervals = new Map(), timeouts = new Map(), objectUrls = new Map();
   const documentListeners = new Map();
   const location = {hash:'',hostname:'student.github.io',pathname:'/classroom/',search:''};
@@ -259,16 +262,21 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
       callbacks.push(callback); documentListeners.set(name,callbacks);
     },
   };
+  const localStore={
+    getItem(key){ return key==='yeobaek-server' ? storedServerValue : localItems.get(key) ?? ''; },
+    setItem(key,value){ storageWrites.push([key,String(value)]); if(key==='yeobaek-server')storedServerValue=String(value); else localItems.set(key,String(value)); },
+    removeItem:key=>localItems.delete(key),
+  };
+  const recoveryHelpers={...heldImportRecovery,HeldImportReceiptStore:class extends heldImportRecovery.HeldImportReceiptStore {
+    constructor(options={}){super({storage:localStore,...options});}
+  }};
   const context = vm.createContext({
     Blob, File, Headers, URL:TestURL, URLSearchParams, AbortController, console, crypto:cryptoImplementation,
     document,
     window:{addEventListener(){}}, performance:{now:() => 0},
     location,history:{replaceState(...args){historyCalls.push(args);}},
     navigator:{clipboard:{writeText:async value => { clipboardWrites.push(value); }}},
-    localStorage:{
-      getItem(key){ return key === 'yeobaek-server' ? storedServerValue : ''; },
-      setItem(key,value){ storageWrites.push([key,String(value)]); if (key === 'yeobaek-server') storedServerValue = String(value); },
-    },
+    localStorage:localStore,
     sessionStorage:tabStorage,
     TestAuthSessionStore:class extends TabAuthSessionStore {
       constructor() { super({getStorage:() => tabStorage}); }
@@ -280,7 +288,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     TestManualNotes,
     TestLectureQuestions, TestStudyNotes, TestLlmResults, TestLiveQueue,
     TestGroupTranscriptSentences:groupTranscriptSentences, TestTranscriptFollow:TranscriptFollow,
-    TestLocalAudioExport, TestRecordingFileSelection, TestEncodeWav:encodeWav,
+    TestLocalAudioExport, TestHeldImportRecovery:recoveryHelpers, TestRecordingFileSelection, TestEncodeWav:encodeWav,
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },
     clearTimeout:value => timeouts.delete(value),
     setInterval:(callback,delay = 0) => { const value = ++id; intervals.set(value,{callback,delay}); return value; },clearInterval:value => intervals.delete(value),
@@ -361,16 +369,17 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
         }
         return {...stored};
       }
-      async closeHeldRecovery(owner,id,{expectedManifest,filesConfirmed} = {}) {
+      async closeHeldRecovery(owner,id,{expectedManifest,filesConfirmed,conversionConfirmed} = {}) {
         requireOwner(owner); requireUuid(id,'captureId');
         const stored=this.sessions.get(id);
         if (!stored || stored.owner!==owner || stored.uploadHeld!==true) throw new Error('not a held session');
-        if (filesConfirmed!==true || !expectedManifest) throw new Error('saved files were not confirmed');
+        if ((filesConfirmed!==true && conversionConfirmed!==true) || !expectedManifest) throw new Error('recovery evidence was not confirmed');
         const snapshot=await this.readExportSnapshot(owner);
         if (TestLiveQueue.heldRecoveryManifest(snapshot,id)!==expectedManifest) throw new Error('held recovery manifest changed');
         stored.recoveryClosedAt=Date.now();
         stored.updatedAt=stored.recoveryClosedAt;
         this.closeHeldRecoveryCalls=(this.closeHeldRecoveryCalls || 0)+1;
+        this.closeHeldRecoveryOptions={expectedManifest,filesConfirmed,conversionConfirmed};
         return {...stored};
       }
       async reopenHeldRecovery(owner,id) {
@@ -7603,9 +7612,9 @@ async function seedHeldScenario(app,{count=1}={}){
   return id;
 }
 
-async function heldRecoveryFixture({count=1,gap=false,FileUploader,fetchResponse}={}) {
+async function heldRecoveryFixture({count=1,gap=false,FileUploader,fetchResponse,heldImportRecovery,localItems}={}) {
   const network=[];
-  const app=setup(async(url,options={})=>{network.push({url,method:options.method || 'GET'});if(fetchResponse)return fetchResponse(url,options);throw new Error('held recovery must remain local');},{FileUploader});
+  const app=setup(async(url,options={})=>{network.push({url,method:options.method || 'GET'});if(fetchResponse)return fetchResponse(url,options);throw new Error('held recovery must remain local');},{FileUploader,heldImportRecovery,localItems});
   const id=await seedHeldScenario(app,{count});
   await app.run('prepareIndependentLesson()');
   const queue=app.run('liveQueue'),stored=queue.sessions.get(id);
@@ -7889,6 +7898,213 @@ test('a staged held import restores its source metadata after viewing another le
   assert.equal(starts[0].file,file);assert.equal(starts[0].options.language,'en');
   assert.match(starts[0].options.title,/이전 보관 수업.*복구 구간 1/);
   assert.equal(queue.sessions.get(id).uploadHeld,true);assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+});
+
+async function heldConversionFixture({count=1,gap=false,localItems=new Map()}={}) {
+  const states=new Map(),control={listed:true,onRequest:null};
+  const fixture=await heldRecoveryFixture({count,gap,localItems,fetchResponse:async(url,options)=>{
+    assert.equal(options.method || 'GET','GET','completion checks must never mutate the server');
+    const path=new URL(url).pathname;
+    if(control.onRequest)await control.onRequest(path,options);
+    if(path==='/imports')return response(control.listed ? [...states.values()] : []);
+    const id=path.startsWith('/imports/') ? path.slice('/imports/'.length) : null;
+    if(id && states.has(id))return response(states.get(id));
+    return response({detail:'synthetic missing import'},404);
+  }});
+  const {app,id}=fixture;
+  await app.run(`prepareLocalAudioExport({captureId:${JSON.stringify(id)}})`);
+  const parts=Array.from(app.run('heldRecoveryEvidence.parts'));
+  async function addCompleted(part,{raw_deleted=false,...changes}={}) {
+    const filename=`보관음성_${id}_${part.startSamples}-${part.endSamples}.wav`;
+    const file=new File([part.blob],filename,{type:'audio/wav',lastModified:0});
+    const state={id:webcrypto.randomUUID(),lecture_id:webcrypto.randomUUID(),filename,total_bytes:file.size,
+      file_fingerprint:await recordingFileFingerprint(file),status:'completed',uploaded_bytes:file.size,next_offset:file.size,
+      part_bytes:480*1024,raw_deleted,cancel_requested:false,error:null,...changes};
+    states.set(state.id,state);return state;
+  }
+  return {...fixture,parts,states,control,addCompleted,localItems};
+}
+
+test('held conversion success requires whole retained audio plus explicit confirmation and a fresh server recheck',async()=>{
+  for(const form of ['single','merged-with-gap','all-separate-parts']){
+    const fixture=await heldConversionFixture(form==='single' ? {} : {count:2,gap:true});
+    const {app,id,queue,network,parts,addCompleted}=fixture;
+    if(form==='merged-with-gap')await addCompleted(await TestLocalAudioExport.mergeLocalAudioExportParts(parts));
+    else for(const part of parts)await addCompleted(part);
+    const before=[...queue.chunks.values()].map(row=>({...row}));
+    const source=app.run(`JSON.stringify(liveSessions.get(${JSON.stringify(id)}).lecture)`);
+    assert.equal(await app.run('verifyHeldRecoveryImports()'),true,form);
+    assert.equal(app.run('heldRecoveryEvidence.downloaded.size'),0,'conversion is not a claimed file download');
+    assert.equal(app.element('local-audio-saved-confirm').disabled,false);
+    assert.match(app.element('local-audio-confirm-label').textContent,/변환.*새 수업/);
+    assert.equal(app.element('local-audio-finish').disabled,true,'server completion cannot close a held capture by itself');
+    assert.equal(await app.run(`closeHeldAudio(${JSON.stringify(id)})`),false);
+    assert.equal(queue.closeHeldRecoveryCalls,undefined);
+    confirmRecoveryFiles(app);assert.equal(app.element('local-audio-finish').disabled,false);
+    const beforeRecheck=network.length;
+    assert.equal(await app.run(`closeHeldAudio(${JSON.stringify(id)})`),true,form);
+    assert.ok(network.length>beforeRecheck,'manual closure rechecks completed jobs instead of trusting the earlier result');
+    assert.equal(queue.closeHeldRecoveryOptions.conversionConfirmed,true);
+    assert.equal(queue.closeHeldRecoveryOptions.filesConfirmed,undefined);
+    assert.equal(queue.sessions.get(id).uploadHeld,true);assert.ok(queue.sessions.get(id).recoveryClosedAt);
+    assert.deepEqual([...queue.chunks.values()],before);assert.equal(app.run('pending.length'),before.length);
+    assert.equal(app.run(`JSON.stringify(liveSessions.get(${JSON.stringify(id)}).lecture)`),source);
+    assert.equal(app.run('manualRetryApprovedIds.size'),0);assert.equal(app.run('recording'),false);
+    assert.ok(network.every(call=>call.method==='GET'&&new URL(call.url).pathname.startsWith('/imports')));
+  }
+});
+
+test('held conversion checking refuses a completed subset, uploaded-only state and same-name different audio',async()=>{
+  for(const mismatch of ['one-of-two','processing','different-fingerprint']){
+    const fixture=await heldConversionFixture({count:2,gap:true});
+    const {app,id,queue,parts,addCompleted}=fixture;
+    const source=mismatch==='one-of-two' ? parts[0] : await TestLocalAudioExport.mergeLocalAudioExportParts(parts);
+    await addCompleted(source,mismatch==='processing' ? {status:'processing'} : mismatch==='different-fingerprint' ? {file_fingerprint:'f'.repeat(64)} : {});
+    assert.equal(await app.run('verifyHeldRecoveryImports()'),false,mismatch);
+    assert.equal(app.run('heldRecoveryEvidence.converted?.completedParts'),mismatch==='one-of-two' ? 1 : 0);
+    confirmRecoveryFiles(app);assert.equal(app.element('local-audio-saved-confirm').checked,false);
+    assert.equal(await app.run(`closeHeldAudio(${JSON.stringify(id)})`),false);
+    assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);assert.equal(queue.chunks.size,2);
+  }
+});
+
+test('held conversion confirmation never survives account token server or dialog changes during verification',async()=>{
+  for(const change of ["user='other-user';token='other-token'","token='new-token'","apiUrl='https://other.example'","clearLocalAudioExports()"]){
+    const {app,id,queue,control,addCompleted,parts,network}=await heldConversionFixture();
+    await addCompleted(parts[0]);const gate=deferred();let entered=false;
+    control.onRequest=async path=>{if(path==='/imports'){entered=true;await gate.promise;}};
+    const work=app.run('verifyHeldRecoveryImports()');await until(()=>entered);
+    app.run(change);gate.resolve();assert.equal(await work,false,change);
+    assert.equal(app.run('heldRecoveryConversionIsCurrent()'),false);
+    assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);assert.equal(queue.chunks.size,1);
+    assert.equal(network.length,1,'no import-detail request uses a changed identity or server');
+  }
+});
+
+test('held conversion close refuses changed completion or missing server evidence while preserving originals',async()=>{
+  for(const change of ['processing','missing','fingerprint','network']){
+    const {app,id,queue,states,control,addCompleted,parts}=await heldConversionFixture();
+    const state=await addCompleted(parts[0]);assert.equal(await app.run('verifyHeldRecoveryImports()'),true);
+    confirmRecoveryFiles(app);const blob=[...queue.chunks.values()][0].blob;
+    if(change==='processing')state.status='processing';
+    else if(change==='missing')states.delete(state.id);
+    else if(change==='fingerprint')state.file_fingerprint='e'.repeat(64);
+    else control.onRequest=async()=>{throw new Error('synthetic unavailable');};
+    assert.equal(await app.run(`closeHeldAudio(${JSON.stringify(id)})`),false,change);
+    assert.equal(app.run('heldRecoveryEvidence.converted'),null);assert.equal(app.element('local-audio-saved-confirm').checked,false);
+    assert.equal(queue.closeHeldRecoveryCalls,undefined);assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+    assert.equal([...queue.chunks.values()][0].blob,blob);assert.equal(app.run('pending.length'),1);
+  }
+});
+
+test('held conversion close rechecks current local source manifest after server verification',async()=>{
+  for(const change of ['session-revision','chunk-revision']){
+    const {app,id,queue,addCompleted,parts}=await heldConversionFixture();
+    await addCompleted(parts[0]);assert.equal(await app.run('verifyHeldRecoveryImports()'),true);confirmRecoveryFiles(app);
+    const before=[...queue.chunks.values()][0].blob;
+    if(change==='session-revision')queue.sessions.get(id).updatedAt+=1;
+    else [...queue.chunks.values()][0].updatedAt+=1;
+    assert.equal(await app.run(`closeHeldAudio(${JSON.stringify(id)})`),false,change);
+    assert.equal(queue.closeHeldRecoveryCalls,undefined);assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+    assert.equal([...queue.chunks.values()][0].blob,before);assert.equal(app.run('pending.length'),1);
+  }
+});
+
+test('held conversion final server recheck cannot close a capture after identity or dialog changes',async()=>{
+  for(const change of ["user='other-user';token='other-token'","token='new-token'","apiUrl='https://other.example'","clearLocalAudioExports()"]){
+    const {app,id,queue,control,addCompleted,parts}=await heldConversionFixture();
+    await addCompleted(parts[0]);assert.equal(await app.run('verifyHeldRecoveryImports()'),true);confirmRecoveryFiles(app);
+    const gate=deferred();let entered=false;
+    control.onRequest=async()=>{entered=true;await gate.promise;};
+    const work=app.run(`closeHeldAudio(${JSON.stringify(id)})`);await until(()=>entered);
+    app.run(change);gate.resolve();assert.equal(await work,false,change);
+    assert.equal(queue.closeHeldRecoveryCalls,undefined);assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+    assert.equal(queue.chunks.size,1);assert.equal(app.run('holdingAudio'),false);
+  }
+});
+
+test('closing the recovery dialog aborts an in-flight final conversion check and promptly releases its busy state',async()=>{
+  const {app,id,queue,control,addCompleted,parts}=await heldConversionFixture();
+  await addCompleted(parts[0]);assert.equal(await app.run('verifyHeldRecoveryImports()'),true);confirmRecoveryFiles(app);
+  const before=[...queue.chunks.values()].map(row=>({...row}));let signal,entered=false,settled=false;
+  control.onRequest=async(path,options)=>{
+    signal=options.signal;assert.ok(signal,'the final authenticated GET must be cancellable');entered=true;
+    await new Promise((resolve,reject)=>{
+      const abort=()=>{const error=new Error('synthetic cancelled request');error.name='AbortError';reject(error);};
+      if(signal.aborted)abort();else signal.addEventListener('abort',abort,{once:true});
+    });
+  };
+  const work=app.run(`closeHeldAudio(${JSON.stringify(id)})`).then(result=>{settled=true;return result;});
+  await until(()=>entered);assert.equal(app.run('holdingAudio'),true);
+  app.run('clearLocalAudioExports()');assert.equal(signal.aborted,true);
+  await until(()=>settled&&!app.run('holdingAudio'),'closing the dialog releases the cancelled verification');
+  assert.equal(await work,false);assert.equal(app.run('localAudioExportController'),null);
+  assert.equal(queue.closeHeldRecoveryCalls,undefined);assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+  assert.deepEqual([...queue.chunks.values()],before);assert.equal(app.run('pending.length'),1);
+});
+
+test('held conversion verification and closure serialize double clicks without duplicate source transitions',async()=>{
+  const {app,id,queue,control,addCompleted,parts,network}=await heldConversionFixture();
+  await addCompleted(parts[0]);let gate=deferred(),entered=false;
+  control.onRequest=async path=>{if(path==='/imports'){entered=true;await gate.promise;}};
+  const verification=app.run('verifyHeldRecoveryImports()');await until(()=>entered);
+  assert.equal(await app.run('verifyHeldRecoveryImports()'),false);assert.equal(network.length,1);
+  assert.equal(await app.run(`closeHeldAudio(${JSON.stringify(id)})`),false);
+  gate.resolve();assert.equal(await verification,true);confirmRecoveryFiles(app);
+  gate=deferred();entered=false;control.onRequest=async()=>{entered=true;await gate.promise;};
+  const closure=app.run(`closeHeldAudio(${JSON.stringify(id)})`);await until(()=>entered);
+  assert.equal(await app.run(`closeHeldAudio(${JSON.stringify(id)})`),false);
+  gate.resolve();assert.equal(await closure,true);assert.equal(queue.closeHeldRecoveryCalls,1);
+});
+
+test('held conversion hints survive dialog refresh but never replace fresh completion verification',async()=>{
+  const {app,id,queue,control,addCompleted,parts,network,localItems,states}=await heldConversionFixture();
+  const state=await addCompleted(parts[0]);assert.equal(await app.run('verifyHeldRecoveryImports()'),true);
+  const stored=JSON.stringify([...localItems]);
+  assert.ok(stored.includes(state.id));assert.ok(stored.includes(id));
+  assert.doesNotMatch(stored,/old-token|file_fingerprint|lecture_id|Bearer/,'persistent hints contain only scoped job identifiers');
+  confirmRecoveryFiles(app);app.run('clearLocalAudioExports()');
+  const freshTab=setup(async()=>{throw new Error('reading hints must not contact the server');},{localItems});
+  assert.deepEqual(Array.from(freshTab.run(`heldImportReceipts.ids(user,apiUrl,${JSON.stringify(id)})`)),[state.id]);
+  assert.deepEqual(Array.from(freshTab.run(`heldImportReceipts.ids('another-owner',apiUrl,${JSON.stringify(id)})`)),[]);
+  assert.deepEqual(Array.from(freshTab.run(`heldImportReceipts.ids(user,'https://different.example',${JSON.stringify(id)})`)),[]);
+  control.listed=false;
+  await app.run(`prepareLocalAudioExport({captureId:${JSON.stringify(id)}})`);
+  assert.equal(app.run('heldRecoveryEvidence.converted'),null);assert.equal(app.element('local-audio-finish').disabled,true);
+  const before=network.length;assert.equal(await app.run('verifyHeldRecoveryImports()'),true);
+  assert.ok(network.slice(before).some(call=>call.url.endsWith('/imports/'+state.id)),'saved hints restore only an authenticated lookup');
+  assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+  app.run('clearLocalAudioExports()');states.delete(state.id);
+  await app.run(`prepareLocalAudioExport({captureId:${JSON.stringify(id)}})`);
+  assert.equal(await app.run('verifyHeldRecoveryImports()'),false,'stale hints cannot resurrect deleted completion');
+  assert.equal(app.element('local-audio-saved-confirm').disabled,true);
+});
+
+test('uploader completion hints bind to the originating owner token server and generation without granting recovery',async()=>{
+  for(const change of ['unchanged','ordinary-file',"token='new-token'","user='another-user';token='replacement-token'","apiUrl='https://other.example'",'importGeneration++']){
+    let callbacks;const localItems=new Map(),captureId=webcrypto.randomUUID(),importId=webcrypto.randomUUID();
+    const app=setup(async()=>{throw new Error('synthetic uploader hint must not contact a server');},{localItems,
+      FileUploader:class{constructor(options){callbacks=options;}}});
+    app.run('refreshLectures=async()=>{};refreshImportLecture=async()=>{};makeFileUploader(importGeneration)');
+    if(!['unchanged','ordinary-file'].includes(change))app.run(change);
+    callbacks.onState({id:importId,filename:change==='ordinary-file' ? 'ordinary.wav' : `보관음성_${captureId}_0-800.wav`,status:'completed'});
+    const ids=Array.from(app.run(`heldImportReceipts.ids('user-alpha','https://classroom.example',${JSON.stringify(captureId)})`));
+    assert.deepEqual(ids,change==='unchanged' ? [importId] : [],change);
+    assert.equal(app.run('heldRecoveryEvidence'),null,'even an accepted completed hint is not verification evidence');
+    assert.equal(app.run('liveSessions.size'),0);
+    assert.doesNotMatch(JSON.stringify([...localItems]),/old-token|new-token|replacement-token/);
+  }
+});
+
+test('held capture conversion shortcut prepares current audio and checks completion without auto-closing',async()=>{
+  const {app,id,queue,parts,addCompleted}=await heldConversionFixture();
+  await addCompleted(parts[0]);app.run('clearLocalAudioExports();renderHeldAudio()');
+  const card=app.element('held-audio-list').children.find(item=>item.dataset.captureId===id);
+  const button=card.querySelectorAll('button').find(item=>item.dataset.action==='finish-import-held');
+  assert.ok(button);button.onclick();
+  await until(()=>app.run('heldRecoveryEvidence?.converted?.complete===true'));
+  assert.equal(app.element('local-audio-dialog').open,true);assert.equal(app.element('local-audio-finish').disabled,true);
+  assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);assert.equal(queue.chunks.size,1);
 });
 
 test('held recovery card download exports only the selected capture and never grants per-chunk skip permission',async()=>{

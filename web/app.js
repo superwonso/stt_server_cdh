@@ -12,6 +12,7 @@ import { RESULT_WARNING, validResultDraft, validResultWarnings } from './llm-res
 import { groupTranscriptSentences } from './transcript-sentences.js';
 import { TranscriptFollow } from './transcript-follow.js';
 import { FileImportCancelledError, RecordingFileUploader, isTerminalImportState } from './file-import.js';
+import { HeldImportReceiptStore, verifyHeldImportCompletion, recheckHeldImportCompletion } from './held-import-recovery.js';
 import { liveCoordination } from './live-coordination.js';
 import { TabAuthSessionStore } from './auth-session.js';
 import {
@@ -56,6 +57,7 @@ const liveSessions = new Map();
 let localAudioExportSequence = 0, localAudioExportBusy = false, localAudioExportController = null;
 let localAudioExportCaptureId = null, localAudioExportForImport = false, heldRecoveryEvidence = null, heldRecoveryMessage = '';
 const localAudioExportUrls = new Set(), failedAudioDownloadUrls = new Set();
+const heldImportReceipts = new HeldImportReceiptStore();
 let fileUploader = null, importJob = null, importProgress = null, importError = '';
 let selectedRecordingFile = null, selectedRecordingOwner = '', recordingSelectionSequence = 0;
 let recordingSelectionLoading = false, recordingDragDepth = 0;
@@ -2022,11 +2024,14 @@ function defaultImportTitle(file) {
   return Array.from(base).slice(0, 120).join('');
 }
 function makeFileUploader(generation) {
+  const receiptOwner=user,receiptToken=token,receiptServer=apiUrl;
   return new RecordingFileUploader({
     request: api,
     onState: state => {
       if (generation !== importGeneration) return;
       if (state?.status) {
+        if(user===receiptOwner && token===receiptToken && apiUrl===receiptServer)
+          heldImportReceipts.remember(receiptOwner,receiptServer,state);
         const previousLecture = importJob?.lecture_id;
         const firstState = !importJob || importJob.id !== state.id;
         importJob = state; importStarting = false;
@@ -2096,9 +2101,10 @@ async function runFileImport(operation, generation) {
     clearRecordingSelection();
     await refreshLectures();
     await refreshImportLecture(result, true, generation);
-    notice(result.raw_deleted
+    notice((result.raw_deleted
       ? '녹음 파일 변환을 마쳤어요. 원본 임시 파일은 서버에서 삭제했습니다.'
-      : '녹음 파일 변환을 마쳤지만 원본 임시 파일 삭제를 재시도하고 있어요.');
+      : '녹음 파일 변환을 마쳤지만 원본 임시 파일 삭제를 재시도하고 있어요.')
+      + (String(result.filename || '').startsWith('보관음성_') ? ' 보관 목록의 “변환 확인 · 보류 종료”에서 보류를 종료할 수 있습니다.' : ''));
   } catch (error) {
     if (generation !== importGeneration) return;
     if (!importJob && error?.importId && fileUploader && token) {
@@ -4972,7 +4978,7 @@ function renderHeldAudio() {
   $('closed-held-audio').hidden=!closed.length;
   $('closed-held-audio-count').textContent=closed.length;
   $('held-audio-state').textContent=rows.length ? `${rows.length}개 수업은 새 수업과 별도로 보관하며 자동 전송하지 않습니다. `
-    + (heldRestoreBlockReason() || '음성 다운로드 후 파일 저장을 확인하면 보류를 종료할 수 있습니다. 전송 복구는 별도로 선택하세요.')
+    + (heldRestoreBlockReason() || '음성 파일 저장 또는 파일 변환 성공을 확인하면 보류를 종료할 수 있습니다. 전송 복구는 별도로 선택하세요.')
     : closed.length ? '복구를 기다리는 보류 수업이 없습니다. 종료한 수업의 기기 음성은 아래 보관함에 남아 있습니다.' : '';
   const signature=JSON.stringify([user,token,apiUrl,!!heldRestoreBlockReason(),!!heldImportBlockReason(),historyNavigationBusy(),[...rows,...closed].map(session=>[session.id,session.title,session.heldError,
     session.heldDurable,session.recoveryClosedAt,heldRecoveryBlockReason(session.id),!!session.lecture,pending.filter(chunk=>chunk.captureId===session.id).length])]);
@@ -4998,13 +5004,16 @@ function renderHeldAudio() {
     const convert=document.createElement('button');convert.type='button';convert.textContent='파일 변환으로 보내기';convert.dataset.action='import-held';
     convert.disabled=!!heldImportBlockReason();
     convert.onclick=()=>{if(sameAccount()&&!heldImportBlockReason())void prepareLocalAudioExport({captureId:session.id,forImport:true});};
+    const finish=document.createElement('button');finish.type='button';finish.textContent='변환 확인 · 보류 종료';finish.dataset.action='finish-import-held';
+    finish.disabled=!!heldRecoveryBlockReason(session.id);
+    finish.onclick=()=>{if(sameAccount()&&!heldRecoveryBlockReason(session.id))void prepareLocalAudioExport({captureId:session.id,checkConversion:true});};
     const restore=document.createElement('button');restore.type='button';restore.textContent='선택한 수업 전송 복구';restore.dataset.action='restore-held';
     restore.disabled=!!heldRestoreBlockReason();restore.onclick=()=>{if(sameAccount())void restoreHeldAudio(session.id);};
     if(isClosed){
       const reopen=document.createElement('button');reopen.type='button';reopen.textContent='보류 목록으로 되돌리기';reopen.dataset.action='reopen-held';
       reopen.disabled=!!heldRecoveryBlockReason(session.id);reopen.onclick=()=>{if(sameAccount())void reopenHeldAudio(session.id);};
       actions.append(view,download,convert,reopen);
-    }else actions.append(view,download,convert,restore);
+    }else actions.append(view,download,convert,finish,restore);
     card.append(title,detail,reason,actions);(isClosed ? $('closed-held-audio-list') : target).append(card);
   }
 }
@@ -5025,47 +5034,95 @@ function heldRecoveryEvidenceIsCurrent(evidence=heldRecoveryEvidence) {
   return !!evidence && evidence===heldRecoveryEvidence && evidence.owner===user && evidence.token===token
     && evidence.server===apiUrl && !!token && localAudioExportCaptureId===evidence.captureId && $('local-audio-dialog').open;
 }
+function heldRecoveryConversionIsCurrent(evidence=heldRecoveryEvidence) {
+  return heldRecoveryEvidenceIsCurrent(evidence) && evidence.converted?.complete===true
+    && evidence.converted.partCount===evidence.partCount && evidence.converted.completedParts===evidence.partCount;
+}
 function renderHeldRecoveryConfirmation() {
   const session=liveSessions.get(localAudioExportCaptureId);
   const visible=!!localAudioExportCaptureId && session?.owner===user && session.uploadHeld && !session.recoveryClosedAt;
   $('local-audio-finish-panel').hidden=!visible;
   const evidence=heldRecoveryEvidence;
   const downloaded=heldRecoveryEvidenceIsCurrent(evidence) && evidence.partCount>0 && evidence.downloaded.size===evidence.partCount;
-  $('local-audio-saved-confirm').disabled=!downloaded || holdingAudio;
-  if(!downloaded)$('local-audio-saved-confirm').checked=false;
+  const converted=heldRecoveryConversionIsCurrent(evidence),confirmed=downloaded || converted;
+  $('local-audio-check-imports').disabled=!heldRecoveryEvidenceIsCurrent(evidence) || localAudioExportBusy || holdingAudio;
+  $('local-audio-check-imports').textContent=localAudioExportBusy ? '음성과 변환 상태 확인 중…' : '파일 변환 완료 확인';
+  $('local-audio-saved-confirm').disabled=!confirmed || localAudioExportBusy || holdingAudio;
+  if(!confirmed)$('local-audio-saved-confirm').checked=false;
+  $('local-audio-confirm-label').textContent=converted ? '파일 변환이 완료된 새 수업을 확인했습니다'
+    : '이 수업의 파일을 모두 저장했고 재생되는 것을 확인했습니다';
+  $('local-audio-finish').textContent=converted ? '변환 성공 확인 · 보류 종료' : '파일 저장 확인 · 보류 종료';
   const blocked=visible ? heldRecoveryBlockReason(session.id) : '';
-  $('local-audio-finish').disabled=!visible || !downloaded || !$('local-audio-saved-confirm').checked || !!blocked;
+  $('local-audio-finish').disabled=!visible || !confirmed || !$('local-audio-saved-confirm').checked || !!blocked;
   $('local-audio-finish-state').textContent=visible ? heldRecoveryMessage || blocked
-    || (downloaded ? '모든 파일의 저장·재생을 확인한 뒤 아래 확인란을 선택하세요.'
-      : evidence ? `준비한 WAV ${evidence.partCount}개를 모두 내려받아 주세요. (${evidence.downloaded.size}/${evidence.partCount})`
+    || (converted ? '현재 보관 음성 전체의 파일 변환 성공을 확인했습니다. 새 수업을 확인하고 아래 확인란을 선택하세요.'
+      : downloaded ? '모든 파일의 저장·재생을 확인한 뒤 아래 확인란을 선택하세요.'
+      : evidence ? `준비한 WAV ${evidence.partCount}개를 모두 내려받거나 파일 변환 완료를 확인해 주세요. (다운로드 ${evidence.downloaded.size}/${evidence.partCount})`
         : '이 수업의 음성을 빠짐없이 읽고 파일을 준비한 뒤에만 보류를 종료할 수 있습니다.') : '';
+}
+async function verifyHeldRecoveryImports() {
+  const evidence=heldRecoveryEvidence;
+  if(!heldRecoveryEvidenceIsCurrent(evidence) || localAudioExportBusy || holdingAudio)return false;
+  const controller=new AbortController();localAudioExportController=controller;localAudioExportBusy=true;
+  evidence.converted=null;$('local-audio-saved-confirm').checked=false;heldRecoveryMessage='보관 음성과 서버의 파일 변환 완료 상태를 확인하고 있습니다.';updateControls();
+  const isCurrent=()=>heldRecoveryEvidenceIsCurrent(evidence) && localAudioExportController===controller && !controller.signal.aborted;
+  const request=(path,options={})=>{
+    if(!isCurrent())throw new Error('보관 음성 확인 화면이 바뀌었습니다. 다시 확인해 주세요.');
+    return api(path,{...options,signal:controller.signal});
+  };
+  try{
+    const result=await verifyHeldImportCompletion({captureId:evidence.captureId,parts:evidence.parts,
+      request,knownIds:heldImportReceipts.ids(evidence.owner,evidence.server,evidence.captureId),signal:controller.signal});
+    if(!isCurrent())return false;
+    for(const receipt of result.imports)heldImportReceipts.remember(evidence.owner,evidence.server,receipt);
+    evidence.converted=result;
+    heldRecoveryMessage=result.complete
+      ? '현재 보관 음성 전체의 파일 변환 성공을 확인했습니다. 새 수업을 확인한 뒤 보류를 종료할 수 있습니다.'
+      : `변환 완료를 확인한 구간 ${result.completedParts}/${result.partCount}. 남은 구간을 변환한 뒤 다시 확인하거나, 모든 WAV를 내려받아 확인해 주세요.`;
+    return result.complete;
+  }catch(error){
+    if(isCurrent())heldRecoveryMessage=`파일 변환 완료를 확인하지 못했습니다. ${errorText(error)} 원본과 보류 상태는 그대로입니다.`;
+    return false;
+  }finally{
+    if(localAudioExportController===controller){localAudioExportController=null;localAudioExportBusy=false;updateControls();}
+  }
 }
 async function changeHeldRecovery(captureId,{reopen=false}={}) {
   if(expireActiveAuthSession())return false;
   const blocked=heldRecoveryBlockReason(captureId);if(blocked){notice(blocked);return false;}
   const session=liveSessions.get(captureId),evidence=heldRecoveryEvidence;
+  const converted=!reopen && heldRecoveryConversionIsCurrent(evidence);
+  const downloaded=heldRecoveryEvidenceIsCurrent(evidence) && evidence.partCount>0 && evidence.downloaded.size===evidence.partCount;
   if(reopen ? !session.recoveryClosedAt : session.recoveryClosedAt || !heldRecoveryEvidenceIsCurrent(evidence)
-      || evidence.captureId!==captureId || evidence.downloaded.size!==evidence.partCount || !evidence.partCount
+      || evidence.captureId!==captureId || (!downloaded && !converted)
       || !$('local-audio-saved-confirm').checked)return false;
   const owner=user,sessionToken=token,server=apiUrl,sequence=++holdAudioSequence,exportSequence=localAudioExportSequence;
   const sameOperation=()=>owner===user && sessionToken===token && server===apiUrl && sequence===holdAudioSequence
     && liveSessions.get(captureId)===session;
   const isCurrent=()=>sameOperation() && (reopen || heldRecoveryEvidenceIsCurrent(evidence));
-  let lease=null;holdingAudio=true;heldRecoveryMessage='';updateControls();
+  let lease=null,conversionController=null;holdingAudio=true;heldRecoveryMessage='';updateControls();
   try{
     await session.persistChain?.catch(()=>{});
     if(!isCurrent())return false;
     if(session.storageFailed || hasVolatilePendingAudio(session))throw new Error('음성 저장 상태가 달라졌습니다. 기기 저장을 확인하고 파일을 다시 내려받아 주세요.');
+    if(converted){
+      conversionController=new AbortController();localAudioExportController=conversionController;
+      try{await recheckHeldImportCompletion(evidence.converted.imports,(path,options)=>{
+        if(!isCurrent())throw new Error('계정 또는 보관 확인 화면이 바뀌었습니다.');
+        return api(path,{...options,signal:conversionController.signal});
+      },{signal:conversionController.signal});}catch(error){if(isCurrent()){evidence.converted=null;$('local-audio-saved-confirm').checked=false;}throw error;}
+      if(!isCurrent())return false;
+    }
     lease=await liveCoordination.acquireLiveCapture(owner);
     if(!isCurrent())return false;
     if(!lease?.acquired || !lease.supported)throw new Error('다른 탭의 녹음이 끝난 뒤 다시 선택해 주세요. 음성과 보류 상태는 그대로입니다.');
     // Do not queue behind an abandoned uploader lock. Neither closing nor
-    // reopening changes held=true, settles audio, or contacts the server.
+    // reopening changes held=true, settles audio, or transmits any audio.
     const result=await liveCoordination.tryAllUploaders(owner,async()=>{
       const queue=await openLiveQueue();if(!isCurrent())return null;
       if(!queue)throw new Error('기기 저장소를 확인하지 못해 보류 상태를 바꾸지 않았습니다.');
       return reopen ? queue.reopenHeldRecovery(owner,captureId)
-        : queue.closeHeldRecovery(owner,captureId,{expectedManifest:evidence.manifest,filesConfirmed:true});
+        : queue.closeHeldRecovery(owner,captureId,{expectedManifest:evidence.manifest,...(converted ? {conversionConfirmed:true} : {filesConfirmed:true})});
     });
     // Closing/refreshing the download dialog cannot undo an IDB commit that
     // already happened. Reflect that result for the same account/session,
@@ -5089,6 +5146,7 @@ async function changeHeldRecovery(captureId,{reopen=false}={}) {
     }
     return false;
   }finally{
+    if(conversionController && localAudioExportController===conversionController)localAudioExportController=null;
     if(lease?.acquired)await lease.release?.().catch(()=>{});
     // Clear the operation's busy flag even if its login/view changed midway.
     if(sequence===holdAudioSequence){
@@ -5314,7 +5372,7 @@ function pinLocalAudioMemory(owner) {
   return {chunks,snapshots,titles};
 }
 
-async function prepareLocalAudioExport({captureId=null,forImport=false}={}) {
+async function prepareLocalAudioExport({captureId=null,forImport=false,checkConversion=false}={}) {
   if (!mayExportLocalAudio() || localAudioExportBusy) return;
   const owner = user, exportToken=token, exportServer=apiUrl, selectionSequence=recordingSelectionSequence;
   if(forImport && (captureId===null || heldImportBlockReason()))return;
@@ -5364,7 +5422,7 @@ async function prepareLocalAudioExport({captureId=null,forImport=false}={}) {
         // A download click is only a request. Keep this evidence separate from
         // chunk.downloadRequested, which permits destructive per-chunk skips.
         heldRecoveryEvidence={owner,token:exportToken,server:exportServer,captureId,manifest:heldRecoveryManifest(stored,captureId),
-          partCount:group.parts.length,downloaded:new Set()};
+          partCount:group.parts.length,parts:group.parts,downloaded:new Set(),converted:null};
       }catch{
         heldRecoveryMessage='기기 원본 목록을 확인하지 못해 보류 종료는 잠겨 있습니다. 다운로드한 파일과 기기 저장 상태를 확인해 주세요.';
       }
@@ -5437,11 +5495,13 @@ async function prepareLocalAudioExport({captureId=null,forImport=false}={}) {
       localAudioExportBusy = false; localAudioExportController = null; $('local-audio-refresh').disabled = false; updateControls();
     }
   }
+  if(checkConversion && isCurrent() && heldRecoveryEvidence)await verifyHeldRecoveryImports();
 }
 $('local-audio-open').onclick = () => { void prepareLocalAudioExport(); };
 $('auth-local-audio-open').onclick = () => { void prepareLocalAudioExport(); };
 $('local-audio-refresh').onclick = () => { void prepareLocalAudioExport({captureId:localAudioExportCaptureId,forImport:localAudioExportForImport}); };
 $('local-audio-saved-confirm').onchange = renderHeldRecoveryConfirmation;
+$('local-audio-check-imports').onclick = () => { void verifyHeldRecoveryImports(); };
 $('local-audio-finish').onclick = () => { if(!$('local-audio-finish').disabled)void closeHeldAudio(localAudioExportCaptureId); };
 $('local-audio-close').onclick = clearLocalAudioExports;
 $('local-audio-dialog').onclose = () => { if (!$('local-audio-dialog').open) clearLocalAudioExports(); };

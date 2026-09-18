@@ -1051,9 +1051,11 @@ export class DurableLiveQueue {
   async closeHeldRecovery(ownerValue, captureIdValue, options) {
     const owner = cleanOwner(ownerValue);
     const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
-    onlyKeys(options,new Set(['expectedManifest','filesConfirmed']),'보관 상태 종료 확인');
-    if (options.filesConfirmed !== true || typeof options.expectedManifest !== 'string' || !options.expectedManifest.length) {
-      throw new LiveQueueValidationError('보관 음성 파일을 모두 내려받아 확인한 뒤 상태를 종료해 주세요.');
+    onlyKeys(options,new Set(['expectedManifest','filesConfirmed','conversionConfirmed']),'보관 상태 종료 확인');
+    if (['filesConfirmed','conversionConfirmed'].some(key => Object.hasOwn(options,key) && typeof options[key] !== 'boolean')
+        || (options.filesConfirmed !== true && options.conversionConfirmed !== true)
+        || typeof options.expectedManifest !== 'string' || !options.expectedManifest.length) {
+      throw new LiveQueueValidationError('음성 파일 저장 또는 파일 변환 완료를 확인한 뒤 보관 상태를 종료해 주세요.');
     }
     const now = this._clock();
     return this._transaction([SESSION_STORE,CHUNK_STORE,SNAPSHOT_STORE],'readwrite',async stores => {
@@ -1066,10 +1068,10 @@ export class DurableLiveQueue {
       const snapshot = {owner,sessions:[value],chunks,snapshots:pcm ? [pcm] : []};
       const manifest = heldRecoveryManifest(snapshot,captureId);
       // The original manifest predates this marker/updatedAt write. Repeating
-      // the same explicit close must not require downloading unchanged audio.
+      // the same explicit close must not require confirming unchanged audio again.
       if (value.recoveryClosedAt !== undefined) return sessionCopy(value);
       if (manifest !== options.expectedManifest) {
-        throw new LiveQueueConflictError('다운로드한 뒤 보관 음성이 바뀌었습니다. 최신 음성을 다시 내려받아 확인해 주세요.');
+        throw new LiveQueueConflictError('확인한 뒤 보관 음성이 바뀌었습니다. 최신 음성 파일 저장 또는 파일 변환 완료를 다시 확인해 주세요.');
       }
       value.recoveryClosedAt = now;
       value.updatedAt = now;
