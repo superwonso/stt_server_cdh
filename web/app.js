@@ -98,11 +98,10 @@ const loadedLectureOwners = new WeakMap();
 let textExportIdentity = '', continuationCapability = '', partialRecordingCapability = '';
 let recordingUploadCapability = '', audioSending = false, audioRetryTimer = null, audioRetryAttempt = 0;
 let audioUploadError = '', audioUploadErrorScope = '';
-// null means "automatic": prefer CLOVA for a new microphone lesson when the
-// authenticated server advertises it, otherwise stay on the local Qwen path.
-// Keep an explicit user choice only in this account session; never persist it
-// in shared browser storage or let status polling rewrite an active lecture.
-let micProviderPreference = null;
+// Choose a default from the language first: Korean prefers configured CLOVA;
+// English and automatic detection prefer Qwen. Explicit choices belong to that
+// language in this account session, never shared storage or an active lecture.
+let micProviderPreferences = {};
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30000;
 const STORAGE_RETRY_BASE_MS = 5000;
@@ -1641,7 +1640,7 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
   if (!pending.length) { sendError = ''; clearUploadRetry(); }
   clearRecordingSelection();
   transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
-  micProviderPreference = null;
+  micProviderPreferences = {};
   $('lecture-title').value = ''; $('language').value = 'ko'; $('audio-source').value = 'microphone';
   $('asr-provider').value = 'qwen'; $('asr-provider-clova').disabled = true;
   $('asr-provider-clova').textContent = 'NAVER CLOVA Speech · 운영자 설정 필요';
@@ -1810,8 +1809,8 @@ async function enterAuthenticatedWorkspace(response, authServer, {notAfter = Inf
     } catch (error) { notice(errorText(error)); }
     if (!token) return;
     // Resolve the authenticated provider list before enabling the workspace.
-    // Otherwise a fast first click could start Qwen while the CLOVA-default
-    // status request is still in flight.
+    // Otherwise a fast first click could use the wrong language default while
+    // the provider availability request is still in flight.
     const statusToken = token, statusUser = user;
     await updateStatus();
     if (!token || token !== statusToken || user !== statusUser || apiUrl !== authServer) return;
@@ -1968,7 +1967,7 @@ async function updateStatus() {
     $('asr-provider-qwen').disabled = !qwenConfigured;
     $('asr-provider-clova').disabled = !clovaConfigured;
     $('asr-provider-clova').textContent = clovaConfigured
-      ? 'NAVER CLOVA Speech · 운영자 클라우드 · 기본' : 'NAVER CLOVA Speech · 운영자 설정 필요';
+      ? 'NAVER CLOVA Speech' : 'NAVER CLOVA Speech · 운영자 설정 필요';
     applyNewLectureProvider();
     $('model-status').textContent = ({unloaded:'로컬 모델 · 첫 받아쓰기 준비됨',loading:'API 연결됨 · 로컬 모델 준비 중',ready:'음성 인식 모델 연결됨',busy:'API 연결됨 · 로컬 모델 처리 중',offline:'API 연결됨 · 로컬 모델 연결 대기',error:'API 연결됨 · 로컬 모델 확인 필요'})[status.model_state] || '서버 연결됨';
     updateProviderGuidance(); updateControls();
@@ -4877,9 +4876,12 @@ function renderCurrent() {
 function selectedCaptureSource() { return $('audio-source').value === 'system' ? 'system' : 'microphone'; }
 function selectedAsrProvider() { return $('asr-provider').value === 'clova' ? 'clova' : 'qwen'; }
 function preferredMicrophoneProvider() {
-  if (micProviderPreference === 'qwen') return 'qwen';
-  if (transcriptionProviders.clova.configured) return 'clova';
-  return 'qwen';
+  const language = $('language').value;
+  if (language === 'auto') return 'qwen';
+  const preference = micProviderPreferences[language];
+  if (preference === 'qwen') return 'qwen';
+  if (preference === 'clova' && transcriptionProviders.clova.configured) return 'clova';
+  return language === 'ko' && transcriptionProviders.clova.configured ? 'clova' : 'qwen';
 }
 function applyNewLectureProvider() {
   // Historical and in-progress lectures display their immutable persisted
@@ -4887,7 +4889,6 @@ function applyNewLectureProvider() {
   if (current || captureSession || draft) return;
   $('asr-provider').value = selectedCaptureSource() === 'system'
     ? 'qwen' : preferredMicrophoneProvider();
-  enforceClovaLanguage(false);
 }
 function displayedAsrProvider() {
   if (current) return current.asr_provider === 'clova' ? 'clova' : 'qwen';
@@ -4901,20 +4902,13 @@ function updateProviderGuidance() {
   $('provider-privacy').textContent = CLOVA_PRIVACY_NOTICE;
   $('provider-privacy').hidden = !clova;
   if (system) {
-    $('provider-guidance').textContent = '컴퓨터·브라우저 탭 소리는 항상 이 PC의 Qwen으로 처리합니다.';
+    $('provider-guidance').textContent = '컴퓨터·브라우저 탭 소리는 항상 Qwen-3으로 처리합니다.';
   } else if (clova && !transcriptionProviders.clova.configured && !current) {
     $('provider-guidance').textContent = 'CLOVA Speech를 사용하려면 서버 컴퓨터에 스트리밍 Secret Key를 먼저 설정해야 합니다.';
   } else if (clova) {
     $('provider-guidance').textContent = '이 수업의 마이크 음성을 사이트 운영자가 설정한 NAVER CLOVA Speech로 처리합니다.';
   } else {
-    $('provider-guidance').textContent = '마이크 음성을 이 PC의 Qwen으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.';
-  }
-}
-function enforceClovaLanguage(announce = false) {
-  if (current || selectedCaptureSource() !== 'microphone' || selectedAsrProvider() !== 'clova') return;
-  if (!['ko','en'].includes($('language').value)) {
-    $('language').value = 'ko';
-    if (announce) notice('CLOVA 실시간 받아쓰기는 한국어와 영어만 지원해 한국어로 바꿨어요.');
+    $('provider-guidance').textContent = '마이크 음성을 Qwen-3으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.';
   }
 }
 function updateSourceGuidance() {
@@ -4928,10 +4922,14 @@ function updateSourceGuidance() {
 }
 $('audio-source').onchange = () => { updateSourceGuidance(); updateControls(); };
 $('asr-provider').onchange = () => {
-  micProviderPreference = selectedAsrProvider();
-  enforceClovaLanguage(true); updateProviderGuidance(); updateControls();
+  if (current || captureSession || draft || selectedCaptureSource() !== 'microphone') return;
+  const language = $('language').value;
+  // Language is the user's intent; an unsupported provider never rewrites it.
+  if (language === 'auto') $('asr-provider').value = 'qwen';
+  else if (language === 'ko' || language === 'en') micProviderPreferences[language] = selectedAsrProvider();
+  applyNewLectureProvider(); updateControls();
 };
-$('language').onchange = () => { enforceClovaLanguage(true); updateControls(); };
+$('language').onchange = () => { applyNewLectureProvider(); updateControls(); };
 function resetNewNote({ focus = false } = {}) {
   ++requestGeneration;
   selectImportLecture = false; ++importLectureSequence;
@@ -5428,7 +5426,7 @@ function updateControls() {
     : '지난 기록을 보는 동안에도 현재 수업을 계속 녹음하고 있어요.';
   $('live-capture-detail').textContent = captureSession?.asrProvider === 'clova'
     ? '음성은 현재 녹음 수업에만 연결되며, CLOVA 처리를 위해 이 서버를 거쳐 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인으로 계속 전송됩니다.'
-    : '음성과 받아쓰기 결과는 현재 녹음 수업에만 저장되며, 이 PC의 Qwen으로 계속 처리됩니다.';
+    : '음성과 받아쓰기 결과는 현재 녹음 수업에만 저장되며, Qwen-3으로 계속 처리됩니다.';
   $('return-live-capture').disabled = !stableLiveCapture();
   $('lecture-date').disabled = historyNavigationBusy();
   $('library-search-open').disabled = historyNavigationBusy();
@@ -5456,10 +5454,10 @@ function updateControls() {
   $('delete-confirm').disabled = deletingLecture;
   $('delete-confirm').textContent = deletingLecture ? '옮기는 중…' : '휴지통으로 이동';
   $('lecture-title').disabled = busy || !!current; $('language').disabled = busy || !!current;
-  $('language-auto').disabled = clova;
+  $('language-auto').disabled = false;
   $('audio-source').disabled = busy || !!current;
   $('asr-provider-qwen').disabled = !transcriptionProviders.qwen.configured;
-  $('asr-provider-clova').disabled = !transcriptionProviders.clova.configured;
+  $('asr-provider-clova').disabled = !transcriptionProviders.clova.configured || $('language').value === 'auto';
   $('asr-provider').disabled = busy || !!current || system;
   updateProviderGuidance();
   $('record-button').disabled = authenticating || loggingOut || holdingAudio || captureTransition || activeImport || importStarting || recordingFinalizePending || (!liveSession && (!!draft || activePendingCount() > 0 || sending));
@@ -5881,13 +5879,13 @@ async function startRecording({continuation = null} = {}) {
   const asrProvider = source === 'system' ? 'qwen' : selectedAsrProvider();
   if (!transcriptionProviders[asrProvider]?.configured) {
     notice(asrProvider === 'clova'
-      ? 'CLOVA Speech가 서버에 설정되지 않았어요. 서버 설정을 확인하거나 Qwen을 선택해 주세요.'
-      : '이 PC의 Qwen을 사용할 수 있는지 서버 상태를 확인해 주세요.');
+      ? 'CLOVA Speech가 서버에 설정되지 않았어요. 서버 설정을 확인하거나 Qwen-3을 선택해 주세요.'
+      : 'Qwen-3을 사용할 수 있는지 서버 상태를 확인해 주세요.');
     updateControls(); return;
   }
   if (asrProvider === 'clova' && !['ko','en'].includes($('language').value)) {
-    $('language').value = 'ko';
-    notice('CLOVA 실시간 받아쓰기는 한국어와 영어만 지원해 한국어로 바꿨어요.');
+    notice('자동 감지는 Qwen-3으로 사용할 수 있어요. 음성 인식 모델을 확인해 주세요.');
+    updateControls(); return;
   }
   ++requestGeneration; starting = true; paused = false; pausing = false; resuming = false;
   if (!nextPendingChunk()) sendError = '';

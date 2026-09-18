@@ -178,6 +178,13 @@
               <label for="lecture-title">수업 이름</label>
               <input id="lecture-title" name="lecture-title" type="text" maxlength="120" placeholder="예: 3교시 한국사" autocomplete="off">
             </div>
+            <div class="field compact-field source-field">
+              <label for="audio-source">실시간 입력</label>
+              <select id="audio-source" name="audio-source" aria-describedby="source-guidance source-privacy">
+                <option value="microphone" selected>기기 마이크</option>
+                <option value="system">컴퓨터·브라우저 탭 소리</option>
+              </select>
+            </div>
             <div class="field compact-field language-field">
               <label for="language">말하는 언어</label>
               <select id="language" name="language">
@@ -186,23 +193,16 @@
                 <option id="language-auto" value="auto">자동 감지</option>
               </select>
             </div>
-            <div class="field compact-field source-field">
-              <label for="audio-source">실시간 입력</label>
-              <select id="audio-source" name="audio-source" aria-describedby="source-guidance source-privacy">
-                <option value="microphone" selected>기기 마이크</option>
-                <option value="system">컴퓨터·브라우저 탭 소리</option>
-              </select>
-            </div>
             <div class="field compact-field provider-field">
               <label for="asr-provider">마이크 음성 인식</label>
               <select id="asr-provider" name="asr-provider" aria-describedby="provider-guidance provider-privacy">
-                <option id="asr-provider-qwen" value="qwen" selected>이 PC의 Qwen · 로컬</option>
+                <option id="asr-provider-qwen" value="qwen" selected>Qwen-3</option>
                 <option id="asr-provider-clova" value="clova" disabled>NAVER CLOVA Speech · 운영자 설정 필요</option>
               </select>
             </div>
             <p id="source-guidance" class="source-guidance">마이크로 주변의 수업 소리를 받아씁니다.</p>
             <p id="source-privacy" class="source-privacy" hidden>공유 대상으로 선택한 범위의 알림·다른 앱 소리도 함께 전송될 수 있습니다. 수업 외 소리는 끄고 공유 범위를 확인하세요.</p>
-            <p id="provider-guidance" class="provider-guidance">마이크 음성을 이 PC의 Qwen으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.</p>
+            <p id="provider-guidance" class="provider-guidance">마이크 음성을 Qwen-3으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.</p>
             <p id="provider-privacy" class="provider-privacy" hidden>선택한 마이크 음성은 브라우저 → 이 서버 → 이 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인으로 전송됩니다. 인식 결과는 운영자가 연결한 Object Storage에 자동 저장되며, 이 앱에서 수업을 삭제해도 그 클라우드 사본은 삭제되지 않습니다.</p>
           </div>
 
@@ -226,7 +226,7 @@
             <div class="file-import-copy">
               <strong id="file-import-title">녹음 파일 가져오기</strong>
               <p id="recording-drop-hint">녹음 파일 한 개를 여기에 끌어 놓거나 파일 선택 버튼으로 골라 주세요. 확인 후 “파일 올려 변환”을 눌러야 업로드가 시작됩니다.</p>
-              <p>WAV, MP3, M4A, AAC, FLAC, OGG, Opus, WebM과 오디오가 든 MP4·MKV·MOV 파일을 올려 이 PC의 Qwen으로 새 수업 기록을 만듭니다.</p>
+              <p>WAV, MP3, M4A, AAC, FLAC, OGG, Opus, WebM과 오디오가 든 MP4·MKV·MOV 파일을 올려 Qwen-3으로 새 수업 기록을 만듭니다.</p>
               <small>파일은 Cloudflare를 거쳐 이 서버에 임시 저장되며, 변환 완료·취소·실패 시 원본을 삭제합니다. 최대 1 GiB·4시간입니다.</small>
             </div>
             <div class="file-import-actions">

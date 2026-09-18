@@ -1502,7 +1502,7 @@ test('the selected computer-audio source is passed to capture without a precedin
   assert.equal(app.element('source-privacy').hidden, false);
   assert.equal(app.element('asr-provider').value, 'qwen');
   assert.equal(app.element('asr-provider').disabled, true);
-  assert.match(app.element('provider-guidance').textContent, /항상 이 PC의 Qwen/);
+  assert.match(app.element('provider-guidance').textContent, /항상 Qwen-3/);
   app.element('audio-source').value = 'microphone';
   app.element('audio-source').onchange();
   assert.equal(app.element('asr-provider').value, 'clova',
@@ -1545,18 +1545,25 @@ test('authenticated status enables only the advertised CLOVA choice and ignores 
   assert.equal(app.element('asr-provider').value,'qwen');
   app.element('language').value = 'auto';
   await app.run('updateStatus()');
-  assert.equal(app.element('asr-provider').value,'clova');
-  assert.equal(app.element('language').value,'ko');
-  assert.equal(app.element('asr-provider-clova').disabled,false);
-  assert.match(app.element('asr-provider-clova').textContent,/기본/);
+  assert.equal(app.element('asr-provider').value,'qwen');
+  assert.equal(app.element('language').value,'auto');
+  assert.equal(app.element('language-auto').disabled,false);
+  assert.equal(app.element('asr-provider-clova').disabled,true);
+  assert.doesNotMatch(app.element('asr-provider-clova').textContent,/기본/);
   assert.match(app.element('asr-provider-clova').textContent,/NAVER CLOVA Speech/);
   assert.doesNotMatch(app.element('asr-provider-clova').textContent,/untrusted|must-not-render/);
   assert.doesNotMatch(app.run('JSON.stringify(transcriptionProviders)'),/secret|label|must-not-render/);
 
-  app.element('language').value = 'auto';
   app.element('asr-provider').value = 'clova';
   app.element('asr-provider').onchange();
-  assert.equal(app.element('language').value,'ko');
+  assert.equal(app.element('language').value,'auto','provider selection cannot overwrite the selected language');
+  assert.equal(app.element('asr-provider').value,'qwen');
+  assert.equal(app.run('micProviderPreferences.auto'),undefined);
+  app.element('language').value = 'en';
+  app.element('language').onchange();
+  app.element('asr-provider').value = 'clova';
+  app.element('asr-provider').onchange();
+  assert.equal(app.element('language').value,'en');
   assert.equal(app.element('provider-privacy').hidden,false);
   assert.match(app.element('provider-privacy').textContent,/NAVER Cloud/);
   assert.match(app.element('provider-privacy').textContent,/사이트 운영자가 관리하는.*계정/);
@@ -1597,7 +1604,7 @@ test('the automatic microphone provider falls back on status failure and returns
   state = 'failed';
   await app.run('updateStatus()');
   assert.equal(app.element('asr-provider').value,'qwen');
-  assert.equal(app.run('micProviderPreference'),null);
+  assert.equal(app.run('JSON.stringify(micProviderPreferences)'),'{}');
   state = 'ready';
   await app.run('updateStatus()');
   assert.equal(app.element('asr-provider').value,'clova');
@@ -1646,6 +1653,132 @@ test('an explicit Qwen microphone preference survives polling, source changes, a
   assert.equal(app.element('asr-provider').value,'qwen');
 });
 
+test('new microphone defaults follow language without rewriting English or automatic detection', async () => {
+  const app = setup(async () => response({model_state:'ready',
+    transcription_providers:{qwen:{configured:true},clova:{configured:true}}}));
+  await app.run('updateStatus()');
+  for (const [language,provider] of [['ko','clova'],['en','qwen'],['auto','qwen'],['ko','clova']]) {
+    app.element('language').value = language;
+    app.element('language').onchange();
+    assert.equal(app.element('asr-provider').value,provider,language);
+    assert.equal(app.element('language').value,language);
+    assert.equal(app.element('language-auto').disabled,false);
+    assert.equal(app.element('asr-provider-clova').disabled,language === 'auto');
+    await app.run('updateStatus()');
+    assert.equal(app.element('asr-provider').value,provider,'status refresh retains the language-specific default');
+    assert.equal(app.element('language').value,language);
+  }
+  assert.equal(app.run('JSON.stringify(micProviderPreferences)'),'{}','automatic choices do not become manual preferences');
+});
+
+test('English and automatic defaults create Qwen lessons with the selected language intact', async () => {
+  for (const language of ['en','auto']) {
+    const creations = [];
+    const app = setup(async (url,options = {}) => {
+      if (url.endsWith('/status')) return response({model_state:'ready',
+        transcription_providers:{qwen:{configured:true},clova:{configured:true}}});
+      if (url.endsWith('/lectures') && options.method === 'POST') {
+        const body = JSON.parse(options.body); creations.push(body);
+        return response({id:options.headers.get('X-Lecture-Id'),...body,created_at:new Date().toISOString(),segments:[]},201);
+      }
+      return response({segments:[]});
+    });
+    await app.run('updateStatus()');
+    app.element('language').value = language; app.element('language').onchange();
+    await app.run('startRecording()');
+    assert.equal(creations.length,1);
+    assert.equal(creations[0].asr_provider,'qwen');
+    assert.equal(creations[0].language,language === 'auto' ? null : language);
+    assert.equal(app.run('captureSession.asrProvider'),'qwen');
+    assert.equal(app.element('language').value,language);
+    app.microphone().tail = null; await app.run('stopRecording()');
+  }
+});
+
+test('manual microphone choices remain scoped to language through polling, source changes and new notes', async () => {
+  const app = setup(async () => response({model_state:'ready',
+    transcription_providers:{qwen:{configured:true},clova:{configured:true}}}));
+  await app.run('updateStatus()');
+  app.element('asr-provider').value = 'qwen'; app.element('asr-provider').onchange();
+  app.element('language').value = 'en'; app.element('language').onchange();
+  assert.equal(app.element('asr-provider').value,'qwen');
+  app.element('asr-provider').value = 'clova'; app.element('asr-provider').onchange();
+  await app.run('updateStatus()');
+  assert.equal(app.element('language').value,'en'); assert.equal(app.element('asr-provider').value,'clova');
+  app.element('audio-source').value = 'system'; app.element('audio-source').onchange();
+  assert.equal(app.element('asr-provider').value,'qwen'); assert.equal(app.element('asr-provider').disabled,true);
+  app.element('audio-source').value = 'microphone'; app.element('audio-source').onchange();
+  assert.equal(app.element('asr-provider').value,'clova');
+  app.element('language').value = 'auto'; app.element('language').onchange();
+  await app.run('updateStatus()');
+  assert.equal(app.element('language').value,'auto'); assert.equal(app.element('asr-provider').value,'qwen');
+  app.element('language').value = 'ko'; app.element('language').onchange();
+  assert.equal(app.element('asr-provider').value,'qwen');
+  app.element('language').value = 'en'; app.element('language').onchange();
+  assert.equal(app.element('asr-provider').value,'clova');
+  app.run('resetNewNote()');
+  assert.equal(app.element('language').value,'ko'); assert.equal(app.element('asr-provider').value,'qwen');
+  assert.deepEqual(JSON.parse(app.run('JSON.stringify(micProviderPreferences)')),{ko:'qwen',en:'clova'});
+});
+
+test('unavailable manual English CLOVA falls back visibly and recovers without changing language', async () => {
+  let configured = true;
+  const app = setup(async () => response({model_state:'ready',
+    transcription_providers:{qwen:{configured:true},clova:{configured}}}));
+  await app.run('updateStatus()');
+  app.element('language').value = 'en'; app.element('language').onchange();
+  app.element('asr-provider').value = 'clova'; app.element('asr-provider').onchange();
+  configured = false; await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'qwen'); assert.equal(app.element('language').value,'en');
+  assert.equal(app.run('micProviderPreferences.en'),'clova');
+  configured = true; await app.run('updateStatus()');
+  assert.equal(app.element('asr-provider').value,'clova'); assert.equal(app.element('language').value,'en');
+});
+
+test('logout clears all language-specific choices before another account receives defaults', async () => {
+  const app = setup(async url => url.endsWith('/status') ? response({model_state:'ready',
+    transcription_providers:{qwen:{configured:true},clova:{configured:true}}}) : response({}));
+  await app.run('updateStatus()');
+  app.element('asr-provider').value = 'qwen'; app.element('asr-provider').onchange();
+  app.element('language').value = 'en'; app.element('language').onchange();
+  app.element('asr-provider').value = 'clova'; app.element('asr-provider').onchange();
+  await app.element('logout').onclick();
+  assert.equal(app.run('JSON.stringify(micProviderPreferences)'),'{}');
+  app.run("user='user-beta';token='synthetic-beta-token'");
+  await app.run('updateStatus()');
+  assert.equal(app.element('language').value,'ko'); assert.equal(app.element('asr-provider').value,'clova');
+  app.element('language').value = 'en'; app.element('language').onchange();
+  assert.equal(app.element('asr-provider').value,'qwen');
+});
+
+test('an invalid CLOVA automatic selection cannot change language or start paid capture', async () => {
+  const requests = [];
+  const app = setup(async url => { requests.push(url); return response({}); });
+  app.run('transcriptionProviders.clova.configured=true');
+  app.element('language').value = 'auto'; app.element('asr-provider').value = 'clova';
+  await app.run('startRecording()');
+  assert.equal(app.element('language').value,'auto'); assert.equal(app.microphone(),undefined);
+  assert.equal(app.run('captureSession'),null); assert.equal(app.run('draft'),null); assert.deepEqual(requests,[]);
+});
+
+test('status and provider events cannot replace persisted or pending lecture choices', async () => {
+  for (const kind of ['current','captureSession','draft']) {
+    const app = setup(async () => response({model_state:'ready',
+      transcription_providers:{qwen:{configured:true},clova:{configured:true}}}));
+    app.run(`micProviderPreferences.en='qwen';
+      ${kind}=${kind === 'current'
+        ? "{id:'saved',title:'Saved fixture',language:'en',asr_provider:'clova',segments:[],recording_finalized:true}"
+        : "{id:'pending',owner:user,language:'en',asrProvider:'clova',source:'microphone',buffered:[],cancelled:false}"};
+      $('language').value='en';$('asr-provider').value='clova';`);
+    await app.run('updateStatus()');
+    assert.equal(app.element('asr-provider').value,'clova',kind);
+    assert.equal(app.element('language').value,'en',kind);
+    app.element('asr-provider').onchange(); app.element('language').onchange();
+    assert.equal(app.run('micProviderPreferences.en'),'qwen',kind);
+    assert.equal(app.run(`${kind}.${kind === 'current' ? 'asr_provider' : 'asrProvider'}`),'clova',kind);
+  }
+});
+
 test('a CLOVA microphone lecture snapshots its provider in creation and every queued chunk', async () => {
   const requests = [];
   const app = setup(async (url,options = {}) => {
@@ -1656,8 +1789,8 @@ test('a CLOVA microphone lecture snapshots its provider in creation and every qu
     return response({segments:[]});
   });
   app.run('transcriptionProviders.clova.configured=true');
+  app.element('language').value = 'ko';
   app.element('asr-provider').value = 'clova';
-  app.element('language').value = 'auto';
   app.element('asr-provider').onchange();
   await app.run('startRecording()');
   const creation = requests.find(request => request.url.endsWith('/lectures'));
@@ -5914,7 +6047,7 @@ async function storageFailureFixture({provider = 'clova',code = 'live_queue_erro
     if (failure.enabled) { const error = new Error('synthetic storage failure'); error.code = code; throw error; }
     return originalEnqueue(...args);
   };
-  app.run(`transcriptionProviders.clova={configured:true}; micProviderPreference=${JSON.stringify(provider)};
+  app.run(`transcriptionProviders.clova={configured:true}; micProviderPreferences.ko=${JSON.stringify(provider)};
     $('asr-provider').value=${JSON.stringify(provider)};`);
   await app.run('startRecording()');
   app.microphone().callbacks.onChunk(chunk(0));
@@ -7333,6 +7466,23 @@ test('continuation keeps automatic language detection and rejects malformed pare
     fixture.app.run(`current.language=${malformed};updateControls()`);fixture.app.element('continue-recording').onclick();
     await tick();assert.equal(fixture.calls.length,0);assert.equal(fixture.app.microphone(),undefined);
   }
+});
+
+test('an English CLOVA continuation and pause resume retain the parent provider despite the Qwen default',async()=>{
+  const {app,calls}=continuationApp();const parent=await seedContinuationParent(app);
+  app.run("current.language='en';current.asr_provider='clova';micProviderPreferences.en='qwen';renderCurrent()");
+  await app.run('updateStatus()');
+  assert.equal(app.element('language').value,'en');assert.equal(app.element('asr-provider').value,'clova');
+  assert.equal(app.element('language').disabled,true);assert.equal(app.element('asr-provider').disabled,true);
+  app.element('continue-recording').onclick();await until(()=>app.run('recording && !draft'));
+  assert.equal(calls.length,1);assert.equal(calls[0].body.continuation_of,parent);
+  assert.equal(calls[0].body.language,'en');assert.equal(calls[0].body.asr_provider,'clova');
+  const id=app.run('captureSession.id');await app.run('pauseRecording()');
+  await app.run('updateStatus()');await app.run('resumeRecording()');
+  assert.equal(app.run('captureSession.id'),id);assert.equal(app.run('captureSession.language'),'en');
+  assert.equal(app.run('captureSession.asrProvider'),'clova');assert.equal(calls.length,1);
+  assert.equal(app.run('micProviderPreferences.en'),'qwen','resuming does not change new-lesson preferences');
+  app.microphone().tail=null;await app.run('stopRecording()');
 });
 
 test('hidden parent recovery verifies the original creation body once then accepts refreshed hidden navigation links',async()=>{
