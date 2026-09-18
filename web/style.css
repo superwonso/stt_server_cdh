@@ -1283,18 +1283,41 @@ button {
 }
 
 .audio-recovery-panel {
-  display: grid;
-  gap: 12px;
-  padding: 18px var(--recorder-inset);
+  padding: 8px var(--recorder-inset);
   border-top: 1px solid var(--line);
   background: var(--surface-muted);
 }
 
-.audio-recovery-panel h3 {
-  margin: 0;
+.audio-recovery-panel > summary,
+.held-audio-panel > summary {
+  min-height: 44px;
+  padding: 12px 0;
   color: var(--ink);
   font-size: 13px;
   font-weight: 750;
+  line-height: 20px;
+  cursor: pointer;
+}
+
+.audio-recovery-panel > summary:focus-visible,
+.held-audio-panel > summary:focus-visible {
+  outline: 2px solid var(--forest-600);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.audio-recovery-content {
+  display: grid;
+  gap: 12px;
+  padding: 4px 0 10px;
+}
+
+.audio-panel-alert {
+  margin-left: 8px;
+  color: #963a25;
+  font-size: 12px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
 }
 
 .audio-recovery-panel .panel-help {
@@ -2874,7 +2897,6 @@ button {
 .study-note-download[hidden] { display: none; }
 #continuation-links:empty, #continuation-state:empty { display: none; }
 .held-audio-panel { margin: 18px var(--recorder-inset); padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface-muted); font-size: 13px; line-height: 1.7; word-break: keep-all; }
-.held-audio-panel h3 { margin: 0 0 8px; font-size: 13px; }
 .held-audio-card { padding: 12px 0; overflow-wrap: anywhere; }
 .held-audio-card + .held-audio-card { border-top: 1px solid var(--line); }
 .held-audio-card p { line-height: 1.6; margin: 8px 0; }

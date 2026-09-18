@@ -249,17 +249,19 @@
             <span class="save-check" aria-hidden="true">✓</span>
             <span id="save-state">녹음 저장 준비</span>
           </div>
-          <section class="audio-recovery-panel" aria-labelledby="audio-recovery-title">
-            <h3 id="audio-recovery-title">녹음 상태 · 음성 보관</h3>
-            <p id="capture-input-status" class="capture-input-status" role="status" aria-live="polite">마이크 녹음 중이 아닙니다.</p>
-            <p id="recording-upload-status" class="capture-input-status" role="status" aria-live="polite" hidden></p>
-            <button id="recording-upload-retry" class="secondary-button" type="button" hidden>원본 녹음 업로드 다시 시도</button>
-            <div class="recovery-actions" role="group" aria-label="기기에 남은 음성 관리">
-              <button id="local-audio-open" class="secondary-button" type="button">기기에 남은 음성 내려받기</button>
-              <button id="hold-new-note" class="secondary-button" type="button" disabled>기존 음성 보관 · 새 수업</button>
+          <details id="audio-recovery-details" class="audio-recovery-panel">
+            <summary id="audio-recovery-title">녹음 상태 · 음성 보관 <span id="audio-recovery-alert" class="audio-panel-alert" role="status" hidden>원본 업로드 오류 · 펼쳐서 확인</span></summary>
+            <div class="audio-recovery-content">
+              <p id="capture-input-status" class="capture-input-status" role="status" aria-live="polite">마이크 녹음 중이 아닙니다.</p>
+              <p id="recording-upload-status" class="capture-input-status" role="status" aria-live="polite" hidden></p>
+              <button id="recording-upload-retry" class="secondary-button" type="button" hidden>원본 녹음 업로드 다시 시도</button>
+              <div class="recovery-actions" role="group" aria-label="기기에 남은 음성 관리">
+                <button id="local-audio-open" class="secondary-button" type="button">기기에 남은 음성 내려받기</button>
+                <button id="hold-new-note" class="secondary-button" type="button" disabled>기존 음성 보관 · 새 수업</button>
+              </div>
+              <p class="panel-help">이전 수업의 전송 오류가 남았다면 음성을 보관하고 새 수업을 열 수 있어요. 현재 녹음은 마지막 음성까지 종료하고, 새 화면에서 시작 버튼을 눌러 주세요. 보관한 음성은 삭제하거나 자동 재전송하지 않습니다.</p>
             </div>
-            <p class="panel-help">이전 수업의 전송 오류가 남았다면 음성을 보관하고 새 수업을 열 수 있어요. 현재 녹음은 마지막 음성까지 종료하고, 새 화면에서 시작 버튼을 눌러 주세요. 보관한 음성은 삭제하거나 자동 재전송하지 않습니다.</p>
-          </section>
+          </details>
           <div id="processing" class="processing" role="status" aria-live="polite" hidden>
             <span class="processing-spinner" aria-hidden="true"></span>
             <span id="processing-text">다음 문장을 듣고 있어요…</span>
@@ -274,8 +276,8 @@
             </div>
             <p id="convert-failed-help" class="panel-help" hidden>파일 변환을 선택하면 현재 녹음을 마지막 음성까지 종료하고 전송 대기 음성을 보관합니다. 이 오류가 난 수업의 기기에 남은 음성을 Qwen-3 파일 변환으로 보낼 수 있어요. 원본은 유지하며, 파일을 선택한 뒤 “파일 올려 변환”을 눌러야 업로드합니다.</p>
           </div>
-          <section id="held-audio-panel" class="held-audio-panel" aria-labelledby="held-audio-title" hidden>
-            <h3 id="held-audio-title">보관 중 · 전송 보류한 수업</h3>
+          <details id="held-audio-panel" class="held-audio-panel" hidden>
+            <summary id="held-audio-title">보관 중 · 전송 보류한 수업</summary>
             <p id="held-audio-state" class="panel-help" role="status"></p>
             <div id="held-audio-list"></div>
             <details id="closed-held-audio" class="closed-held-audio" hidden>
@@ -283,7 +285,7 @@
               <p class="panel-help">사용자가 보류 처리를 종료한 수업입니다. 기기 음성은 삭제하지 않으며 계속 공간을 사용합니다. 다시 내려받거나 보류 목록으로 되돌릴 수 있습니다. 서버 전사 완료와는 다릅니다.</p>
               <div id="closed-held-audio-list"></div>
             </details>
-          </section>
+          </details>
         </section>
 
         <section class="transcript-section" aria-labelledby="transcript-title">

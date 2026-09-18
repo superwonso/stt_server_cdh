@@ -131,10 +131,10 @@ test('lesson heading separates its title from a wrapping toolbar without enablin
 });
 
 test('audio recovery panel groups live input status with explicit preservation controls and guidance', () => {
-  const panel = html.match(/<section\b[^>]*class="audio-recovery-panel"[^>]*>([\s\S]*?)<\/section>/);
+  const panel = html.match(/<details\b[^>]*class="audio-recovery-panel"[^>]*>([\s\S]*?)<\/details>/);
   assert.ok(panel, 'input health and local recovery must remain in the recorder panel');
-  assert.match(panel[0], /aria-labelledby="audio-recovery-title"/);
-  assert.match(panel[1], /<h[23]\b[^>]*id="audio-recovery-title"[^>]*>[^<]+<\/h[23]>/);
+  assert.doesNotMatch(panel[0].split('>')[0], /\sopen(?:\s|=|$)/);
+  assert.match(panel[1], /^\s*<summary\b[^>]*id="audio-recovery-title"[^>]*>[\s\S]*?<\/summary>/);
   assert.match(panel[1], /<p\b[^>]*id="capture-input-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(panel[1], /<div\b[^>]*class="recovery-actions"[^>]*role="group"[^>]*aria-label="[^"]+"/);
   for (const id of ['local-audio-open','hold-new-note']) {

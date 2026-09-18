@@ -5540,7 +5540,9 @@ function updateControls() {
   const audioDescription = recordingAudioUploadDescription();
   $('recording-upload-status').hidden = !audioDescription;
   $('recording-upload-status').textContent = audioDescription;
-  $('recording-upload-retry').hidden = !(audioUploadErrorScope === recordingAudioScope() && audioUploadError);
+  const hasAudioUploadError = !!(audioUploadErrorScope === recordingAudioScope() && audioUploadError);
+  $('recording-upload-retry').hidden = !hasAudioUploadError;
+  $('audio-recovery-alert').hidden = !hasAudioUploadError;
   $('recording-upload-retry').disabled = audioSending || holdingAudio || !recordingAudioUploadEnabled();
   $('new-note').disabled = !!newLessonBlockReason(); $('logout').disabled = busy || pending.length>0
     || [...liveSessions.values()].some(session=>session.owner===user && hasVolatilePendingAudio(session));
