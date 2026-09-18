@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {encodeWav} from '../web/audio.js';
-import {buildLocalAudioExports,buildRecoverableLocalAudioExports,validateLocalWav,LocalAudioExportError} from '../web/local-audio-export.js';
+import {buildLocalAudioExports,buildRecoverableLocalAudioExports,mergeLocalAudioExportParts,validateLocalWav,LocalAudioExportError} from '../web/local-audio-export.js';
 
 const OWNER = 'synthetic-owner';
 const CAPTURE = '10000000-0000-4000-8000-000000000000';
@@ -237,4 +237,138 @@ test('recoverable export retains cancellation and pins caller metadata before it
   }}};
   await assert.rejects(buildRecoverableLocalAudioExports({owner:OWNER,chunks:[aborting],signal:controller.signal}),
     error => error.code === 'aborted');
+});
+
+function assembledPart(samples,start=0,end=samples.length) {
+  return {blob:encodeWav(samples.slice(start,end)),startSamples:start,endSamples:end,durationSamples:end-start};
+}
+
+test('merge keeps every part in time order, pads only internal gaps, and preserves exact PCM',async () => {
+  const samples = source(400), first = assembledPart(samples,50,100), middle = assembledPart(samples,140,200),
+    last = assembledPart(samples,210,400), parts = [last,first,middle], before = [...parts];
+  const result = await mergeLocalAudioExportParts(parts);
+  const expected = samples.slice(); expected.fill(0,100,140); expected.fill(0,200,210);
+  assert.equal(result.gapSamples,50);
+  assert.equal(result.blob.type,'audio/wav');
+  await assertAudio(result,expected,50,400);
+  assert.deepEqual(parts,before,'the input order and source parts stay unchanged');
+  await assertAudio(first,samples,50,100); await assertAudio(last,samples,210,400);
+});
+
+test('merge adjacent parts and previously deduplicated overlaps never repeat boundary samples',async () => {
+  const samples = source(600);
+  const direct = await mergeLocalAudioExportParts([assembledPart(samples,0,200),assembledPart(samples,200,600)]);
+  assert.equal(direct.gapSamples,0); await assertAudio(direct,samples,0,600);
+  const built = await buildLocalAudioExports({owner:OWNER,chunks:[
+    chunk(samples,0,200),chunk(samples,100,300,{sequence:1,overlapSamples:100}),
+    chunk(samples,400,600,{sequence:2})]});
+  const joined = await mergeLocalAudioExportParts(built.groups[0].parts);
+  const expected = samples.slice(); expected.fill(0,300,400);
+  assert.equal(joined.gapSamples,100); await assertAudio(joined,expected,0,600);
+});
+
+test('merge validates large assembled WAVs beyond the raw chunk cap and preserves a single Blob',async () => {
+  const frames = 3 * 1024 * 1024;
+  const bytes = new Uint8Array(await encodeWav(source(1)).slice(0,44).arrayBuffer());
+  const view = new DataView(bytes.buffer); view.setUint32(4,36+frames*2,true); view.setUint32(40,frames*2,true);
+  const zero = new Blob([new Uint8Array(65536)]);
+  const blob = new Blob([bytes,...Array(frames*2/zero.size).fill(zero)],{type:'audio/wav'});
+  const part = {blob,startSamples:11,endSamples:11+frames,durationSamples:frames};
+  const joined = await mergeLocalAudioExportParts([part]);
+  assert.equal(joined.blob,blob); assert.equal(joined.gapSamples,0);
+  assert.equal(joined.startSamples,11); assert.equal(joined.endSamples,11+frames);
+  assert.equal(joined.durationSamples,frames);
+  await assert.rejects(validateLocalWav(blob),error=>error.code==='invalid_wav','raw chunks keep their 4 MiB cap');
+});
+
+test('merge only reads 44-byte headers and composes long silence without reading full audio',async () => {
+  const samples = source(70000), reads = [];
+  const guard = blob => ({size:blob.size,arrayBuffer(){throw new Error('whole audio read forbidden');},
+    slice(start,end) {
+      const slice = blob.slice(start,end);
+      const read = slice.arrayBuffer.bind(slice);
+      Object.defineProperty(slice,'arrayBuffer',{value(){
+        reads.push([start,end]);
+        assert.equal(start,0); assert.equal(end,44);
+        return read();
+      }});
+      return slice;
+    }});
+  const first = assembledPart(samples,0,35000), last = assembledPart(samples,35000,70000);
+  const gap = 16000*180+7;
+  last.startSamples += gap; last.endSamples += gap;
+  first.blob=guard(first.blob); last.blob=guard(last.blob);
+  const joined = await mergeLocalAudioExportParts([first,last]);
+  assert.deepEqual(reads,[[0,44],[0,44]]);
+  assert.equal(joined.gapSamples,gap); assert.equal(joined.durationSamples,70000+gap);
+  assert.equal(joined.blob.size,44+(70000+gap)*2);
+  assert.deepEqual(new Uint8Array(await joined.blob.slice(44,44+70000).arrayBuffer()),await pcm(encodeWav(samples.slice(0,35000))));
+  assert.deepEqual(new Uint8Array(await joined.blob.slice(44+70000,44+70000+65536).arrayBuffer()),new Uint8Array(65536));
+  assert.deepEqual(new Uint8Array(await joined.blob.slice(44+(35000+gap)*2).arrayBuffer()),await pcm(encodeWav(samples.slice(35000))));
+});
+
+test('merge rejects empty, invalid ranges and overlaps before reading any source audio',async () => {
+  const part = assembledPart(source(20));
+  const unread = {...part,blob:{size:part.blob.size,arrayBuffer(){},slice(){throw new Error('should not read');}}};
+  for (const parts of [null,{},[],[null],[{...part,startSamples:-1}],[{...part,endSamples:20.5}],
+    [{...part,durationSamples:0}],[{...part,durationSamples:19}],[{...part,startSamples:true}],
+    [{...part,endSamples:Number.MAX_SAFE_INTEGER+1}]]) {
+    await assert.rejects(mergeLocalAudioExportParts(parts),error=>error.code==='invalid_record');
+  }
+  for (const second of [part,{...part,startSamples:10,endSamples:30}]) {
+    await assert.rejects(mergeLocalAudioExportParts([unread,second]),error=>error.code==='overlap_conflict');
+  }
+});
+
+test('merge enforces absolute timeline, part count and WAV size limits without huge allocations',async () => {
+  const part = assembledPart(source(1)), cap = 16000*4*60*60;
+  const last = await mergeLocalAudioExportParts([{...part,startSamples:cap-1,endSamples:cap}]);
+  assert.equal(last.durationSamples,1); assert.equal(last.startSamples,cap-1);
+  for (const parts of [[{...part,startSamples:cap,endSamples:cap+1}],Array(50001).fill(part)]) {
+    await assert.rejects(mergeLocalAudioExportParts(parts),error=>error.code==='export_limit');
+  }
+  const huge = {...part,blob:{size:1024*1024*1024+2,arrayBuffer(){},slice(){throw new Error('must not read');}}};
+  await assert.rejects(mergeLocalAudioExportParts([huge]),error=>error.code==='invalid_wav');
+});
+
+test('merge rejects malformed canonical headers and mismatched PCM lengths',async () => {
+  const part = assembledPart(source(10));
+  for (const offset of [0,4,8,12,16,20,22,24,28,32,34,36,40]) {
+    const bytes = new Uint8Array(await part.blob.arrayBuffer()); bytes[offset] ^= 1;
+    await assert.rejects(mergeLocalAudioExportParts([{...part,blob:new Blob([bytes])}]),error=>error.code==='invalid_wav');
+  }
+  for (const blob of [new Blob(),encodeWav(source(9)),new Blob([new Uint8Array(65)])]) {
+    await assert.rejects(mergeLocalAudioExportParts([{...part,blob}]),error=>error.code==='invalid_wav');
+  }
+});
+
+test('merge pins all caller metadata and Blob references before asynchronous validation',async () => {
+  const samples = source(100), first = assembledPart(samples,10,40), second = assembledPart(samples,60,100);
+  const originalFirst = first.blob, originalSecond = second.blob;
+  const parts = [second,first], job = mergeLocalAudioExportParts(parts);
+  first.startSamples=999; second.endSamples=1234; first.blob=new Blob(); parts.length=0;
+  const joined = await job, expected = samples.slice(); expected.fill(0,40,60);
+  await assertAudio(joined,expected,10,100); assert.equal(joined.gapSamples,20);
+  assert.equal(originalFirst.size,104); assert.equal(originalSecond.size,124);
+});
+
+test('merge cancellation before and during header reads never returns partial output or private errors',async () => {
+  const part = assembledPart(source(10)), controller = new AbortController(); controller.abort();
+  await assert.rejects(mergeLocalAudioExportParts([part],{signal:controller.signal}),error=>error.code==='aborted');
+  for (const readFails of [false,true]) {
+    const pending = new AbortController();
+    const blob = {size:part.blob.size,arrayBuffer(){},slice(start,end) {
+      const slice = part.blob.slice(start,end);
+      return {async arrayBuffer() {
+        pending.abort();
+        if(readFails)throw new Error('private storage detail');
+        return slice.arrayBuffer();
+      }};
+    }};
+    await assert.rejects(mergeLocalAudioExportParts([{...part,blob}],{signal:pending.signal}),error=>error.code==='aborted');
+  }
+  const broken = {...part,blob:{size:part.blob.size,arrayBuffer(){},slice(){throw new Error('private storage detail');}}};
+  await assert.rejects(mergeLocalAudioExportParts([broken]),error=>{
+    assert.equal(error.code,'read_failed'); assert.doesNotMatch(String(error),/private/); return true;
+  });
 });

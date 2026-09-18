@@ -1,6 +1,6 @@
 import { MicrophoneCapture } from './audio.js';
 import { validateRecordingSelection, isFileDrag, recordingFileFromDrop } from './recording-file-selection.js';
-import { buildRecoverableLocalAudioExports, validateLocalWav } from './local-audio-export.js';
+import { buildRecoverableLocalAudioExports, mergeLocalAudioExportParts, validateLocalWav } from './local-audio-export.js';
 import { renderDriveStatus } from './admin-storage.js';
 import { renderMaintenanceStatus } from './admin-maintenance.js';
 import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';
@@ -54,11 +54,12 @@ let captureCoordinationLease = null;
 let connectionRecoveryPromise = null, lastConnectionRecoveryAt = 0;
 const liveSessions = new Map();
 let localAudioExportSequence = 0, localAudioExportBusy = false, localAudioExportController = null;
-let localAudioExportCaptureId = null, heldRecoveryEvidence = null, heldRecoveryMessage = '';
+let localAudioExportCaptureId = null, localAudioExportForImport = false, heldRecoveryEvidence = null, heldRecoveryMessage = '';
 const localAudioExportUrls = new Set(), failedAudioDownloadUrls = new Set();
 let fileUploader = null, importJob = null, importProgress = null, importError = '';
 let selectedRecordingFile = null, selectedRecordingOwner = '', recordingSelectionSequence = 0;
 let recordingSelectionLoading = false, recordingDragDepth = 0;
+let selectedRecordingImportSource = null;
 let importStarting = false, importCancelling = false, importPromise = null, importGeneration = 0;
 let importLectureRequest = null, lastImportLectureRefresh = 0, selectImportLecture = false;
 let lectureRefreshGeneration = 0, importLectureSequence = 0;
@@ -4973,7 +4974,7 @@ function renderHeldAudio() {
   $('held-audio-state').textContent=rows.length ? `${rows.length}개 수업은 새 수업과 별도로 보관하며 자동 전송하지 않습니다. `
     + (heldRestoreBlockReason() || '음성 다운로드 후 파일 저장을 확인하면 보류를 종료할 수 있습니다. 전송 복구는 별도로 선택하세요.')
     : closed.length ? '복구를 기다리는 보류 수업이 없습니다. 종료한 수업의 기기 음성은 아래 보관함에 남아 있습니다.' : '';
-  const signature=JSON.stringify([user,token,apiUrl,!!heldRestoreBlockReason(),historyNavigationBusy(),[...rows,...closed].map(session=>[session.id,session.title,session.heldError,
+  const signature=JSON.stringify([user,token,apiUrl,!!heldRestoreBlockReason(),!!heldImportBlockReason(),historyNavigationBusy(),[...rows,...closed].map(session=>[session.id,session.title,session.heldError,
     session.heldDurable,session.recoveryClosedAt,heldRecoveryBlockReason(session.id),!!session.lecture,pending.filter(chunk=>chunk.captureId===session.id).length])]);
   if(heldAudioRenderSignature===signature)return;
   heldAudioRenderSignature=signature;target.replaceChildren();$('closed-held-audio-list').replaceChildren();
@@ -4994,13 +4995,16 @@ function renderHeldAudio() {
     view.onclick=()=>{if(sameAccount()&&session.lecture)void selectLecture({id:session.id});};
     const download=document.createElement('button');download.type='button';download.textContent='보관 음성 다운로드';
     download.onclick=()=>{if(sameAccount())void prepareLocalAudioExport({captureId:session.id});};
+    const convert=document.createElement('button');convert.type='button';convert.textContent='파일 변환으로 보내기';convert.dataset.action='import-held';
+    convert.disabled=!!heldImportBlockReason();
+    convert.onclick=()=>{if(sameAccount()&&!heldImportBlockReason())void prepareLocalAudioExport({captureId:session.id,forImport:true});};
     const restore=document.createElement('button');restore.type='button';restore.textContent='선택한 수업 전송 복구';restore.dataset.action='restore-held';
     restore.disabled=!!heldRestoreBlockReason();restore.onclick=()=>{if(sameAccount())void restoreHeldAudio(session.id);};
     if(isClosed){
       const reopen=document.createElement('button');reopen.type='button';reopen.textContent='보류 목록으로 되돌리기';reopen.dataset.action='reopen-held';
       reopen.disabled=!!heldRecoveryBlockReason(session.id);reopen.onclick=()=>{if(sameAccount())void reopenHeldAudio(session.id);};
-      actions.append(view,download,reopen);
-    }else actions.append(view,download,restore);
+      actions.append(view,download,convert,reopen);
+    }else actions.append(view,download,convert,restore);
     card.append(title,detail,reason,actions);(isClosed ? $('closed-held-audio-list') : target).append(card);
   }
 }
@@ -5276,7 +5280,7 @@ function mayExportLocalAudio() {
 
 function clearLocalAudioExports() {
   ++localAudioExportSequence;
-  localAudioExportCaptureId=null;heldRecoveryEvidence=null;heldRecoveryMessage='';
+  localAudioExportCaptureId=null;localAudioExportForImport=false;heldRecoveryEvidence=null;heldRecoveryMessage='';
   $('local-audio-saved-confirm').checked=false;
   $('local-audio-finish-panel').hidden=true;
   localAudioExportController?.abort(); localAudioExportController = null;
@@ -5310,16 +5314,25 @@ function pinLocalAudioMemory(owner) {
   return {chunks,snapshots,titles};
 }
 
-async function prepareLocalAudioExport({captureId=null}={}) {
+async function prepareLocalAudioExport({captureId=null,forImport=false}={}) {
   if (!mayExportLocalAudio() || localAudioExportBusy) return;
-  const owner = user, exportToken=token, exportServer=apiUrl;
+  const owner = user, exportToken=token, exportServer=apiUrl, selectionSequence=recordingSelectionSequence;
+  if(forImport && (captureId===null || heldImportBlockReason()))return;
   if(captureId!==null && (liveSessions.get(captureId)?.owner!==owner || !liveSessions.get(captureId)?.uploadHeld))return;
   clearLocalAudioExports();
-  localAudioExportCaptureId=captureId;
+  localAudioExportCaptureId=captureId;localAudioExportForImport=forImport;
+  $('local-audio-title').textContent=forImport ? '파일 변환할 보관 음성 선택' : '기기에 남은 음성 내려받기';
+  $('local-audio-description').textContent=forImport
+    ? '기기에 남은 구간을 선택하면 녹음 파일 가져오기로 보냅니다. “파일 올려 변환”을 누르면 Qwen-3으로 새 수업을 만듭니다. 이미 전송되어 기기에서 지워진 부분은 포함되지 않습니다. 원래 수업과 보류 상태는 유지됩니다.'
+    : '현재 계정의 이 브라우저에 남아 있는 음성만 복사합니다. 녹음·전송을 멈추거나 원본을 삭제하지 않습니다. 이미 서버로 전송되어 기기에서 지워진 구간, 다른 기기의 음성은 포함되지 않으므로 전체 수업 파일이 아닐 수 있습니다.';
+  $('local-audio-instructions').textContent=forImport
+    ? '겹치는 음성은 한 번만 담습니다. 구간을 각각 선택하거나, 여러 구간을 WAV 하나로 합쳐 선택할 수 있습니다. 합칠 때 녹음이 없는 중간 구간은 무음으로 채웁니다.'
+    : '겹친 부분은 한 번만 담고, 비어 있는 구간은 무음으로 채우지 않고 별도 파일로 나눕니다. 준비한 파일을 각각 눌러 저장하세요. 다운로드가 끝날 때까지 이 창을 열어 두세요.';
   const sequence = ++localAudioExportSequence;
   const controller = new AbortController(); localAudioExportController = controller;
   const isCurrent = () => sequence === localAudioExportSequence && user === owner
-    && mayExportLocalAudio() && $('local-audio-dialog').open;
+    && mayExportLocalAudio() && $('local-audio-dialog').open
+    && (!forImport || (token===exportToken && apiUrl===exportServer && selectionSequence===recordingSelectionSequence));
   localAudioExportBusy = true;
   $('local-audio-dialog').showModal();
   $('local-audio-status').textContent = '기기에 남은 음성을 읽는 중입니다. 원본은 삭제하지 않습니다.';
@@ -5361,6 +5374,20 @@ async function prepareLocalAudioExport({captureId=null}={}) {
     const downloadEvidence=heldRecoveryEvidence;
     let partCount = 0;
     for (const [groupIndex,group] of result.groups.entries()) {
+      if(forImport && group.parts.length>1){
+        const session=liveSessions.get(group.captureId);
+        if(session?.owner===owner && session.uploadHeld){
+          const combine=document.createElement('button');combine.type='button';combine.className='secondary-button';
+          combine.dataset.action='import-local-all';combine.textContent=`${group.parts.length}개 구간을 WAV 하나로 합쳐 보내기`;
+          const evidence={owner,token:exportToken,server:exportServer,captureId:group.captureId,session,sequence,selectionSequence,
+            title:Array.from(`${memory.titles.get(group.captureId) || '수업'} · 보관 음성 복구`).slice(0,120).join(''),
+            language:session.language,partIndex:0,partCount:group.parts.length,merged:true,
+            partial:!!storageWarning || !!result.warnings.length || !!group.warnings?.length};
+          combine.onclick=()=>stageMergedHeldAudioImport(evidence,group.parts);
+          const explanation=document.createElement('p');explanation.textContent='같은 수업의 구간을 시간순으로 합칩니다. 녹음이 없는 중간 구간은 무음으로 채워 시간 간격을 유지합니다.';
+          $('local-audio-files').append(combine,explanation);
+        }
+      }
       for (const [partIndex,part] of group.parts.entries()) {
         const wrapper = document.createElement('article'); wrapper.className = 'local-audio-file';
         const title = document.createElement('strong'); title.textContent = memory.titles.get(group.captureId) || `수업 ${groupIndex + 1}`;
@@ -5368,14 +5395,31 @@ async function prepareLocalAudioExport({captureId=null}={}) {
         detail.textContent = `${fmt(part.startSamples / 16000)}–${fmt(part.endSamples / 16000)} · ${(part.durationSamples / 16000).toFixed(2)}초 · ${bytesLabel(part.blob.size)} · 기기에 남은 구간`;
         const link = document.createElement('a'), url = URL.createObjectURL(part.blob);
         localAudioExportUrls.add(url); link.href = url;
-        link.download = `${safeFilename(title.textContent)}_기기보관_${groupIndex + 1}_${partIndex + 1}_${fmt(part.startSamples / 16000).replace(':','-')}.wav`;
+        link.download = forImport ? heldImportFilename(group.captureId,part)
+          : `${safeFilename(title.textContent)}_기기보관_${groupIndex + 1}_${partIndex + 1}_${fmt(part.startSamples / 16000).replace(':','-')}.wav`;
         link.textContent = `구간 ${partIndex + 1} WAV 내려받기`;
         link.onclick = event => { if (!isCurrent()) { event.preventDefault(); return; }
           if(heldRecoveryEvidenceIsCurrent(downloadEvidence) && group.captureId===downloadEvidence.captureId){
             downloadEvidence.downloaded.add(partIndex);heldRecoveryMessage='';renderHeldRecoveryConfirmation();
           }
           notice('다운로드가 실제로 완료됐는지 파일 크기와 재생으로 확인해 주세요. 원본 음성과 전송 상태는 그대로 유지합니다.'); };
-        wrapper.append(title,detail,link); $('local-audio-files').append(wrapper); partCount += 1;
+        wrapper.append(title,detail,link);
+        if(forImport){
+          const session=liveSessions.get(group.captureId);
+          if(session?.owner===owner && session.uploadHeld){
+            const convert=document.createElement('button');convert.type='button';convert.className='secondary-button';
+            convert.dataset.action='import-local-part';convert.textContent=`구간 ${partIndex+1} 파일 변환으로 보내기`;
+            const evidence={owner,token:exportToken,server:exportServer,captureId:group.captureId,session,sequence,selectionSequence,
+              file:new File([part.blob],link.download,{type:'audio/wav',lastModified:0}),
+              title:Array.from(`${title.textContent} · 복구 구간 ${partIndex+1}`).slice(0,120).join(''),
+              language:session.language,startSamples:part.startSamples,endSamples:part.endSamples,
+              partIndex,partCount:group.parts.length,
+              partial:!!storageWarning || !!result.warnings.length || !!group.warnings?.length};
+            convert.disabled=!!heldImportBlockReason();
+            convert.onclick=()=>stageHeldAudioImport(evidence);wrapper.append(convert);
+          }
+        }
+        $('local-audio-files').append(wrapper); partCount += 1;
       }
     }
     const separated = result.groups.some(group => group.parts.length > 1 || group.warnings?.length);
@@ -5396,7 +5440,7 @@ async function prepareLocalAudioExport({captureId=null}={}) {
 }
 $('local-audio-open').onclick = () => { void prepareLocalAudioExport(); };
 $('auth-local-audio-open').onclick = () => { void prepareLocalAudioExport(); };
-$('local-audio-refresh').onclick = () => { void prepareLocalAudioExport({captureId:localAudioExportCaptureId}); };
+$('local-audio-refresh').onclick = () => { void prepareLocalAudioExport({captureId:localAudioExportCaptureId,forImport:localAudioExportForImport}); };
 $('local-audio-saved-confirm').onchange = renderHeldRecoveryConfirmation;
 $('local-audio-finish').onclick = () => { if(!$('local-audio-finish').disabled)void closeHeldAudio(localAudioExportCaptureId); };
 $('local-audio-close').onclick = clearLocalAudioExports;
@@ -5542,6 +5586,7 @@ function updateControls() {
   for (const button of $('lecture-list').querySelectorAll('button')) button.disabled = historyNavigationBusy();
   updateCorrectionControls(noteToolsBusy);
   renderHeldAudio();
+  for(const button of $('local-audio-files').querySelectorAll('button')) button.disabled=!!heldImportBlockReason();
   renderHeldRecoveryConfirmation();
   renderImportStatus();
   notePresenceStateChange();
@@ -5556,7 +5601,7 @@ function clearRecordingDragState() {
 }
 function clearRecordingSelection() {
   ++recordingSelectionSequence; recordingSelectionLoading = false;
-  selectedRecordingFile = null; selectedRecordingOwner = '';
+  selectedRecordingFile = null; selectedRecordingOwner = ''; selectedRecordingImportSource=null;
   $('recording-file').value = ''; $('recording-file-selection').textContent = '';
   clearRecordingDragState();
 }
@@ -5570,17 +5615,73 @@ function recordingSelectionBlock() {
   }
   return '';
 }
+function heldImportBlockReason() {
+  return recordingSelectionBlock() || (capture || inputUnavailable || liveQueueRecoveryPromise
+    ? '현재 녹음과 기기 음성 복구를 마친 뒤 파일 변환을 선택해 주세요.'
+    : localAudioExportBusy || recordingSelectionLoading ? '음성 파일 준비가 끝난 뒤 선택해 주세요.' : '');
+}
+function heldImportFilename(captureId,part) {
+  // Stable across titles, reloads and list order for fingerprint-checked resume.
+  return `보관음성_${captureId}_${part.startSamples}-${part.endSamples}.wav`;
+}
+function heldImportEvidenceIsCurrent(evidence) {
+  return !!evidence && evidence.sequence===localAudioExportSequence && $('local-audio-dialog').open
+    && localAudioExportForImport && !!token && evidence.owner===user && evidence.token===token && evidence.server===apiUrl
+    && evidence.selectionSequence===recordingSelectionSequence
+    && evidence.session===liveSessions.get(evidence.captureId) && evidence.session.uploadHeld
+    && evidence.session.owner===user && [null,'ko','en'].includes(evidence.language);
+}
+async function stageMergedHeldAudioImport(evidence,parts) {
+  if(!heldImportEvidenceIsCurrent(evidence))return false;
+  const blocked=heldImportBlockReason();if(blocked){notice(blocked);return false;}
+  const controller=new AbortController();localAudioExportController=controller;localAudioExportBusy=true;updateControls();
+  let combined;
+  try{
+    combined=await mergeLocalAudioExportParts(parts,{signal:controller.signal});
+    if(!heldImportEvidenceIsCurrent(evidence))return false;
+  }catch(error){
+    if(heldImportEvidenceIsCurrent(evidence))$('local-audio-status').textContent=`음성을 합치지 못했습니다. ${errorText(error)}`;
+    return false;
+  }finally{
+    if(localAudioExportController===controller){localAudioExportController=null;localAudioExportBusy=false;updateControls();}
+  }
+  return stageHeldAudioImport({...evidence,...combined,
+    file:new File([combined.blob],heldImportFilename(evidence.captureId,combined),{type:'audio/wav',lastModified:0})});
+}
+function stageHeldAudioImport(evidence) {
+  if(!heldImportEvidenceIsCurrent(evidence))return false;
+  const blocked=heldImportBlockReason();if(blocked){notice(blocked);return false;}
+  ++recordingSelectionSequence;recordingSelectionLoading=false;
+  if(!selectRecordingFile(evidence.file))return false;
+  const existingJob=importIsActive() || (!importJob && fileUploader?.importId && importError);
+  selectedRecordingImportSource={captureId:evidence.captureId,title:evidence.title,language:evidence.language};
+  if(!existingJob){
+    $('lecture-title').value=evidence.title;$('language').value=evidence.language || 'auto';applyNewLectureProvider();
+  }
+  const range=`${fmt(evidence.startSamples/16000)}–${fmt(evidence.endSamples/16000)}`;
+  $('recording-file-selection').textContent+=` 보관 음성 ${range} · ${evidence.merged ? `${evidence.partCount}개 구간을 합친 WAV` : `구간 ${evidence.partIndex+1}/${evidence.partCount}`}. `
+    + (existingJob ? '기존 파일과 같으면 업로드를 이어갑니다. '
+      : '기기에 남은 이 구간만 Qwen-3으로 새 수업에 변환하며, 새 기록의 시간은 0초부터 시작합니다. ')
+    + '원래 수업과 전송 보류는 유지됩니다.'
+    + (evidence.merged ? ` 녹음이 없는 ${(evidence.gapSamples/16000).toFixed(2)}초는 무음으로 채웠습니다.`
+      : evidence.partCount>1 ? ' 나머지 구간도 각각 선택해 변환하세요.' : '')
+    + (evidence.partial ? ' 기기에 없거나 읽지 못한 음성은 이 파일에 포함되지 않습니다.' : '');
+  clearLocalAudioExports();updateControls();
+  $('recording-dropzone').scrollIntoView?.({block:'center'});$('import-button').focus();
+  return true;
+}
 function selectRecordingFile(file,{fromPicker = false} = {}) {
   const blocked = recordingSelectionBlock();
   if (blocked) { notice(blocked); return false; }
   try { validateRecordingSelection(file); }
   catch (error) { notice(errorText(error)); return false; }
-  selectedRecordingFile = file; selectedRecordingOwner = user;
+  selectedRecordingFile = file; selectedRecordingOwner = user; selectedRecordingImportSource=null;
   // FileList assignment is unsupported in some browsers. Keep the selected
   // immutable File separately for both start() and fingerprint-checked resume().
   if (!fromPicker) $('recording-file').value = '';
-  if (file && current && !isBusy() && !importIsActive()) resetNewNote();
-  if (file && !current && !importIsActive() && !$('lecture-title').value.trim()) {
+  const reconcilingUnknownJob=!importJob && fileUploader?.importId && importError;
+  if (file && current && !isBusy() && !importIsActive() && !reconcilingUnknownJob) resetNewNote();
+  if (file && !current && !importIsActive() && !reconcilingUnknownJob && !$('lecture-title').value.trim()) {
     $('lecture-title').value = defaultImportTitle(file);
   }
   $('recording-file-selection').textContent = `선택한 파일: ${file.name} · ${bytesLabel(file.size)}. 확인한 뒤 “${importJob?.status === 'uploading' ? '같은 파일 이어 올리기' : '파일 올려 변환'}”를 눌러 주세요.`;
@@ -5650,29 +5751,46 @@ async function startOrResumeFileImport() {
     notice('실시간 음성 전송이 모두 끝난 뒤 녹음 파일을 올려 주세요.'); return;
   }
   const reconcilingUnknownJob = !importJob && fileUploader?.importId && importError;
-  if (current && !reconcilingUnknownJob && !importIsActive()) resetNewNote();
+  if (current && !reconcilingUnknownJob && !importIsActive()) {
+    resetNewNote();
+    if(selectedRecordingImportSource){
+      $('lecture-title').value=selectedRecordingImportSource.title;
+      $('language').value=selectedRecordingImportSource.language || 'auto';applyNewLectureProvider();
+    }
+  }
   // If every response after the idempotent init POST was lost, the browser may
   // not yet know whether the server created this exact ID. Reconcile it before
   // generating another ID that would collide with the one-active-job rule.
   if (!importJob && fileUploader?.importId && importError && !fileUploader.running) {
+    const uploader=fileUploader,generation=importGeneration,owner=user,sessionToken=token,server=apiUrl;
+    const selectionSequence=recordingSelectionSequence;
+    const requestIsCurrent=()=>fileUploader===uploader && importGeneration===generation && user===owner
+      && token===sessionToken && apiUrl===server && selectionSequence===recordingSelectionSequence
+      && currentRecordingFile()===file;
     importStarting = true; updateControls();
     try {
-      const state = await api(`/imports/${fileUploader.importId}`);
-      const generation = importGeneration;
+      const state = await api(`/imports/${uploader.importId}`);
+      if(!requestIsCurrent())return;
       importError = '';
-      const recovered = fileUploader.recover(state, file);
+      const recovered = uploader.recover(state, file);
       updateControls();
       void runFileImport(recovered, generation);
       return;
     } catch (error) {
+      if(!requestIsCurrent())return;
       if (error?.status !== 404) {
         importError = `${errorText(error)} 기존 파일 작업 상태를 확인한 뒤 다시 시도해 주세요.`;
         notice(importError); return;
       }
-      // The server confirms that the previous ID never existed, so a new
-      // idempotent import may now be created safely.
+      // Only a confirmed missing old job permits a new one. Its preserved UI
+      // metadata must not override the newly selected held recording's source.
+      if(selectedRecordingImportSource){
+        if(current)resetNewNote();
+        $('lecture-title').value=selectedRecordingImportSource.title;
+        $('language').value=selectedRecordingImportSource.language || 'auto';applyNewLectureProvider();
+      }
     } finally {
-      importStarting = false; updateControls();
+      if(fileUploader===uploader && importGeneration===generation){importStarting = false; updateControls();}
     }
   }
   if (importIsActive()) {

@@ -25,6 +25,7 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
   .replace("import { MicrophoneCapture } from './audio.js';", 'const MicrophoneCapture = TestCapture;')
   .replace("import { validateRecordingSelection, isFileDrag, recordingFileFromDrop } from './recording-file-selection.js';", 'const { validateRecordingSelection, isFileDrag, recordingFileFromDrop } = TestRecordingFileSelection;')
   .replace("import { buildRecoverableLocalAudioExports, validateLocalWav } from './local-audio-export.js';", 'const { buildRecoverableLocalAudioExports, validateLocalWav } = TestLocalAudioExport;')
+  .replace("import { buildRecoverableLocalAudioExports, mergeLocalAudioExportParts, validateLocalWav } from './local-audio-export.js';", 'const { buildRecoverableLocalAudioExports, mergeLocalAudioExportParts, validateLocalWav } = TestLocalAudioExport;')
   .replace("import { renderDriveStatus } from './admin-storage.js';", 'const renderDriveStatus = TestRenderDriveStatus;')
   .replace("import { renderMaintenanceStatus } from './admin-maintenance.js';", 'const renderMaintenanceStatus = TestRenderMaintenanceStatus;')
   .replace("import { readRecordingClip, RecordingClipPlayer, filterTranscript } from './recording-review.js';", 'const { readRecordingClip, RecordingClipPlayer, filterTranscript } = TestRecordingReview;')
@@ -259,7 +260,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     },
   };
   const context = vm.createContext({
-    Blob, Headers, URL:TestURL, URLSearchParams, AbortController, console, crypto:cryptoImplementation,
+    Blob, File, Headers, URL:TestURL, URLSearchParams, AbortController, console, crypto:cryptoImplementation,
     document,
     window:{addEventListener(){}}, performance:{now:() => 0},
     location,history:{replaceState(...args){historyCalls.push(args);}},
@@ -7602,9 +7603,9 @@ async function seedHeldScenario(app,{count=1}={}){
   return id;
 }
 
-async function heldRecoveryFixture({count=1,gap=false}={}) {
+async function heldRecoveryFixture({count=1,gap=false,FileUploader,fetchResponse}={}) {
   const network=[];
-  const app=setup(async(url,options={})=>{network.push({url,method:options.method || 'GET'});throw new Error('held recovery must remain local');});
+  const app=setup(async(url,options={})=>{network.push({url,method:options.method || 'GET'});if(fetchResponse)return fetchResponse(url,options);throw new Error('held recovery must remain local');},{FileUploader});
   const id=await seedHeldScenario(app,{count});
   await app.run('prepareIndependentLesson()');
   const queue=app.run('liveQueue'),stored=queue.sessions.get(id);
@@ -7641,6 +7642,254 @@ async function prepareConfirmedHeldRecovery(fixture) {
   requestRecoveryDownloads(fixture.app);confirmRecoveryFiles(fixture.app);
   assert.equal(fixture.app.element('local-audio-finish').disabled,false);
 }
+
+function localImportButtons(app) {
+  return app.element('local-audio-files').querySelectorAll('button').filter(button=>button.dataset.action==='import-local-part');
+}
+async function openHeldImport(fixture) {
+  const {app,id}=fixture;
+  const card=[...app.element('held-audio-list').children,...app.element('closed-held-audio-list').children]
+    .find(item=>item.dataset.captureId===id);
+  const open=card.querySelectorAll('button').find(button=>button.dataset.action==='import-held');
+  assert.ok(open,'each held capture exposes the file-import bridge');assert.equal(open.disabled,false);
+  open.onclick();await until(()=>app.element('local-audio-dialog').open&&!app.run('localAudioExportBusy'));
+  return localImportButtons(app);
+}
+
+test('held import stages the validated immutable WAV and starts only after the existing import button',async()=>{
+  const starts=[],operation=deferred();
+  const fixture=await heldRecoveryFixture({FileUploader:class{
+    detach(){}start(file,options){this.running=true;starts.push({file,options});return operation.promise;}
+  }}),{app,id,queue,network}=fixture;
+  queue.sessions.get(id).language='en';app.run(`liveSessions.get(${JSON.stringify(id)}).language='en'`);
+  const beforeChunks=[...queue.chunks.values()].map(row=>({...row})),beforeSession={...queue.sessions.get(id)};
+  const beforePending=Array.from(app.run('pending'));
+  const buttons=await openHeldImport(fixture);assert.equal(buttons.length,1);
+  const blob=app.objectUrlBlob(localRecoveryLinks(app)[0].href),evidence=app.run('heldRecoveryEvidence');
+  assert.equal(starts.length,0);assert.equal(network.length,0);assert.equal(app.run('currentRecordingFile()'),null);
+  buttons[0].onclick();await tick();
+  const file=app.run('currentRecordingFile()');assert.ok(file instanceof File);
+  assert.equal(file.type,'audio/wav');assert.equal(file.lastModified,0);
+  assert.deepEqual(new Uint8Array(await file.arrayBuffer()),new Uint8Array(await blob.arrayBuffer()));
+  assert.equal(app.element('local-audio-dialog').open,false);assert.equal(app.element('import-button').focused,true);
+  assert.equal(app.element('language').value,'en');assert.match(app.element('lecture-title').value,/이전 보관 수업.*복구 구간 1/);
+  assert.match(app.element('recording-file-selection').textContent,/기기에 남은.*구간/);
+  assert.match(app.element('recording-file-selection').textContent,/새 수업/);
+  assert.ok(!evidence || evidence.downloaded.size===0,'staging a File is not a verified download');
+  assert.equal(app.run('pending.some(row=>row.downloadRequested)'),false);
+  assert.deepEqual([...queue.chunks.values()],beforeChunks);assert.deepEqual(queue.sessions.get(id),beforeSession);
+  for(let i=0;i<beforePending.length;i++)assert.equal(app.run(`pending[${i}]`),beforePending[i]);
+  assert.equal(network.length,0);assert.equal(starts.length,0);
+  app.element('import-button').onclick();await until(()=>starts.length===1);
+  assert.equal(starts[0].file,file);assert.equal(starts[0].options.language,'en');
+  assert.match(starts[0].options.title,/이전 보관 수업.*복구 구간 1/);
+  assert.deepEqual([...queue.chunks.values()],beforeChunks);assert.deepEqual(queue.sessions.get(id),beforeSession);
+  assert.equal(network.length,0,'only the synthetic existing uploader receives the selected File');
+});
+
+test('held import stages only one selected gap range and retains automatic source language and all source bytes',async()=>{
+  const fixture=await heldRecoveryFixture({count:2,gap:true}),{app,id,queue,network}=fixture;
+  queue.sessions.get(id).language=null;app.run(`liveSessions.get(${JSON.stringify(id)}).language=null`);
+  const before=[...queue.chunks.values()].map(row=>({...row}));
+  const buttons=await openHeldImport(fixture);assert.equal(buttons.length,2);
+  const links=localRecoveryLinks(app),secondBlob=app.objectUrlBlob(links[1].href),evidence=app.run('heldRecoveryEvidence');
+  assert.equal(secondBlob.size,44+800*2);
+  buttons[1].onclick();await tick();
+  const file=app.run('currentRecordingFile()');
+  assert.deepEqual(new Uint8Array(await file.arrayBuffer()),new Uint8Array(await secondBlob.arrayBuffer()));
+  assert.equal(file.size,44+800*2,'missing ranges are not fabricated or concatenated across a gap');
+  assert.equal(app.element('language').value,'auto');assert.match(app.element('lecture-title').value,/복구 구간 2/);
+  assert.match(app.element('recording-file-selection').textContent,/2\s*\/\s*2/);
+  assert.ok(!evidence || evidence.downloaded.size===0);assert.deepEqual([...queue.chunks.values()],before);
+  assert.equal(queue.sessions.get(id).uploadHeld,true);assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+  assert.equal(network.length,0);
+});
+
+test('stale held import buttons reject changed identity, source ownership, export generation and dialog state',async()=>{
+  for(const change of ["user='user-beta'","token='new-session'","apiUrl='https://different.example'",
+    'clearLocalAudioExports()',"$('local-audio-dialog').close()",'localAudioExportSequence++',
+    'liveSessions.get(localAudioExportCaptureId).uploadHeld=false',
+    'liveSessions.set(localAudioExportCaptureId,{...liveSessions.get(localAudioExportCaptureId)})']){
+    const fixture=await heldRecoveryFixture(),{app,queue,network}=fixture;
+    const buttons=await openHeldImport(fixture),before=[...queue.chunks.values()].map(row=>({...row}));
+    app.run(change);buttons[0].onclick();await tick();
+    assert.equal(app.run('currentRecordingFile()'),null,change);
+    assert.deepEqual([...queue.chunks.values()],before,change);assert.equal(network.length,0,change);
+  }
+});
+
+test('held import never stages while capture or file work becomes active after preparing a WAV',async()=>{
+  for(const state of ['recording=true','paused=true','capture={}','inputUnavailable=true','starting=true',
+    'recordingSelectionLoading=true','localAudioExportBusy=true','liveQueueRecoveryPromise=Promise.resolve()',
+    'importStarting=true','importCancelling=true',
+    "fileUploader={running:true};importJob={status:'uploading'}", "fileUploader={running:false};importJob={status:'processing'}"]){
+    const fixture=await heldRecoveryFixture(),{app,id,queue,network}=fixture;
+    const buttons=await openHeldImport(fixture),before={...queue.sessions.get(id)};
+    app.run(state);buttons[0].onclick();await tick();
+    assert.equal(app.run('currentRecordingFile()'),null,state);
+    assert.deepEqual(queue.sessions.get(id),before,state);assert.equal(network.length,0,state);
+  }
+});
+
+test('a late held snapshot cannot present import actions after an account token or API changes',async()=>{
+  for(const change of ["user='user-beta'","token='new-session'","apiUrl='https://different.example'"]){
+    const {app,id,queue,network}=await heldRecoveryFixture();
+    const snapshot=await queue.readExportSnapshot('user-alpha'),gate=deferred();let entered=false;
+    queue.readExportSnapshot=async()=>{entered=true;return gate.promise;};
+    const work=app.run(`prepareLocalAudioExport({captureId:${JSON.stringify(id)},forImport:true})`);
+    await until(()=>entered);app.run(change);gate.resolve(snapshot);await work;
+    assert.equal(localImportButtons(app).length,0,change);assert.equal(app.run('currentRecordingFile()'),null,change);
+    assert.equal(network.length,0,change);
+  }
+});
+
+test('a newer picker selection survives delayed held preparation and stale prepared-part buttons',async()=>{
+  for(const phase of ['preparing','prepared']){
+    const fixture=await heldRecoveryFixture(),{app,id,queue,network}=fixture;
+    const replacement=importSelectionFile('replacement.wav');
+    let operation,buttons,gate;
+    if(phase==='preparing'){
+      const snapshot=await queue.readExportSnapshot('user-alpha');gate=deferred();let entered=false;
+      queue.readExportSnapshot=async()=>{entered=true;await gate.promise;return snapshot;};
+      operation=app.run(`prepareLocalAudioExport({captureId:${JSON.stringify(id)},forImport:true})`);
+      await until(()=>entered);
+    }else buttons=await openHeldImport(fixture);
+    app.element('recording-file').files=[replacement];app.element('recording-file').onchange();
+    assert.equal(app.run('currentRecordingFile()'),replacement,phase);
+    if(phase==='preparing'){
+      gate.resolve();await operation;assert.equal(localImportButtons(app).length,0);
+    }else{buttons[0].onclick();await tick();}
+    assert.equal(app.run('currentRecordingFile()'),replacement,phase);
+    assert.equal(queue.sessions.get(id).uploadHeld,true);assert.equal(network.length,0);
+  }
+});
+
+test('combining held ranges produces one WAV with explicit silent gaps and no upload or source settlement',async()=>{
+  const starts=[],operation=deferred();
+  const fixture=await heldRecoveryFixture({count:2,gap:true,FileUploader:class{
+    detach(){}start(file,options){this.running=true;starts.push({file,options});return operation.promise;}
+  }}),{app,id,queue,network}=fixture;
+  const beforeChunks=[...queue.chunks.values()].map(row=>({...row})),beforeSession={...queue.sessions.get(id)};
+  await openHeldImport(fixture);
+  const combined=app.element('local-audio-files').querySelectorAll('button').find(button=>button.dataset.action==='import-local-all');
+  assert.ok(combined,'split same-lecture ranges offer one combined import');assert.equal(combined.disabled,false);
+  const evidence=app.run('heldRecoveryEvidence');combined.onclick();
+  await until(()=>app.run('currentRecordingFile()') instanceof File);
+  const file=app.run('currentRecordingFile()'),data=new DataView(await file.arrayBuffer());
+  assert.equal(file.type,'audio/wav');assert.equal(file.lastModified,0);assert.equal(data.byteLength,44+2400*2);
+  assert.equal(data.getInt16(44,true),3277);assert.equal(data.getInt16(44+799*2,true),3277);
+  assert.equal(data.getInt16(44+800*2,true),0);assert.equal(data.getInt16(44+1599*2,true),0);
+  assert.equal(data.getInt16(44+1600*2,true),3277);assert.equal(data.getInt16(data.byteLength-2,true),3277);
+  assert.match(app.element('recording-file-selection').textContent,/무음/);
+  assert.match(app.element('recording-file-selection').textContent,/새 수업/);
+  assert.equal(app.element('language').value,'ko');
+  assert.deepEqual([...queue.chunks.values()],beforeChunks);assert.deepEqual(queue.sessions.get(id),beforeSession);
+  assert.ok(!evidence || evidence.downloaded.size===0);assert.equal(app.run('pending.some(row=>row.downloadRequested)'),false);
+  assert.equal(network.length,0);assert.equal(starts.length,0);
+  app.element('import-button').onclick();await until(()=>starts.length===1);
+  assert.equal(starts[0].file,file);assert.equal(starts[0].options.language,'ko');
+  assert.match(starts[0].options.title,/이전 보관 수업/);
+  assert.deepEqual([...queue.chunks.values()],beforeChunks);assert.equal(queue.sessions.get(id).uploadHeld,true);
+  assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);assert.equal(network.length,0);
+});
+
+test('held import supplies only the WAV to a paused upload resume and never replaces existing job metadata',async()=>{
+  const fixture=await heldRecoveryFixture(),{app,id,queue,network}=fixture;
+  const buttons=await openHeldImport(fixture);
+  app.run("globalThis.resumeFiles=[];fileUploader={running:false,resume(file){resumeFiles.push(file);return new Promise(()=>{});}};"+
+    "importJob={id:'existing-job',status:'uploading',lecture_id:'existing-lecture'};"+
+    "$('lecture-title').value='Existing import title';$('language').value='en';updateControls()");
+  buttons[0].onclick();await tick();const file=app.run('currentRecordingFile()');assert.ok(file instanceof File);
+  assert.equal(app.run('resumeFiles.length'),0);assert.equal(app.run('importJob.id'),'existing-job');
+  assert.equal(app.element('lecture-title').value,'Existing import title');assert.equal(app.element('language').value,'en');
+  assert.equal(app.element('import-button').textContent,'같은 파일 이어 올리기');
+  app.element('import-button').onclick();await until(()=>app.run('resumeFiles.length')===1);
+  assert.equal(app.run('resumeFiles[0]'),file,'the existing uploader retains responsibility for exact fingerprint matching');
+  assert.equal(app.run('importJob.id'),'existing-job');assert.equal(queue.sessions.get(id).uploadHeld,true);
+  assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);assert.equal(network.length,0);
+});
+
+test('held import does not replace unresolved import initialization metadata',async()=>{
+  const fixture=await heldRecoveryFixture(),{app,network}=fixture;
+  const buttons=await openHeldImport(fixture);
+  app.run("fileUploader={running:false,importId:'unresolved-job'};importJob=null;importError='synthetic lost response';"+
+    "$('lecture-title').value='Unresolved import title';$('language').value='en'");
+  buttons[0].onclick();await tick();
+  assert.ok(app.run('currentRecordingFile()') instanceof File);
+  assert.equal(app.element('lecture-title').value,'Unresolved import title');assert.equal(app.element('language').value,'en');
+  assert.equal(app.run('fileUploader.importId'),'unresolved-job');assert.equal(network.length,0);
+});
+
+test('confirmed missing unknown imports restore held source metadata only when creating a new job',async()=>{
+  for(const status of [404,200,503]){
+    const starts=[],operation=deferred();
+    const fixture=await heldRecoveryFixture({FileUploader:class{
+      detach(){}start(file,options){starts.push({file,options});return operation.promise;}
+    },fetchResponse:async url=>{
+      assert.match(url,/\/imports\/unresolved-job$/);
+      return response(status===200?{id:'unresolved-job',status:'uploading'}:{detail:'synthetic lookup result'},status);
+    }}),{app,id,queue,network}=fixture;
+    const buttons=await openHeldImport(fixture);
+    app.run("globalThis.recoveredFiles=[];fileUploader={running:false,importId:'unresolved-job',detach(){},"+
+      "recover(state,file){recoveredFiles.push(file);return new Promise(()=>{});}};"+
+      "importJob=null;importError='synthetic lost response';"+
+      "current={id:'old-import-view',title:'Old import title',language:'en',segments:[]};renderCurrent()");
+    buttons[0].onclick();await tick();const file=app.run('currentRecordingFile()');
+    assert.equal(app.element('lecture-title').value,'Old import title');assert.equal(app.element('language').value,'en');
+    await app.run('startOrResumeFileImport()');
+    assert.equal(network.length,1);assert.equal(queue.sessions.get(id).uploadHeld,true);
+    assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+    if(status===404){
+      assert.equal(starts.length,1);assert.equal(starts[0].file,file);
+      assert.equal(starts[0].options.language,'ko');assert.match(starts[0].options.title,/이전 보관 수업.*복구 구간 1/);
+      assert.equal(app.run('current'),null);assert.equal(app.run('recoveredFiles.length'),0);
+    }else{
+      assert.equal(starts.length,0);assert.equal(app.element('lecture-title').value,'Old import title');
+      assert.equal(app.element('language').value,'en');assert.equal(app.run('current.id'),'old-import-view');
+      assert.equal(app.run('recoveredFiles.length'),status===200?1:0);
+      if(status===200)assert.equal(app.run('recoveredFiles[0]'),file);
+    }
+  }
+});
+
+test('late unknown import responses cannot recover or restart held audio after identity or selection changes',async()=>{
+  for(const status of [200,404])for(const change of ["user='user-beta'","token='new-session'",
+    "apiUrl='https://different.example'",'recordingSelectionSequence++',
+    "importGeneration++;fileUploader={marker:'new-uploader'};importStarting=true"]){
+    const gate=deferred(),starts=[];
+    const fixture=await heldRecoveryFixture({FileUploader:class{
+      detach(){}start(file,options){starts.push({file,options});return new Promise(()=>{});}
+    },fetchResponse:()=>gate.promise}),{app,id,queue,network}=fixture;
+    const buttons=await openHeldImport(fixture);
+    app.run("globalThis.recoveredFiles=[];fileUploader={running:false,importId:'unresolved-job',detach(){},"+
+      "recover(state,file){recoveredFiles.push(file);return new Promise(()=>{});}};"+
+      "importJob=null;importError='synthetic lost response'");
+    buttons[0].onclick();await tick();
+    const work=app.run('startOrResumeFileImport()');await until(()=>network.length===1);
+    app.run(change);gate.resolve(response(status===200?{id:'unresolved-job',status:'uploading'}:{detail:'missing'},status));
+    await work;
+    assert.equal(starts.length,0,change);assert.equal(app.run('recoveredFiles.length'),0,change);
+    assert.equal(queue.sessions.get(id).uploadHeld,true);assert.equal(network.length,1);
+    if(change.includes('importGeneration')){
+      assert.equal(app.run('fileUploader.marker'),'new-uploader');assert.equal(app.run('importStarting'),true);
+    }
+  }
+});
+
+test('a staged held import restores its source metadata after viewing another lecture before explicit start',async()=>{
+  const starts=[],operation=deferred();
+  const fixture=await heldRecoveryFixture({FileUploader:class{
+    detach(){}start(file,options){starts.push({file,options});return operation.promise;}
+  }}),{app,id,queue}=fixture;
+  queue.sessions.get(id).language='en';app.run(`liveSessions.get(${JSON.stringify(id)}).language='en'`);
+  const buttons=await openHeldImport(fixture);buttons[0].onclick();await tick();
+  const file=app.run('currentRecordingFile()');
+  app.run("current={id:'other',title:'Unrelated Korean class',language:'ko',segments:[]};renderCurrent()");
+  app.element('import-button').onclick();await until(()=>starts.length===1);
+  assert.equal(starts[0].file,file);assert.equal(starts[0].options.language,'en');
+  assert.match(starts[0].options.title,/이전 보관 수업.*복구 구간 1/);
+  assert.equal(queue.sessions.get(id).uploadHeld,true);assert.equal(queue.sessions.get(id).recoveryClosedAt,undefined);
+});
 
 test('held recovery card download exports only the selected capture and never grants per-chunk skip permission',async()=>{
   const {app,id,queue,network}=await heldRecoveryFixture();

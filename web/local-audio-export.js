@@ -2,6 +2,7 @@
 const RATE = 16000;
 const HEADER_BYTES = 44;
 const MAX_CHUNK_BYTES = 4 * 1024 * 1024;
+const MAX_MERGED_BYTES = 1024 * 1024 * 1024;
 const COMPARE_BYTES = 64 * 1024;
 const MAX_ITEMS = 50000;
 const MAX_BYTES = 2 * 1024 * 1024 * 1024;
@@ -52,8 +53,12 @@ async function readSlice(blob, start, end) {
 
 /** Validate only the bounded canonical header, never allocate the whole audio. */
 export async function validateLocalWav(blob, durationSamples = undefined) {
+  return validateCanonicalWav(blob,durationSamples,MAX_CHUNK_BYTES);
+}
+
+async function validateCanonicalWav(blob, durationSamples, maxBytes) {
   if (!blob || typeof blob.slice !== 'function' || typeof blob.arrayBuffer !== 'function'
-      || !validInteger(blob.size, HEADER_BYTES + 2, MAX_CHUNK_BYTES) || (blob.size - HEADER_BYTES) % 2) fail('invalid_wav');
+      || !validInteger(blob.size, HEADER_BYTES + 2, maxBytes) || (blob.size - HEADER_BYTES) % 2) fail('invalid_wav');
   const frames = (blob.size - HEADER_BYTES) / 2;
   if (durationSamples !== undefined && (!validInteger(durationSamples, 1) || durationSamples !== frames)) fail('invalid_wav');
   const view = new DataView(await readSlice(blob, 0, HEADER_BYTES));
@@ -106,6 +111,69 @@ async function verifyOverlap(part, record, end, signal) {
     position = until;
   }
   if (position !== end) fail('overlap_conflict');
+}
+
+/**
+ * Join already assembled parts from ONE capture, preserving their time offsets.
+ * The caller must keep the capture/owner boundary and disclose gapSamples as
+ * inserted silence, not recovered audio. Missing time before the first part is
+ * not padded. The export builder must resolve byte-equal overlaps beforehand;
+ * any overlap reaching this function is rejected instead of dropping samples.
+ */
+export async function mergeLocalAudioExportParts(parts, {signal} = {}) {
+  cancelled(signal);
+  if (!Array.isArray(parts) || !parts.length) fail('invalid_record');
+  if (parts.length > MAX_ITEMS) fail('export_limit');
+  // Pin every range and immutable Blob before the first asynchronous read.
+  const pinned = parts.map(value => {
+    if (!value || typeof value !== 'object' || !validInteger(value.startSamples)
+        || !validInteger(value.endSamples,1) || !validInteger(value.durationSamples,1)
+        || value.endSamples - value.startSamples !== value.durationSamples) fail('invalid_record');
+    if (value.endSamples > MAX_CAPTURE_SAMPLES) fail('export_limit');
+    return {blob:value.blob,startSamples:value.startSamples,endSamples:value.endSamples,
+      durationSamples:value.durationSamples};
+  }).sort((a,b) => a.startSamples-b.startSamples);
+  let gapSamples = 0;
+  for (let index = 1; index < pinned.length; index += 1) {
+    const gap = pinned[index].startSamples-pinned[index-1].endSamples;
+    if (gap < 0) fail('overlap_conflict');
+    gapSamples += gap;
+  }
+  const startSamples = pinned[0].startSamples, endSamples = pinned[pinned.length-1].endSamples;
+  const durationSamples = endSamples-startSamples, byteLength = HEADER_BYTES+durationSamples*2;
+  if (byteLength > MAX_MERGED_BYTES) fail('export_limit');
+  for (let index = 0; index < pinned.length; index += 1) {
+    cancelled(signal);
+    try {
+      await validateCanonicalWav(pinned[index].blob,pinned[index].durationSamples,MAX_MERGED_BYTES);
+    } catch (error) {
+      cancelled(signal);
+      throw error;
+    }
+    cancelled(signal);
+    if (index && index % 64 === 0) await new Promise(resolve => setTimeout(resolve,0));
+  }
+  cancelled(signal);
+  if (pinned.length === 1) return {...pinned[0],gapSamples:0};
+  // Blob composition references existing data. At most one 64 KiB zero buffer
+  // is allocated even when a missing interval lasts several hours.
+  const silence = gapSamples ? new Blob([new Uint8Array(COMPARE_BYTES)]) : null;
+  const pieces = [header(durationSamples)];
+  let position = startSamples;
+  for (let index = 0; index < pinned.length; index += 1) {
+    cancelled(signal);
+    const part = pinned[index];
+    for (let bytes = (part.startSamples-position)*2; bytes > 0; bytes -= COMPARE_BYTES) {
+      pieces.push(bytes >= COMPARE_BYTES ? silence : silence.slice(0,bytes));
+    }
+    pieces.push(part.blob.slice(HEADER_BYTES,part.blob.size));
+    position = part.endSamples;
+    if (index && index % 64 === 0) await new Promise(resolve => setTimeout(resolve,0));
+  }
+  cancelled(signal);
+  const blob = new Blob(pieces,{type:'audio/wav'});
+  if (blob.size !== byteLength) fail('read_failed');
+  return {blob,startSamples,endSamples,durationSamples,gapSamples};
 }
 
 /**

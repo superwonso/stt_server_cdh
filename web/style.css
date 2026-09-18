@@ -2894,6 +2894,7 @@ button {
 .local-audio-file { padding: 14px 0; border-bottom: 1px solid #dedbd4; overflow-wrap: anywhere; }
 .local-audio-file a { display: inline-block; padding: 10px 0; }
 .local-audio-file p { margin: 4px 0; }
+.local-audio-file button { display: block; margin: 6px 0; max-width: 100%; white-space: normal; text-align: left; }
 .rescue-limits { font-size: .9rem; line-height: 1.7; margin: 16px 0; overflow-wrap: anywhere; }
 
 @media (prefers-reduced-motion: reduce) {
