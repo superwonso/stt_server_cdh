@@ -131,7 +131,9 @@ API와 로컬 Qwen 모델은 같은 PC의 별도 프로세스로 운영합니다
 AI 기능은 마지막 저장까지 끝난 **확정 원문**을 사용하며, 원문을 덮어쓰지 않고 별도 결과를 만듭니다.
 지난 수업에 AI 작업을 요청해도 현재 다른 수업의 녹음은 멈추지 않습니다.
 
-새 후보정·요약·번역·수업 질문은 기존 NOVA Gateway의 **GPT-5.6 Luna**를 사용합니다. [다섯 모델의 실제 비교 결과](LLM_EVALUATION.md)를 바탕으로 선택했으며, 이미 저장된 결과는 보존하고 자동 재생성하지 않습니다. 음성 인식 CLOVA/Qwen은 그대로입니다.
+새 후보정·요약·번역·수업 질문·영어 정리본의 기본 모델은 기존 NOVA Gateway의 **GPT-6 Luna**(`gpt-6-luna`)입니다. [이전 다섯 모델의 비교 기록](LLM_EVALUATION.md)은 GPT-5.6 Luna를 포함한 당시 평가이며, GPT-6 Luna의 평가 결과는 아닙니다. 이미 저장된 결과는 보존하고 자동 재생성하지 않습니다. 음성 인식 CLOVA/Qwen은 그대로입니다.
+
+GPT-6 Luna 요청은 기존 기본 추론 수준인 `medium`을 유지하도록 `reasoning_effort`를 생략하고, 함께 사용할 수 없는 샘플링 옵션을 공통 전송 단계에서 제외합니다. 출력 상한은 같은 값의 `max_completion_tokens`로 전달합니다. 명시적으로 `reasoning_effort=none`인 요청의 샘플링 옵션과 다른 모델 설정은 보존합니다. [OpenAI 이전 안내](https://developers.openai.com/api/docs/guides/latest-model#update-api-and-model-parameters)
 
 - **AI 후보정 만들기:** 원문 구간과 시각을 유지하며 표현을 다듬습니다. 녹음 중인 수업에서 누르면 종료·저장 후 실행하도록 예약합니다.
 - **수업 요약 만들기:** 개요·주제별 핵심 내용·복습 질문과 근거가 되는 원문 위치를 보여 줍니다.

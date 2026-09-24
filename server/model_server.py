@@ -7,6 +7,7 @@ health and cached status remain available during loading/inference.
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import sys
 import threading
@@ -20,6 +21,38 @@ from .model_protocol import (
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, ModelUnavailableError, ProtocolError,
     dump_json, load_json, make_result, read_request, safe_status,
 )
+
+
+_LOG = logging.getLogger(__name__)
+_FAILURE_STAGES = frozenset({"warmup", "infer_protocol", "infer", "worker"})
+_FAILURE_FILES = frozenset({
+    "model_server.py", "model_protocol.py", "transcriber.py", "qwen_boundary.py",
+    "qwen_language.py", "qwen3_asr.py", "qwen3_forced_aligner.py",
+    "modeling_qwen3_asr.py", "modeling_qwen3_asr_thinker.py",
+    "modeling_qwen3_forced_aligner.py", "modeling_qwen3.py",
+    "generation.py", "utils.py", "module.py", "functional.py", "_tensor.py",
+})
+
+
+def _log_model_failure(stage, error):
+    """Log bounded provenance only; never format an exception or its chain."""
+    stage = stage if stage in _FAILURE_STAGES else "unknown"
+    kind = type(error).__name__
+    if not (len(kind) <= 64 and kind.isascii() and kind.isidentifier()):
+        kind = "Exception"
+    origin, line = "unknown", 0
+    trace = BaseException.__getattribute__(error, "__traceback__")
+    for _ in range(128):
+        if trace is None:
+            break
+        basename = trace.tb_frame.f_code.co_filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if basename in _FAILURE_FILES:
+            origin, line = basename, trace.tb_lineno
+        trace = trace.tb_next
+    # No exc_info/stack_info: traceback text can expose private paths, model
+    # inputs, credentials in exception messages, and chained exceptions.
+    _LOG.error("Local model failure stage=%s exception=%s origin=%s line=%d",
+               stage, kind, origin, line)
 
 
 def _gpu_snapshot(device):
@@ -82,9 +115,8 @@ def create_model_app(settings, transcriber=None, *, shutdown=None) -> FastAPI:
                 engine.warmup()
                 refresh_gpu()
                 set_state("ready")
-            except Exception:
-                # Never log exception repr: model loaders can contain paths or
-                # audio/text. The operator sees only a fixed error state.
+            except Exception as error:
+                _log_model_failure("warmup", error)
                 set_state("error")
 
     @asynccontextmanager
@@ -165,11 +197,13 @@ def create_model_app(settings, transcriber=None, *, shutdown=None) -> FastAPI:
             refresh_gpu()
             set_state("ready")
             return encoded
-        except ProtocolError:
+        except ProtocolError as error:
             # Invalid output is not an ordinary model-busy retry.
+            _log_model_failure("infer_protocol", error)
             set_state("error")
             raise ModelUnavailableError("model_protocol_error") from None
-        except Exception:
+        except Exception as error:
+            _log_model_failure("infer", error)
             set_state("error")
             raise ModelUnavailableError() from None
 
@@ -198,7 +232,8 @@ def create_model_app(settings, transcriber=None, *, shutdown=None) -> FastAPI:
                 result = infer(value)
             except ModelUnavailableError as failure:
                 error = failure
-            except BaseException:
+            except BaseException as failure:
+                _log_model_failure("worker", failure)
                 set_state("error")
                 error = ModelUnavailableError()
             finally:

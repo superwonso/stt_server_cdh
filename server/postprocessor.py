@@ -505,6 +505,17 @@ class MindlogicPostprocessor:
         payload: dict[str, Any],
         interrupted: Callable[[], bool] | None,
     ) -> dict[str, Any]:
+        if payload.get("model") == "gpt-6-luna":
+            # All five features share this transport but can select different
+            # models. Preserve the caller's payload and default medium effort;
+            # GPT-6 sampling controls are supported only with explicit none.
+            payload = dict(payload)
+            if payload.get("reasoning_effort") != "none":
+                for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
+                    payload.pop(field, None)
+            if "max_tokens" in payload:
+                limit = payload.pop("max_tokens")
+                payload.setdefault("max_completion_tokens", limit)
         url = f"{self.base_url}/chat/completions/"
         headers = {
             "Authorization": f"Bearer {self.api_key}",

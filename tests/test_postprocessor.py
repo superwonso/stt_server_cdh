@@ -23,6 +23,56 @@ class MindlogicPostprocessorTests(unittest.TestCase):
         values.update(changes)
         return Settings(**values)
 
+    def test_gpt6_wire_compatibility_uses_payload_model_and_preserves_caller(self):
+        for effort in (None, "low", "medium", "high", "none"):
+            for existing_limit in (None, 4096):
+                with self.subTest(effort=effort, existing_limit=existing_limit):
+                    payload = {
+                        "model": "gpt-6-luna", "messages": [{"role": "user", "content": "synthetic"}],
+                        "temperature": 0, "top_p": .8, "top_logprobs": 2, "logprobs": True,
+                        "max_tokens": 8192, "response_format": {"type": "json_object"},
+                    }
+                    if effort is not None:
+                        payload["reasoning_effort"] = effort
+                    if existing_limit is not None:
+                        payload["max_completion_tokens"] = existing_limit
+                    before = copy.deepcopy(payload)
+                    requests = []
+
+                    def handler(request):
+                        requests.append(json.loads(request.content))
+                        return httpx.Response(200, json={"synthetic": True})
+
+                    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                        processor = MindlogicPostprocessor(self.settings(mindlogic_model="synthetic-correction"), client)
+                        self.assertEqual(processor._request(payload, None), {"synthetic": True})
+                    self.assertEqual(payload, before)
+                    expected = copy.deepcopy(before)
+                    expected.pop("max_tokens")
+                    expected.setdefault("max_completion_tokens", 8192)
+                    if effort != "none":
+                        for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
+                            expected.pop(field)
+                    self.assertEqual(requests, [expected])
+
+    def test_gpt6_transport_does_not_rewrite_other_models_or_matching_prefixes(self):
+        for model in ("gpt-5.6-luna", "solar-pro4", "gpt-6-luna-other", "gpt-6-sol"):
+            with self.subTest(model=model):
+                payload = {"model": model, "temperature": 0, "top_p": .9, "logprobs": False,
+                           "max_tokens": 8192, "messages": [{"role": "user", "content": "synthetic"}]}
+                before = copy.deepcopy(payload)
+                requests = []
+
+                def handler(request):
+                    requests.append(json.loads(request.content))
+                    return httpx.Response(200, json={"synthetic": True})
+
+                with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                    processor = MindlogicPostprocessor(self.settings(mindlogic_model="gpt-6-luna"), client)
+                    processor._request(payload, None)
+                self.assertEqual(requests, [before])
+                self.assertEqual(payload, before)
+
     @staticmethod
     def source_segments():
         return [
@@ -99,7 +149,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
             self.assertFalse(request.url.params)
             body = json.loads(request.content)
             requests.append(body)
-            self.assertEqual(body["model"], "gpt-5.6-luna")
+            self.assertEqual(body["model"], "gpt-6-luna")
             self.assertEqual(body["response_format"]["type"], "json_schema")
             user_data = json.loads(body["messages"][1]["content"])
             self.assertNotIn("lecture_title", user_data)
@@ -444,9 +494,9 @@ class MindlogicPostprocessorTests(unittest.TestCase):
             size = len(json.dumps(expected, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             self.assertLessEqual(size, 12 * 1024)
             self.assertLessEqual(len(data["segments"]), 64)
-            self.assertGreater(body["max_tokens"], 8192)
-            self.assertLessEqual(body["max_tokens"], 16384)
-            self.assertGreaterEqual(body["max_tokens"], size + 4096)
+            self.assertGreater(body["max_completion_tokens"], 8192)
+            self.assertLessEqual(body["max_completion_tokens"], 16384)
+            self.assertGreaterEqual(body["max_completion_tokens"], size + 4096)
             calls.append(body)
             return self.echo_response(body)
 
@@ -486,7 +536,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
 
         def handler(request):
             body = json.loads(request.content)
-            calls.append(body["max_tokens"])
+            calls.append(body["max_completion_tokens"])
             return self.echo_response(body)
 
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
@@ -519,7 +569,7 @@ class MindlogicPostprocessorTests(unittest.TestCase):
         def handler(request):
             body = json.loads(request.content)
             calls.append(body)
-            self.assertEqual(body["max_tokens"], 16384)
+            self.assertEqual(body["max_completion_tokens"], 16384)
             return httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {"content": "{"}}]})
 
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:

@@ -26,7 +26,7 @@ from server.model_protocol import (
     ModelUnavailableError, ProtocolError, dump_json, load_json, make_request,
     make_result, read_request, read_result, safe_status,
 )
-from server.model_server import create_model_app
+from server.model_server import _log_model_failure, create_model_app
 from server.remote_transcriber import RemoteTranscriber, validate_socket_path
 
 
@@ -250,6 +250,98 @@ class ModelProtocolTests(unittest.TestCase):
 
 
 class ModelServerTests(unittest.TestCase):
+    def test_failure_log_only_contains_allowlisted_origin_and_sanitized_class(self):
+        for filename, error_type, stage, expected_origin, expected_kind in (
+            (r"C:\synthetic-path-secret\transcriber.py", RuntimeError,
+             "infer", "transcriber.py", "RuntimeError"),
+            ("/synthetic-path-secret/private-recording-secret.py",
+             type("synthetic-class-secret\n", (Exception,), {}),
+             "synthetic-stage-secret", "unknown", "Exception"),
+        ):
+            with self.subTest(origin=expected_origin):
+                namespace = {"error_type": error_type}
+                exec(compile(
+                    "def fail():\n"
+                    "    try:\n"
+                    "        raise ValueError('synthetic-chain-secret')\n"
+                    "    except ValueError as cause:\n"
+                    "        raise error_type('synthetic-message-secret') from cause\n",
+                    filename, "exec"), namespace)
+                with self.assertLogs("server.model_server", level="ERROR") as logs:
+                    try:
+                        namespace["fail"]()
+                    except Exception as error:
+                        _log_model_failure(stage, error)
+                self.assertEqual(len(logs.records), 1)
+                record = logs.records[0]
+                self.assertEqual(record.args, (
+                    "infer" if expected_origin != "unknown" else "unknown",
+                    expected_kind, expected_origin, 5 if expected_origin != "unknown" else 0,
+                ))
+                self.assertIsNone(record.exc_info)
+                self.assertIsNone(record.stack_info)
+                self.assertNotIn("secret", "\n".join(logs.output))
+                self.assertNotIn("Traceback", "\n".join(logs.output))
+
+    def test_warmup_and_infer_failure_logs_preserve_error_state_without_private_text(self):
+        def fail():
+            try:
+                raise ValueError("synthetic-chain-secret")
+            except ValueError as cause:
+                raise RuntimeError("synthetic-message-secret") from cause
+
+        for stage in ("warmup", "infer"):
+            with self.subTest(stage=stage):
+                engine = FakeEngine()
+                if stage == "warmup":
+                    engine.warmup = fail
+                else:
+                    engine.transcribe = lambda *args, **kwargs: fail()
+                with self.assertLogs("server.model_server", level="ERROR") as logs:
+                    with TestClient(create_model_app(settings(model_warmup=stage == "warmup"), engine)) as client:
+                        if stage == "warmup":
+                            until(lambda: client.get("/status").json()["model_state"] == "error")
+                        response = client.post("/transcribe", json=request())
+                        self.assertEqual(response.status_code, 503)
+                        self.assertEqual(response.json()["code"], "model_unavailable")
+                        self.assertEqual(client.get("/health").json(), {"status": "ok", "model_state": "error"})
+                        self.assertNotIn("secret", response.text)
+                self.assertEqual(len(logs.records), 1)
+                self.assertEqual(logs.records[0].args[:3], (stage, "RuntimeError", "model_server.py"))
+                self.assertGreater(logs.records[0].args[3], 0)
+                self.assertIsNone(logs.records[0].exc_info)
+                self.assertNotIn("secret", "\n".join(logs.output))
+
+    def test_protocol_and_worker_failure_logs_retain_fixed_response_codes(self):
+        for stage, error_type, code in (
+            ("infer_protocol", ProtocolError, "model_protocol_error"),
+            ("worker", KeyboardInterrupt, "model_unavailable"),
+        ):
+            with self.subTest(stage=stage):
+                def fail(*args, **kwargs):
+                    try:
+                        raise ValueError("synthetic-chain-secret")
+                    except ValueError as cause:
+                        error = error_type()
+                        error.args = ("synthetic-message-secret",)
+                        raise error from cause
+
+                engine = FakeEngine()
+                engine.transcribe = fail
+                with self.assertLogs("server.model_server", level="ERROR") as logs:
+                    with TestClient(create_model_app(settings(), engine)) as client:
+                        response = client.post("/transcribe", json=request())
+                        self.assertEqual(response.status_code, 503)
+                        self.assertEqual(response.json()["code"], code)
+                        self.assertEqual(client.get("/status").json()["model_state"], "error")
+                        self.assertEqual(client.post("/transcribe", json=request()).status_code, 503)
+                        self.assertNotIn("secret", response.text)
+                self.assertEqual(len(logs.records), 1)
+                self.assertEqual(logs.records[0].args[:3], (stage, error_type.__name__, "model_server.py"))
+                self.assertGreater(logs.records[0].args[3], 0)
+                self.assertIsNone(logs.records[0].exc_info)
+                self.assertNotIn("secret", "\n".join(logs.output))
+
     def test_factory_never_loads_application_settings_or_auth_routes(self):
         with patch("server.settings.Settings.from_env", side_effect=AssertionError("application env forbidden")):
             with TestClient(create_model_app(settings(), FakeEngine())) as client:

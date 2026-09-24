@@ -70,7 +70,7 @@ class StudyNoteTests(unittest.TestCase):
             self.assertFalse(request.url.params)
             payload, data, rows = read_request(request)
             calls.append(payload)
-            self.assertEqual(payload["model"], "gpt-5.6-luna")
+            self.assertEqual(payload["model"], "gpt-6-luna")
             instructions = payload["messages"][0]["content"]
             self.assertIn("전체적인 맥락을 고려해서 영어로 작성되어 있는 것들을 한글로 번역해줘. 영어인데 한글로 써져있는 것들도 있으니 이것도 해결해주면 좋을거같아", instructions)
             self.assertIn("기존 후보정·번역·수동수정을 적용하지 않은", instructions)
@@ -82,7 +82,7 @@ class StudyNoteTests(unittest.TestCase):
             schema = payload["response_format"]["json_schema"]
             self.assertTrue(schema["strict"])
             self.assertEqual(schema["schema"]["properties"]["paragraphs"]["items"]["properties"]["source_ids"]["items"]["enum"], ["S000001"])
-            self.assertLessEqual(payload["max_tokens"], 16384)
+            self.assertLessEqual(payload["max_completion_tokens"], 16384)
             self.assertNotIn("tools", payload)
             return response(echo_document(data, rows))
 
@@ -129,7 +129,7 @@ class StudyNoteTests(unittest.TestCase):
             requests.append(data)
             self.assertEqual(len(rows), len(raw))
             self.assertLessEqual(len(data["target_source_ids"]), 64)
-            self.assertLessEqual(payload["max_tokens"], 16384)
+            self.assertLessEqual(payload["max_completion_tokens"], 16384)
             return response(echo_document(data, rows))
 
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
