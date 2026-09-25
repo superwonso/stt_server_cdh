@@ -1,5 +1,7 @@
 // Public code contains no account data. Classification lives on the private API.
 export function lectureTitle(lecture) {
+  if (lecture?.course_name) return [lecture.course_name,lecture.session_name || lecture.display_title || lecture.title].filter(Boolean).join(' · ');
+  if (lecture?.session_name) return lecture.session_name;
   return typeof lecture?.display_title === 'string' && lecture.display_title.trim()
     ? lecture.display_title : lecture?.title || '수업';
 }

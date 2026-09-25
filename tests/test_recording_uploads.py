@@ -411,7 +411,7 @@ class RecordingUploadMigrationTests(unittest.TestCase):
                 after = dict(connection.execute("SELECT * FROM lectures").fetchone())
                 self.assertEqual(after.pop("audio_finalized"), 0)
                 self.assertEqual(after, before)
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 22)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 23)
                 connection.execute("INSERT INTO recording_chunks VALUES(?,?,?,?,?,?,?,?)",
                     ("synthetic-lecture", "synthetic-chunk", "a" * 64, 0, 800, 0, 1, "now"))
                 connection.execute("DELETE FROM lectures WHERE id='synthetic-lecture'")

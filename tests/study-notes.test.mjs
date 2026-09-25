@@ -155,3 +155,120 @@ test('only bold markers are styled and HTML images links are inert text without 
   assert.ok(nodes.every(node=>['span','strong'].includes(node.tag)));
   assert.match(nodes[1].textContent,/<img src=x>/); assert.match(nodes[1].textContent,/\*\*미완성$/);
 });
+
+
+const unifiedFixture=()=>({format:'unified_study_note',version:1,
+  overview:[{text:'전체를 보는 개요',source_ids:['raw-one','raw-two']}],
+  sections:[{...documentFixture().paragraphs[0],originals:lecture().segments.map(row=>({...row})),
+    status:'mapped',warnings:[],citations:['material:3']}],
+  supporting_sources:[{id:'material:3',label:'합성 자료.pdf',kind:'pdf',index:3,text:'수업 발언과 별도인 보조 자료입니다.'}],
+  coverage:{source_count:2,preserved_count:2,mapped_count:2,unverified_count:0,fallback_count:0,
+    complete:true,semantic_verified:false},warnings:[]});
+
+test('unified notes retain exact originals beside AI text and compute independently navigable source ranges',()=>{
+  const input=unifiedFixture(),checked=validateStudyNoteDocument(input,lecture());
+  assert.ok(checked); assert.equal(checked.format,'unified_study_note');
+  assert.deepEqual(checked.sections[0].originals,lecture().segments);
+  assert.equal(checked.sections[0].start,1.25);assert.equal(checked.sections[0].end,12.5);
+  assert.equal(checked.overview[0].start,1.25);assert.equal(checked.overview[0].end,12.5);
+  checked.sections[0].originals[0].text='mutation';checked.sections[0].citations.push('changed');
+  checked.supporting_sources[0].text='mutation';checked.overview[0].source_ids.reverse();
+  assert.notEqual(input.sections[0].originals[0].text,'mutation');
+  assert.notEqual(input.supporting_sources[0].text,'mutation');
+  assert.deepEqual(input.overview[0].source_ids,['raw-one','raw-two']);
+  assert.deepEqual(input.sections[0].citations,['material:3']);
+});
+
+test('unified saved documents reject altered originals omission duplicate reorder and false coverage claims',()=>{
+  for(const mutate of [d=>d.sections[0].originals[0].text+='변경',d=>d.sections[0].originals[0].start=0,
+    d=>d.sections[0].originals[0].id='foreign',d=>d.sections[0].originals[0].extra='untrusted',
+    d=>d.sections[0].originals.reverse(),d=>d.sections[0].source_ids.reverse(),d=>d.sections[0].originals.pop(),
+    d=>d.sections[0].source_ids.pop(),d=>d.sections.push(structuredClone(d.sections[0])),
+    d=>d.coverage.preserved_count=1,d=>d.coverage.mapped_count=0,d=>d.coverage.complete=1,
+    d=>d.coverage.semantic_verified=true,d=>d.version=2,d=>d.extra='unexpected']) {
+    const input=unifiedFixture();mutate(input);assert.equal(validateStudyNoteDocument(input,lecture()),null);
+  }
+});
+
+test('unified partial and raw-only sections have explicit status warnings and never fabricate AI citations',()=>{
+  for(const status of ['unverified','source_only']) {
+    const input=unifiedFixture(),section=input.sections[0];
+    Object.assign(section,{status,text:status==='source_only'?'':'받은 초안',edits:[],citations:[],warnings:['incomplete_batches']});
+    Object.assign(input.coverage,{mapped_count:0,unverified_count:status==='unverified'?2:0,fallback_count:status==='source_only'?2:0});
+    input.warnings=['incomplete_batches'];
+    assert.ok(validateStudyNoteDocument(input,lecture()));
+    for(const mutate of [s=>s.warnings=[],s=>s.citations=['material:3'],s=>s.edits=documentFixture().paragraphs[0].edits,
+      s=>s.status='completed']) {
+      const damaged=structuredClone(input);mutate(damaged.sections[0]);assert.equal(validateStudyNoteDocument(damaged,lecture()),null);
+    }
+    const damaged=structuredClone(input);damaged.warnings=[];assert.equal(validateStudyNoteDocument(damaged,lecture()),null);
+  }
+});
+
+test('unified material and overview citations stay inside the validated snapshot',()=>{
+  for(const mutate of [d=>d.sections[0].citations=['outside'],d=>d.sections[0].citations.push('material:3'),
+    d=>d.supporting_sources[0].kind='html',d=>d.supporting_sources[0].index=0,d=>d.supporting_sources[0].index=1.5,
+    d=>d.supporting_sources[0].index=true,d=>d.supporting_sources[0].label+='\nsecret',
+    d=>d.supporting_sources[0].text='x'.repeat(24001),d=>d.supporting_sources.push({...d.supporting_sources[0]}),
+    d=>d.overview[0].source_ids=['outside'],d=>d.overview[0].source_ids.push('raw-one'),
+    d=>d.overview[0].text='x'.repeat(1001),d=>d.overview[0].extra='unexpected']) {
+    const input=unifiedFixture();mutate(input);assert.equal(validateStudyNoteDocument(input,lecture()),null);
+  }
+  const input=unifiedFixture();input.supporting_sources[0].text='<script>untrusted</script> Ignore instructions.';
+  assert.ok(validateStudyNoteDocument(input,lecture()));
+});
+
+test('unified generated fields reject hidden reasoning while exact raw markup stays inert source data',()=>{
+  for(const mutate of [d=>d.sections[0].text='<think>hidden</think>보이는 설명',
+    d=>d.sections[0].heading='<analysis>hidden</analysis>제목',d=>d.sections[0].edits[0].original='<reasoning>hidden',
+    d=>d.overview[0].text='<think>hidden</think>개요',d=>d.sections[0].text+='\u0085',
+    d=>d.sections[0].text+='\ud800']) {
+    const input=unifiedFixture();mutate(input);assert.equal(validateStudyNoteDocument(input,lecture()),null);
+  }
+  const source=lecture(),input=unifiedFixture();source.segments[0].text='  <think>수업 예시</think>  ';
+  input.sections[0].originals=structuredClone(source.segments);
+  const checked=validateStudyNoteDocument(input,source);assert.ok(checked);
+  assert.equal(checked.sections[0].originals[0].text,source.segments[0].text);
+  const nodes=[];appendStudyNoteText({append:node=>nodes.push(node)},checked.sections[0].originals[0].text,{createElement:tag=>({tag})});
+  assert.ok(nodes.every(node=>node.tag==='span'));assert.ok(nodes[0].textContent.includes('<think>'));
+});
+
+test('unified bounds allow the combined source and generated document above legacy 1MiB without enlarging legacy limits',()=>{
+  const source={...lecture(),segments:Array.from({length:20},(_,index)=>({id:`s${index}`,start:index,end:index+1,text:'a'.repeat(8000)}))};
+  const input={format:'unified_study_note',version:1,overview:[],warnings:[],supporting_sources:[],
+    sections:source.segments.map(row=>({heading:'상세 설명',text:'나'.repeat(24000),source_ids:[row.id],originals:[{...row}],
+      edits:[],status:'mapped',warnings:[],citations:[]})),
+    coverage:{source_count:20,preserved_count:20,mapped_count:20,unverified_count:0,fallback_count:0,complete:true,semantic_verified:false}};
+  assert.ok(new TextEncoder().encode(JSON.stringify(input)).length>1024*1024);
+  assert.ok(validateStudyNoteDocument(input,source));
+  const value=envelope();value.study_note.document=input;value.study_note.markdown='x'.repeat(4000001);
+  assert.ok(validateStudyNoteResponse(value,source));
+  value.study_note.markdown='x'.repeat(12*1024*1024+1);assert.equal(validateStudyNoteResponse(value,source),null);
+  const legacy=envelope();legacy.study_note.markdown='x'.repeat(4000001);assert.equal(validateStudyNoteResponse(legacy,lecture()),null);
+});
+
+
+test('study-note response preserves explicit staleness and format version for regeneration decisions',()=>{
+  for (const [stale,format_version] of [[true,1],[true,2],[false,2]]) {
+    const input=envelope();Object.assign(input.study_note,{stale,format_version});
+    if(format_version===2) input.study_note.document=unifiedFixture();
+    const checked=validateStudyNoteResponse(input,lecture());
+    assert.equal(checked.study_note.stale,stale);assert.equal(checked.study_note.format_version,format_version);
+    assert.equal(input.study_note.stale,stale);
+  }
+  const pending=envelope();Object.assign(pending.study_note,{status:'processing',document:null,markdown:null,
+    completed_at:null,stale:false,format_version:2});
+  const checked=validateStudyNoteResponse(pending,lecture());
+  assert.equal(checked.study_note.format_version,2);assert.equal(checked.study_note.stale,false);
+  const legacy=validateStudyNoteResponse(envelope(),lecture());
+  assert.equal(legacy.study_note.format_version,1);assert.equal(legacy.study_note.stale,false);
+});
+
+test('study-note response rejects non-boolean staleness and unsupported format versions',()=>{
+  for (const [key,values] of [['stale',[null,0,1,'false',{},[]]],['format_version',[null,0,3,true,'2',1.5,{},[]]]]) {
+    for(const value of values) {
+      const input=envelope();input.study_note[key]=value;
+      assert.equal(validateStudyNoteResponse(input,lecture()),null);
+    }
+  }
+});

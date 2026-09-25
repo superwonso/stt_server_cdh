@@ -130,6 +130,44 @@ class StudyNoteApiTests(unittest.TestCase):
                     for table in ("segments", "chunks", "transcript_corrections", "lecture_summaries", "lecture_translations",
                                   "lecture_manual_state", "lecture_manual_notes", "lecture_manual_edits", "lecture_metadata")}
 
+    def assert_unified(self, document, identifier, *, status=None):
+        self.assertEqual(document["format"], "unified_study_note")
+        self.assertEqual(document["version"], 1)
+        with self.database.connect() as connection:
+            raw = self.service.raw_segments(connection, identifier)
+        self.assertEqual([row for section in document["sections"] for row in section["originals"]], raw)
+        self.assertEqual(document["coverage"]["preserved_count"], len(raw))
+        self.assertTrue(document["coverage"]["complete"])
+        self.assertIs(document["coverage"]["semantic_verified"], False)
+        if status is not None:
+            self.assertTrue(all(section["status"] == status for section in document["sections"]))
+        return document["sections"]
+
+    def assert_unified_paragraph(self, document, identifier, paragraph):
+        sections = self.assert_unified(document, identifier, status="mapped")
+        self.assertEqual(len(sections), 1)
+        self.assertEqual({key: sections[0][key] for key in paragraph}, paragraph)
+
+    def material(self, identifier, *, text="첨부한 합성 자료의 설명입니다.", status="ready", warnings=()):
+        material_id = str(uuid.uuid4())
+        document = {"units": [{"index": 1, "markdown": text, "warnings": list(warnings)}]}
+        with self.database.connect() as connection:
+            connection.execute(
+                "INSERT INTO study_materials(id,username,lecture_id,filename,kind,size_bytes,uploaded_bytes,sha256,storage_name,"
+                "status,document_json,error_code,revision,created_at,updated_at) "
+                "VALUES(?,'user-alpha',?,'synthetic-material.pdf','pdf',1,1,?,?,?, ?,?,1,'now','now')",
+                (material_id, identifier, "a" * 64, material_id + ".pdf", status,
+                 json.dumps(document, ensure_ascii=False) if status == "ready" else None,
+                 None if status == "ready" else "awaiting_upload"),
+            )
+        return material_id
+
+    def change_material(self, material_id, text="변경된 합성 자료입니다."):
+        document = {"units": [{"index": 1, "markdown": text, "warnings": []}]}
+        with self.database.connect() as connection:
+            connection.execute("UPDATE study_materials SET document_json=?,revision=revision+1 WHERE id=?",
+                               (json.dumps(document, ensure_ascii=False), material_id))
+
     def test_owner_only_get_post_and_no_administrator_bypass(self):
         identifier, _ = self.lecture(username="user-beta")
         for call in (self.get, self.post):
@@ -153,9 +191,9 @@ class StudyNoteApiTests(unittest.TestCase):
         before = self.row(identifier)
         response = self.get(identifier).json()["study_note"]
         self.assertEqual(set(response), {"lecture_id", "status", "model", "error_code", "error", "created_at",
-                                         "updated_at", "completed_at", "document", "markdown"})
-        self.assertEqual(response["document"]["paragraphs"][0]["source_ids"], [segment])
-        self.assertEqual(response["document"]["paragraphs"][0]["text"], "식물은 빛을 이용해 양분을 만든다.")
+                                         "updated_at", "completed_at", "document", "markdown", "stale", "format_version"})
+        self.assertEqual(response["document"]["sections"][0]["source_ids"], [segment])
+        self.assertEqual(response["document"]["sections"][0]["text"], "식물은 빛을 이용해 양분을 만든다.")
         self.assertIn(r"식물은 빛을 이용해 양분을 만든다\.", response["markdown"])
         self.assertNotIn("synthetic-private-title", response["markdown"])
         self.assertEqual(self.row(identifier), before)
@@ -178,7 +216,7 @@ class StudyNoteApiTests(unittest.TestCase):
         self.assertTrue(self.service.process_next())
         saved = self.row(identifier)
         self.assertEqual(saved["status"], "completed")
-        self.assertEqual(json.loads(saved["document_json"]), {"paragraphs": [paragraph]})
+        self.assert_unified_paragraph(json.loads(saved["document_json"]), identifier, paragraph)
         self.assertIsNone(saved["error_code"])
         self.assertIsNotNone(saved["completed_at"])
 
@@ -186,7 +224,7 @@ class StudyNoteApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         note = response.json()["study_note"]
         self.assertEqual(note["status"], "completed")
-        self.assertEqual(note["document"], {"paragraphs": [paragraph]})
+        self.assert_unified_paragraph(note["document"], identifier, paragraph)
         self.assertIn("1주차 · 2027년 수업 정리", note["markdown"])
         self.assertIn("2027년 수업에서는 광합성을 12번 설명했다", note["markdown"])
         self.assertIn(r"classroom@example\.invalid", note["markdown"])
@@ -220,9 +258,9 @@ class StudyNoteApiTests(unittest.TestCase):
         saved = self.row(identifier)
         note = self.get(identifier).json()["study_note"]
         self.assertEqual(saved["status"], "completed")
-        self.assertEqual(json.loads(saved["document_json"]), {"paragraphs": [paragraph]})
+        self.assert_unified_paragraph(json.loads(saved["document_json"]), identifier, paragraph)
         self.assertEqual(note["status"], "completed")
-        self.assertEqual(note["document"], {"paragraphs": [paragraph]})
+        self.assert_unified_paragraph(note["document"], identifier, paragraph)
         self.assertIn(r"광합성\(photosynthesis\)", note["markdown"])
         self.assertIn("추정 · 확인 필요", note["markdown"])
         self.assertEqual(self.get(identifier).json()["study_note"], note)
@@ -251,9 +289,124 @@ class StudyNoteApiTests(unittest.TestCase):
         note = self.get(identifier).json()["study_note"]
         self.assertEqual(note["status"], "completed")
         self.assertIsNone(note["error_code"])
-        self.assertEqual(note["document"], {"paragraphs": [paragraph]})
+        self.assert_unified_paragraph(note["document"], identifier, paragraph)
         self.assertIn("2가지 단계", note["markdown"])
         self.assertEqual(len(self.engine.calls), 2)
+
+    def test_legacy_get_preserves_saved_result_until_explicit_post_upgrades_contract(self):
+        identifier, segment = self.lecture()
+        self.queued(identifier); self.service.process_next()
+        legacy = {"paragraphs": [{"heading": "기존 저장본", "source_ids": [segment],
+                                  "text": "이전 생성 결과입니다.", "edits": []}]}
+        with self.database.connect() as connection:
+            connection.execute("UPDATE lecture_study_notes SET document_json=?,format_version=1,"
+                               "material_revision='',source_manifest_json=NULL WHERE lecture_id=?",
+                               (json.dumps(legacy, ensure_ascii=False), identifier))
+        before, call_count = self.row(identifier), len(self.engine.calls)
+        for _ in range(2):
+            note = self.get(identifier).json()["study_note"]
+            self.assertEqual(note["document"], legacy)
+            self.assertEqual(note["status"], "completed")
+            self.assertEqual(note["format_version"], 1)
+            self.assertTrue(note["stale"])
+            self.assertFalse(self.service.process_next())
+        self.assertEqual(self.row(identifier), before)
+        self.assertEqual(len(self.engine.calls), call_count)
+        upgraded = self.queued(identifier)
+        self.assertEqual(upgraded["format_version"], 2)
+        self.assertNotEqual(upgraded["job_id"], before["job_id"])
+        self.assertEqual(len(self.engine.calls), call_count)
+        self.service.process_next()
+        note = self.get(identifier).json()["study_note"]
+        self.assert_unified(note["document"], identifier, status="mapped")
+        self.assertFalse(note["stale"])
+        self.assertEqual(len(self.engine.calls), call_count + 1)
+
+    def test_material_change_marks_saved_note_stale_without_recall_then_explicitly_regenerates(self):
+        identifier, _ = self.lecture()
+        material_id = self.material(identifier, warnings=["images_not_described"])
+        first_job = self.queued(identifier)
+        self.assertEqual(first_job["format_version"], 2)
+        self.assertEqual(json.loads(first_job["source_manifest_json"])[0]["id"], material_id)
+        self.service.process_next()
+        first = self.get(identifier).json()["study_note"]
+        self.assertFalse(first["stale"])
+        evidence = first["document"]["supporting_sources"][0]
+        self.assertEqual(evidence["id"], material_id + ":1")
+        self.assertIn("자료 추출 주의", evidence["text"])
+        self.assertIn("원본을 확인", first["markdown"])
+        self.change_material(material_id)
+        before = self.row(identifier)
+        stale = self.get(identifier).json()["study_note"]
+        self.assertTrue(stale["stale"])
+        self.assertEqual(stale["status"], "completed")
+        self.assertEqual(stale["document"], first["document"])
+        self.assertEqual(self.row(identifier), before)
+        self.assertEqual(len(self.engine.calls), 1)
+        self.assertFalse(self.service.process_next())
+        second_job = self.queued(identifier)
+        self.assertNotEqual(second_job["job_id"], first_job["job_id"])
+        self.assertNotEqual(second_job["material_revision"], first_job["material_revision"])
+        self.service.process_next()
+        second = self.get(identifier).json()["study_note"]
+        self.assertFalse(second["stale"])
+        self.assertEqual(second["document"]["supporting_sources"][0]["text"], "변경된 합성 자료입니다.")
+        self.assertEqual(len(self.engine.calls), 2)
+
+    def test_material_snapshot_change_before_claim_or_during_generation_never_publishes(self):
+        for during in (False, True):
+            with self.subTest(during=during):
+                identifier, _ = self.lecture()
+                material_id = self.material(identifier)
+                self.queued(identifier)
+                previous_calls = len(self.engine.calls)
+                if during:
+                    self.engine.during = lambda *_: self.change_material(material_id)
+                else:
+                    self.change_material(material_id)
+                    self.service.recover()
+                self.assertTrue(self.service.process_next())
+                row = self.row(identifier)
+                self.assertEqual((row["status"], row["error_code"]), ("failed", "source_changed"))
+                self.assertIsNone(row["document_json"])
+                self.assertEqual(len(self.engine.calls), previous_calls + int(during))
+                self.assertFalse(self.service.process_next())
+                self.engine.during = None
+
+    def test_unready_attachment_blocks_creation_and_keeps_previously_completed_document(self):
+        identifier, _ = self.lecture()
+        self.queued(identifier); self.service.process_next()
+        previous = self.get(identifier).json()["study_note"]
+        self.material(identifier, status="processing")
+        saved = self.row(identifier)
+        current = self.get(identifier).json()["study_note"]
+        self.assertTrue(current["stale"])
+        self.assertEqual(current["document"], previous["document"])
+        self.assertEqual(self.post(identifier).status_code, 409)
+        self.assertEqual(self.row(identifier), saved)
+        self.assertEqual(len(self.engine.calls), 1)
+        self.assertFalse(self.service.process_next())
+
+    def test_new_jobs_choose_unified_engine_and_snapshot_materials_cannot_be_mutated(self):
+        identifier, _ = self.lecture()
+        self.material(identifier)
+        inputs = []
+        def unified(*, language, segments, supporting_sources, interrupted):
+            inputs.append(copy.deepcopy(supporting_sources))
+            self.assertFalse(interrupted())
+            supporting_sources[0]["text"] = "엔진의 사본 변조"
+            return StudyNoteDocument([{"heading": "구간", "source_ids": [row["id"]],
+                                       "text": row["text"], "edits": []} for row in segments])
+        self.engine.create_unified = unified
+        self.queued(identifier)
+        self.assertTrue(self.service.process_next())
+        note = self.get(identifier).json()["study_note"]
+        self.assertEqual(note["status"], "completed")
+        self.assertEqual(self.engine.calls, [])
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(note["document"]["supporting_sources"], inputs[0])
+        self.assertNotIn("엔진의 사본 변조", json.dumps(note, ensure_ascii=False))
+        self.assert_unified(note["document"], identifier, status="mapped")
 
     def test_original_corrected_translated_and_manual_products_are_untouched(self):
         identifier, segment = self.lecture()
@@ -280,7 +433,7 @@ class StudyNoteApiTests(unittest.TestCase):
         self.service.process_next()
         note = self.get(identifier).json()["study_note"]
         self.assertEqual(note["status"], "completed")
-        self.assertEqual(note["document"]["format"], "draft")
+        self.assert_unified(note["document"], identifier, status="unverified")
         self.assertEqual(note["document"]["warnings"], ["invalid_response"])
         self.assertEqual(self.snapshot(identifier), before)
         self.assertEqual(self.engine.calls, [{"language": "ko", "segments": raw}])
@@ -412,11 +565,10 @@ class StudyNoteApiTests(unittest.TestCase):
         saved = self.row(identifier)
         self.assertEqual(saved["status"], "completed")
         draft = json.loads(saved["document_json"])
-        self.assertEqual(set(draft), {"format", "text", "warnings"})
-        self.assertEqual(draft["format"], "draft")
-        self.assertIn("식물은 빛을 이용해 양분을 만든다.", draft["text"])
+        sections = self.assert_unified(draft, identifier, status="unverified")
+        self.assertIn("식물은 빛을 이용해 양분을 만든다.", sections[0]["text"])
         self.assertEqual(draft["warnings"], ["invalid_response"])
-        self.assertNotIn("outside-source", draft["text"])
+        self.assertNotIn("outside-source", sections[0]["text"])
         self.assertEqual(self.snapshot(identifier), before)
         note = self.get(identifier).json()["study_note"]
         self.assertEqual(note["status"], "completed")
@@ -445,13 +597,16 @@ class StudyNoteApiTests(unittest.TestCase):
         self.assertTrue(self.service.process_next())
         saved = self.row(identifier)
         self.assertEqual(saved["status"], "completed")
-        self.assertEqual(json.loads(saved["document_json"]), draft)
+        unified = json.loads(saved["document_json"])
+        sections = self.assert_unified(unified, identifier, status="unverified")
+        self.assertEqual(sections[0]["text"], draft["text"])
+        self.assertTrue(set(draft["warnings"]).issubset(unified["warnings"]))
         self.assertIsNone(saved["error"])
         self.assertIsNone(saved["error_code"])
         self.assertIsNotNone(saved["completed_at"])
         note = self.get(identifier).json()["study_note"]
         self.assertEqual(note["status"], "completed")
-        self.assertEqual(note["document"], draft)
+        self.assertEqual(note["document"], unified)
         self.assertIn("생성된 부분까지만 보관한다", note["markdown"])
         body, footer = note["markdown"].rsplit(study_notes.STUDY_NOTE_RESULT_WARNING, 1)
         self.assertIn("생성된 부분까지만 보관한다", body)
@@ -468,7 +623,7 @@ class StudyNoteApiTests(unittest.TestCase):
         self.assertEqual(self.get(identifier, "user-beta").status_code, 404)
         self.assertEqual(self.post(identifier, "user-beta").status_code, 404)
 
-    def test_no_usable_engine_body_still_fails_without_inventing_a_result(self):
+    def test_no_usable_engine_body_preserves_source_only_without_inventing_ai_content(self):
         with patch.object(self.service.limiter, "allow", return_value=True):
             for document in ({}, {"paragraphs": []}, {"format": "draft", "text": " ", "warnings": ["invalid_response"]}):
                 with self.subTest(document=document):
@@ -477,12 +632,14 @@ class StudyNoteApiTests(unittest.TestCase):
                     self.engine.document = FakeStudyNoteOutput(document)
                     self.queued(identifier)
                     self.assertTrue(self.service.process_next())
-                    self.assertEqual(self.row(identifier)["status"], "failed")
-                    self.assertIsNone(self.row(identifier)["document_json"])
+                    self.assertEqual(self.row(identifier)["status"], "completed")
                     note = self.get(identifier).json()["study_note"]
-                    self.assertEqual(note["status"], "failed")
-                    self.assertIsNone(note["document"])
-                    self.assertIsNone(note["markdown"])
+                    self.assertEqual(note["status"], "completed")
+                    sections = self.assert_unified(note["document"], identifier, status="source_only")
+                    self.assertTrue(all(section["text"] == "" for section in sections))
+                    self.assertEqual(note["document"]["coverage"]["mapped_count"], 0)
+                    self.assertIn("AI 작성 미완료", note["markdown"])
+                    self.assertIn(study_notes.STUDY_NOTE_RESULT_WARNING, note["markdown"])
                     self.assertEqual(self.snapshot(identifier), before)
                     self.assertFalse(self.service.process_next())
 
@@ -649,7 +806,7 @@ class StudyNoteApiTests(unittest.TestCase):
         self.service.process_next()
         self.assertEqual(self.row(identifier)["status"], "completed")
         note = self.get(identifier).json()["study_note"]
-        self.assertEqual(note["document"]["format"], "draft")
+        self.assert_unified(note["document"], identifier, status="unverified")
         self.assertEqual(note["document"]["warnings"], ["invalid_response"])
         self.assertNotIn("outside-source", note["markdown"])
         self.assertEqual(self.snapshot(identifier), before)

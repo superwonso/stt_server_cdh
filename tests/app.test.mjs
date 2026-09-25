@@ -23,7 +23,11 @@ import { groupTranscriptSentences } from '../web/transcript-sentences.js';
 import { TranscriptFollow } from '../web/transcript-follow.js';
 import { AUTH_SESSION_STORAGE_KEY, TabAuthSessionStore } from '../web/auth-session.js';
 
+import * as TestUnifiedNoteView from '../web/unified-note-view.js';
 const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
+  .replace("import { renderUnifiedStudyNote } from './unified-note-view.js';", 'const {renderUnifiedStudyNote} = TestUnifiedNoteView;')
+  .replace("import { createMaterialPanel } from './study-materials.js';", 'const createMaterialPanel = () => ({reset(){},setScope(){}});')
+  .replace("import { createCourseWorkspace } from './course-workspace.js';", 'const createCourseWorkspace = () => ({reset(){},open(){}});')
   .replace("import { MicrophoneCapture } from './audio.js';", 'const MicrophoneCapture = TestCapture;')
   .replace("import { validateRecordingSelection, isFileDrag, recordingFileFromDrop } from './recording-file-selection.js';", 'const { validateRecordingSelection, isFileDrag, recordingFileFromDrop } = TestRecordingFileSelection;')
   .replace("import { buildRecoverableLocalAudioExports, validateLocalWav } from './local-audio-export.js';", 'const { buildRecoverableLocalAudioExports, validateLocalWav } = TestLocalAudioExport;')
@@ -286,7 +290,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     TestRecordingReview:{readRecordingClip,RecordingClipPlayer,filterTranscript},
     TestLectureLibrary,
     TestManualNotes,
-    TestLectureQuestions, TestStudyNotes, TestLlmResults, TestLiveQueue,
+    TestLectureQuestions, TestStudyNotes,TestUnifiedNoteView, TestLlmResults, TestLiveQueue,
     TestGroupTranscriptSentences:groupTranscriptSentences, TestTranscriptFollow:TranscriptFollow,
     TestLocalAudioExport, TestHeldImportRecovery:recoveryHelpers, TestRecordingFileSelection, TestEncodeWav:encodeWav,
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },

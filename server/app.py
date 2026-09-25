@@ -60,6 +60,8 @@ from .translator import MindlogicTranslator
 from .translation_service import TranslationService
 from .study_notes import MindlogicStudyNotes
 from .study_note_service import StudyNoteService
+from .material_service import MaterialService
+from .course_review import CourseReviewService, install_courses, course_session_for, active_lecture_review
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
 from .settings import Settings
 from .platform_files import ensure_private_directory, open_file, validate_private_path
@@ -358,6 +360,7 @@ def create_app(
     translator=None,
     question_answerer=None,
     study_note_maker=None,
+    course_review_maker=None,
     drive_storage=None,
     tunnel_status=None,
     tunnel_restart=None,
@@ -386,6 +389,8 @@ def create_app(
     translation_service = TranslationService(settings, database, translator or MindlogicTranslator(settings), limiter)
     question_service = QuestionService(settings, database, question_answerer or QuestionAnswerer(settings), limiter)
     study_note_service = StudyNoteService(settings, database, study_note_maker or MindlogicStudyNotes(settings), limiter)
+    material_service = MaterialService(settings, database, limiter)
+    course_review_service = CourseReviewService(settings, database, course_review_maker or MindlogicStudyNotes(settings), limiter)
     inference_lock = threading.Lock()
     capacity = threading.BoundedSemaphore(settings.max_pending_chunks)
     chunk_admission_lock = threading.Lock()
@@ -465,6 +470,8 @@ def create_app(
         translation_service.recover()
         question_service.recover()
         study_note_service.recover()
+        material_service.recover()
+        course_review_service.recover()
         if settings.model_warmup and not (settings.local_model_socket or settings.local_model_runtime) and hasattr(engine, "warmup"):
             await run_in_threadpool(engine.warmup)
         try:
@@ -475,6 +482,7 @@ def create_app(
             translation_service.start()
             question_service.start()
             study_note_service.start()
+            course_review_service.start()
             archive_manager.start()
             lease_renewer.start()
             if backup_scheduler is not None:
@@ -489,6 +497,8 @@ def create_app(
             translation_service.request_shutdown()
             question_service.request_shutdown()
             study_note_service.request_shutdown()
+            material_service.request_shutdown()
+            course_review_service.request_shutdown()
             archive_manager.request_shutdown()
             lease_renewer.request_shutdown()
             if backup_scheduler is not None:
@@ -499,6 +509,8 @@ def create_app(
             translation_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             question_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             study_note_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
+            material_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
+            course_review_service.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             import_stopped = stop_import_worker(timeout=max(0.0, shutdown_deadline - time.monotonic()))
             archive_stopped = archive_manager.stop(
                 timeout=max(0.0, shutdown_deadline - time.monotonic())
@@ -526,6 +538,8 @@ def create_app(
     app.state.translation_service = translation_service
     app.state.question_service = question_service
     app.state.study_note_service = study_note_service
+    app.state.material_service = material_service
+    app.state.course_review_service = course_review_service
     app.state.recording_store = recording_store
     app.state.archive_manager = archive_manager
     app.state.lease_renewer = lease_renewer
@@ -946,7 +960,9 @@ def create_app(
                     " AND lq.status IN ('queued','processing')) AS question_jobs, "
                     "(SELECT COUNT(*) FROM lecture_study_notes sn JOIN lectures l5 ON l5.id=sn.lecture_id "
                     " WHERE l5.username=u.username AND sn.username=u.username "
-                    " AND sn.status IN ('queued','processing')) AS study_note_jobs "
+                    " AND sn.status IN ('queued','processing')) AS study_note_jobs, "
+                    "(SELECT COUNT(*) FROM course_review_jobs cr WHERE cr.username=u.username AND cr.status IN ('queued','processing')) AS course_review_jobs, "
+                    "(SELECT COUNT(*) FROM study_materials sm WHERE sm.username=u.username AND sm.status='processing') AS material_jobs "
                     "FROM users u",
                     (current_time,),
                 ).fetchall()
@@ -976,6 +992,8 @@ def create_app(
                     "SELECT COUNT(*) FROM lecture_study_notes WHERE status IN ('queued','processing')"
                 ).fetchone()[0],
             }
+            queues['course_reviews'] = connection.execute("SELECT COUNT(*) FROM course_review_jobs WHERE status IN ('queued','processing')").fetchone()[0]
+            queues['materials'] = connection.execute("SELECT COUNT(*) FROM study_materials WHERE status='processing'").fetchone()[0]
             recent_audit = [
                 {
                     "timestamp": row["timestamp"],
@@ -1022,6 +1040,8 @@ def create_app(
                         "translations": row["translation_jobs"],
                         "questions": row["question_jobs"],
                         "study_notes": row["study_note_jobs"],
+                        "course_reviews": row["course_review_jobs"],
+                        "materials": row["material_jobs"],
                     },
                 }
             )
@@ -1160,6 +1180,7 @@ def create_app(
         }
         with database.connect() as connection:
             result.update(lecture_library.metadata_for(connection, lecture))
+            result.update(course_session_for(connection, lecture))
             result.update(lecture_continuations.fields_for(connection, lecture))
         result.update(
             recording_flags(
@@ -2702,12 +2723,19 @@ def create_app(
             normalized = str(uuid.UUID(import_id))
         except (ValueError, AttributeError) as error:
             raise HTTPException(404, "파일 변환 작업을 찾을 수 없습니다.") from error
-        job = fetch_import(normalized, username)
-        if job is None:
-            raise HTTPException(404, "파일 변환 작업을 찾을 수 없습니다.")
+        # Cancellation deletes the temporary lecture and clears its FK. Read
+        # ownership and visibility in one SQLite snapshot so a completed cleanup
+        # cannot turn a still-existing import job into a transient 404.
         with database.connect() as connection:
-            require_visible_import_lecture(connection, job)
-        return job
+            row = connection.execute(
+                "SELECT i.* FROM imports i WHERE i.id=? AND i.username=? AND "
+                "(i.lecture_id IS NULL OR EXISTS (SELECT 1 FROM lectures l "
+                "WHERE l.id=i.lecture_id AND l.username=i.username AND l.trashed_at IS NULL))",
+                (normalized, username),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(404, "파일 변환 작업을 찾을 수 없습니다.")
+        return dict(row)
 
     def require_visible_import_lecture(connection, job) -> None:
         if job["lecture_id"] is not None and connection.execute(
@@ -2834,6 +2862,11 @@ def create_app(
         except (OSError, RecordingCorruptError):
             log.exception("Could not remove private recording for lecture %s", lecture_id)
             archive_manager.wake()
+            return False
+        try:
+            if not material_service.purge_lecture(lecture_id, username):
+                return False
+        except (OSError, ValueError, sqlite3.Error):
             return False
         with database.connect() as connection:
             connection.execute(
@@ -3894,6 +3927,10 @@ def create_app(
                                 raw_segments=raw_segments, transcript_revision=transcript_revision)
     question_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
                              raw_segments=raw_segments, transcript_revision=transcript_revision)
+    install_courses(app, database, identity=data_identity, limiter=limiter)
+    material_service.install(app, identity=data_identity)
+    course_review_service.install(app, identity=data_identity, raw_segments=raw_segments,
+                                  transcript_revision=transcript_revision)
     study_note_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
                                raw_segments=raw_segments, transcript_revision=transcript_revision)
     lecture_tools.install(app, settings, database, recording_store, archive_manager,

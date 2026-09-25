@@ -2969,3 +2969,15 @@ button {
 
 .ai-result-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .ai-result-warning { margin: 20px 0 0; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: .82rem; line-height: 1.6; }
+
+/* Unified notes and explicitly grouped courses. */
+.course-dialog{width:min(960px,calc(100vw - 32px));max-height:90dvh;overflow:auto;padding:24px;border:1px solid #ddd4c8;border-radius:18px;background:#fffdf9;color:#292621}
+.course-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:20px 0;padding:16px;border:1px solid #e6dfd5;border-radius:12px}
+.course-form label{display:grid;gap:6px}.course-form h3{grid-column:1/-1;margin:0}
+.course-form input,.course-form select,#course-workspace>label select{max-width:100%;min-width:0;padding:10px;border:1px solid #cfc8bc;border-radius:8px;background:white;color:inherit}
+.course-form button{align-self:end}.course-session,.course-review-session,.study-material-details{margin:12px 0;padding:14px;border:1px solid #e6dfd5;border-radius:10px}
+.course-session>label{font-weight:600}.course-session input[type=checkbox]{margin-inline:10px}
+.course-reviews{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}.course-review-output{overflow-wrap:anywhere}.course-review-output details>summary,.study-material-details>summary{cursor:pointer;font-weight:600}
+#course-workspace>label{display:grid;gap:8px}.course-review-output p{white-space:pre-wrap}.course-review-output details>div{margin-top:16px}
+#legacy-ai-results>summary{cursor:pointer;font-weight:600}#legacy-ai-results>div,#legacy-ai-results>section{margin-inline:0}
+@media(max-width:600px){.course-dialog{padding:16px;width:calc(100vw - 20px)}.course-form{grid-template-columns:1fr}.course-dialog .study-actions{flex-wrap:wrap}}

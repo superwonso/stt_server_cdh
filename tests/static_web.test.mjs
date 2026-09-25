@@ -211,14 +211,18 @@ test('AI correction summary and translation start collapsed with native keyboard
   assert.match(css, /\.ai-tool-details > summary\s*\{[^}]*overflow-wrap:\s*anywhere/);
 });
 
-test('separate study-note details provide explicit generation safe Markdown and source-limit guidance', () => {
+test('unified study-note details preserve originals and disclose material transmission', () => {
   assert.match(html,/<details id="study-note-details">/);
   assert.match(html,/<button[^>]*id="study-note-create"[^>]*type="button"[^>]*disabled/);
   assert.match(html,/<button[^>]*id="study-note-refresh"/);
   assert.match(html,/<a[^>]*id="study-note-download"[^>]*download[^>]*hidden/);
-  assert.match(html,/원문·후보정본·번역본을 덮어쓰지 않습니다/);
-  assert.match(html,/오디오·수업 제목·계정 ID·개인 필기는 보내지 않습니다/);
-  assert.match(html,/다른 수업을 녹음하는 동안에도/);
+  assert.match(html,/상세 설명과 모든 원문 구간을 함께 보관합니다/);
+  assert.match(html,/확정 원문과 연결된 강의자료 텍스트를 NOVA/);
+  assert.match(html,/녹음은 보내지 않습니다/);
+  for (const id of ['correct-transcript','summarize-lecture','translate-lecture']) assert.match(html,new RegExp(`<button[^>]*id="${id}"[^>]*hidden`));
+  assert.match(html,/<details id="legacy-ai-results"[^>]*>/);
+  assert.match(html,/id="course-open"/);
+  assert.match(html,/id="study-material-details"/);
   assert.match(css,/\.lesson-study-note \.summary-actions > \* \{ width: 100%/);
 });
 

@@ -234,13 +234,15 @@ def _database_info(path: Path, cancel=None, deadline=float("inf")) -> dict:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         jobs = 0
-        for table in ("imports", "transcript_corrections", "lecture_summaries", "lecture_translations", "lecture_questions", "lecture_study_notes"):
+        for table in ("imports", "transcript_corrections", "lecture_summaries", "lecture_translations", "lecture_questions", "lecture_study_notes", "course_review_jobs", "study_materials"):
             if table in tables:
                 jobs += connection.execute(f"SELECT COUNT(*) FROM {table} WHERE status IN ('uploading','queued','processing')").fetchone()[0]
         if "chunks" in tables:
             jobs += connection.execute("SELECT COUNT(*) FROM chunks WHERE status='pending'").fetchone()[0]
         unfinalized = connection.execute("SELECT COUNT(*) FROM lectures WHERE recording_finalized=0").fetchone()[0] if "lectures" in tables else 0
+        materials = connection.execute("SELECT COUNT(*) FROM study_materials").fetchone()[0] if "study_materials" in tables else 0
     return {"accounts": accounts, "schema_version": version,
+            "material_files_omitted": materials,
             "unfinished_jobs": jobs, "unfinalized_lectures": unfinalized}
 
 
@@ -423,6 +425,7 @@ class RecoveryBackupManager:
                         "account_count": len(configured_accounts),
                         "accounts_sha256": hashlib.sha256(_json_bytes({"accounts": configured_accounts})).hexdigest(),
                         "warnings": {"unfinished_jobs": info["unfinished_jobs"],
+                                     "material_files_omitted": info["material_files_omitted"],
                                      "unfinalized_lectures": info["unfinalized_lectures"],
                                      "local_wav_files_omitted": _local_wav_count(self.settings.data_dir / "recordings", cancel, deadline)}}
             _write_new(workspace / "manifest.json", _json_bytes(manifest))
@@ -611,7 +614,7 @@ def verify_recovery_archive(archive: Path, identity: Path, *, age_binary: Path =
                 or type(manifest["schema_version"]) is not int or manifest["schema_version"] < 0
                 or type(manifest["account_count"]) is not int or not 2 <= manifest["account_count"] <= 10
                 or not isinstance(manifest["warnings"], dict)
-                or set(manifest["warnings"]) != {"unfinished_jobs", "unfinalized_lectures", "local_wav_files_omitted"}
+                or set(manifest["warnings"]) not in ({"unfinished_jobs", "unfinalized_lectures", "local_wav_files_omitted"}, {"unfinished_jobs", "unfinalized_lectures", "local_wav_files_omitted", "material_files_omitted"})
                 or any(type(value) is not int or not 0 <= value <= 10 ** 9 for value in manifest["warnings"].values())):
             raise BackupError("invalid_manifest")
         for alias, expected in manifest["files"].items():

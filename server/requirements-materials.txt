@@ -1,0 +1,4 @@
+# Local-only page/slide extraction; no cloud OCR, plugins, Office, or GPU runtime.
+pdfminer.six==20260107
+python-pptx==1.0.2
+defusedxml==0.7.1

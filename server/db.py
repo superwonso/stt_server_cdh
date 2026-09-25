@@ -659,5 +659,7 @@ class Database:
                     "INSERT INTO users(username) VALUES (?)",
                     [(name,) for name in self.accounts],
                 )
-            if schema_version < 22:
-                connection.execute("PRAGMA user_version = 22")
+            from .course_schema import migrate_course_schema
+            migrate_course_schema(connection)
+            if schema_version < 23:
+                connection.execute("PRAGMA user_version = 23")

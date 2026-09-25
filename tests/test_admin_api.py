@@ -261,7 +261,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(result["server"]["state"], "online")
         self.assertEqual(result["server"]["model"], "fake-model")
         self.assertEqual(result["queues"], {"transcription": 1, "imports": 1, "corrections": 1,
-                                          "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0})
+                                          "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0, "course_reviews": 0, "materials": 0})
         self.assertEqual(result["tunnel"]["state"], "online")
         self.assertEqual(
             set(result["tunnel"]),
@@ -284,7 +284,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(accounts["user-beta"]["activity"], "transcribing")
         self.assertEqual(
             accounts["user-beta"]["jobs"],
-            {"transcription": 1, "imports": 1, "corrections": 1, "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0},
+            {"transcription": 1, "imports": 1, "corrections": 1, "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0, "course_reviews": 0, "materials": 0},
         )
         self.assertNotEqual(accounts["user-beta"]["account_id"], "user-beta")
         self.assertEqual(result["recent_audit"], [])
@@ -325,7 +325,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         result = response.json()
         self.assertEqual(result["queues"], {"transcription": 0, "imports": 0, "corrections": 0,
-                                          "summaries": 1, "translations": 1, "questions": 0, "study_notes": 0})
+                                          "summaries": 1, "translations": 1, "questions": 0, "study_notes": 0, "course_reviews": 0, "materials": 0})
         accounts = {account["label"]: account for account in result["accounts"]}
         for username, expected in (("user-alpha", (0, 0)), ("user-beta", (1, 0)), ("user-gamma", (0, 1))):
             self.assertEqual((accounts[username]["jobs"]["summaries"], accounts[username]["jobs"]["translations"]), expected)
@@ -358,13 +358,66 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         result = response.json()
         self.assertEqual(result["queues"], {"transcription": 0, "imports": 0, "corrections": 0,
-                                          "summaries": 0, "translations": 0, "questions": 3, "study_notes": 0})
+                                          "summaries": 0, "translations": 0, "questions": 3, "study_notes": 0, "course_reviews": 0, "materials": 0})
         accounts = {account["label"]: account for account in result["accounts"]}
         for username, expected in (("user-alpha", 2), ("user-beta", 1), ("user-gamma", 0)):
             self.assertEqual(accounts[username]["jobs"]["questions"], expected)
             self.assertEqual(accounts[username]["is_self"], username == "user-alpha")
         for private in (*private_ids, "PRIVATE-QUESTION-TITLE", "PRIVATE-QUESTION-TEXT",
                         "PRIVATE-QUESTION-MODEL", "PRIVATE-QUESTION-ANSWER"):
+            self.assertNotIn(private, response.text)
+
+    def test_course_review_and_material_queues_are_owned_aggregate_only_and_exclude_terminal_jobs(self):
+        private_ids = []
+        with self.app.state.database.connect() as connection:
+            for owner, review_status, material_codes in (
+                ("user-alpha", "queued", ("awaiting_upload", "converting")),
+                ("user-beta", "processing", ("converting",)),
+                ("user-gamma", None, ()),
+            ):
+                course_id = str(uuid.uuid4())
+                private_ids.append(course_id)
+                connection.execute("INSERT INTO course_groups(id,username,name,normalized_name,semester,created_at,updated_at) "
+                                   "VALUES(?,?,'PRIVATE-COURSE-NAME','PRIVATE-COURSE-NAME','PRIVATE-SEMESTER','now','now')", (course_id, owner))
+                for status in ((review_status,) if review_status else ()) + ("completed", "failed"):
+                    job_id = str(uuid.uuid4()); private_ids.append(job_id)
+                    connection.execute(
+                        "INSERT INTO course_review_jobs(id,username,course_id,model,status,source_revision,source_manifest_json,"
+                        "document_json,created_at,updated_at,completed_at,error_code) VALUES(?,?,?,'PRIVATE-REVIEW-MODEL',?,?,"
+                        "'{\"private\":\"PRIVATE-SOURCE-MANIFEST\"}',?,'now','now',?,?)",
+                        (job_id, owner, course_id, status, "a" * 64,
+                         '{"private":"PRIVATE-REVIEW-DOCUMENT"}' if status == "completed" else None,
+                         "now" if status == "completed" else None, "PRIVATE-REVIEW-FAILURE" if status == "failed" else None))
+                material_states = [("processing", code) for code in material_codes] + [("ready", None), ("failed", "PRIVATE-MATERIAL-FAILURE")]
+                for status, error in material_states:
+                    material_id = str(uuid.uuid4()); private_ids.append(material_id)
+                    connection.execute(
+                        "INSERT INTO study_materials(id,username,course_id,filename,kind,size_bytes,uploaded_bytes,sha256,"
+                        "storage_name,status,document_json,error_code,created_at,updated_at) "
+                        "VALUES(?,?,?,'PRIVATE-MATERIAL-FILENAME.pdf','pdf',3,?,?,?, ?,?,?,'now','now')",
+                        (material_id, owner, course_id, 0 if error == "awaiting_upload" else 3, "b" * 64,
+                         material_id + ".pdf", status,
+                         '{"unit_count":1,"warnings":[],"markdown":"PRIVATE-MATERIAL-DOCUMENT"}' if status == "ready" else None, error))
+        for owner in ("user-beta", "user-gamma"):
+            self.assertEqual(self.client.get("/admin/overview", headers=self.headers(owner)).status_code, 403)
+        response = self.client.get("/admin/overview", headers=self.headers())
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["queues"], {"transcription": 0, "imports": 0, "corrections": 0,
+                         "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0,
+                         "course_reviews": 2, "materials": 3})
+        accounts = {row["label"]: row for row in result["accounts"]}
+        for owner, expected in (("user-alpha", (1, 2)), ("user-beta", (1, 1)), ("user-gamma", (0, 0))):
+            jobs = accounts[owner]["jobs"]
+            self.assertEqual((jobs["course_reviews"], jobs["materials"]), expected)
+            self.assertEqual(set(jobs), set(result["queues"]))
+            self.assertTrue(all(type(value) is int for value in jobs.values()))
+            self.assertNotIn("username", accounts[owner])
+            self.assertNotIn("password_hash", accounts[owner])
+        for private in (*private_ids, *self.tokens.values(), *(digest(token) for token in self.tokens.values()),
+                        "PRIVATE-COURSE-NAME", "PRIVATE-SEMESTER", "PRIVATE-REVIEW-MODEL", "PRIVATE-SOURCE-MANIFEST",
+                        "PRIVATE-REVIEW-DOCUMENT", "PRIVATE-REVIEW-FAILURE", "PRIVATE-MATERIAL-FILENAME",
+                        "PRIVATE-MATERIAL-DOCUMENT", "PRIVATE-MATERIAL-FAILURE"):
             self.assertNotIn(private, response.text)
 
     def test_study_note_counts_include_only_active_jobs_without_private_contents(self):

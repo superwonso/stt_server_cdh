@@ -119,6 +119,7 @@
         </select>
       </div>
       <div class="library-actions">
+        <button id="course-open" class="secondary-button" type="button" aria-haspopup="dialog">강의별 자료 · 복습</button>
         <button id="library-search-open" class="secondary-button" type="button" aria-haspopup="dialog">⌕ 모든 수업 검색</button>
         <button id="trash-open" class="text-button" type="button" aria-haspopup="dialog">휴지통 · 삭제 취소</button>
       </div>
@@ -339,7 +340,7 @@
           <section id="manual-panel" class="lesson-summary" aria-label="내 필기와 직접 수정" hidden>
             <details id="manual-details">
               <summary>내 필기 · 직접 수정</summary>
-              <p class="summary-privacy">원문·AI 후보정본은 그대로 보존합니다. 필기와 직접 수정본은 이 서버에만 저장되며 AI 요약·번역·수업 질문은 받아쓴 원문을 기준으로 합니다. 원문 구간 보기에서 각 구간의 직접 수정 버튼으로 내용을 고칠 수 있어요.</p>
+              <p class="summary-privacy">원문·AI 후보정본은 그대로 보존합니다. 필기와 직접 수정본은 이 서버에만 저장되며 수업 정리본·질문은 받아쓴 원문을 기준으로 합니다. 원문 구간 보기에서 각 구간의 직접 수정 버튼으로 내용을 고칠 수 있어요.</p>
               <div class="summary-actions"><button id="manual-refresh" class="secondary-button" type="button">필기 · 수정본 불러오기</button><button id="manual-history-all" class="secondary-button" type="button" disabled>수정 이력</button><button id="manual-download" class="secondary-button" type="button" disabled>↓ 필기 Markdown</button></div>
               <p id="manual-state" role="status" aria-live="polite"></p>
               <form id="manual-note-form" class="manual-note-form">
@@ -351,6 +352,22 @@
               <div id="manual-note-list" class="library-results"></div>
             </details>
           </section>
+          <section id="study-note-panel" class="lesson-summary lesson-study-note" aria-label="수업 정리본" hidden>
+            <details id="study-note-details">
+              <summary>수업 정리본 · 핵심 흐름부터 전체 상세 정리까지</summary>
+              <p class="summary-privacy">후보정·핵심 흐름·한국어 번역·주제별 상세 정리를 하나로 만듭니다. 짧은 요약 아래에 상세 설명과 모든 원문 구간을 함께 보관합니다. AI가 뜻을 정확히 옮겼는지는 원문 대조에서 확인해 주세요.</p>
+              <p class="summary-privacy">생성할 때 확정 원문과 연결된 강의자료 텍스트를 NOVA(Mindlogic)로 보냅니다. 녹음은 보내지 않습니다. 숫자와 일부 개인정보는 가리지만 이름 등은 포함될 수 있습니다.</p>
+              <details id="study-material-details" class="study-material-details"><summary>PDF · PPTX 강의자료</summary><div id="study-materials"></div></details>
+              <div class="summary-actions">
+                <button id="study-note-create" class="secondary-button" type="button" disabled>수업 정리본 만들기</button>
+                <button id="study-note-refresh" class="secondary-button" type="button" disabled>상태 새로고침</button>
+                <a id="study-note-download" class="secondary-button study-note-download" download hidden>↓ 수업 정리본.md</a>
+              </div>
+              <p id="study-note-state" role="status" aria-live="polite"></p>
+              <div id="study-note-content"></div>
+            </details>
+          </section>
+          <details id="legacy-ai-results" class="lesson-summary"><summary>이전 AI 결과</summary><p class="summary-privacy">이전에 저장한 후보정·요약·번역 결과입니다. 새 결과는 수업 정리본에서 만듭니다.</p>
           <div id="correction-panel" class="correction-panel" data-state="idle" hidden>
             <details id="correction-details" class="ai-tool-details">
               <summary>AI 후보정</summary>
@@ -363,7 +380,7 @@
                     <small class="correction-privacy">후보정 시 받아쓴 텍스트만 NOVA(Mindlogic)로 전송하고 오디오는 보내지 않습니다. 모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호는 이 PC에서 먼저 가리지만, 이름 등 다른 정보는 포함될 수 있습니다.</small>
                   </div>
                 </div>
-                <button id="correct-transcript" class="secondary-button correction-button" type="button" disabled>AI 후보정 만들기</button>
+                <button id="correct-transcript" class="secondary-button correction-button" type="button" hidden disabled>이전 후보정 상태 확인</button>
               </div>
             </details>
           </div>
@@ -373,7 +390,7 @@
               <p id="summary-state" role="status" aria-live="polite">수업을 종료하고 저장한 뒤 요약할 수 있어요.</p>
               <p class="summary-privacy">요청할 때 받아쓴 원문 텍스트를 NOVA(Mindlogic)로 보내 요약합니다. 오디오와 수업 제목은 보내지 않으며, 일부 개인정보·숫자는 가린 뒤 처리합니다. 이름 등 다른 정보는 포함될 수 있습니다. AI 요약은 틀리거나 중요한 내용을 빠뜨릴 수 있으니 표시된 원문 시간을 함께 확인하세요.</p>
               <div class="summary-actions">
-                <button id="summarize-lecture" class="secondary-button" type="button" disabled>수업 요약 만들기</button>
+                <button id="summarize-lecture" class="secondary-button" type="button" hidden disabled>이전 요약 상태 확인</button>
                 <button id="summary-download" class="secondary-button" type="button" disabled>↓ 요약 Markdown</button>
               </div>
               <div id="summary-content"></div>
@@ -385,7 +402,7 @@
               <p id="translation-state" role="status" aria-live="polite">수업을 종료하고 저장한 뒤 번역할 수 있어요.</p>
               <p class="summary-privacy">수업 전체에서 추린 문맥과 앞뒤 문장을 함께 참고해 원문의 각 구간을 한국어로 번역합니다. 요청할 때 받아쓴 원문 텍스트만 NOVA(Mindlogic)로 보내며, 오디오·수업 제목·계정 ID는 보내지 않습니다. 숫자와 일부 개인정보는 가리지만 이름 등은 포함될 수 있습니다. 원문 인식 오류나 번역의 의미 오류는 원문·녹음과 비교해 확인하세요.</p>
               <div class="summary-actions">
-                <button id="translate-lecture" class="secondary-button" type="button" disabled>한국어 번역 만들기</button>
+                <button id="translate-lecture" class="secondary-button" type="button" hidden disabled>이전 번역 상태 확인</button>
                 <button id="translation-download" class="secondary-button" type="button" disabled>↓ 번역 Markdown</button>
               </div>
               <div id="translation-views" class="transcript-versions" role="group" aria-label="번역 표시 방식" hidden>
@@ -395,20 +412,7 @@
               <div id="translation-content"></div>
             </details>
           </section>
-          <section id="study-note-panel" class="lesson-summary lesson-study-note" aria-label="수업 정리본" hidden>
-            <details id="study-note-details">
-              <summary>수업 정리본.md · 원문 흐름을 따라 주제별 정리</summary>
-              <p class="summary-privacy">후보정·요약·번역과 별도로 만드는 한국어 수업 정리본입니다. 확정 원문 전체의 맥락을 참고해 영어는 한국어로 옮기고, 한글로 잘못 받아쓴 영어 표현도 문맥에 따라 복원합니다. 모든 원문 구간을 순서대로 묶어 주제·시간범위와 함께 보여 줍니다. 핵심용어·문맥 복원·불명확한 부분은 AI의 판단이므로 원문·녹음으로 확인하세요. 원문·후보정본·번역본을 덮어쓰지 않습니다.</p>
-              <p class="summary-privacy">생성을 누를 때 받아쓴 원문 텍스트를 NOVA(Mindlogic)로 보냅니다. 오디오·수업 제목·계정 ID·개인 필기는 보내지 않습니다. 숫자와 일부 개인정보는 가리지만 이름 등은 포함될 수 있습니다. 다른 수업을 녹음하는 동안에도 사용할 수 있어요.</p>
-              <div class="summary-actions">
-                <button id="study-note-create" class="secondary-button" type="button" disabled>수업 정리본 만들기</button>
-                <button id="study-note-refresh" class="secondary-button" type="button" disabled>상태 새로고침</button>
-                <a id="study-note-download" class="secondary-button study-note-download" download hidden>↓ 수업 정리본.md</a>
-              </div>
-              <p id="study-note-state" role="status" aria-live="polite"></p>
-              <div id="study-note-content"></div>
-            </details>
-          </section>
+          </details>
           <section id="question-panel" class="lesson-summary" aria-label="수업 내용에 질문하기" hidden>
             <details id="question-details">
               <summary>수업 내용에 질문하기</summary>
@@ -427,6 +431,12 @@
     </main>
   </div>
   </div>
+
+  <dialog id="course-dialog" class="course-dialog" aria-labelledby="course-dialog-title">
+    <div class="dialog-heading"><h2 id="course-dialog-title">강의별 자료 · 복습</h2><button id="course-close" class="secondary-button" type="button">닫기</button></div>
+    <p class="summary-privacy">강의명, 회차 제목, 수업 일시를 따로 관리합니다. 같은 강의로 연결한 수업과 공통 자료를 모아 복습하세요.</p>
+    <div id="course-workspace"></div>
+  </dialog>
 
   <dialog id="connection-dialog" class="connection-dialog" aria-labelledby="connection-title" aria-describedby="connection-description connection-status">
     <form id="connection-form" class="connection-form">
@@ -683,6 +693,8 @@
           <article><span>수업 요약</span><strong id="admin-summary-queue">0</strong><small>대기·처리</small></article>
           <article><span>수업 번역</span><strong id="admin-translation-queue">0</strong><small>대기·처리</small></article>
           <article><span>수업 정리본</span><strong id="admin-study-note-queue">0</strong><small>대기·처리</small></article>
+          <article><span>강의 복습</span><strong id="admin-course-review-queue">0</strong><small>대기·처리</small></article>
+          <article><span>강의자료</span><strong id="admin-material-queue">0</strong><small>전송·변환</small></article>
           <article><span>수업 질문</span><strong id="admin-question-queue">0</strong><small>대기·처리</small></article>
         </div>
       </section>

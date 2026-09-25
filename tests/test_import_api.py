@@ -9,6 +9,7 @@ import unittest
 import uuid
 import wave
 from unittest import mock
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -308,6 +309,114 @@ class ImportApiTests(unittest.TestCase):
         self.assertIsNone(cancelled["lecture_id"])
         raw = self.settings.data_dir / "imports" / "user-alpha" / f"{import_id}.upload"
         self.assertFalse(raw.exists())
+
+    def test_status_snapshot_survives_cancellation_cleanup_between_fetch_and_return(self):
+        # Hold real synthetic transcription, then force cancellation cleanup to
+        # commit after the owner SELECT fetched its row but before it returns.
+        # A second visibility connection used to turn this valid snapshot into
+        # a transient 404 once DELETE cleared imports.lecture_id via its FK.
+        self.engine.block = True
+        payload = wav_file(2)
+        created = self.create(payload)
+        self.assertEqual(created.status_code, 201, created.text)
+        import_id = created.json()["id"]
+        self.assertEqual(self.put(import_id, payload, 0).status_code, 200)
+        self.assertEqual(self.client.post(f"/imports/{import_id}/complete", headers=self.headers()).status_code, 200)
+        self.assertTrue(self.engine.entered.wait(5))
+        cancelling = self.client.post(f"/imports/{import_id}/cancel", headers=self.headers())
+        self.assertEqual(cancelling.status_code, 200)
+        self.assertEqual(cancelling.json()["status"], "processing")
+        self.assertTrue(cancelling.json()["cancel_requested"])
+        lecture_id = cancelling.json()["lecture_id"]
+        self.assertIsNotNone(lecture_id)
+        database = self.app.state.database
+        original_connect = database.connect
+        observed = []
+        outer = self
+
+        class InterleavedCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __getattr__(self, name):
+                return getattr(self.cursor, name)
+
+            def fetchone(self):
+                snapshot = self.cursor.fetchone()
+                if snapshot is not None and not observed:
+                    observed.append("snapshot_fetched")
+                    outer.assertEqual(snapshot["lecture_id"], lecture_id)
+                    outer.assertEqual(snapshot["status"], "processing")
+                    outer.engine.release.set()
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        # Use the original connection directly: the worker and
+                        # its real FK cleanup must finish, not mocked state.
+                        with original_connect() as connection:
+                            terminal = connection.execute(
+                                "SELECT status,lecture_id,raw_deleted FROM imports WHERE id=?", (import_id,)
+                            ).fetchone()
+                        if (terminal is not None and terminal["status"] == "cancelled"
+                                and terminal["lecture_id"] is None and terminal["raw_deleted"]):
+                            observed.append("cleanup_committed")
+                            break
+                        time.sleep(0.01)
+                    outer.assertEqual(observed, ["snapshot_fetched", "cleanup_committed"])
+                    observed.append("snapshot_returned")
+                return snapshot
+
+        class InterleavedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, sql, parameters=()):
+                cursor = self.connection.execute(sql, parameters)
+                normalized = " ".join(sql.upper().split())
+                if normalized.startswith("SELECT ") and "FROM IMPORTS " in normalized and tuple(parameters) == (import_id, "user-alpha"):
+                    return InterleavedCursor(cursor)
+                return cursor
+
+        @contextmanager
+        def interleaved_connect():
+            with original_connect() as connection:
+                yield InterleavedConnection(connection)
+
+        with mock.patch.object(database, "connect", interleaved_connect):
+            response = self.client.get(f"/imports/{import_id}", headers=self.headers())
+        self.assertEqual(observed, ["snapshot_fetched", "cleanup_committed", "snapshot_returned"])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["id"], import_id)
+        self.assertEqual(response.json()["status"], "processing")
+        self.assertTrue(response.json()["cancel_requested"])
+        # The next poll sees the completed cancellation and cleared FK.
+        current = self.client.get(f"/imports/{import_id}", headers=self.headers())
+        self.assertEqual(current.status_code, 200, current.text)
+        self.assertEqual(current.json()["status"], "cancelled")
+        self.assertIsNone(current.json()["lecture_id"])
+        self.assertTrue(current.json()["raw_deleted"])
+        self.assertEqual(self.client.get(f"/imports/{import_id}", headers=self.headers("user-beta")).status_code, 404)
+        with original_connect() as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM lectures WHERE id=?", (lecture_id,)).fetchone())
+        self.assertEqual(self.clova.calls, 0)
+
+    def test_import_visibility_snapshot_still_rejects_foreign_and_trashed_lectures(self):
+        import_id = self.create(wav_file()).json()["id"]
+        lecture_id = str(uuid.uuid4())
+        with self.app.state.database.connect() as connection:
+            connection.execute("INSERT INTO lectures(id,username,title,language,created_at) "
+                               "VALUES(?,'user-alpha','Synthetic visibility fixture','ko','2026-09-25T00:00:00Z')", (lecture_id,))
+            connection.execute("UPDATE imports SET lecture_id=? WHERE id=?", (lecture_id, import_id))
+        self.assertEqual(self.client.get(f"/imports/{import_id}", headers=self.headers()).status_code, 200)
+        self.assertEqual(self.client.get(f"/imports/{import_id}", headers=self.headers("user-beta")).status_code, 404)
+        with self.app.state.database.connect() as connection:
+            connection.execute("UPDATE lectures SET trashed_at='2026-09-25T00:00:00Z' WHERE id=?", (lecture_id,))
+        self.assertEqual(self.client.get(f"/imports/{import_id}", headers=self.headers()).status_code, 404)
+        self.assertEqual(self.client.get(f"/imports/{import_id}", headers=self.headers("user-beta")).status_code, 404)
+        self.assertEqual(self.engine.calls, 0)
+        self.assertEqual(self.clova.calls, 0)
 
     def test_graceful_stop_requeues_and_new_app_resumes_deterministic_chunks(self):
         self.app.state.stop_import_worker()

@@ -11,3 +11,5 @@ protobuf==5.29.6
 # Used directly for bounded, streaming decode of uploaded recordings.  Keep it
 # explicit even though qwen-omni-utils currently brings it in transitively.
 av==18.1.0
+# Bounded local PDF/PPTX lecture-material conversion.
+-r requirements-materials.txt

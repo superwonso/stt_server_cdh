@@ -19,6 +19,9 @@ def _require_idle(connection, lecture_id):
     # claims its job inside BEGIN IMMEDIATE too, so a claim and trash cannot
     # both succeed. Queued AI jobs are preserved, not silently cancelled or
     # unexpectedly restarted by restoring a lesson.
+    from .course_review import active_lecture_review
+    if active_lecture_review(connection, lecture_id):
+        raise HTTPException(409, "이 수업을 사용하는 강의 복습이 끝난 뒤 휴지통으로 옮기세요.")
     for table, states in (
         ("chunks", "'pending'"),
         ("imports", "'uploading','queued','processing'"),
@@ -27,6 +30,7 @@ def _require_idle(connection, lecture_id):
         ("lecture_translations", "'queued','processing'"),
         ("lecture_questions", "'queued','processing'"),
         ("lecture_study_notes", "'queued','processing'"),
+        ("study_materials", "'processing'"),
     ):
         if connection.execute(
             f"SELECT 1 FROM {table} WHERE lecture_id=? AND status IN ({states}) LIMIT 1",

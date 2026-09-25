@@ -59,6 +59,31 @@ def seed_question_jobs(database):
             )
 
 
+def seed_material_and_review_jobs(database):
+    """Two synthetic owners; active and terminal rows, never service execution."""
+    with database.connect() as connection:
+        for owner, active_review, upload_code in zip(ACCOUNTS, ("queued", "processing"), ("awaiting_upload", "converting")):
+            course_id = str(uuid.uuid4())
+            connection.execute("INSERT INTO course_groups(id,username,name,normalized_name,created_at,updated_at) "
+                               "VALUES(?,?,'synthetic private course','synthetic private course','now','now')", (course_id, owner))
+            for status in (active_review, "completed", "failed"):
+                connection.execute(
+                    "INSERT INTO course_review_jobs(id,username,course_id,model,status,source_revision,source_manifest_json,"
+                    "document_json,error_code,created_at,updated_at,completed_at) "
+                    "VALUES(?,?,?,'synthetic private model',?,?,'[]',?,?,'now','now',?)",
+                    (str(uuid.uuid4()), owner, course_id, status, "a" * 64,
+                     '{"private":"synthetic private review document"}' if status == "completed" else None,
+                     "interrupted" if status == "failed" else None, "now" if status == "completed" else None))
+            for status, code in (("processing", upload_code), ("ready", None), ("failed", "invalid_file")):
+                material_id = str(uuid.uuid4())
+                connection.execute(
+                    "INSERT INTO study_materials(id,username,course_id,filename,kind,size_bytes,uploaded_bytes,sha256,storage_name,"
+                    "status,document_json,error_code,created_at,updated_at) "
+                    "VALUES(?,?,?,'synthetic private material.pdf','pdf',3,?,?,?, ?,?,?,'now','now')",
+                    (material_id, owner, course_id, 0 if code == "awaiting_upload" else 3, "b" * 64, material_id + ".pdf", status,
+                     '{"unit_count":1,"warnings":[],"markdown":"synthetic private material document"}' if status == "ready" else None, code))
+
+
 class RecoveryQuestionInfoTests(unittest.TestCase):
     def test_study_note_backup_warnings_are_readonly_and_legacy_optional(self):
         with tempfile.TemporaryDirectory(prefix="stt-study-note-backup-test-") as temporary:
@@ -74,13 +99,46 @@ class RecoveryQuestionInfoTests(unittest.TestCase):
                                        (identifier,owner,str(uuid.uuid4()),"a"*64,status))
                 before = [tuple(row) for row in connection.execute("SELECT * FROM lecture_study_notes ORDER BY lecture_id")]
             result = _database_info(database.path)
-            self.assertEqual(result["schema_version"],22)
+            self.assertEqual(result["schema_version"],23)
             self.assertEqual(result["unfinished_jobs"],2)
             with database.connect() as connection:
                 self.assertEqual([tuple(row) for row in connection.execute("SELECT * FROM lecture_study_notes ORDER BY lecture_id")],before)
                 connection.execute("DROP TABLE lecture_study_notes")
                 connection.execute("PRAGMA user_version=19")
             self.assertEqual(_database_info(database.path)["unfinished_jobs"],0)
+
+    def test_material_and_course_review_counts_are_readonly_and_exclude_terminal_jobs(self):
+        with tempfile.TemporaryDirectory(prefix="stt-material-backup-info-") as temporary:
+            database = Database(Path(temporary) / "private" / "database.sqlite3", ACCOUNTS)
+            database.initialize()
+            seed_material_and_review_jobs(database)
+            with database.connect() as connection:
+                before = {table: [tuple(row) for row in connection.execute("SELECT * FROM " + table + " ORDER BY id")]
+                          for table in ("course_groups", "course_review_jobs", "study_materials")}
+            result = _database_info(database.path)
+            self.assertEqual(result["unfinished_jobs"], 4)
+            self.assertEqual(result["material_files_omitted"], 6)
+            self.assertEqual(result["unfinalized_lectures"], 0)
+            for private in ("synthetic private course", "synthetic private model", "synthetic private review document",
+                            "synthetic private material.pdf", "synthetic private material document"):
+                self.assertNotIn(private, json.dumps(result))
+            with database.connect() as connection:
+                after = {table: [tuple(row) for row in connection.execute("SELECT * FROM " + table + " ORDER BY id")]
+                         for table in before}
+            self.assertEqual(after, before)
+
+    def test_legacy_database_without_material_or_course_tables_reports_zero_new_jobs(self):
+        with tempfile.TemporaryDirectory(prefix="stt-material-legacy-backup-") as temporary:
+            database = Database(Path(temporary) / "private" / "database.sqlite3", ACCOUNTS)
+            database.initialize()
+            with database.connect() as connection:
+                for table in ("course_review_sources", "course_review_jobs", "study_materials", "course_sessions", "course_groups"):
+                    connection.execute("DROP TABLE " + table)
+                connection.execute("PRAGMA user_version=22")
+            result = _database_info(database.path)
+            self.assertEqual(result["schema_version"], 22)
+            self.assertEqual(result["unfinished_jobs"], 0)
+            self.assertEqual(result["material_files_omitted"], 0)
 
     def test_unfinished_question_warning_counts_only_queued_and_processing_without_changes(self):
         with tempfile.TemporaryDirectory(prefix="stt-question-backup-test-") as temporary:
@@ -220,6 +278,57 @@ class RecoveryBackupTests(unittest.TestCase):
         self.assertNotIn("synthetic private question", manifest_text)
         with closing(sqlite3.connect(directory / "database.sqlite3")) as connection, connection:
             self.assertEqual(connection.execute("SELECT * FROM lecture_questions ORDER BY id").fetchall(), before)
+
+    def test_material_and_course_jobs_survive_encrypted_roundtrip_with_explicit_original_omission(self):
+        seed_material_and_review_jobs(self.database)
+        tables = ("course_groups", "course_review_jobs", "study_materials")
+        with self.database.connect() as connection:
+            before = {table: [tuple(row) for row in connection.execute("SELECT * FROM " + table + " ORDER BY id")]
+                      for table in tables}
+            names = [row[0] for row in connection.execute("SELECT storage_name FROM study_materials")]
+        original_paths = [self.settings.data_dir / "study-materials" / name for name in names]
+        for path in original_paths:
+            private_write(path, b"synthetic original material excluded")
+        original_bytes = [path.read_bytes() for path in original_paths]
+        result = self.verify(self.exported())
+        self.assertEqual(result["warnings"]["unfinished_jobs"], 4)
+        self.assertEqual(result["warnings"]["material_files_omitted"], 6)
+        self.assertEqual(result["file_count"], 6)
+        directory = Path(result["directory"])
+        self.assertFalse(any(path.suffix.lower() in {".pdf", ".pptx"} for path in directory.rglob("*")))
+        manifest = (directory / "manifest.json").read_text()
+        for private in (*names, *ACCOUNTS, "synthetic private course", "synthetic private model",
+                        "synthetic private review document", "synthetic private material document", str(self.root)):
+            self.assertNotIn(private, manifest)
+        with closing(sqlite3.connect(directory / "database.sqlite3")) as connection:
+            after = {table: connection.execute("SELECT * FROM " + table + " ORDER BY id").fetchall() for table in tables}
+            self.assertEqual(after, before)
+        self.assertEqual([path.read_bytes() for path in original_paths], original_bytes)
+
+    def test_legacy_manifest_without_material_omission_field_remains_readable(self):
+        result = self.verify(self.exported())
+        directory = Path(result["directory"])
+        manifest = json.loads((directory / "manifest.json").read_bytes())
+        self.assertEqual(manifest["warnings"].pop("material_files_omitted"), 0)
+        members = [(path.name, json.dumps(manifest).encode() if path.name == "manifest.json" else path.read_bytes(), tarfile.REGTYPE)
+                   for path in directory.iterdir()]
+        restored = self.verify(self.encrypt_tar(members))
+        self.assertTrue(restored["verified"])
+        self.assertEqual(set(restored["warnings"]), {"unfinished_jobs", "unfinalized_lectures", "local_wav_files_omitted"})
+
+    def test_material_omission_manifest_count_rejects_negative_boolean_and_private_extra_fields(self):
+        result = self.verify(self.exported())
+        directory = Path(result["directory"])
+        original = json.loads((directory / "manifest.json").read_bytes())
+        for changed in ({"material_files_omitted": -1}, {"material_files_omitted": True},
+                        {"material_files_omitted": "6"}, {"material_files_omitted": 10 ** 9 + 1},
+                        {"material_owner": "synthetic private account"}):
+            with self.subTest(changed=changed):
+                manifest = {**original, "warnings": {**original["warnings"], **changed}}
+                members = [(path.name, json.dumps(manifest).encode() if path.name == "manifest.json" else path.read_bytes(), tarfile.REGTYPE)
+                           for path in directory.iterdir()]
+                with self.assertRaisesRegex(BackupError, "invalid_manifest"):
+                    self.verify(self.encrypt_tar(members))
 
     def test_wrong_key_and_tamper_never_expose_a_partially_decrypted_restore(self):
         archive = self.exported()

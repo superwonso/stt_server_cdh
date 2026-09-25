@@ -1,3 +1,6 @@
+import { renderUnifiedStudyNote } from './unified-note-view.js';
+import { createMaterialPanel } from './study-materials.js';
+import { createCourseWorkspace } from './course-workspace.js';
 import { MicrophoneCapture } from './audio.js';
 import { validateRecordingSelection, isFileDrag, recordingFileFromDrop } from './recording-file-selection.js';
 import { buildRecoverableLocalAudioExports, mergeLocalAudioExportParts, validateLocalWav } from './local-audio-export.js';
@@ -1180,6 +1183,17 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
   try {
     const response = await fetch(baseUrl + path, {...requestOptions, headers, signal:controller.signal, credentials:'omit', cache:'no-store', referrerPolicy:'no-referrer'});
     if (response.ok && responseType === 'recording-clip') return await readRecordingClip(response);
+    if (response.ok && responseType === 'material-file') {
+      const mime=(response.headers.get('Content-Type')||'').split(';')[0].toLowerCase();
+      const allowed=['application/octet-stream','application/pdf','application/vnd.openxmlformats-officedocument.presentationml.presentation'];
+      if(!allowed.includes(mime))throw new Error('자료 파일 형식을 확인하지 못했습니다.');
+      const reader=response.body?.getReader();if(!reader)throw new Error('자료 다운로드를 확인하지 못했습니다.');
+      const parts=[];let size=0;
+      try { while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;
+        if(size>32*1024*1024)throw new Error('자료 다운로드 크기를 초과했습니다.');parts.push(value);}
+      }finally{await reader.cancel();reader.releaseLock();}
+      if(!size)throw new Error('자료 파일이 비어 있습니다.');return new Blob(parts,{type:mime});
+    }
     const data = response.status === 204 ? null : await response.json().catch(() => null);
     if (!response.ok) {
       let message = typeof data?.detail === 'string' ? data.detail : `요청을 처리하지 못했습니다 (${response.status}).`;
@@ -1999,7 +2013,7 @@ async function refreshLectures() {
   const captureSummary = refreshed.find(lecture => lecture.id === captureSession?.lecture?.id);
   for (const [target,summary] of [[current,selectedSummary],[captureSession?.lecture,captureSummary]]) {
     if (!target || !summary) continue;
-    for (const key of ['display_title','course','semester','metadata_revision']) {
+    for (const key of ['display_title','course','semester','metadata_revision','course_id','course_name','session_name','session_at','session_revision']) {
       if (key in summary) target[key] = summary[key];
     }
     for (const key of ['continuation_of','continuations']) if (key in summary) target[key] = summary[key];
@@ -2294,8 +2308,8 @@ function renderHistory() {
   renderMetadataSuggestions();
   const dateCounts = new Map();
   for (const lecture of lectures) {
-    const key = dateKey(lecture.created_at);
-    const entry = dateCounts.get(key) || {count:0,label:dateLabel(lecture.created_at)};
+    const key = dateKey(lecture.session_at || lecture.created_at);
+    const entry = dateCounts.get(key) || {count:0,label:dateLabel(lecture.session_at || lecture.created_at)};
     entry.count += 1; dateCounts.set(key,entry);
   }
   if (lectureDateFilter && !dateCounts.has(lectureDateFilter)) lectureDateFilter = '';
@@ -2307,7 +2321,7 @@ function renderHistory() {
   }
   dateSelect.value = lectureDateFilter;
 
-  const visible = lectureDateFilter ? lectures.filter(lecture => dateKey(lecture.created_at) === lectureDateFilter) : lectures;
+  const visible = lectureDateFilter ? lectures.filter(lecture => dateKey(lecture.session_at || lecture.created_at) === lectureDateFilter) : lectures;
   const filtered = !!lectureDateFilter;
   $('lecture-count').textContent = filtered ? `${visible.length}/${lectures.length}` : lectures.length;
   $('lecture-count').ariaLabel = filtered ? `선택한 조건의 수업 ${visible.length}개, 전체 ${lectures.length}개` : `저장된 수업 ${lectures.length}개`;
@@ -2320,7 +2334,7 @@ function renderHistory() {
   }
   const groups = new Map();
   for (const lecture of visible) {
-    const key = dateKey(lecture.created_at);
+    const key = dateKey(lecture.session_at || lecture.created_at);
     if (!groups.has(key)) groups.set(key,[]);
     groups.get(key).push(lecture);
   }
@@ -2336,7 +2350,7 @@ function renderHistory() {
       button.disabled = historyNavigationBusy();
       if (current?.id === lecture.id) button.setAttribute('aria-current','page');
       const title = document.createElement('strong'); title.textContent = lectureTitle(lecture);
-      const date = document.createElement('span'); date.textContent = dateLabel(lecture.created_at); button.append(title,date);
+      const date = document.createElement('span'); date.textContent = dateLabel(lecture.session_at || lecture.created_at); button.append(title,date);
       if (lecture.course || lecture.semester) {
         const classification = document.createElement('span'); classification.textContent = [lecture.semester,lecture.course].filter(Boolean).join(' · ');
         button.append(classification);
@@ -2724,6 +2738,7 @@ function clearCorrectionPoll() {
   correctionPollTimer = null;
 }
 function resetCorrectionState(lectureId = '') {
+  resetLearningWorkspace();
   $('correction-details').open = false;
   resetStudyNoteView();
   resetQuestionWorkspace();
@@ -3303,7 +3318,7 @@ function adminActivityLabel(account) {
   })[account?.activity] || (account?.online ? '접속 중' : '오프라인');
 }
 function accountJobLabel(jobs) {
-  const values = [jobs?.transcription,jobs?.imports,jobs?.corrections,jobs?.summaries,jobs?.translations,jobs?.questions,jobs?.study_notes].map(value => {
+  const values = [jobs?.transcription,jobs?.imports,jobs?.corrections,jobs?.summaries,jobs?.translations,jobs?.questions,jobs?.study_notes,jobs?.course_reviews,jobs?.materials].map(value => {
     if (typeof value === 'number') return Math.max(0,Math.floor(value));
     return Math.max(0,Math.floor(Number(value?.queued) || 0)) + Math.max(0,Math.floor(Number(value?.processing) || 0));
   });
@@ -3457,6 +3472,8 @@ function renderAdminOverview() {
   $('admin-correction-queue').textContent = queueLabel(queues.corrections);
   $('admin-summary-queue').textContent = queueLabel(queues.summaries);
   $('admin-translation-queue').textContent = queueLabel(queues.translations);
+  $('admin-course-review-queue').textContent = Object.hasOwn(queues,'course_reviews') ? queueLabel(queues.course_reviews) : '서버 미지원';
+  $('admin-material-queue').textContent = Object.hasOwn(queues,'materials') ? queueLabel(queues.materials) : '서버 미지원';
   $('admin-study-note-queue').textContent = Object.hasOwn(queues,'study_notes') ? queueLabel(queues.study_notes) : '서버 미지원';
   $('admin-question-queue').textContent = queueLabel(queues.questions);
 
@@ -4672,6 +4689,13 @@ function renderStudyNoteDocument(view) {
   if (view.rendered === doc) return;
   view.rendered = doc;
   const container = $('study-note-content'); container.replaceChildren();
+  if (doc?.format === 'unified_study_note') {
+    renderUnifiedStudyNote(doc,container,{onSeek(start,sourceIds){
+      if(!studyNoteIsCurrent(view))return;
+      correctionView='raw';reviewView.query='';$('transcript-search').value='';renderCurrent();
+      revealTranscriptSegment(sourceIds[0]);if(canPlayRecording())void playRecordingClip(start);
+    }});return;
+  }
   if (doc?.format === 'draft') {
     const section = document.createElement('section'); section.className = 'study-note-paragraph';
     const body = document.createElement('p'); body.className = 'study-note-text';
@@ -4728,16 +4752,17 @@ function renderStudyNote() {
       : studyNotePending(view) ? (view.polls >= 200
         ? '자동 상태 확인을 마쳤지만 서버의 작업은 계속 진행됩니다. 상태 새로고침으로 다시 확인하세요.'
         : '서버에서 수업 정리본을 만들고 있어요. 다른 수업의 녹음은 계속할 수 있습니다.')
-        : completed ? (view.row.document?.format === 'draft'
+        : completed && view.row.stale ? '수업 또는 자료가 바뀌었습니다. 아래 이전 결과를 유지하며, 새 정리본을 요청할 수 있어요.'
+          : completed ? (view.row.document?.format === 'draft'
           ? '정리본을 저장했어요. 아래에서 읽거나 Markdown으로 내려받을 수 있습니다.'
           : '정리본을 만들었어요. 원문 시간과 불명확한 부분을 확인한 뒤 Markdown으로 저장하세요.')
           : !view.loaded ? '정리본 상태를 불러오면 생성할 수 있어요. 아직 생성 요청을 보내지 않았습니다.'
             : !view.configured ? '운영자의 수업 정리본 API 설정이 필요해요.'
               : view.row?.status === 'failed' ? (view.row.error || '정리본을 만들지 못했어요. 상태 확인 후 명시적으로 다시 요청할 수 있습니다.')
-                : '원문·후보정·번역을 유지하고 별도의 주제별 수업 정리본을 만듭니다.');
+                : '핵심 흐름·상세 정리·한국어 번역·원문 대조를 하나의 수업 정리본으로 만듭니다.');
   $('study-note-create').disabled = !eligible || !view.loaded || !view.configured || view.busy
-    || view.unsupported || !!view.error || studyNotePending(view) || completed;
-  $('study-note-create').textContent = view.row?.status === 'failed' ? '정리본 다시 만들기' : completed ? '정리본 생성 완료' : '수업 정리본 만들기';
+    || view.unsupported || !!view.error || studyNotePending(view) || (completed && !view.row.stale);
+  $('study-note-create').textContent = completed && view.row.stale ? '변경된 내용으로 정리본 만들기' : view.row?.status === 'failed' ? '정리본 다시 만들기' : completed ? '정리본 생성 완료' : '수업 정리본 만들기';
   $('study-note-refresh').disabled = !eligible || view.busy;
   if (completed && studyNoteIsCurrent(view)) {
     if (view.urlText !== view.row.markdown) {
@@ -4763,7 +4788,7 @@ async function fetchStudyNote(create = false, manual = false) {
   renderStudyNote(); const view = studyNoteView;
   if (!studyNoteEligible() || view.busy || !$('study-note-details').open) return;
   if (create && (!view.loaded || !view.configured || view.error || view.unsupported
-      || studyNotePending(view) || view.row?.status === 'completed')) return;
+      || studyNotePending(view) || (view.row?.status === 'completed' && !view.row.stale))) return;
   const source = studyNoteSourceSnapshot(current);
   if (source === null) { view.error = '정리본에 사용할 확정 원문의 형식이나 크기를 확인하지 못했습니다.'; renderStudyNote(); return; }
   view.source = source;
@@ -4809,6 +4834,32 @@ $('study-note-download').onclick = event => {
   }
 };
 
+let courseWorkspace=null,studyMaterialPanel=null;
+function learningScopeKey(){return JSON.stringify([user,token,apiUrl]);}
+function resetLearningWorkspace(){
+  courseWorkspace?.reset();studyMaterialPanel?.reset();
+  if($('course-dialog').open)$('course-dialog').close();
+  $('study-material-details').open=false;
+}
+function closeCourseWorkspace(){courseWorkspace?.reset();$('course-dialog').close();}
+$('course-open').onclick=()=>{
+  if(!user||!token||expireActiveAuthSession())return;
+  if(!courseWorkspace)courseWorkspace=createCourseWorkspace({container:$('course-workspace'),api,scopeKey:learningScopeKey,
+    getCurrent:()=>current,onSessionChanged(row){
+      if(current?.id===row.lecture_id)Object.assign(current,row);
+      const stored=lectures.find(item=>item.id===row.lecture_id);if(stored)Object.assign(stored,row);
+      renderCurrent();renderHistory();
+    },onSelectLecture:async id=>{closeCourseWorkspace();await selectLecture({id});}});
+  $('course-dialog').showModal();void courseWorkspace.open();
+};
+$('course-close').onclick=closeCourseWorkspace;$('course-dialog').oncancel=closeCourseWorkspace;
+$('study-material-details').ontoggle=()=>{
+  if(!$('study-material-details').open||!current||!token){studyMaterialPanel?.reset();return;}
+  if(!studyMaterialPanel)studyMaterialPanel=createMaterialPanel({container:$('study-materials'),api,scopeKey:learningScopeKey,
+    onChanged(){if($('study-note-details').open)void fetchStudyNote(false,true);}});
+  studyMaterialPanel.setScope({kind:'lecture',id:current.id});
+};
+
 function renderCurrent() {
   const exportIdentity = JSON.stringify([user,token,apiUrl]);
   if (textExportIdentity !== exportIdentity) { clearTextExports(); textExportIdentity = exportIdentity; }
@@ -4818,7 +4869,7 @@ function renderCurrent() {
     resetCorrectionState(lectureId);
     if (current?.correction) correction = correctionPayload(current.correction);
   }
-  $('note-date').textContent = dateLabel(current?.created_at || new Date());
+  $('note-date').textContent = current?.session_at ? new Date(current.session_at).toLocaleString('ko-KR') : dateLabel(current?.created_at || new Date());
   $('view-label').textContent = current ? lectureTitle(current) : '새 수업';
   document.querySelector('.note-heading h1').textContent = current ? lectureTitle(current) : '오늘의 배움을 담아보세요.';
   if (current) {
@@ -6108,7 +6159,7 @@ async function startRecording({continuation = null} = {}) {
   captureWarning = '';
   inputUnavailable = false; inputReconnectNeeded = false; inputUnavailableMessage = '';
   sampleSeconds = 0; elapsedActiveMs = 0; elapsedStartedAt = 0; $('elapsed').textContent = '00:00'; updateControls();
-  const title = $('lecture-title').value.trim() || `${dateLabel(new Date())} 수업`;
+  const title = $('lecture-title').value.trim() || '수업';
   const language = $('language').value === 'auto' ? null : $('language').value;
   const createdAt = continuation ? [...liveSessions.values()].reduce((latest,previous) => previous.owner === user
     && Number.isSafeInteger(previous.createdAt) ? Math.max(latest,previous.createdAt + 1) : latest,Date.now()) : Date.now();

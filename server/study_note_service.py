@@ -14,9 +14,10 @@ from datetime import datetime, timezone
 from fastapi import Depends, HTTPException
 
 from .postprocessor import PostprocessingError
+from .material_service import material_snapshot
 from .study_notes import (
     StudyNoteError, coerce_study_note_document, study_note_markdown, validate_study_note_document,
-    validate_study_note_source,
+    validate_study_note_source, coerce_unified_study_note_document, validate_supporting_sources,
 )
 
 
@@ -115,8 +116,10 @@ class StudyNoteService:
                 else:
                     raw = self.raw_segments(connection, lecture_id)
                     revision = self.revision(raw)
+                    materials = material_snapshot(connection, user["username"], [lecture_id])
                     if (existing is not None and existing["status"] == "completed"
-                            and existing["raw_revision"] == revision and existing["model"] == self.model):
+                            and existing["raw_revision"] == revision and existing["model"] == self.model
+                            and existing["format_version"] == 2 and existing["material_revision"] == materials["revision"]):
                         result = self.result(existing, connection, lecture=lecture, raw=raw)
                         if result["status"] == "completed":
                             return self.envelope(result)
@@ -126,6 +129,7 @@ class StudyNoteService:
                         raise HTTPException(409, "정리본을 만들 받아쓰기 내용이 없습니다.")
                     try:
                         validate_study_note_source(raw)
+                        validate_supporting_sources(materials["sources"])
                     except StudyNoteError as error:
                         safe = StudyNoteError(error.code)
                         raise HTTPException(413 if safe.code == "source_too_large" else 422, str(safe)) from None
@@ -138,12 +142,14 @@ class StudyNoteService:
                         raise HTTPException(429, "정리본 요청이 많습니다. 잠시 후 다시 시도하세요.")
                     now = _now()
                     connection.execute(
-                        "INSERT INTO lecture_study_notes(lecture_id,username,job_id,raw_revision,status,model,created_at,updated_at) "
-                        "VALUES(?,?,?,?,'queued',?,?,?) ON CONFLICT(lecture_id) DO UPDATE SET "
+                        "INSERT INTO lecture_study_notes(lecture_id,username,job_id,raw_revision,status,model,created_at,updated_at,material_revision,source_manifest_json,format_version) "
+                        "VALUES(?,?,?,?,'queued',?,?,?,?,?,2) ON CONFLICT(lecture_id) DO UPDATE SET "
                         "job_id=excluded.job_id,raw_revision=excluded.raw_revision,status='queued',model=excluded.model,"
                         "document_json=NULL,error_code=NULL,error=NULL,attempts=0,created_at=excluded.created_at,"
-                        "updated_at=excluded.updated_at,completed_at=NULL",
-                        (lecture_id, user["username"], str(uuid.uuid4()), revision, self.model, now, now),
+                        "updated_at=excluded.updated_at,completed_at=NULL,material_revision=excluded.material_revision,"
+                        "source_manifest_json=excluded.source_manifest_json,format_version=excluded.format_version",
+                        (lecture_id, user["username"], str(uuid.uuid4()), revision, self.model, now, now,
+                         materials["revision"], json.dumps(materials["manifest"], ensure_ascii=False)),
                     )
                     row = connection.execute("SELECT * FROM lecture_study_notes WHERE lecture_id=?", (lecture_id,)).fetchone()
                     result = self.result(row, connection, lecture=lecture)
@@ -159,7 +165,7 @@ class StudyNoteService:
         result = {key: row[key] for key in (
             "lecture_id", "status", "model", "error_code", "error", "created_at", "updated_at", "completed_at",
         )}
-        result.update(document=None, markdown=None)
+        result.update(document=None, markdown=None, stale=False, format_version=row["format_version"])
         if row["status"] != "completed" and (
                 row["status"] == "failed" or row["error_code"] is not None or row["error"] is not None):
             result["error_code"], result["error"] = _safe_error(row["error_code"])
@@ -175,7 +181,12 @@ class StudyNoteService:
                 markdown = study_note_markdown(document, raw)
                 if not isinstance(markdown, str):
                     raise ValueError("invalid markdown")
-                result.update(document=document, markdown=markdown)
+                try:
+                    latest_materials = material_snapshot(connection, row["username"], [row["lecture_id"]])
+                    stale = row["format_version"] < 2 or latest_materials["revision"] != row["material_revision"]
+                except HTTPException:
+                    stale = True
+                result.update(document=document, markdown=markdown, stale=stale)
             except Exception:
                 result.update(status="failed", error_code="invalid_saved_study_note", error=_ERRORS["invalid_saved_study_note"])
         return result
@@ -215,7 +226,14 @@ class StudyNoteService:
                 "AND l.trashed_at IS NULL AND l.recording_finalized=1",
                 (job["job_id"], job["lecture_id"], job["username"], job["raw_revision"], job["model"]),
             ).fetchone()
-            return row is None or not self._access(connection)
+            if row is None or not self._access(connection):
+                return True
+            if job["format_version"] == 2:
+                try:
+                    return material_snapshot(connection, job["username"], [job["lecture_id"]])["revision"] != job["material_revision"]
+                except (HTTPException, ValueError):
+                    return True
+            return False
 
     def process_next(self):
         if not self.process_lock.acquire(blocking=False):
@@ -246,7 +264,13 @@ class StudyNoteService:
                 return False
             job = dict(row)
             raw = self.raw_segments(connection, job["lecture_id"])
-            if self.revision(raw) != job["raw_revision"] or job["model"] != self.model:
+            try:
+                materials = material_snapshot(connection, job["username"], [job["lecture_id"]]) if job["format_version"] == 2 else {"sources": [], "revision": ""}
+            except HTTPException:
+                self._terminal(connection, job, "source_changed")
+                return True
+            if (self.revision(raw) != job["raw_revision"] or job["model"] != self.model
+                    or materials["revision"] != job["material_revision"]):
                 self._terminal(connection, job, "source_changed")
                 return True
             connection.execute("UPDATE lecture_study_notes SET status='processing',attempts=1,updated_at=? WHERE job_id=?",
@@ -255,9 +279,17 @@ class StudyNoteService:
         document, failure = None, "study_note_failed"
         try:
             if not self._interrupted(job):
-                output = self.engine.create(language=job["language"], segments=copy.deepcopy(raw),
-                                            interrupted=lambda: self._interrupted(job))
-                document = coerce_study_note_document(output.to_dict(), raw)
+                arguments = {"language": job["language"], "segments": copy.deepcopy(raw),
+                             "interrupted": lambda: self._interrupted(job)}
+                if job["format_version"] == 2:
+                    if hasattr(self.engine, "create_unified"):
+                        output = self.engine.create_unified(**arguments, supporting_sources=copy.deepcopy(materials["sources"]))
+                    else:
+                        output = self.engine.create(**arguments)
+                    document = coerce_unified_study_note_document(output.to_dict(), raw, supporting_sources=materials["sources"])
+                else:
+                    output = self.engine.create(**arguments)
+                    document = coerce_study_note_document(output.to_dict(), raw)
                 # Verify the promised download before publishing completion;
                 # usable drafts are saved with warnings, but a failed rendering
                 # or missing body must not be advertised as a downloadable note.
@@ -278,9 +310,13 @@ class StudyNoteService:
                     "SELECT 1 FROM lectures WHERE id=? AND username=? AND deleting=0 "
                     "AND trashed_at IS NULL AND recording_finalized=1", (job["lecture_id"], job["username"]),
                 ).fetchone()
+                try:
+                    material_changed = job["format_version"] == 2 and material_snapshot(connection, job["username"], [job["lecture_id"]])["revision"] != job["material_revision"]
+                except HTTPException:
+                    material_changed = True
                 if self.shutdown.is_set() or not self._access(connection):
                     self._terminal(connection, job, "interrupted")
-                elif (lecture is None or any(current[key] != job[key] for key in ("raw_revision", "model"))
+                elif (lecture is None or material_changed or any(current[key] != job[key] for key in ("raw_revision", "model", "material_revision"))
                       or self.revision(self.raw_segments(connection, job["lecture_id"])) != job["raw_revision"]):
                     self._terminal(connection, job, "source_changed")
                 elif document is None:
