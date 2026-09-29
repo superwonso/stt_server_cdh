@@ -211,3 +211,12 @@ AI 기능을 직접 요청하면 받아쓴 텍스트가 NOVA Gateway로 전송�
 ## Windows 네이티브 독립 시험
 
 Windows PowerShell 설치·시작·종료와 별도 가상 계정/DB 안내는 [WINDOWS.md](WINDOWS.md)를 참고하세요. 기존 Linux/ROCm 실행 절차는 유지합니다. Windows 통합 검증은 현재 Codex 샌드박스 복구 후 이어가야 하며 운영 전환 완료를 의미하지 않습니다.
+
+
+## 리마인더 · 같은 로그인으로 복습 계획
+
+로그인 뒤 상단 **여백 / 리마인더** 탭에서 전환합니다. 복습 일정·달력 이동·지난 수업 따라잡기·루틴·시험 회독표를 사용자별 서버에 저장합니다. 여백 녹음은 탭을 전환해도 계속됩니다. 시간표 이미지·글 인식에는 기존 NOVA의 **GPT-6 Luna**를 사용하며 결과를 확인한 뒤 저장합니다.
+
+- 기존 설치/시작 명령으로 실행하며 최초 시작에 추가형 DB schema24를 적용합니다.
+- 인식은 기존 `MINDLOGIC_API_KEY`, `MINDLOGIC_BASE_URL`, `MINDLOGIC_MODEL` 설정을 재사용합니다. 키가 없으면 직접 입력만 표시합니다. `REVIEW_TIMETABLE_RECOGNITION_ENABLED=0`으로 인식을 끌 수 있습니다.
+- `data/review-holidays/YYYY.json`과 `scripts/update-review-holidays.py`로 공휴일을 갱신합니다. 파일 검증·배포·API 재시작 순서와 API·데이터 구조는 [리마인더 운영 안내](docs/REMINDER.md)에 있습니다.
