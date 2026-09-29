@@ -968,6 +968,7 @@ button {
 
 .lesson-fields {
   display: grid;
+  align-items: start;
   padding: 21px 23px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
@@ -2983,18 +2984,37 @@ button {
 @media(max-width:600px){.course-dialog{padding:16px;width:calc(100vw - 20px)}.course-form{grid-template-columns:1fr}.course-dialog .study-actions{flex-wrap:wrap}}
 
 /* Authenticated services share one page and keep the audio workspace alive. */
+@media screen {
+/* Keep the logout track even while its button is hidden. */
+.site-header:has(.service-tabs:not([hidden])) {
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr) 68px auto;
+  column-gap:12px;
+}
+.site-header:has(.service-tabs:not([hidden])) .brand { grid-column:1; grid-row:1; }
+.site-header:has(.service-tabs:not([hidden])) .service-tabs { grid-column:2; grid-row:1; justify-self:center; margin-inline:0; }
+.site-header:has(.service-tabs:not([hidden])) #reminder-logout { grid-column:3; grid-row:1; justify-self:center; margin:0; }
+.site-header:has(.service-tabs:not([hidden])) .connection-button { grid-column:4; grid-row:1; justify-self:end; }
+}
 .service-tabs { display:flex; gap:4px; margin-inline:auto; padding:4px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
 .service-tabs button { min-height:40px; padding:8px 20px; border:0; border-radius:10px; background:transparent; color:var(--muted); font-weight:700; white-space:nowrap; }
 .service-tabs button[aria-selected="true"] { color:var(--surface); background:var(--forest-700); }
 .service-tabs button:focus-visible { outline:3px solid var(--forest-600); outline-offset:3px; }
 #service-recording { font-size:11px; }
 .workspace.show-reminder { display:block; }
-@media (max-width:700px) {
-  .site-header:has(.service-tabs:not([hidden])) { flex-wrap:wrap; gap:8px; height:auto; min-height:var(--header-height); }
-  .service-tabs { order:3; flex:1 1 100%; justify-content:center; }
+@media screen and (max-width:900px) {
+  .site-header:has(.service-tabs:not([hidden])) {
+    grid-template-columns:auto minmax(64px,1fr) auto;
+    grid-template-rows:var(--header-height) auto;
+    column-gap:6px;
+    height:auto;
+    padding-bottom:8px;
+  }
+  .site-header:has(.service-tabs:not([hidden])) .service-tabs { grid-column:1/-1; grid-row:2; justify-self:stretch; }
+  .site-header:has(.service-tabs:not([hidden])) #reminder-logout { grid-column:2; justify-self:end; margin:0; font-size:12px; }
+  .site-header:has(.service-tabs:not([hidden])) .connection-button { grid-column:3; max-width:min(150px,38vw); }
+  .service-tabs { justify-content:center; }
   .service-tabs button { flex:1; }
-  #reminder-logout { margin-left:auto; font-size:12px; }
-  .site-header:has(.service-tabs:not([hidden])) .connection-button { max-width:150px; }
 }
 
 /* Explicit timetable suggestions fill text fields without changing a lecture group. */
