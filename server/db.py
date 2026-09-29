@@ -661,5 +661,7 @@ class Database:
                 )
             from .course_schema import migrate_course_schema
             migrate_course_schema(connection)
-            if schema_version < 23:
-                connection.execute("PRAGMA user_version = 23")
+            from .review_schema import migrate_review_schema
+            migrate_review_schema(connection)
+            if schema_version < 24:
+                connection.execute("PRAGMA user_version = 24")
