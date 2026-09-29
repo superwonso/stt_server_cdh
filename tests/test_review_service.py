@@ -96,6 +96,59 @@ class ReviewServiceTests(unittest.TestCase):
         self.service.recognition = lambda: {"enabled": True}
         self.assertTrue(self.get()["recognition"]["enabled"])
 
+    def test_timetable_read_does_not_create_missing_profile(self):
+        with self.database.connect() as connection:
+            before = connection.execute("SELECT COUNT(*) FROM review_profiles WHERE username='beta'").fetchone()[0]
+        self.assertEqual(before, 0)
+        response = self.client.get("/review/timetable", headers=self.headers("beta"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"timetable": None})
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_profiles WHERE username='beta'").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_items WHERE username='beta'").fetchone()[0], 0)
+
+    def test_timetable_read_uses_only_owner_and_returns_no_review_metadata(self):
+        self.timetable()
+        self.item()
+        response = self.client.get("/review/timetable", headers=self.headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"timetable": {"classes": CLASS_ROWS, "from": "2026-09-29", "until": "2026-12-31"}})
+        other = self.client.get("/review/timetable?username=alpha", headers=self.headers("beta"))
+        self.assertEqual(other.status_code, 200)
+        self.assertEqual(other.json(), {"timetable": None})
+        self.act("timetable.disable")
+        self.assertEqual(self.client.get("/review/timetable", headers=self.headers()).json(), {"timetable": None})
+
+    def test_timetable_read_is_side_effect_free_even_when_generation_is_due(self):
+        self.timetable()
+        self.item()
+        self.days[0] = "2026-10-01"
+        tables = ("review_profiles", "review_items", "review_sources", "review_requests", "review_undo")
+
+        def snapshot():
+            with self.database.connect() as connection:
+                return {table: [tuple(row) for row in connection.execute("SELECT * FROM " + table + " ORDER BY rowid")] for table in tables}
+
+        before = snapshot()
+        with patch.object(self.service, "_load", side_effect=AssertionError("must not create a profile")), patch.object(self.service, "_generate", side_effect=AssertionError("must not generate items")):
+            for owner in ("alpha", "readonly"):
+                response = self.client.get("/review/timetable", headers=self.headers(owner))
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["timetable"]["classes"], CLASS_ROWS)
+        self.assertEqual(snapshot(), before)
+        # The fixture really has pending generation; only the existing full
+        # state route advances the cursor and adds the next class.
+        after_generation = self.get()
+        self.assertGreater(len(after_generation["items"]), len(self.state["items"]))
+
+    def test_timetable_read_keeps_authentication_and_data_access_guards(self):
+        self.assertEqual(self.client.get("/review/timetable").status_code, 401)
+        with self.database.connect() as connection:
+            connection.execute("UPDATE operational_state SET access_enabled=0")
+        self.assertEqual(self.client.get("/review/timetable", headers=self.headers()).status_code, 503)
+        self.assertEqual(self.client.get("/review/timetable", headers=self.headers("readonly")).status_code, 503)
+        self.assertEqual(self.client.get("/review/timetable").status_code, 401)
+
     def test_add_review_undo_and_reset_preserve_history(self):
         identifier = self.item()
         self.act("item.review", {"id": identifier})

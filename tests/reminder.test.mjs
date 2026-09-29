@@ -107,6 +107,13 @@ test('recognition is hidden without capability, explicit-only when enabled, and 
 test('periodic refresh and hide/reopen retain unsaved new item and timetable drafts',async t=>{
   const h=harness(t);await h.controller.open();field(section(h.container,'새로 공부한 내용'),'공부한 내용').value='아직 저장하지 않은 내용';await h.click('시간표 등록');const f=field(section(h.container,'수업 시간표'),'과목');f.value='편집 중';await f.event('input');await h.controller.refresh();assert.equal(f.value,'편집 중');assert.equal(field(section(h.container,'새로 공부한 내용'),'공부한 내용').value,'아직 저장하지 않은 내용');h.controller.hide();await h.controller.open();assert.equal(f.value,'편집 중');assert.equal(field(section(h.container,'새로 공부한 내용'),'공부한 내용').value,'아직 저장하지 않은 내용');
 });
+test('date chips update from the unsaved learned date and new server intervals without creating a record',async t=>{
+  const h=harness(t);await h.controller.open();const add=section(h.container,'새로 공부한 내용'),learned=field(add,'공부한 날');
+  learned.value='2026-09-20';await learned.event('input');const chips=()=>descendants(add).filter(node=>node.classList.contains('rv-preview-date')).map(node=>node.textContent);
+  assert.deepEqual(chips(),['9/21 (월)','9/23 (수)','9/27 (일)','10/4 (일)','10/20 (화)']);
+  h.state.settings.offsets=[0,2];h.state.revision++;await h.controller.refresh();assert.equal(learned.value,'2026-09-20');assert.deepEqual(chips(),['9/20 (일)','9/22 (화)']);
+  assert.equal(h.calls.filter(call=>call.method==='POST').length,0);assert.equal(h.state.items.length,0);
+});
 test('scope change aborts pending reads and removes the previous account form and records',async t=>{
   const state=baseState();state.items=[item()];const h=harness(t,state);await h.controller.open();field(section(h.container,'새로 공부한 내용'),'공부한 내용').value='이전 계정 초안';let release,signal;h.hook=call=>call.path==='/review/state'?new Promise(resolve=>{release=resolve;signal=call.signal;}):undefined;const pending=h.controller.refresh();await settle();h.controller.reset();h.key='different-owner';assert.equal(signal.aborted,true);release(state);await pending;assert.ok(!h.container.textContent.includes('합성 공부'));assert.equal(field(section(h.container,'새로 공부한 내용'),'공부한 내용').value,'');
 });

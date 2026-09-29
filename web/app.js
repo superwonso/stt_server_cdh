@@ -1,3 +1,4 @@
+import { createTimetableCatalog, fillTimetableSelect } from './timetable-subjects.js';
 import { createReminder } from './reminder.js';
 import { renderUnifiedStudyNote } from './unified-note-view.js';
 import { createMaterialPanel } from './study-materials.js';
@@ -1836,6 +1837,7 @@ async function enterAuthenticatedWorkspace(response, authServer, {notAfter = Inf
     $('auth-capture-stop').hidden = true;
     $('auth-screen').hidden = true; $('workspace').hidden = false; $('current-user').textContent = user;
     updateServiceTabs();
+    void timetableCatalog.load({force:true});
     document.querySelector('.user-avatar').textContent = user[0].toUpperCase();
     renderCurrent();
     if (current?.id && current.recording_finalized === true && current.segments?.length) void loadCorrection(current.id);
@@ -2392,7 +2394,9 @@ function renderMetadataSuggestions() {
   for (const field of ['course','semester']) {
     const suggestions = $(`${field}-options`);
     suggestions.replaceChildren();
-    for (const value of libraryOptions(lectures,field)) {
+    const values = libraryOptions(lectures,field);
+    if (field === 'course') values.push(...timetableCatalog.snapshot().subjects);
+    for (const value of [...new Set(values)].sort((a,b)=>a.localeCompare(b,'ko'))) {
       const suggestion = document.createElement('option'); suggestion.value = value; suggestions.append(suggestion);
     }
   }
@@ -2402,7 +2406,9 @@ $('metadata-open').onclick = async () => {
   if (!token || !current?.recording_finalized || historyNavigationBusy()) return;
   metadataAbort?.abort(); const controller = new AbortController(); metadataAbort = controller;
   const scope = libraryAuthScope(), id = current.id; metadataScope = scope; metadataRevision = null;
-  $('metadata-dialog').showModal(); $('metadata-save').disabled = true; $('metadata-state').textContent = '현재 분류를 확인하고 있어요…';
+  $('metadata-dialog').showModal();
+  void timetableCatalog.load({force:true}); renderTimetableSuggestions();
+  $('metadata-save').disabled = true; $('metadata-state').textContent = '현재 분류를 확인하고 있어요…';
   $('metadata-title').value = lectureTitle(current); $('metadata-course').value = current.course || ''; $('metadata-semester').value = current.semester || '';
   try {
     const data = await api(`/lectures/${id}/metadata`,{signal:controller.signal});
@@ -2412,7 +2418,7 @@ $('metadata-open').onclick = async () => {
     $('metadata-title').value = data.display_title; $('metadata-course').value = data.course; $('metadata-semester').value = data.semester;
     $('metadata-state').textContent = ''; $('metadata-save').disabled = false;
   } catch (error) { if (metadataIsCurrent(scope,id,controller)) $('metadata-state').textContent = errorText(error); }
-  finally { if (metadataAbort === controller) metadataAbort = null; }
+  finally { if (metadataAbort === controller) metadataAbort = null; updateTimetablePickerAvailability(); }
 };
 $('metadata-close').onclick = () => { metadataAbort?.abort(); metadataScope = ''; $('metadata-dialog').close(); };
 $('metadata-dialog').oncancel = () => { metadataAbort?.abort(); metadataScope = ''; };
@@ -4840,8 +4846,40 @@ $('study-note-download').onclick = event => {
 // Service navigation changes presentation only: microphone, transfer queues,
 // selected lecture and their recovery state remain owned by the existing app.
 let reminderWorkspace = null, activeService = 'yeobaek';
+const timetableCatalog = createTimetableCatalog({api,scopeKey:learningScopeKey,onChange:renderTimetableSuggestions});
+function updateTimetablePickerAvailability() {
+  const empty = !timetableCatalog.snapshot().subjects.length;
+  $('lecture-timetable').disabled = empty || !token || !!current || isBusy() || importIsActive();
+  $('metadata-timetable').disabled = empty || !token || metadataRevision === null || !!metadataAbort;
+}
+function renderTimetableSuggestions() {
+  const state = timetableCatalog.snapshot();
+  for (const id of ['lecture-timetable','metadata-timetable']) fillTimetableSelect($(id),document,state);
+  const help = state.status === 'unavailable' ? '직접 입력할 수 있어요. 목록 새로고침으로 다시 확인하세요.'
+    : state.subjects.length ? '시간표의 과목명을 골라 입력할 수 있어요. 직접 입력도 가능합니다.'
+    : state.status === 'loading' ? '내 시간표를 확인하고 있어요.' : '리마인더에 시간표를 등록하면 여기서도 과목을 고를 수 있어요.';
+  $('lecture-timetable-help').textContent = help; $('metadata-timetable-help').textContent = help;
+  updateTimetablePickerAvailability(); renderMetadataSuggestions();
+}
+function selectedTimetableSubject(select) {
+  return !select.disabled && timetableCatalog.snapshot().subjects.includes(select.value) ? select.value : '';
+}
+$('lecture-timetable').onchange = () => {
+  const subject = selectedTimetableSubject($('lecture-timetable'));
+  if (!subject || current || isBusy() || importIsActive() || !token) return;
+  $('lecture-title').value = subject; $('lecture-timetable').value = ''; $('lecture-title').focus();
+};
+$('metadata-timetable').onchange = () => {
+  const subject = selectedTimetableSubject($('metadata-timetable'));
+  if (!subject || metadataAbort || metadataRevision === null || !metadataIsCurrent(metadataScope,current?.id)) return;
+  $('metadata-course').value = subject; $('metadata-timetable').value = ''; $('metadata-course').focus();
+};
+for (const id of ['lecture-timetable-refresh','metadata-timetable-refresh']) $(id).onclick = () => {
+  if (token && user) void timetableCatalog.load({force:true});
+};
+
 function resetReminderWorkspace() {
-  reminderWorkspace?.reset(); activeService = 'yeobaek';
+  reminderWorkspace?.reset(); timetableCatalog.reset(); activeService = 'yeobaek';
   $('service-tabs').hidden = true; $('reminder-logout').hidden = true;
   $('reminder-panel').hidden = true; $('main-content').hidden = false;
   document.querySelector('.sidebar').hidden = false;
@@ -4872,7 +4910,7 @@ function selectService(name) {
   if (showingReminder) {
     if (!reminderWorkspace) reminderWorkspace = createReminder({container:$('reminder-panel'),api,scopeKey:learningScopeKey});
     void reminderWorkspace.open();
-  } else reminderWorkspace?.hide();
+  } else { reminderWorkspace?.hide(); void timetableCatalog.load({force:true}); }
 }
 $('service-yeobaek').onclick = () => selectService('yeobaek');
 $('service-reminder').onclick = () => selectService('reminder');
@@ -4896,6 +4934,7 @@ function closeCourseWorkspace(){courseWorkspace?.reset();$('course-dialog').clos
 $('course-open').onclick=()=>{
   if(!user||!token||expireActiveAuthSession())return;
   if(!courseWorkspace)courseWorkspace=createCourseWorkspace({container:$('course-workspace'),api,scopeKey:learningScopeKey,
+    getTimetableSubjects:()=>timetableCatalog.load({force:true}),
     getCurrent:()=>current,onSessionChanged(row){
       if(current?.id===row.lecture_id)Object.assign(current,row);
       const stored=lectures.find(item=>item.id===row.lecture_id);if(stored)Object.assign(stored,row);
@@ -5638,7 +5677,7 @@ $('local-audio-close').onclick = clearLocalAudioExports;
 $('local-audio-dialog').onclose = () => { if (!$('local-audio-dialog').open) clearLocalAudioExports(); };
 
 function updateControls() {
-  updateServiceTabs();
+  updateServiceTabs(); updateTimetablePickerAvailability();
   const busy = isBusy(), queued = queuedCount(), activeQueued=activePendingCount(), system = selectedCaptureSource() === 'system', activeImport = importIsActive();
   const audioDescription = recordingAudioUploadDescription();
   $('recording-upload-status').hidden = !audioDescription;

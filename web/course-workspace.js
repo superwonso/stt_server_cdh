@@ -1,3 +1,4 @@
+import { fillTimetableSelect } from './timetable-subjects.js';
 import { validateUnifiedStudyNoteDocument } from './study-notes.js';
 import { renderUnifiedStudyNote } from './unified-note-view.js';
 import { createMaterialPanel } from './study-materials.js';
@@ -17,7 +18,7 @@ export function validCoursePage(value) {
     && value.courses.every(row => id(row.id) && typeof row.name === 'string' && row.name.length <= 160
       && typeof row.semester === 'string' && Number.isSafeInteger(row.revision));
 }
-export function createCourseWorkspace({container,api,scopeKey,getCurrent,onSessionChanged,onSelectLecture}) {
+export function createCourseWorkspace({container,api,scopeKey,getCurrent,onSessionChanged,onSelectLecture,getTimetableSubjects=async()=>[]}) {
   const document = container.ownerDocument;
   let context = null, sequence = 0, timer = null, course = null, pending = null, activeReview = null;
   let createIntent=null;
@@ -32,7 +33,12 @@ export function createCourseWorkspace({container,api,scopeKey,getCurrent,onSessi
   const newName=input('text',80),semester=input('text',40);
   const createForm=el('form','','course-form');
   const createButton=el('button','강의 만들기','secondary-button');createButton.type='submit';
-  createForm.append(label('강의명',newName),label('학기 · 선택',semester),createButton);
+  const timetablePicker=el('select');timetablePicker.setAttribute('aria-label','시간표에서 강의명 선택');
+  const timetableHelp=el('small','직접 입력하거나 시간표의 과목명을 고를 수 있어요.','timetable-pick-help');
+  const timetableField=el('div','','course-timetable-field');timetableField.append(label('시간표 과목 · 선택',timetablePicker),timetableHelp);
+  timetablePicker.onchange=()=>{if(context&&valid(context)&&!timetablePicker.disabled&&timetableSubjects.includes(timetablePicker.value)){newName.value=timetablePicker.value;timetablePicker.value='';}};
+  let timetableSubjects=[];
+  createForm.append(label('강의명',newName),label('학기 · 선택',semester),createButton,timetableField);
   const assignment=el('form','','course-form'), assigned=el('select');
   const sessionName=input('text',120),sessionAt=input('datetime-local');
   const assignButton=el('button','현재 수업 정보 저장','secondary-button');assignButton.type='submit';
@@ -63,9 +69,11 @@ export function createCourseWorkspace({container,api,scopeKey,getCurrent,onSessi
     for(const url of urls)URL.revokeObjectURL(url);urls.clear();
     picker.replaceChildren();assigned.replaceChildren();sessions.replaceChildren();reviews.replaceChildren();output.replaceChildren();
     newName.value='';semester.value='';sessionName.value='';sessionAt.value='';status.textContent='';assignment.hidden=true;
+    timetableSubjects=[];fillTimetableSelect(timetablePicker,document,{subjects:[],status:'idle'});timetableHelp.textContent='직접 입력하거나 시간표의 과목명을 고를 수 있어요.';
   }
   async function open() {
     reset();context={key:scopeKey(),controller:new AbortController()};const captured=context;
+    void loadTimetableSubjects(captured);
     await action(async()=>{
       let page=0;
       do {const result=await request(`/courses?offset=${page}&limit=200`,{},captured);
@@ -77,6 +85,15 @@ export function createCourseWorkspace({container,api,scopeKey,getCurrent,onSessi
       if(courseRows.length){const initial=courseRows.some(row=>row.id===assignmentState?.course_id)?assignmentState.course_id:courseRows[0].id;picker.value=initial;await loadCourse(initial,0,captured);}
       else status.textContent='강의를 만든 뒤 현재 수업을 연결하면 자료와 복습을 한곳에서 볼 수 있어요.';
     });
+  }
+  async function loadTimetableSubjects(captured) {
+    fillTimetableSelect(timetablePicker,document,{subjects:[],status:'loading'});
+    try {
+      const values=await getTimetableSubjects();if(!valid(captured))return;
+      if(!Array.isArray(values)||values.length>60||values.some(v=>typeof v!=='string'||!v.trim()||v.length>40))throw new Error('invalid_subjects');
+      timetableSubjects=[...new Set(values)];fillTimetableSelect(timetablePicker,document,{subjects:timetableSubjects,status:'ready'});
+      timetableHelp.textContent=values.length?'선택한 과목명을 입력해요. 학기를 확인한 뒤 강의를 만들어 주세요.':'리마인더에 시간표를 등록하면 여기서도 고를 수 있어요. 직접 입력도 가능합니다.';
+    } catch { if(valid(captured)){timetableSubjects=[];fillTimetableSelect(timetablePicker,document,{subjects:[],status:'unavailable'});timetableHelp.textContent='시간표를 확인하지 못했지만 직접 강의명을 입력할 수 있어요.';} }
   }
   function fillOptions(){
     picker.replaceChildren();assigned.replaceChildren();const none=el('option','연결하지 않음');none.value='';assigned.append(none);

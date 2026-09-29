@@ -2996,3 +2996,12 @@ button {
   #reminder-logout { margin-left:auto; font-size:12px; }
   .site-header:has(.service-tabs:not([hidden])) .connection-button { max-width:150px; }
 }
+
+/* Explicit timetable suggestions fill text fields without changing a lecture group. */
+.timetable-pick-row { display:flex; align-items:center; gap:8px; min-width:0; }
+.timetable-pick-row select { flex:1; width:0; min-width:0; max-width:100%; font-size:12px; min-height:40px; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--surface); color:var(--ink); }
+.timetable-pick-row button { flex-shrink:0; font-size:12px; min-height:40px; }
+.timetable-pick-help { display:block; color:var(--muted); font-size:11px; line-height:1.5; overflow-wrap:anywhere; }
+.workspace.show-reminder { grid-template-columns:minmax(0,1fr); }
+
+.course-timetable-field { grid-column:1/-1; display:grid; gap:6px; }

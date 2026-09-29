@@ -15,6 +15,7 @@ class FakeTranscriber:
 
 arguments=argparse.ArgumentParser(description=__doc__)
 arguments.add_argument('--state-file',type=Path,required=True)
+arguments.add_argument('--seed-lecture',action='store_true',help='Add one empty, finalized synthetic lecture for metadata UI checks.')
 args=arguments.parse_args()
 sock=socket.socket();sock.bind(('127.0.0.1',0));sock.listen();port=sock.getsockname()[1]
 with tempfile.TemporaryDirectory(prefix='reminder-browser-') as temporary:
@@ -23,6 +24,9 @@ with tempfile.TemporaryDirectory(prefix='reminder-browser-') as temporary:
     app.state.review_service.today=lambda:'2026-09-29'
     with app.state.database.connect() as connection:
         connection.execute('UPDATE users SET password_hash=?',(PASSWORD_HASHER.hash('synthetic-test-password'),))
+        if args.seed_lecture:
+            connection.execute('INSERT INTO lectures(id,username,title,created_at,recording_finalized) VALUES (?,?,?,?,1)',
+                               ('11111111-1111-4111-8111-111111111111','user-alpha','합성 연결 검증','2026-09-29T00:00:00Z'))
     app.mount('/app',StaticFiles(directory=str(root/'web'),html=True),name='fixture-web')
     server=uvicorn.Server(uvicorn.Config(app,host='127.0.0.1',port=port,log_level='error',access_log=False))
     @app.post('/_fixture/stop')

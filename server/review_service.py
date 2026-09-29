@@ -220,6 +220,23 @@ class ReviewService:
             result["undo"] = {"token": undo["token"], "expires_at": datetime.fromtimestamp(undo["expires_at"], timezone.utc).isoformat().replace("+00:00", "Z")}
         return result
 
+    def timetable(self, username):
+        """Read course choices without creating a profile or generating items."""
+        with self.database.connect() as connection:
+            connection.execute("PRAGMA query_only=ON")
+            self._access(connection)
+            profile = connection.execute(
+                "SELECT timetable_json FROM review_profiles WHERE username=?", (username,)
+            ).fetchone()
+            if profile is None or profile["timetable_json"] is None:
+                return {"timetable": None}
+            stored = json.loads(profile["timetable_json"])
+            return {"timetable": {
+                "classes": [{key: row[key] for key in ("subject", "day", "start", "end", "room")} for row in stored["classes"]],
+                "from": stored["from"],
+                "until": stored["until"],
+            }}
+
     def state(self, username):
         today = day(self.today())
         with self.database.connect() as connection:
@@ -567,6 +584,12 @@ class ReviewService:
 
 def install_review(app, database, *, identity, recognition=None, **options):
     service = ReviewService(database, recognition=recognition, **options)
+
+    @app.get("/review/timetable")
+    def review_timetable(user: dict = Depends(identity)):
+        # A read-only session may inspect its own classes; no profile, cursor,
+        # generated item, revision, or undo record is changed on this route.
+        return service.timetable(user["username"])
 
     @app.get("/review/state")
     def review_state(user: dict = Depends(identity)):

@@ -33,7 +33,7 @@ function fixture(){
     supporting_sources:[],coverage:{source_count:1,preserved_count:1,mapped_count:1,unverified_count:0,fallback_count:0,complete:true,semantic_verified:false},warnings:[]};
   return {lecture,note};
 }
-function harness(t){
+function harness(t,{getTimetableSubjects}={}){
   const document={createElement(tag){return new Element(tag,this);},defaultView:{confirm:()=>true}};
   const container=new Element('div',document),calls=[],selected=[],sessionChanges=[],created=[],revoked=[];
   const {lecture,note}=fixture();
@@ -66,7 +66,7 @@ function harness(t){
     if(path===`/lectures/${LECTURE}`)return clone(lecture);
     throw Error('Unexpected synthetic endpoint '+path);
   }
-  const workspace=createCourseWorkspace({container,api,scopeKey:()=>key,getCurrent:()=>current,
+  const workspace=createCourseWorkspace({container,api,getTimetableSubjects,scopeKey:()=>key,getCurrent:()=>current,
     onSessionChanged:row=>sessionChanges.push(row),onSelectLecture:identifier=>selected.push(identifier)});
   t.after(()=>workspace.destroy());
   async function click(text){const button=byText(container,'button',text);assert.ok(button,'Missing button '+text);assert.equal(button.disabled,false,'Disabled '+text);await button.click();await settle();}
@@ -196,4 +196,21 @@ test('a late review detail after account reset never fetches source or creates a
   const pending=h.workspace.open();for(let i=0;i<50&&!release;i++)await turn();assert.equal(typeof release,'function');h.workspace.reset();h.key='another-account';release(h.review);await pending;
   assert.equal(signal.aborted,true);assert.equal(h.created.length,0);
   assert.equal(h.calls.filter(call=>call.path===`/lectures/${LECTURE}`).length,0);
+});
+
+
+test('timetable subject only fills the proposed new course name until explicit creation',async t=>{
+  const h=harness(t,{getTimetableSubjects:async()=>['합성 시간표','다른 과목']});await h.workspace.open();await settle();
+  const picker=all(h.container,node=>node.attributes['aria-label']==='시간표에서 강의명 선택')[0];assert.equal(picker.disabled,false);
+  const name=labeled(h.container,'강의명');name.value='직접 입력';assert.equal(h.calls.some(c=>c.method==='POST'),false);
+  picker.value='합성 시간표';await picker.event('change');assert.equal(name.value,'합성 시간표');assert.equal(h.calls.some(c=>c.method==='POST'),false);
+  labeled(h.container,'학기 · 선택').value='2026-2';await name.parent.parent.event('submit');await settle();
+  const created=h.calls.find(c=>c.method==='POST');assert.equal(created.path,'/courses');assert.equal(JSON.parse(created.body).name,'합성 시간표');assert.equal(JSON.parse(created.body).semester,'2026-2');
+});
+
+test('late timetable suggestions after reset remain private and do not overwrite typed course names',async t=>{
+  let release;const h=harness(t,{getTimetableSubjects:()=>new Promise(resolve=>release=resolve)});await h.workspace.open();
+  const name=labeled(h.container,'강의명');name.value='직접 입력';release(['늦은 과목']);await settle();assert.equal(name.value,'직접 입력');
+  await h.workspace.open();h.workspace.reset();h.key='another-owner';release(['OLD PRIVATE']);await settle();
+  const picker=all(h.container,node=>node.attributes['aria-label']==='시간표에서 강의명 선택')[0];assert.equal(picker.disabled,true);assert.equal(picker.textContent.includes('OLD PRIVATE'),false);
 });

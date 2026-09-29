@@ -23,8 +23,10 @@ import { groupTranscriptSentences } from '../web/transcript-sentences.js';
 import { TranscriptFollow } from '../web/transcript-follow.js';
 import { AUTH_SESSION_STORAGE_KEY, TabAuthSessionStore } from '../web/auth-session.js';
 
+import * as TestTimetableSubjects from '../web/timetable-subjects.js';
 import * as TestUnifiedNoteView from '../web/unified-note-view.js';
 const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
+  .replace("import { createTimetableCatalog, fillTimetableSelect } from './timetable-subjects.js';", 'const {createTimetableCatalog,fillTimetableSelect}=TestTimetableSubjects;')
   .replace("import { createReminder } from './reminder.js';", 'const createReminder = () => ({reset(){},open(){},hide(){}});')
   .replace("import { renderUnifiedStudyNote } from './unified-note-view.js';", 'const {renderUnifiedStudyNote} = TestUnifiedNoteView;')
   .replace("import { createMaterialPanel } from './study-materials.js';", 'const createMaterialPanel = () => ({reset(){},setScope(){}});')
@@ -289,7 +291,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     TestRenderDriveStatus:renderDriveStatus,
     TestRenderMaintenanceStatus:renderMaintenanceStatus,
     TestRecordingReview:{readRecordingClip,RecordingClipPlayer,filterTranscript},
-    TestLectureLibrary,
+    TestLectureLibrary, TestTimetableSubjects,
     TestManualNotes,
     TestLectureQuestions, TestStudyNotes,TestUnifiedNoteView, TestLlmResults, TestLiveQueue,
     TestGroupTranscriptSentences:groupTranscriptSentences, TestTranscriptFollow:TranscriptFollow,
@@ -8790,4 +8792,38 @@ test('service tabs allow keyboard navigation without changing audio state',()=>{
   assert.equal(app.element('service-reminder').focused,true);
   app.element('service-tabs').onkeydown({key:'Home',preventDefault(){}});
   assert.equal(app.run('activeService'),'yeobaek');
+});
+
+
+test('timetable choices merge with metadata suggestions and only explicit choice fills a new title',async()=>{
+  const calls=[];const app=reviewApp((url,options)=>{calls.push({url,method:options?.method||'GET'});return response({timetable:{classes:[{subject:'시간표 수학'},{subject:'시간표 수학'},{subject:'<b>영어</b>'}]}});});
+  openReviewFixture(app);app.run("current=null;lectures=[{course:'기존 과목',semester:'2026-2'}];");
+  app.element('lecture-title').value='내가 적은 이름';app.element('metadata-course').value='직접 적은 과목';
+  await app.run('timetableCatalog.load()');
+  assert.equal(app.element('lecture-title').value,'내가 적은 이름');assert.equal(app.element('metadata-course').value,'직접 적은 과목');
+  assert.deepEqual(app.element('course-options').children.map(x=>x.value).sort(),['<b>영어</b>','기존 과목','시간표 수학'].sort());
+  const picker=app.element('lecture-timetable');assert.equal(picker.children.filter(x=>x.value==='시간표 수학').length,1);
+  picker.value='시간표 수학';picker.onchange();assert.equal(app.element('lecture-title').value,'시간표 수학');
+  app.run("current={id:'already-created',title:'원래 이름'};updateTimetablePickerAvailability();");picker.value='<b>영어</b>';picker.onchange();assert.equal(app.element('lecture-title').value,'시간표 수학');
+  assert.equal(calls.length,1);assert.ok(calls[0].url.endsWith('/review/timetable'));assert.equal(calls[0].method,'GET');
+});
+
+test('metadata timetable choice uses normal explicit save and never infers a course group',async()=>{
+  const writes=[];const app=reviewApp((url,options={})=>{
+    if(url.endsWith('/review/timetable'))return response({timetable:{classes:[{subject:'시간표 통계'}]}});
+    if(url.endsWith('/metadata')){if(options.method==='PATCH'){const body=JSON.parse(options.body);writes.push(body);return response({lecture_id:'review-lesson',...body,revision:1});}
+      return response({lecture_id:'review-lesson',display_title:'원래 제목',course:'기존 분류',semester:'2026-2',revision:0});}
+    return response({});
+  });openReviewFixture(app);await app.element('metadata-open').onclick();await app.run('timetableCatalog.load()');
+  assert.equal(app.element('metadata-course').value,'기존 분류');const picker=app.element('metadata-timetable');assert.equal(picker.disabled,false);
+  picker.value='시간표 통계';picker.onchange();assert.equal(app.element('metadata-course').value,'시간표 통계');assert.equal(writes.length,0);
+  await app.element('metadata-form').onsubmit({preventDefault(){}});assert.equal(writes.length,1);assert.equal(writes[0].course,'시간표 통계');assert.equal(Object.hasOwn(writes[0],'course_id'),false);assert.equal(app.run('current.course'),'시간표 통계');
+});
+
+test('logout clears timetable choices and a late old account list cannot repaint them',async()=>{
+  const gate=deferred();const app=reviewApp(()=>gate.promise);openReviewFixture(app);
+  const loading=app.run('timetableCatalog.load()');await tick();app.run('showLogin()');
+  gate.resolve(response({timetable:{classes:[{subject:'OLD PRIVATE'}]}}));await loading;
+  for(const id of ['lecture-timetable','metadata-timetable','course-options'])assert.equal(app.element(id).children.some(x=>x.value==='OLD PRIVATE'),false);
+  assert.equal(app.element('lecture-timetable').disabled,true);assert.equal(app.element('metadata-timetable').disabled,true);
 });

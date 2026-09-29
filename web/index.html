@@ -184,6 +184,11 @@
             <div class="field compact-field">
               <label for="lecture-title">수업 이름</label>
               <input id="lecture-title" name="lecture-title" type="text" maxlength="120" placeholder="예: 3교시 한국사" autocomplete="off">
+              <div class="timetable-pick-row">
+                <select id="lecture-timetable" aria-label="시간표에서 수업 이름 선택" aria-describedby="lecture-timetable-help" disabled><option value="">등록된 시간표 과목이 없어요</option></select>
+                <button id="lecture-timetable-refresh" type="button" class="text-button" aria-label="시간표 과목 목록 새로고침">새로고침</button>
+              </div>
+              <small id="lecture-timetable-help" class="timetable-pick-help">리마인더에 시간표를 등록하면 여기서도 과목을 고를 수 있어요.</small>
             </div>
             <div class="field compact-field source-field">
               <label for="audio-source">실시간 입력</label>
@@ -475,6 +480,11 @@
       <datalist id="semester-options"></datalist>
       <label for="metadata-course">과목</label><input id="metadata-course" type="text" maxlength="80" list="course-options" placeholder="예: 통계학" autocomplete="off">
       <datalist id="course-options"></datalist>
+      <div class="timetable-pick-row">
+        <select id="metadata-timetable" aria-label="시간표에서 과목 분류 선택" aria-describedby="metadata-timetable-help" disabled><option value="">등록된 시간표 과목이 없어요</option></select>
+        <button id="metadata-timetable-refresh" type="button" class="text-button" aria-label="과목 분류의 시간표 목록 새로고침">새로고침</button>
+      </div>
+      <small id="metadata-timetable-help" class="timetable-pick-help"></small>
       <p id="metadata-state" role="status" aria-live="polite"></p>
       <button id="metadata-save" class="primary-button" type="submit" disabled>저장</button>
     </form>
