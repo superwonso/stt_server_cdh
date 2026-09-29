@@ -1,3 +1,4 @@
+import { createReminder } from './reminder.js';
 import { renderUnifiedStudyNote } from './unified-note-view.js';
 import { createMaterialPanel } from './study-materials.js';
 import { createCourseWorkspace } from './course-workspace.js';
@@ -1676,6 +1677,7 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
   renderCurrent(); renderHistory();
 }
 function showLogin(clear = true) {
+  resetReminderWorkspace();
   clearTextExports(); continuationCapability = ''; partialRecordingCapability = '';
   recordingUploadCapability = ''; resetRecordingAudioRetry(); audioUploadError = ''; audioUploadErrorScope = '';
   clearLocalAudioExports();
@@ -1833,6 +1835,7 @@ async function enterAuthenticatedWorkspace(response, authServer, {notAfter = Inf
     if (!token || token !== statusToken || user !== statusUser || apiUrl !== authServer) return;
     $('auth-capture-stop').hidden = true;
     $('auth-screen').hidden = true; $('workspace').hidden = false; $('current-user').textContent = user;
+    updateServiceTabs();
     document.querySelector('.user-avatar').textContent = user[0].toUpperCase();
     renderCurrent();
     if (current?.id && current.recording_finalized === true && current.segments?.length) void loadCorrection(current.id);
@@ -4834,6 +4837,54 @@ $('study-note-download').onclick = event => {
   }
 };
 
+// Service navigation changes presentation only: microphone, transfer queues,
+// selected lecture and their recovery state remain owned by the existing app.
+let reminderWorkspace = null, activeService = 'yeobaek';
+function resetReminderWorkspace() {
+  reminderWorkspace?.reset(); activeService = 'yeobaek';
+  $('service-tabs').hidden = true; $('reminder-logout').hidden = true;
+  $('reminder-panel').hidden = true; $('main-content').hidden = false;
+  document.querySelector('.sidebar').hidden = false;
+  $('workspace').classList.toggle('show-reminder',false);
+}
+function updateServiceTabs() {
+  const signedIn = !!user && !!token && !$('workspace').hidden;
+  $('service-tabs').hidden = !signedIn;
+  $('reminder-logout').hidden = !signedIn || activeService !== 'reminder';
+  $('reminder-logout').disabled = isBusy() || pending.length > 0
+    || [...liveSessions.values()].some(session => session.owner === user && hasVolatilePendingAudio(session));
+  $('service-recording').hidden = !recording && !paused;
+  $('service-recording').textContent = paused ? ' · 일시정지' : ' · 녹음 중';
+  for (const name of ['yeobaek','reminder']) {
+    $('service-'+name).setAttribute('aria-selected', String(name === activeService));
+    $('service-'+name).tabIndex = name === activeService ? 0 : -1;
+  }
+}
+function selectService(name) {
+  if (!user || !token || $('workspace').hidden || !['yeobaek','reminder'].includes(name)) return;
+  activeService = name;
+  const showingReminder = name === 'reminder';
+  $('main-content').hidden = showingReminder;
+  document.querySelector('.sidebar').hidden = showingReminder;
+  $('reminder-panel').hidden = !showingReminder;
+  $('workspace').classList.toggle('show-reminder', showingReminder);
+  updateServiceTabs();
+  if (showingReminder) {
+    if (!reminderWorkspace) reminderWorkspace = createReminder({container:$('reminder-panel'),api,scopeKey:learningScopeKey});
+    void reminderWorkspace.open();
+  } else reminderWorkspace?.hide();
+}
+$('service-yeobaek').onclick = () => selectService('yeobaek');
+$('service-reminder').onclick = () => selectService('reminder');
+$('reminder-logout').onclick = () => $('logout').click();
+$('service-tabs').onkeydown = event => {
+  if (!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
+  event.preventDefault();
+  const name = event.key === 'Home' ? 'yeobaek' : event.key === 'End' ? 'reminder'
+    : activeService === 'yeobaek' ? 'reminder' : 'yeobaek';
+  selectService(name); $('service-'+name).focus();
+};
+
 let courseWorkspace=null,studyMaterialPanel=null;
 function learningScopeKey(){return JSON.stringify([user,token,apiUrl]);}
 function resetLearningWorkspace(){
@@ -5587,6 +5638,7 @@ $('local-audio-close').onclick = clearLocalAudioExports;
 $('local-audio-dialog').onclose = () => { if (!$('local-audio-dialog').open) clearLocalAudioExports(); };
 
 function updateControls() {
+  updateServiceTabs();
   const busy = isBusy(), queued = queuedCount(), activeQueued=activePendingCount(), system = selectedCaptureSource() === 'system', activeImport = importIsActive();
   const audioDescription = recordingAudioUploadDescription();
   $('recording-upload-status').hidden = !audioDescription;

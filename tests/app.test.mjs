@@ -25,6 +25,7 @@ import { AUTH_SESSION_STORAGE_KEY, TabAuthSessionStore } from '../web/auth-sessi
 
 import * as TestUnifiedNoteView from '../web/unified-note-view.js';
 const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
+  .replace("import { createReminder } from './reminder.js';", 'const createReminder = () => ({reset(){},open(){},hide(){}});')
   .replace("import { renderUnifiedStudyNote } from './unified-note-view.js';", 'const {renderUnifiedStudyNote} = TestUnifiedNoteView;')
   .replace("import { createMaterialPanel } from './study-materials.js';", 'const createMaterialPanel = () => ({reset(){},setScope(){}});')
   .replace("import { createCourseWorkspace } from './course-workspace.js';", 'const createCourseWorkspace = () => ({reset(){},open(){}});')
@@ -8750,4 +8751,43 @@ test('untimed corrected text carries the warning only below its body and in corr
   app.run('renderCurrent()');assert.equal(transcript.children.filter(node=>node.className==='ai-result-warning').length,1);
   app.run("correctionView='raw';renderCurrent()");assert.equal(transcript.children.some(node=>node.className==='ai-result-warning'),false);
   assert.equal(app.run("exportText(selectedTranscriptLecture(),'text')").includes(TestLlmResults.RESULT_WARNING),false);
+});
+
+
+test('service tabs preserve live recording, current lesson and pending transfer identity',()=>{
+  const app=reviewApp(()=>response({}));openReviewFixture(app);
+  app.run("capture={capturedSeconds:12}; captureSession={id:'synthetic-live',lecture:{id:'synthetic-live'}}; recording=true; pending=[{id:'pending-synthetic'}];");
+  app.element('workspace').hidden=false;
+  const before=app.run('JSON.stringify([current,captureSession,pending])');
+  app.run("selectService('reminder')");
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.element('workspace').hidden,false);
+  assert.equal(app.element('main-content').hidden,true);
+  assert.equal(app.element('reminder-panel').hidden,false);
+  assert.equal(app.element('service-reminder')['aria-selected'],'true');
+  assert.equal(app.element('service-recording').hidden,false);
+  assert.equal(app.element('reminder-logout').disabled,true);
+  assert.equal(app.run('JSON.stringify([current,captureSession,pending])'),before);
+  app.run("selectService('yeobaek')");
+  assert.equal(app.element('main-content').hidden,false);
+  assert.equal(app.run('JSON.stringify([current,captureSession,pending])'),before);
+});
+test('service tabs require login and reset reminder private state at login boundary',()=>{
+  const app=reviewApp(()=>response({}));openReviewFixture(app);
+  app.run("globalThis.reminderResets=0;reminderWorkspace={reset(){reminderResets++},open(){},hide(){}}; selectService('reminder');");
+  app.run('showLogin()');
+  assert.equal(app.run('reminderResets'),1);
+  assert.equal(app.element('service-tabs').hidden,true);
+  assert.equal(app.element('reminder-panel').hidden,true);
+  app.run("selectService('reminder')");
+  assert.equal(app.run('activeService'),'yeobaek');
+});
+test('service tabs allow keyboard navigation without changing audio state',()=>{
+  const app=reviewApp(()=>response({}));openReviewFixture(app);
+  let prevented=false;
+  app.element('service-tabs').onkeydown({key:'End',preventDefault(){prevented=true;}});
+  assert.ok(prevented);assert.equal(app.run('activeService'),'reminder');
+  assert.equal(app.element('service-reminder').focused,true);
+  app.element('service-tabs').onkeydown({key:'Home',preventDefault(){}});
+  assert.equal(app.run('activeService'),'yeobaek');
 });
