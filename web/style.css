@@ -3025,3 +3025,16 @@ button {
 .workspace.show-reminder { grid-template-columns:minmax(0,1fr); }
 
 .course-timetable-field { grid-column:1/-1; display:grid; gap:6px; }
+
+/* Public policy links remain available outside both service workspaces. */
+.service-policy-footer {
+  padding:12px 20px;
+  border-top:1px solid var(--line);
+  background:var(--surface-muted);
+  font-size:13px;
+}
+.service-policy-footer nav { display:flex; flex-wrap:wrap; justify-content:center; gap:4px 20px; }
+.service-policy-footer a { display:inline-flex; min-height:44px; align-items:center; flex-wrap:wrap; gap:4px; color:var(--forest-700); text-underline-offset:3px; }
+.service-policy-footer a:hover { color:var(--forest-950); }
+.service-policy-new-window { font-size:11px; color:var(--muted); }
+@media print { .service-policy-footer { display:none; } }
