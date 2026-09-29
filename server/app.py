@@ -31,6 +31,8 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .db import Database
+from .review_service import install_review
+from .review_parse import TimetableRecognizer
 from .drive_archive import DriveArchiveManager
 from .drive_storage import DriveStorageError
 from . import lecture_tools, lecture_library, lecture_trash, manual_notes, account_recovery, admin_usage, lecture_continuations
@@ -242,6 +244,12 @@ class BodySizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
+        if scope.get("path") == "/review/timetable/parse" and scope.get("method") == "POST":
+            # This route authenticates before streaming its own 10 MiB image /
+            # 32 KB text limit. Do not buffer images under the audio chunk limit.
+            await self.app(scope, receive, send)
+            return
+
         content_length = next(
             (value for key, value in scope.get("headers", []) if key.lower() == b"content-length"),
             None,
@@ -385,6 +393,7 @@ def create_app(
     clova_engine = clova_transcriber or ClovaStreamingTranscriber(settings)
     correction_engine = postprocessor or MindlogicPostprocessor(settings)
     limiter = RateLimiter()
+    timetable_recognizer = TimetableRecognizer(settings, database)
     summary_service = SummaryService(settings, database, summarizer or MindlogicSummarizer(settings), limiter)
     translation_service = TranslationService(settings, database, translator or MindlogicTranslator(settings), limiter)
     question_service = QuestionService(settings, database, question_answerer or QuestionAnswerer(settings), limiter)
@@ -531,6 +540,7 @@ def create_app(
     app = FastAPI(title="Classroom Transcription", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings = settings
     app.state.database = database
+    app.state.timetable_recognizer = timetable_recognizer
     app.state.transcriber = engine
     app.state.clova_transcriber = clova_engine
     app.state.postprocessor = correction_engine
@@ -3928,6 +3938,8 @@ def create_app(
     question_service.install(app, identity=data_identity, owned_lecture=owned_lecture,
                              raw_segments=raw_segments, transcript_revision=transcript_revision)
     install_courses(app, database, identity=data_identity, limiter=limiter)
+    install_review(app, database, identity=data_identity, recognition=timetable_recognizer.capabilities)
+    timetable_recognizer.install(app, identity=data_identity)
     material_service.install(app, identity=data_identity)
     course_review_service.install(app, identity=data_identity, raw_segments=raw_segments,
                                   transcript_revision=transcript_revision)

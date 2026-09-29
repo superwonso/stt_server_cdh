@@ -13,3 +13,6 @@ protobuf==5.29.6
 av==18.1.0
 # Bounded local PDF/PPTX lecture-material conversion.
 -r requirements-materials.txt
+
+# Explicit validation of in-memory timetable screenshots (also used by Qwen).
+Pillow==12.3.0

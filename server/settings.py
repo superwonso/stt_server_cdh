@@ -157,6 +157,7 @@ class Settings:
     mindlogic_api_key: str | None = field(default=None, repr=False)
     mindlogic_base_url: str = f"https://{MINDLOGIC_GATEWAY_HOST}{MINDLOGIC_GATEWAY_PATH}"
     mindlogic_model: str = "gpt-6-luna"
+    review_timetable_recognition_enabled: bool = True
     summary_model: str = "gpt-6-luna"
     summary_chunk_chars: int = 6000
     summary_max_source_chars: int = 250000
@@ -335,6 +336,7 @@ class Settings:
                 )
             ),
             mindlogic_model=(os.getenv("MINDLOGIC_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"),
+            review_timetable_recognition_enabled=os.getenv("REVIEW_TIMETABLE_RECOGNITION_ENABLED", "1").strip().lower() in {"1", "true", "yes"},
             summary_model=(os.getenv("SUMMARY_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"),
             summary_chunk_chars=max(1000, min(int(os.getenv("SUMMARY_CHUNK_CHARS", "6000")), 24000)),
             summary_max_source_chars=max(
