@@ -69,3 +69,7 @@ API:
 선택적 실제 브라우저 시험은 `tests/reminder_browser_fixture.py --state-file <임시 JSON 경로>`로 격리 API를 실행한 뒤, 반환 포트를 `REMINDER_SMOKE_ORIGIN=http://127.0.0.1:<port>`로 지정하여 `node tests/reminder-browser-smoke.cjs`를 실행합니다. 기존 Playwright 경로는 `REMINDER_PLAYWRIGHT_PATH`, 선택한 브라우저 실행 파일은 `REMINDER_BROWSER_EXECUTABLE`, 결과 폴더는 `REMINDER_SMOKE_OUTPUT`으로 지정합니다. 시험 서버는 운영 설정을 읽지 않고 임시 계정·DB만 사용하며40분 후 자동 종료합니다. 종료용 `POST /_fixture/stop`은 시험 서버에만 있고 `X-Fixture: synthetic-preview-only`가 필요합니다.
 
 미검증: 실제 사용자 시간표·모바일 실물 기기·동시 다수 사용자/장기 실행. 기존 노트북의 Linux/ROCm 실제 실행은 이번에 재검증하지 않았으며 기존 실행 경로와 모델을 변경하지 않았습니다.
+
+## Windows 운영 반영 · 2026-09-29
+
+사용자 배포 승인 후 진행 중인 전사·정리·파일 처리와 최근 음성 갱신이 없는 것을 확인하고 API만 재시작했습니다. 일관된 비공개 DB 백업 후 schema24를 적용했으며 모든 기존 테이블의 기존 열 값이 백업과 일치하고 DB 무결성 검사를 통과했습니다. 새 개인 리마인더 테이블은 빈 상태이고 공개 공휴일만 초기화했습니다. 기존 운영 설정·Qwen 모델 프로세스·터널 프로세스·공개 API 주소를 유지했으며 API와 터널 준비 상태를 확인했습니다. GitHub Pages는 같은 저장소의 기존 배포 워크플로로 게시하며 게시된 정적 파일과 해당 커밋의 일치 여부를 별도 확인합니다.
