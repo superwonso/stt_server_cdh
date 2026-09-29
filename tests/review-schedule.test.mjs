@@ -164,6 +164,19 @@ test('spec 12 tolerant parser keeps Korean/English days, canonical time, and saf
   for(const invalid of ['25:00','12:61','13:00 junk','<script>','١٣:٠٠'])assert.equal(s.normTime(invalid),'');
 });
 
+test('eve reapply clears only unreviewed catchup move even when its base already matches',()=>{
+  const moved={stage:0,date:'2026-10-10'};
+  for(const base of ['2026-10-02','2026-09-30']){
+    const row=item({source:'timetable',subject:'글로벌문화',catchup:true,learned:SEM,base,moved}),before=structuredClone(row);
+    const changed=s.applyMode(row,timetable(EVE),SETTINGS,HOLIDAYS,TODAY);
+    assert.equal(changed.base,'2026-09-30');assert.equal(changed.moved,null);assert.equal(s.nextDue(changed),'2026-09-30');assert.deepEqual(row,before);
+  }
+  for(const changes of [{source:'manual',catchup:true},{source:'timetable',catchup:false},
+    {source:'timetable',catchup:true,reviews:['2026-09-20'],moved:{stage:1,date:'2026-10-10'}}]){
+    const row=item({moved,...changes});assert.deepEqual(s.applyMode(row,timetable(RHYTHM),SETTINGS,HOLIDAYS,TODAY).moved,row.moved);
+  }
+});
+
 test('holiday source is user supplied, May Day omitted, no-next-class fallback and ten-year limit explicit',()=>{
   assert.equal(HOLIDAYS.source,'user-provided');assert.equal(s.holidayMap(HOLIDAYS)['2026-05-01'],undefined);
   assert.deepEqual(s.offsetsFor('없는 과목',TODAY,timetable(EVE),SETTINGS,HOLIDAYS),[1]);

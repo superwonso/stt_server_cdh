@@ -270,14 +270,33 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(self.row(manual)["offsets"], [1, 3, 7])
 
     def test_group_review_undo_is_atomic_and_foreign_or_future_ids_reject_everything(self):
-        identifiers = [self.item(title=str(index)) for index in range(3)]
+        identifiers = [self.item(title=str(index)) for index in range(7)]
+        other_ids = [self.item(title="다른 과목 " + str(index), subject="별도 합성 과목") for index in range(2)]
         before = self.get()
         self.act("item.group_review", {"ids": identifiers + [str(uuid.uuid4())]}, expected=404)
         self.assertEqual(self.get(), before)
         self.act("item.group_review", {"ids": identifiers})
-        self.assertTrue(all(row["reviews"] == ["2026-09-29"] for row in self.state["items"]))
+        self.assertEqual(sum(row["reviews"] == ["2026-09-29"] for row in self.state["items"]), 7)
+        self.assertTrue(all(self.row(item_id)["reviews"] == [] for item_id in other_ids))
         self.act("undo", {"token": self.state["undo"]["token"]})
-        self.assertTrue(all(row["reviews"] == [] for row in self.state["items"]))
+        self.assertEqual(self.state["items"], before["items"])
+        self.assertEqual(len(self.state["items"]), 9)
+
+    def test_eve_mode_apply_clears_previous_move_for_unreviewed_catchup(self):
+        self.timetable()
+        rows = schedule.catchup_preview(self.state["timetable"], "2026-09-01", self.state["today"], self.state["settings"], self.state["holidays"])
+        source = next(row["source_key"] for row in rows if row["subject"] == "글로벌문화" and row["selected"])
+        self.act("timetable.catchup", {"sem_start": "2026-09-01", "source_keys": [source], "per_day": 5})
+        identifier = next(row["id"] for row in self.state["items"] if row["catchup"])
+        self.act("item.move", {"id": identifier, "date": "2026-10-10"})
+        before = copy.deepcopy(self.row(identifier))
+        self.act("timetable.mode", {"mode": {"sameDay": False, "nextDay": False, "eve": True, "curve": False}, "apply_existing": True})
+        current = self.row(identifier)
+        self.assertEqual(current["base"], "2026-09-30")
+        self.assertIsNone(current["moved"])
+        self.assertEqual(schedule.next_due(current), "2026-09-30")
+        for key in ("id", "learned", "reviews", "history", "source_key"):
+            self.assertEqual(current[key], before[key])
 
     def test_past_completion_edit_last_removal_and_earliest_date(self):
         identifier = self.item(learned="2026-09-20")

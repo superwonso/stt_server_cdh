@@ -355,6 +355,7 @@ def apply_mode(item, timetable, settings, holidays, today):
     result["offsets"] = catchup_offsets(timetable, settings) if item.get("catchup") else offsets_for(item["subject"], item["learned"], timetable, settings, holidays)
     if item.get("catchup") and not item.get("reviews") and _mode(timetable)["eve"]:
         result["base"] = eve_target(item["subject"], today, timetable, holidays)
+        result["moved"] = None
     return result
 
 

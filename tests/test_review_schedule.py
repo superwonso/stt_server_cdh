@@ -220,6 +220,22 @@ class ReviewScheduleTests(unittest.TestCase):
         for invalid in ('25:00', '12:61', '13:00 junk', '<script>', '١٣:٠٠'):
             self.assertEqual(s.norm_time(invalid), '')
 
+    def test_eve_reapply_clears_only_unreviewed_catchup_move_even_when_base_unchanged(self):
+        moved = {'stage': 0, 'date': '2026-10-10'}
+        for base in ('2026-10-02', '2026-09-30'):
+            row = item(source='timetable', subject='글로벌문화', catchup=True, learned=SEM, base=base, moved=moved)
+            before = deepcopy(row)
+            changed = s.apply_mode(row, timetable(EVE), SETTINGS, HOLIDAYS, TODAY)
+            self.assertEqual(changed['base'], '2026-09-30')
+            self.assertIsNone(changed['moved'])
+            self.assertEqual(s.next_due(changed), '2026-09-30')
+            self.assertEqual(row, before)
+        for changes in ({'source': 'manual', 'catchup': True}, {'source': 'timetable', 'catchup': False},
+                        {'source': 'timetable', 'catchup': True, 'reviews': ['2026-09-20'], 'moved': {'stage': 1, 'date': '2026-10-10'}}):
+            row = item(moved=moved, **{key: value for key, value in changes.items() if key != 'moved'})
+            row.update(changes)
+            self.assertEqual(s.apply_mode(row, timetable(RHYTHM), SETTINGS, HOLIDAYS, TODAY)['moved'], row['moved'])
+
     def test_python_and_javascript_results_match_on_spec_and_edge_cases(self):
         node = os.environ.get('STT_TEST_NODE_BINARY') or shutil.which('node')
         if not node: self.skipTest('Node is needed for cross-language parity')
@@ -234,7 +250,8 @@ class ReviewScheduleTests(unittest.TestCase):
                  ('examStats', 'exam_stats', [ex, sessions, TODAY]),
                  ('cleanClasses', 'clean_classes', [[{'subject': '글로벌문화', 'day': 'Thu', 'start': '15시', 'end': '13:00'}, {'subject': '숫자 검사', 'day': 2, 'start': '١٣:٠٠'}]])]
         routine = {'name': '단어', 'start': '2026-09-28', 'days': [], 'count': 6, 'done': ['2026-09-28', TODAY]}
-        cases.extend([('routineStats', 'routine_stats', [routine, TODAY]), ('placeReview', 'place_review', [item(catchup=True, learned=SEM, base='2026-10-02'), '2026-09-02', TODAY])])
+        cases.extend([('routineStats', 'routine_stats', [routine, TODAY]), ('placeReview', 'place_review', [item(catchup=True, learned=SEM, base='2026-10-02'), '2026-09-02', TODAY]),
+                      ('applyMode', 'apply_mode', [item(source='timetable', subject='글로벌문화', catchup=True, learned=SEM, base='2026-09-30', moved={'stage': 0, 'date': '2026-10-10'}), timetable(EVE), SETTINGS, HOLIDAYS, TODAY])])
         script = 'import * as s from ' + json.dumps((ROOT / 'web/review-schedule.js').as_uri()) + ';let x="";for await(const c of process.stdin)x+=c;process.stdout.write(JSON.stringify(JSON.parse(x).map(v=>s[v.name](...v.args))));'
         result = subprocess.run([node, '--input-type=module', '-e', script], input=json.dumps([{'name': js, 'args': args} for js, _, args in cases]),
                                 text=True, encoding='utf-8', capture_output=True, timeout=20, check=True)

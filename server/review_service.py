@@ -447,6 +447,7 @@ class ReviewService:
                                        schedule.offsets_for(item["subject"], item["learned"], old, state["settings"], self.holidays))
                     if old["mode"]["eve"] and item["catchup"] and not item["reviews"]:
                         item["base"] = schedule.eve_target(item["subject"], today, old, self.holidays)
+                        item["moved"] = None
                     item["updated_at"] = self._timestamp()
             return
         if action == "catchup":
