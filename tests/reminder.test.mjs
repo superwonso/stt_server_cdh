@@ -171,6 +171,41 @@ test('mode draft, stage date input and all-record filters survive a background s
   const state=baseState();state.items=[item({reviews:['2026-09-29']})];state.timetable={classes:[{subject:'합성',day:2,start:'13:00',end:'14:00',room:''}],from:TODAY,until:null,through:TODAY,mode:copy(schedule.DEFAULT_MODE)};const h=harness(t,state);await h.controller.open();await h.click('수업 리듬');const review=field(section(h.container,'기억 곡선 · 추정'),'1회차 복습한 날짜');review.value='2026-09-28';await review.event('input');h.state.revision++;await h.controller.refresh();assert.equal(field(section(h.container,'수업 시간표'),'수업 당일').checked,true);assert.equal(field(section(h.container,'기억 곡선 · 추정'),'1회차 복습한 날짜').value,'2026-09-28');
 });
 
+function modeExampleState(classes,extra={}){
+  const state=baseState();state.timetable={classes:classes.map(row=>({start:'09:00',end:'10:00',room:'',...row})),from:TODAY,until:null,through:TODAY,mode:{sameDay:true,nextDay:false,eve:false,curve:false},...extra};return state;
+}
+const modeExampleTexts=root=>descendants(section(root,'수업 시간표')).filter(node=>node.tagName==='p'&&node.textContent.includes('수업이면 →')).map(node=>node.textContent);
+
+test('mode example uses the next actual weekday and anchors review dates to that lesson',async t=>{
+  const state=modeExampleState([{subject:'금요일',day:5},{subject:'수요일',day:3}],{mode:copy(schedule.DEFAULT_MODE)}),h=harness(t,state);await h.controller.open();
+  assert.deepEqual(modeExampleTexts(h.container),['9/30 (수) 수요일 수업이면 → 10/6 (화)에 복습해요.']);
+  await h.click('수업 리듬');assert.deepEqual(modeExampleTexts(h.container),['9/30 (수) 수요일 수업이면 → 9/30 (수) · 10/6 (화)에 복습해요.']);
+  assert.deepEqual(h.state,state);assert.equal(h.calls.filter(call=>call.method==='POST').length,0);
+});
+test('mode example skips holidays and the scheduled subjects own exam date',async t=>{
+  const state=modeExampleState([{subject:'화요일',day:2},{subject:'수요일',day:3},{subject:'목요일',day:4}]);state.holidays[TODAY]='합성 휴일';state.exams=[{id:ID,subject:'수요일',kind:'mid',date:'2026-09-30',rounds:3,lead:7,done:{}}];const h=harness(t,state);await h.controller.open();
+  assert.deepEqual(modeExampleTexts(h.container),['10/1 (목) 목요일 수업이면 → 10/1 (목)에 복습해요.']);assert.deepEqual(h.state,state);assert.equal(h.calls.filter(call=>call.method==='POST').length,0);
+});
+test('mode example still includes today when only a different subject has an exam',async t=>{
+  const state=modeExampleState([{subject:'화요일',day:2}]);state.exams=[{id:ID,subject:'다른 과목',kind:'mid',date:TODAY,rounds:3,lead:7,done:{}}];const h=harness(t,state);await h.controller.open();
+  assert.deepEqual(modeExampleTexts(h.container),['9/29 (화) 화요일 수업이면 → 9/29 (화)에 복습해요.']);assert.equal(h.calls.filter(call=>call.method==='POST').length,0);
+});
+test('mode example respects timetable start and inclusive end dates',async t=>{
+  const state=modeExampleState([{subject:'화요일',day:2},{subject:'수요일',day:3},{subject:'목요일',day:4}],{from:'2026-09-30',until:'2026-09-30'}),h=harness(t,state);await h.controller.open();
+  assert.deepEqual(modeExampleTexts(h.container),['9/30 (수) 수요일 수업이면 → 9/30 (수)에 복습해요.']);
+  h.state.timetable={...h.state.timetable,from:'2026-09-01',until:'2026-09-28'};h.state.revision++;await h.controller.refresh();assert.deepEqual(modeExampleTexts(h.container),[]);assert.equal(h.calls.filter(call=>call.method==='POST').length,0);
+});
+test('mode example searches fourteen dates including today and clears when no lesson qualifies',async t=>{
+  const state=modeExampleState([{subject:'월요일',day:1}],{from:'2026-10-12'}),h=harness(t,state);await h.controller.open();
+  assert.deepEqual(modeExampleTexts(h.container),['10/12 (월) 월요일 수업이면 → 10/12 (월)에 복습해요.']);
+  h.state.timetable={...h.state.timetable,from:'2026-10-13',classes:[{subject:'범위 밖 화요일',day:2,start:'09:00',end:'10:00',room:''}]};h.state.revision++;await h.controller.refresh();assert.deepEqual(modeExampleTexts(h.container),[]);
+  h.state.timetable.classes=[];h.state.revision++;await h.controller.refresh();await h.click('전날만');assert.deepEqual(modeExampleTexts(h.container),[]);assert.equal(h.calls.filter(call=>call.method==='POST').length,0);
+});
+test('mode example selects the earliest start on the first eligible day without reordering saved classes',async t=>{
+  const state=modeExampleState([{subject:'오후',day:2,start:'14:00',end:'15:00'},{subject:'아침',day:2,start:'09:00',end:'10:00'},{subject:'낮',day:2,start:'11:00',end:'12:00'}]),h=harness(t,state);await h.controller.open();
+  assert.deepEqual(modeExampleTexts(h.container),['9/29 (화) 아침 수업이면 → 9/29 (화)에 복습해요.']);await h.controller.refresh();assert.deepEqual(h.state,state);assert.equal(h.calls.filter(call=>call.method==='POST').length,0);
+});
+
 test('new KST day on visibility refresh updates today without discarding manual learned date',async t=>{
   const h=harness(t);await h.controller.open();const learned=field(section(h.container,'새로 공부한 내용'),'공부한 날');learned.value='2026-09-22';h.state.today='2026-09-30';h.listeners.visibilitychange();await settle();assert.match(h.container.textContent,/2026\.09\.30 수요일/);assert.equal(learned.value,'2026-09-22');
 });
