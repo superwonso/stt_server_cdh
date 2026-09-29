@@ -61,15 +61,15 @@
       <h2 id="providers">2. 외부 서비스와 데이터 전달</h2>
       <p>공개 웹페이지와 개인 수업 저장소는 구분됩니다. 아래 업체는 표시한 기능에 필요한 정보를 처리합니다. 외부 업체의 자체 로그·보관은 각 업체의 정책과 운영자가 적용받는 서비스 조건의 영향을 받습니다.</p>
       <div class="policy-table" tabindex="0" role="region" aria-label="외부 서비스별 처리 정보">
-        <table>
-          <caption>기능별 처리업체와 전달 범위</caption>
-          <thead><tr><th scope="col">업체·서비스</th><th scope="col">목적·시점</th><th scope="col">처리하는 정보</th></tr></thead>
-          <tbody>
-            <tr><th scope="row">GitHub Pages</th><td>웹사이트를 열 때 화면 파일 제공</td><td>페이지 요청·IP 주소 등 접속 정보. 운영 데이터베이스와 녹음 파일을 공개 저장소에 게시하지 않습니다.</td></tr>
-            <tr><th scope="row">Cloudflare</th><td>브라우저와 운영 서버의 통신 연결·보안</td><td>접속 정보와 서버로 전송하는 로그인·음성·수업 요청 및 응답. 통신을 중계하므로 모든 내용이 브라우저 안에서만 처리되는 서비스는 아닙니다.</td></tr>
-            <tr><th scope="row">Google Drive</th><td>Drive 연동 시 완료된 녹음 보관·다운로드·삭제</td><td>녹음 WAV, 이용자 아이디를 사용한 보관 폴더명, 파일 식별자·크기·검증 정보, 연결한 Google 계정의 식별 정보와 접근 권한. 자세한 내용은 3항을 참고하세요.</td></tr>
-            <tr><th scope="row">NAVER Cloud · CLOVA Speech</th><td>CLOVA를 선택한 수업의 실시간 음성 인식</td><td>음성 및 인식 처리에 필요한 정보. 인식 결과는 운영자의 NAVER Cloud Object Storage에도 저장될 수 있으며, 여백의 수업 삭제만으로 그 사본이 삭제되지는 않습니다.</td></tr>
-            <tr><th scope="row">마인드로직 · NOVA와 연결된 AI 모델 제공업체</th><td>AI 후보정·요약·번역·정리·질문·복습 또는 시간표 인식을 요청할 때</td><td>해당 작업에 필요한 전사·자료 텍스트와 자료명, 질문·참조 내용, 시간표 글 또는 이미지. 현재 서비스는 GPT-6 Luna를 요청하며 마인드로직의 연결 서비스를 이용합니다. 일부 정보 가림은 완전한 익명화를 뜻하지 않으며, 시간표 인식에는 제출한 글·이미지를 그대로 보냅니다.</td></tr>
+        <table role="table" aria-labelledby="provider-table-caption">
+          <caption id="provider-table-caption">기능별 처리업체와 전달 범위</caption>
+          <thead role="rowgroup"><tr role="row"><th id="provider-service" role="columnheader" scope="col">업체·서비스</th><th id="provider-purpose" role="columnheader" scope="col">목적·시점</th><th id="provider-data" role="columnheader" scope="col">처리하는 정보</th></tr></thead>
+          <tbody role="rowgroup">
+            <tr role="row"><th id="provider-github" role="rowheader" scope="row">GitHub Pages</th><td role="cell" headers="provider-github provider-purpose" data-label="목적·시점">웹사이트를 열 때 화면 파일 제공</td><td role="cell" headers="provider-github provider-data" data-label="처리하는 정보">페이지 요청·IP 주소 등 접속 정보. 운영 데이터베이스와 녹음 파일을 공개 저장소에 게시하지 않습니다.</td></tr>
+            <tr role="row"><th id="provider-cloudflare" role="rowheader" scope="row">Cloudflare</th><td role="cell" headers="provider-cloudflare provider-purpose" data-label="목적·시점">브라우저와 운영 서버의 통신 연결·보안</td><td role="cell" headers="provider-cloudflare provider-data" data-label="처리하는 정보">접속 정보와 서버로 전송하는 로그인·음성·수업 요청 및 응답. 통신을 중계하므로 모든 내용이 브라우저 안에서만 처리되는 서비스는 아닙니다.</td></tr>
+            <tr role="row"><th id="provider-google" role="rowheader" scope="row">Google Drive</th><td role="cell" headers="provider-google provider-purpose" data-label="목적·시점">Drive 연동 시 완료된 녹음 보관·다운로드·삭제</td><td role="cell" headers="provider-google provider-data" data-label="처리하는 정보">녹음 WAV, 이용자 아이디를 사용한 보관 폴더명, 파일 식별자·크기·검증 정보, 연결한 Google 계정의 식별 정보와 접근 권한. 자세한 내용은 3항을 참고하세요.</td></tr>
+            <tr role="row"><th id="provider-clova" role="rowheader" scope="row">NAVER Cloud · CLOVA Speech</th><td role="cell" headers="provider-clova provider-purpose" data-label="목적·시점">CLOVA를 선택한 수업의 실시간 음성 인식</td><td role="cell" headers="provider-clova provider-data" data-label="처리하는 정보">음성 및 인식 처리에 필요한 정보. 인식 결과는 운영자의 NAVER Cloud Object Storage에도 저장될 수 있으며, 여백의 수업 삭제만으로 그 사본이 삭제되지는 않습니다.</td></tr>
+            <tr role="row"><th id="provider-nova" role="rowheader" scope="row">마인드로직 · NOVA와 연결된 AI 모델 제공업체</th><td role="cell" headers="provider-nova provider-purpose" data-label="목적·시점">AI 후보정·요약·번역·정리·질문·복습 또는 시간표 인식을 요청할 때</td><td role="cell" headers="provider-nova provider-data" data-label="처리하는 정보">해당 작업에 필요한 전사·자료 텍스트와 자료명, 질문·참조 내용, 시간표 글 또는 이미지. 현재 서비스는 GPT-6 Luna를 요청하며 마인드로직의 연결 서비스를 이용합니다. 일부 정보 가림은 완전한 익명화를 뜻하지 않으며, 시간표 인식에는 제출한 글·이미지를 그대로 보냅니다.</td></tr>
           </tbody>
         </table>
       </div>
