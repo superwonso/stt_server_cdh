@@ -9,6 +9,7 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 from fastapi import FastAPI, Header, HTTPException
@@ -288,7 +289,7 @@ class ReviewServiceTests(unittest.TestCase):
 
     def test_catchup_selection_revalidated_and_atomic_zero_writes_on_bad_key(self):
         self.timetable()
-        rows = schedule.catchup_preview(self.state["timetable"], "2026-09-01", self.state["today"], self.state["settings"], self.state["holidays"])
+        rows = schedule.catchup_preview(self.state["timetable"], "2026-09-01", self.state["today"], self.state["settings"], self.state["holidays"], self.state["source_keys"])
         keys = [row["source_key"] for row in rows if row["selected"]]
         before = self.get()
         self.act("timetable.catchup", {"sem_start": "2026-09-01", "source_keys": keys + ["not-an-occurrence"], "per_day": 5}, expected=409)
@@ -298,6 +299,98 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(self.state["timetable"]["from"], "2026-09-01")
         self.assertEqual(self.state["timetable"]["through"], "2026-09-29")
         self.assertEqual(sum(item["base"] == "2026-09-29" for item in self.state["items"] if item["catchup"]), min(5, len(keys)))
+
+    def test_repeated_catchup_adds_only_explicit_holiday_and_preserves_three_prior_records(self):
+        self.act("timetable.save", {"classes": [CLASS_ROWS[-1]], "from": self.days[0], "mode": CURVE})
+
+        def preview():
+            return schedule.catchup_preview(self.state["timetable"], "2026-09-01", self.days[0],
+                                            self.state["settings"], self.state["holidays"], self.state["source_keys"])
+
+        selected = [row["source_key"] for row in preview() if row["selected"]]
+        self.assertEqual(len(selected), 3)
+        self.act("timetable.catchup", {"sem_start": "2026-09-01", "source_keys": selected, "per_day": 0})
+        self.assertEqual(len(self.state["items"]), 3)
+        self.assertEqual(self.state["timetable"]["from"], "2026-09-01")
+        self.assertEqual(self.state["timetable"]["through"], self.days[0])
+        self.act("item.review", {"id": self.state["items"][0]["id"]})
+        originals = copy.deepcopy(self.state["items"])
+        self.assertEqual(len(schedule.due_items(originals, self.days[0])), 2)
+        again = preview()
+        self.assertEqual(len(again), 4)
+        self.assertTrue(all(row["existing"] and not row["selected"] for row in again[:3]))
+        holiday = again[-1]
+        self.assertEqual((holiday["date"], holiday["holiday"], holiday["existing"], holiday["selected"]),
+                         ("2026-09-24", "추석", False, False))
+        payload = {"sem_start": "2026-09-01", "source_keys": [holiday["source_key"]], "per_day": 0}
+        before = self.get()
+        self.act("timetable.catchup", {**payload, "source_keys": [selected[0], holiday["source_key"]]}, expected=409)
+        self.assertEqual(self.get(), before, "a stale mixed selection must not partially insert its new holiday")
+        body = self.request("timetable.catchup", payload)
+        response = self.send(body)
+        self.assertEqual(response.status_code, 200)
+        self.state = response.json()
+        self.assertEqual(len(self.state["items"]), 4)
+        self.assertEqual([self.row(row["id"]) for row in originals], originals)
+        added = next(row for row in self.state["items"] if row["source_key"] == holiday["source_key"])
+        self.assertEqual((added["learned"], added["reviews"]), ("2026-09-24", []))
+        self.assertEqual(len(schedule.due_items(self.state["items"], self.days[0])), 3)
+        self.assertEqual(sum(len(group["items"]) for group in schedule.group_due_items(self.state["items"], self.days[0])), 3)
+        self.assertEqual(self.send(body).json()["items"], self.state["items"], "a lost-response replay creates nothing twice")
+        before = self.get()
+        self.act("timetable.catchup", payload, expected=409)
+        self.assertEqual(self.get(), before)
+        self.act("item.review", {"id": added["id"]})
+        self.assertEqual(len(schedule.due_items(self.state["items"], self.days[0])), 2)
+        self.act("undo", {"token": self.state["undo"]["token"]})
+        self.assertEqual(self.state["items"], before["items"])
+        self.act("item.delete", {"id": added["id"]})
+        undo = self.state["undo"]["token"]
+        self.assertEqual(self.state["items"], originals)
+        tombstone = next(row for row in preview() if row["source_key"] == holiday["source_key"])
+        self.assertTrue(tombstone["existing"])
+        self.assertFalse(tombstone["selected"])
+        self.act("timetable.catchup", payload, expected=409)
+        self.act("undo", {"token": undo})
+        self.assertEqual(self.state["items"], before["items"])
+        self.assertEqual(len(self.get()["items"]), 4)
+
+    def test_today_catchup_and_automatic_generation_race_creates_one_source_once(self):
+        self.days[0] = "2026-09-28"
+        self.act("timetable.save", {"classes": [CLASS_ROWS[0]], "from": "2026-09-29", "mode": CURVE})
+        self.assertEqual(self.state["items"], [])
+        self.days[0] = "2026-09-29"
+        rows = schedule.catchup_preview(self.state["timetable"], self.days[0], self.days[0],
+                                        self.state["settings"], self.state["holidays"], self.state["source_keys"])
+        self.assertEqual(len(rows), 1)
+        payload = {"sem_start": self.days[0], "source_keys": [rows[0]["source_key"]], "per_day": 0}
+        body = self.request("timetable.catchup", payload)
+        start = Barrier(2)
+
+        def generate():
+            start.wait(timeout=10)
+            return self.service.state("alpha")
+
+        def catchup():
+            start.wait(timeout=10)
+            return self.send(body)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            generation = pool.submit(generate)
+            action = pool.submit(catchup)
+            generated, response = generation.result(timeout=15), action.result(timeout=15)
+        self.assertEqual(len(generated["items"]), 1)
+        self.assertIn(response.status_code, (200, 409))
+        if response.status_code == 409:
+            self.assertEqual(response.json()["detail"], "stale_revision")
+        self.state = self.get()
+        self.assertEqual(len(self.state["items"]), 1)
+        self.assertEqual(self.state["source_keys"], payload["source_keys"])
+        self.assertEqual(self.state["timetable"]["through"], self.days[0])
+        self.assertEqual(len(schedule.due_items(self.state["items"], self.days[0])), 1)
+        before = copy.deepcopy(self.state)
+        self.act("timetable.catchup", payload, expected=409)
+        self.assertEqual(self.get(), before)
 
     def test_catchup_can_explicitly_include_holiday_and_use_early_learning_date(self):
         self.timetable(mode={"sameDay": False, "nextDay": False, "eve": True, "curve": False})

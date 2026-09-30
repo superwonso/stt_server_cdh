@@ -323,7 +323,9 @@ def week_no(day, sem_start):
 
 def catchup_preview(timetable, sem_start, today, settings, holidays, existing_keys=(), exams=()):
     if not timetable: return []
-    end = min(add_days(timetable["from"], -1), today, timetable.get("until") or today)
+    # Catch-up can revisit omitted lessons after an earlier import moves `from`.
+    # `from` remains the automatic-generation boundary; source keys prevent duplicates.
+    end = min(today, timetable.get("until") or today)
     excluded, seen, rows = holiday_map(holidays), set(existing_keys), []
     for day in _dates(sem_start, end):
         for entry in _classes(day, timetable, exams):

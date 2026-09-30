@@ -88,8 +88,12 @@ class ReviewScheduleTests(unittest.TestCase):
         self.assertEqual(s.next_class_date('사회조사방법론I', TODAY, tt, HOLIDAYS), s.add_days(TODAY, 1))
 
     def test_spec_4_catchup_38_holidays_selection_existing_and_base_spread(self):
-        tt = timetable(); rows = s.catchup_preview(tt, SEM, TODAY, SETTINGS, HOLIDAYS)
-        self.assertEqual(len(rows), 40)
+        tt = timetable()
+        generated = s.timetable_preview(tt, TODAY, SETTINGS, HOLIDAYS)['items']
+        rows = s.catchup_preview(tt, SEM, TODAY, SETTINGS, HOLIDAYS, [row['source_key'] for row in generated])
+        self.assertEqual(len(rows), 42)
+        self.assertEqual(sum(row['existing'] for row in rows), 2)
+        self.assertTrue(all(row['existing'] and not row['selected'] for row in rows if row['date'] == TODAY))
         self.assertTrue(all(not row['selected'] and row['holiday'] == '추석' for row in rows if row['date'] == '2026-09-24'))
         plan = s.catchup_plan(rows, tt, TODAY, SETTINGS, HOLIDAYS, 5)
         self.assertEqual(len(plan), 38)
@@ -106,6 +110,37 @@ class ReviewScheduleTests(unittest.TestCase):
         for row in rows:
             if row['holiday']: row['selected'] = True
         self.assertEqual(len(s.catchup_plan(rows, timetable(), TODAY, SETTINGS, HOLIDAYS)), 39)
+
+    def test_catchup_reopens_missing_holiday_after_from_moves_without_reviving_prior_sources(self):
+        tt = timetable(); tt['classes'] = [tt['classes'][-1]]
+        rows = s.catchup_preview(tt, SEM, TODAY, SETTINGS, HOLIDAYS)
+        first = s.catchup_plan(rows, tt, TODAY, SETTINGS, HOLIDAYS, 0)
+        self.assertEqual([row['learned'] for row in first], ['2026-09-03', '2026-09-10', '2026-09-17'])
+        keys = [row['source_key'] for row in first]
+        tt['from'] = SEM; tt['through'] = TODAY
+        again = s.catchup_preview(tt, SEM, TODAY, SETTINGS, HOLIDAYS, keys)
+        self.assertEqual(len(again), 4)
+        self.assertTrue(all(row['existing'] and not row['selected'] for row in again[:3]))
+        holiday = again[-1]
+        self.assertEqual((holiday['date'], holiday['holiday'], holiday['existing'], holiday['selected']), ('2026-09-24', '추석', False, False))
+        holiday['selected'] = True
+        self.assertEqual([row['learned'] for row in s.catchup_plan(again, tt, TODAY, SETTINGS, HOLIDAYS)], ['2026-09-24'])
+        # The source ledger also contains deleted occurrences: selection cannot recreate one.
+        blocked = s.catchup_preview(tt, SEM, TODAY, SETTINGS, HOLIDAYS, keys + [holiday['source_key']])
+        for row in blocked: row['selected'] = True
+        self.assertEqual(s.catchup_plan(blocked, tt, TODAY, SETTINGS, HOLIDAYS), [])
+
+    def test_catchup_includes_today_but_respects_until_exams_and_future_boundary(self):
+        tt = timetable(); tt['classes'] = [tt['classes'][6]]; tt['from'] = SEM
+        excluded = [{'subject': '창업과공동체', 'date': '2026-09-22'}]
+        rows = s.catchup_preview(tt, '2026-09-22', TODAY, SETTINGS, HOLIDAYS, exams=excluded)
+        self.assertEqual([row['date'] for row in rows], [TODAY])
+        tt['until'] = TODAY
+        self.assertEqual([row['date'] for row in s.catchup_preview(tt, '2026-09-22', '2026-10-06', SETTINGS, HOLIDAYS, exams=excluded)], [TODAY])
+        tt['until'] = '2026-09-28'
+        self.assertEqual(s.catchup_preview(tt, '2026-09-22', TODAY, SETTINGS, HOLIDAYS, exams=excluded), [])
+        tt['until'] = None
+        self.assertEqual(s.catchup_preview(tt, '2026-09-30', TODAY, SETTINGS, HOLIDAYS), [])
 
     def test_spec_5_exam_ranges_exact_session_counts_and_week_boundaries(self):
         expected = [(13, '2026-09-02', '2026-10-19', 1, 8), (15, '2026-10-26', '2026-12-14', 9, 16), (9, '2026-09-01', '2026-10-01', 1, 5)]

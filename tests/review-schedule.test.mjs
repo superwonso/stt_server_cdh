@@ -55,8 +55,10 @@ test('spec 2 rhythm offsets and spec 3 eve targets skip next-class holidays',()=
 });
 
 test('spec 4 catchup has 38 selected sessions, five per day and explicit optional holiday selection',()=>{
-  const tt=timetable(),rows=s.catchupPreview(tt,SEM,TODAY,SETTINGS,HOLIDAYS),plan=s.catchupPlan(rows,tt,TODAY,SETTINGS,HOLIDAYS,5);
-  assert.equal(rows.length,40);assert.equal(plan.length,38);
+  const tt=timetable(),generated=s.timetablePreview(tt,TODAY,SETTINGS,HOLIDAYS).items;
+  const rows=s.catchupPreview(tt,SEM,TODAY,SETTINGS,HOLIDAYS,generated.map(row=>row.source_key)),plan=s.catchupPlan(rows,tt,TODAY,SETTINGS,HOLIDAYS,5);
+  assert.equal(rows.length,42);assert.equal(plan.length,38);
+  assert.equal(rows.filter(row=>row.existing).length,2);assert.ok(rows.filter(row=>row.date===TODAY).every(row=>row.existing&&!row.selected));
   assert.ok(rows.filter(row=>row.date==='2026-09-24').every(row=>!row.selected&&row.holiday==='추석'));
   const counts=Object.fromEntries(Array.from({length:8},(_,i)=>[s.addDays(TODAY,i),i===7?3:5]));
   assert.deepEqual(plan.reduce((total,row)=>(total[row.base]=(total[row.base]||0)+1,total),{}),counts);
@@ -66,6 +68,31 @@ test('spec 4 catchup has 38 selected sessions, five per day and explicit optiona
   rows[0].existing=true;for(const row of rows)if(row.holiday)row.selected=true;
   assert.equal(s.catchupPlan(rows,tt,TODAY,SETTINGS,HOLIDAYS).length,39);
   const oldThrough=tt.through;tt.from=SEM;assert.equal(tt.from,SEM);assert.equal(tt.through,oldThrough);
+});
+
+test('catchup still offers a missing holiday after its first import moves from back to semester start',()=>{
+  const tt=timetable();tt.classes=[tt.classes.at(-1)];
+  const first=s.catchupPlan(s.catchupPreview(tt,SEM,TODAY,SETTINGS,HOLIDAYS),tt,TODAY,SETTINGS,HOLIDAYS,0);
+  assert.deepEqual(first.map(row=>row.learned),['2026-09-03','2026-09-10','2026-09-17']);
+  const keys=first.map(row=>row.source_key);tt.from=SEM;tt.through=TODAY;
+  const again=s.catchupPreview(tt,SEM,TODAY,SETTINGS,HOLIDAYS,keys);assert.equal(again.length,4);
+  assert.ok(again.slice(0,3).every(row=>row.existing&&!row.selected));
+  const holiday=again.at(-1);assert.deepEqual([holiday.date,holiday.holiday,holiday.existing,holiday.selected],['2026-09-24','추석',false,false]);
+  holiday.selected=true;
+  assert.deepEqual(s.catchupPlan(again,tt,TODAY,SETTINGS,HOLIDAYS).map(row=>row.learned),['2026-09-24']);
+  const blocked=s.catchupPreview(tt,SEM,TODAY,SETTINGS,HOLIDAYS,[...keys,holiday.source_key]);
+  for(const row of blocked)row.selected=true;
+  assert.deepEqual(s.catchupPlan(blocked,tt,TODAY,SETTINGS,HOLIDAYS),[],'even an explicitly selected deleted source remains blocked');
+});
+
+test('catchup includes today and respects the inclusive end, exam exclusions and future boundary',()=>{
+  const tt=timetable();tt.classes=[tt.classes[6]];tt.from=SEM;
+  const exams=[{subject:'창업과공동체',date:'2026-09-22'}];
+  assert.deepEqual(s.catchupPreview(tt,'2026-09-22',TODAY,SETTINGS,HOLIDAYS,[],exams).map(row=>row.date),[TODAY]);
+  tt.until=TODAY;
+  assert.deepEqual(s.catchupPreview(tt,'2026-09-22','2026-10-06',SETTINGS,HOLIDAYS,[],exams).map(row=>row.date),[TODAY]);
+  tt.until='2026-09-28';assert.deepEqual(s.catchupPreview(tt,'2026-09-22',TODAY,SETTINGS,HOLIDAYS,[],exams),[]);
+  tt.until=null;assert.deepEqual(s.catchupPreview(tt,'2026-09-30',TODAY,SETTINGS,HOLIDAYS),[]);
 });
 
 test('spec 5 exact midterm/final ranges have 13/15/9 sessions and Monday-based weeks',()=>{
