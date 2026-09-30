@@ -8,7 +8,7 @@ import { setTimeout as hostDelay } from 'node:timers/promises';
 import { encodeWav } from '../web/audio.js';
 import * as TestLocalAudioExport from '../web/local-audio-export.js';
 import * as TestHeldImportRecovery from '../web/held-import-recovery.js';
-import { recordingFileFingerprint } from '../web/file-import.js';
+import { recordingFileFingerprint, RecordingFileUploader, IMPORT_PART_BYTES } from '../web/file-import.js';
 import * as TestRecordingFileSelection from '../web/recording-file-selection.js';
 import { renderDriveStatus } from '../web/admin-storage.js';
 import { renderMaintenanceStatus } from '../web/admin-maintenance.js';
@@ -1991,7 +1991,7 @@ test('auth expiry keeps a paused capture open and offers an explicit local stop'
   app.microphone().tail = chunk(0,2,2,true);
   await app.run('pauseRecording()');
   assert.equal(app.run('isBusy()'),true,'beforeunload and navigation must remain guarded while paused');
-  assert.equal(app.run('presenceActivity()'),'recording');
+  assert.ok(['paused','transcribing'].includes(app.run('presenceActivity()')),'a paused capture reports pause or its still-saving audio tail');
   app.run('showLogin()');
   await tick(); await tick();
   assert.equal(app.microphone().stopCalls,undefined);
@@ -3122,7 +3122,7 @@ test('admin work totals include summary translation and study notes without reve
   assert.equal(app.element('admin-summary-queue').textContent, '2');
   assert.equal(app.element('admin-translation-queue').textContent, '3');
   assert.equal(app.element('admin-study-note-queue').textContent, '4');
-  assert.match(app.element('admin-accounts').children[1].children[1].children[1].textContent, /진행 작업 3개/);
+  assert.match(app.element('admin-accounts').children[1].children[1].children[1].textContent, /요약 1개 \/ 번역 1개 \/ 수업 정리본 1개/);
   app.run('adminOverview={...adminOverview,queues:{}}; renderAdminOverview()');
   assert.equal(app.element('admin-summary-queue').textContent, '0 · 0');
   assert.equal(app.element('admin-translation-queue').textContent, '0 · 0');
@@ -3149,7 +3149,7 @@ test('admin overview renders safe operational metadata, refreshes while open, an
   const accountRows = app.element('admin-accounts').children;
   assert.equal(accountRows.length, 2);
   assert.equal(accountRows[0].children[0].children[0].textContent, 'user-alpha');
-  assert.equal(accountRows[0].children[1].children[0].textContent, '녹음 중');
+  assert.equal(accountRows[0].children[1].children[0].textContent, '녹음 중 · 받아쓰기 처리 중');
   assert.equal(accountRows[0].children[2].tagName, 'SPAN');
   assert.equal(accountRows[0].children[2].textContent, '현재 계정');
   assert.equal(accountRows[1].children[0].children[1].textContent, '초대·비밀번호 설정 대기');
@@ -3206,7 +3206,7 @@ test('admin mutations require confirmation and send only the opaque account refe
   assert.equal(calls.filter(call => call.url.endsWith('/admin/tunnel/restart')).length, 0);
 });
 
-test('presence heartbeat reports only activity and follows recording, away, and logout state', async () => {
+test('presence heartbeat reports fixed activity, memory-only tab and idle duration without hiding background recording', async () => {
   const bodies = [];
   const app = setup(async (url, options = {}) => {
     if (url.endsWith('/presence')) bodies.push(JSON.parse(options.body));
@@ -3214,21 +3214,211 @@ test('presence heartbeat reports only activity and follows recording, away, and 
   });
   app.run('startPresence()');
   await app.runTimeout(0);
-  assert.deepEqual(bodies.at(-1),{activity:'viewing'});
+  assert.equal(bodies.at(-1).activity,'viewing');
+  assert.match(bodies.at(-1).tab_id,/^[a-f0-9]{32}$/);
+  const tab = bodies.at(-1).tab_id;
 
   app.run('recording=true; notePresenceStateChange()');
   await tick(); await tick();
-  assert.deepEqual(bodies.at(-1),{activity:'recording'});
+  assert.equal(bodies.at(-1).activity,'recording');
   app.document.hidden = true;
   await app.dispatchDocument('visibilitychange');
-  assert.deepEqual(bodies.at(-1),{activity:'away'});
+  assert.equal(bodies.at(-1).activity,'recording');
   await app.runInterval(15000);
-  assert.deepEqual(bodies.at(-1),{activity:'away'});
-  assert.ok(bodies.every(body => Object.keys(body).length === 1 && typeof body.activity === 'string'));
+  assert.equal(bodies.at(-1).activity,'recording');
+  assert.ok(bodies.every(body => Object.keys(body).sort().join(',') === 'activity,idle_seconds,tab_id'
+    && body.tab_id === tab && Number.isInteger(body.idle_seconds) && body.idle_seconds >= 0 && body.idle_seconds <= 86400));
+  assert.ok(app.storageWrites.every(([,value]) => !value.includes(tab)));
 
   app.run('recording=false; showLogin()');
   assert.equal(app.intervals.size, 0);
   assert.ok(![...app.timeouts.values()].some(timer => timer.delay === 5 * 60 * 1000));
+});
+
+test('presence switches at five minutes and trusted input restores the selected page without focus or polling resetting idle', async () => {
+  const bodies=[];
+  const app=setup(async(url,options={})=>{if(url.endsWith('/presence'))bodies.push(JSON.parse(options.body));return response({status:'ok'});});
+  app.run('globalThis.testNow=1000000; Date.now=()=>testNow; startPresence(); activeService="reminder"');
+  await app.runTimeout(0);
+  assert.equal(bodies.at(-1).activity,'reminder');
+  app.run('testNow+=299000');app.document.hidden=true;
+  await app.dispatchDocument('visibilitychange');await app.runInterval(15000);
+  assert.equal(bodies.at(-1).activity,'reminder');assert.equal(bodies.at(-1).idle_seconds,299);
+  assert.equal(app.run('lastPresenceInteraction'),1000000);
+  app.run('testNow+=1000');await app.runTimeout(300000);
+  assert.equal(bodies.at(-1).activity,'idle');assert.equal(bodies.at(-1).idle_seconds,300);
+  await app.dispatchDocument('input',{isTrusted:false,target:{value:'PRIVATE INPUT'}});
+  assert.equal(app.run('lastPresenceInteraction'),1000000);
+  app.document.hidden=false;await app.dispatchDocument('visibilitychange');
+  assert.equal(app.run('lastPresenceInteraction'),1000000);
+  await app.dispatchDocument('wheel',{isTrusted:true});
+  assert.equal(bodies.at(-1).activity,'reminder');assert.equal(bodies.at(-1).idle_seconds,0);
+  for(const name of ['pointerdown','keydown','input','change']){
+    app.run('testNow+=1000');await app.dispatchDocument(name,{isTrusted:true,target:{value:'PRIVATE INPUT'},key:'PRIVATE KEY'});
+    assert.equal(app.run('lastPresenceInteraction'),app.run('testNow'));
+  }
+  const interaction=app.run('lastPresenceInteraction');app.run('testNow+=1000');
+  await app.dispatchDocument('mousemove',{isTrusted:true});await app.dispatchDocument('scroll',{isTrusted:true});
+  assert.equal(app.run('lastPresenceInteraction'),interaction);
+  app.run('testNow+=90000000');await app.runInterval(15000);assert.equal(bodies.at(-1).idle_seconds,86400);
+  assert.doesNotMatch(JSON.stringify(bodies),/PRIVATE/);
+});
+
+test('presence prioritizes real processing and separates paused recording, pages and idle',()=>{
+  const scenarios=[
+    ['recording=true','recording'],['paused=true','idle'],['importStarting=true','uploading'],
+    ['importJob={status:"processing"}','transcribing'],['correctionStarting=true','correcting'],
+    ['studyNoteView.row={status:"processing"}','study_notes'],['summaryView.row={status:"queued"}','summarizing'],
+    ['translationView.row={status:"processing"}','translating'],['questionView.page={questions:[{status:"queued"}]}','questioning'],
+    ['presenceRequests.set("course_review",1)','course_review'],['presenceRequests.set("materials",1)','materials'],
+  ];
+  for(const [state,expected]of scenarios){const app=setup(async()=>response({}));app.document.hidden=true;app.run('lastPresenceInteraction=Date.now()-600000;'+state);assert.equal(app.run('presenceActivity()'),expected);}
+  const app=setup(async()=>response({}));app.run('paused=true');assert.equal(app.run('presenceActivity()'),'paused');
+  app.run('paused=false; activeService="reminder"');assert.equal(app.run('presenceActivity()'),'reminder');
+  app.element('course-dialog').open=true;assert.equal(app.run('presenceActivity()'),'course_review');
+  app.run('adminAuthorized=true');app.element('admin-dialog').open=true;assert.equal(app.run('presenceActivity()'),'admin');
+  app.run('lastPresenceInteraction=Date.now()-300000');assert.equal(app.run('presenceActivity()'),'idle');
+});
+
+test('a recovered upload waiting for its file becomes idle while an active transfer remains uploading',async()=>{
+  const bodies=[];
+  const job={id:webcrypto.randomUUID(),lecture_id:webcrypto.randomUUID(),status:'uploading',
+    title:'Synthetic retained upload',filename:'synthetic.wav',language:'ko',
+    total_bytes:16044,uploaded_bytes:0,next_offset:0,part_bytes:IMPORT_PART_BYTES,
+    file_fingerprint:'a'.repeat(64),raw_deleted:false};
+  const app=setup(async(url,options={})=>{
+    if(url.endsWith('/presence')){bodies.push(JSON.parse(options.body));return response({status:'ok'});}
+    if(url.endsWith('/imports'))return response({imports:[job]});
+    if(url.endsWith(`/lectures/${job.lecture_id}`))return response({id:job.lecture_id,title:job.title,
+      created_at:'2026-09-30T00:00:00Z',segments:[]});
+    return response([]);
+  },{FileUploader:RecordingFileUploader});
+  app.run('globalThis.testNow=1000000; Date.now=()=>testNow; startPresence()');
+  await app.runTimeout(0);
+  await app.run('recoverFileImport()');
+  assert.equal(app.run('fileUploader.running'),false);
+  assert.equal(app.run('fileUploader.file'),null);
+  assert.equal(app.run('importJob.status'),'uploading');
+  app.run('testNow+=299000');await app.runInterval(15000);
+  assert.equal(bodies.at(-1).activity,'viewing');
+  app.run('testNow+=1000');await app.runTimeout(300000);
+  assert.equal(bodies.at(-1).activity,'idle');
+  assert.equal(bodies.at(-1).idle_seconds,300);
+  // An actual uploader run includes bounded automatic retry waits. Once it
+  // settles, the same resumable server row must stop overriding inactivity.
+  app.run('fileUploader.running=true; notePresenceStateChange()');await tick();await tick();
+  assert.equal(bodies.at(-1).activity,'uploading');
+  app.run('fileUploader.running=false; importError="synthetic stopped transfer"; notePresenceStateChange()');
+  await tick();await tick();
+  assert.equal(bodies.at(-1).activity,'idle');
+  assert.equal(app.run('importJob.status'),'uploading');
+  assert.doesNotMatch(JSON.stringify(bodies),/synthetic|Synthetic/);
+});
+
+test('failed or held audio does not report processing after five minutes but active sends and automatic retries do',async()=>{
+  const bodies=[];
+  const app=setup(async(url,options={})=>{
+    if(url.endsWith('/presence'))bodies.push(JSON.parse(options.body));
+    return response({status:'ok'});
+  });
+  app.run(`globalThis.testNow=1000000; Date.now=()=>testNow; startPresence();
+    liveSessions.set('synthetic-capture',{owner:user,uploadHeld:false});
+    pending=[{captureId:'synthetic-capture',owner:user}];
+    sendError='synthetic manual retry required';`);
+  await app.runTimeout(0);
+  app.run('testNow+=299000');await app.runInterval(15000);
+  assert.equal(bodies.at(-1).activity,'viewing');
+  app.run('testNow+=1000');await app.runTimeout(300000);
+  assert.equal(bodies.at(-1).activity,'idle');
+  app.run('sending=true; notePresenceStateChange()');await tick();await tick();
+  assert.equal(bodies.at(-1).activity,'transcribing');
+  app.run('sending=false; sendError=""; retryTimer=123; notePresenceStateChange()');await tick();await tick();
+  assert.equal(bodies.at(-1).activity,'transcribing','automatic retry still owns active work');
+  app.run('retryTimer=null; liveSessions.get("synthetic-capture").uploadHeld=true; notePresenceStateChange()');
+  await tick();await tick();
+  assert.equal(bodies.at(-1).activity,'idle');
+  assert.equal(app.run('pending.length'),1,'activity checks leave retained audio unchanged');
+  assert.equal(app.run('liveSessions.get("synthetic-capture").uploadHeld'),true);
+  assert.doesNotMatch(JSON.stringify(bodies),/synthetic|manual retry/);
+});
+
+test('presence tab identity differs between pages and stays in memory across auth reset',()=>{
+  const a=setup(async()=>response({})),b=setup(async()=>response({}));
+  const first=a.run('presenceTabId'),second=b.run('presenceTabId');assert.notEqual(first,second);
+  a.run('resetPresence()');assert.equal(a.run('presenceTabId'),first);
+  assert.ok(a.storageWrites.every(([,value])=>!value.includes(first)));
+});
+
+test('presence supports a strict old server using one bounded legacy retry',async()=>{
+  const bodies=[];const app=setup(async(url,options={})=>{
+    if(url.endsWith('/presence')){const body=JSON.parse(options.body);bodies.push(body);if('tab_id'in body)return response({detail:'unsupported_fields'},422);}
+    return response({status:'ok'});
+  });
+  app.run('activeService="reminder"; startPresence()');await app.runTimeout(0);await tick();await tick();
+  assert.equal(bodies.length,2);assert.deepEqual(bodies[1],{activity:'viewing'});assert.equal(app.run('presenceLegacy'),true);
+  await app.runInterval(15000);assert.deepEqual(bodies.at(-1),{activity:'viewing'});assert.equal(bodies.length,3);
+  app.run('resetPresence()');assert.equal(app.run('presenceLegacy'),false);
+});
+
+test('late presence errors cannot send a legacy heartbeat or update state for a replacement account',async()=>{
+  const pending=deferred(),calls=[];
+  const app=setup(async(url,options={})=>{calls.push({url,body:options.body});if(url.endsWith('/presence'))return pending.promise;return response({});});
+  app.run('startPresence()');await app.runTimeout(0);assert.equal(calls.length,1);
+  app.run('resetPresence(); user="replacement"; token="replacement-token"; apiUrl="https://replacement.example"');
+  pending.resolve(response({detail:'unsupported_fields'},422));await tick();await tick();
+  assert.equal(calls.length,1);assert.equal(app.run('presenceLastSent'),'');assert.equal(app.run('presenceLegacy'),false);
+  assert.equal(app.run('presenceSending'),false);
+});
+
+test('changing API origin releases an in-flight heartbeat without treating reconnection as user interaction',async()=>{
+  const pending=deferred();let calls=0;
+  const app=setup(async(url)=>{if(url.endsWith('/presence')){calls++;return pending.promise;}return response({});});
+  app.run('globalThis.testNow=1000000; Date.now=()=>testNow; startPresence()');await app.runTimeout(0);
+  assert.equal(app.run('presenceSending'),true);
+  const before=app.run('presenceSequence');app.run('testNow+=299000; setServer("https://replacement.trycloudflare.com")');
+  assert.ok(app.run('presenceSequence')>before);assert.equal(app.run('presenceSending'),false);
+  assert.equal(app.run('presenceIdleSeconds()'),299);assert.equal(app.intervals.size,1);
+  pending.resolve(response({detail:'unsupported_fields'},422));await tick();await tick();
+  assert.equal(calls,1);assert.equal(app.run('presenceLastSent'),'');assert.equal(app.run('presenceLegacy'),false);
+});
+
+test('material and course HTTP activity tracks only fixed kinds and stale completions cannot alter a new scope',async()=>{
+  const pending=deferred(),bodies=[];
+  const app=setup(async(url,options={})=>{
+    if(url.endsWith('/presence')){bodies.push(JSON.parse(options.body));return response({status:'ok'});}
+    if(url.endsWith('/convert'))return pending.promise;return response({});
+  });
+  app.run('startPresence()');await app.runTimeout(0);
+  const job=app.run('api("/study-materials/private-id/convert",{method:"POST",body:JSON.stringify({title:"PRIVATE"})})');
+  await tick();await tick();assert.equal(bodies.at(-1).activity,'materials');assert.equal(app.run('presenceRequests.get("materials")'),1);
+  app.run('resetPresence(); presenceRequests.set("materials",2)');pending.resolve(response({status:'processing'}));await job;
+  assert.equal(app.run('presenceRequests.get("materials")'),2);assert.doesNotMatch(JSON.stringify(bodies),/PRIVATE|private-id/);
+});
+
+test('administrator shows multiple activities, every server job kind and distinct request versus completion without leaking unknown codes',()=>{
+  const app=setup(async()=>response({}));
+  const now='2026-09-30T03:00:00Z';
+  app.run(`renderAdminAccounts([{label:'synthetic-user',account_id:'opaque',online:false,idle:true,activity:'offline',
+    activities:['study_notes','materials','study_notes','PRIVATE_ACTIVITY'],last_seen_at:${JSON.stringify(now)},last_activity_at:${JSON.stringify(now)},
+    last_action:'reminder_changed',last_action_at:${JSON.stringify(now)},jobs:{transcription:1,imports:2,corrections:3,summaries:4,translations:5,questions:6,study_notes:7,course_reviews:8,materials:{queued:1,processing:2}}}])`);
+  const account=app.element('admin-accounts').children[0],activity=account.children[1];
+  assert.match(activity.children[0].textContent,/^오프라인 · AI 수업 정리 중 · 자료 변환 중/);
+  assert.match(activity.children[0].textContent,/파일 변환 중/);
+  for(const label of ['받아쓰기','파일 전사','후보정','요약','번역','질문','수업 정리본','강의 복습','자료 변환','대기 1','처리 2','최근 입력·작업','접속 확인','리마인더 기록 변경'])assert.match(activity.children[1].textContent,new RegExp(label));
+  assert.doesNotMatch(activity.children[0].textContent,/PRIVATE/);
+  const entries=[{timestamp:now,account_id:'not-rendered',label:'<img src=x>',action:'study_notes',result:'requested'},
+    {timestamp:now,label:'synthetic-user',action:'reminder_changed',result:'completed'},
+    {timestamp:now,label:'synthetic-user',action:'PRIVATE_ACTION',result:'PRIVATE_RESULT'}];
+  app.run(`renderAdminRecentActivity(${JSON.stringify(entries)})`);
+  const rows=app.element('admin-recent-activity').children;
+  assert.equal(rows[0].children[1].textContent,'요청 접수');assert.equal(rows[1].children[1].textContent,'완료');
+  assert.match(rows[0].children[0].children[1].textContent,/<img src=x>/);assert.equal(rows[0].children[0].children[1].children.length,0);
+  assert.equal(rows[2].children[0].children[0].textContent,'사용자 활동');assert.equal(rows[2].children[1].textContent,'확인되지 않음');
+  app.run(`renderAdminRecentActivity(${JSON.stringify(Array(60).fill(entries[0]))})`);assert.equal(app.element('admin-recent-activity').children.length,50);
+  app.run('resetAdminState()');assert.equal(app.element('admin-recent-activity').children.length,0);
+  app.run('renderAdminRecentActivity(undefined)');assert.match(app.element('admin-recent-activity').children[0].textContent,/제공하지 않습니다/);
+  app.run('renderAdminAccounts([{label:"old-server",online:true,activity:"viewing",last_activity_at:null}])');
+  assert.match(app.element('admin-accounts').children[0].children[1].children[1].textContent,/최근 접속 확인/);
 });
 
 test('tunnel recovery retries published config after five seconds and is cancelled by logout', async () => {

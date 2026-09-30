@@ -236,6 +236,21 @@ test('admin controls are hidden by default, accessible, and contain no embedded 
   assert.match(html, /<button\b[^>]*\bid="admin-tunnel-restart"[^>]*\bdisabled/i);
   assert.match(html, /<dialog\b[^>]*\bid="admin-confirm-dialog"[^>]*\baria-labelledby="admin-confirm-title"[^>]*\baria-describedby="admin-confirm-description"/i);
   assert.match(html, /<div\b[^>]*\bid="admin-accounts"[^>]*><\/div>/i);
-  assert.match(html, /관리자 현황용 상태에는 IP, 기기 정보, 수업 제목과 내용을 저장하거나 표시하지 않습니다/);
+  const accounts = html.match(/<section\b[^>]*aria-labelledby="admin-accounts-title"[^>]*>([\s\S]*?)<\/section>/i)?.[1];
+  assert.ok(accounts, 'the account status guidance remains beside the account list');
+  assert.match(accounts, /5\s*분/);
+  assert.match(accounts, /자리\s*비움/);
+  const excluded = [...accounts.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)].map(match => match[1])
+    .find(value => /(?:수집|저장|표시)/.test(value) && /(?:않|제외)/.test(value) && /내용/.test(value));
+  assert.ok(excluded, 'the activity guidance explains which personal information is excluded');
+  for (const category of [/(?:입력|수업)\s*내용/,/수업\s*제목/,/파일\s*명/,/\bIP\b/i,/(?:기기|장치)\s*정보/]) {
+    assert.match(excluded, category);
+  }
+  const recent = html.match(/<section\b[^>]*aria-labelledby="admin-recent-activity-title"[^>]*>([\s\S]*?)<\/section>/i)?.[1];
+  assert.ok(recent, 'user activity has its own labelled section');
+  assert.match(recent, /<div\b[^>]*\bid="admin-recent-activity"[^>]*\baria-label="[^"]+"[^>]*><\/div>/i);
+  for (const information of [/7\s*일/,/500\s*건/,/50\s*건/,/요청/,/완료/]) assert.match(recent, information);
+  assert.doesNotMatch(recent, /\bid="admin-audit"/);
+  assert.match(html, /<section\b[^>]*aria-labelledby="admin-audit-title"/i);
   assert.doesNotMatch(html, /data-account-id|MINDLOGIC_API_KEY|OPENAI_API_KEY/i);
 });

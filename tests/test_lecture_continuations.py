@@ -84,6 +84,13 @@ class ContinuationApiTests(unittest.TestCase):
         self.assertEqual(self.count(), (1, 0))
 
     def test_finalized_parent_links_without_changing_original_wav_raw_ai_or_drive_metadata(self):
+        def preserved_rows(connection, table):
+            # A successful creation may append enum-only activity metadata.
+            # Every existing operational/content table and every other
+            # autoincrement sequence must still remain exactly unchanged.
+            return [tuple(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')
+                    if table != "sqlite_sequence" or row[0] != "user_activity"]
+
         parent = self.lecture(finalized=True)
         chunk_id, segment_id = str(uuid.uuid4()), str(uuid.uuid4())
         with self.database.connect() as connection:
@@ -95,8 +102,8 @@ class ContinuationApiTests(unittest.TestCase):
                                "VALUES(?,?,?,'failed','synthetic','now','now')", (parent, str(uuid.uuid4()), "a" * 64))
             connection.execute("INSERT INTO recording_archives(lecture_id,state,object_key,updated_at) VALUES(?,'pending',?,'now')",
                                (parent, "b" * 64))
-            tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('lectures','lecture_continuations')")]
-            before = {table: [tuple(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')] for table in tables}
+            tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('lectures','lecture_continuations','user_activity')")]
+            before = {table: preserved_rows(connection, table) for table in tables}
             original = tuple(connection.execute("SELECT * FROM lectures WHERE id=?", (parent,)).fetchone())
         store = self.app.state.recording_store
         store.write_chunk("user-alpha", parent, start_seconds=0, overlap_seconds=0, pcm=b"\x01\x00" * 16000)
@@ -115,7 +122,14 @@ class ContinuationApiTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(wav_path.read_bytes()).digest(), wav_hash)
         with self.database.connect() as connection:
             self.assertEqual(tuple(connection.execute("SELECT * FROM lectures WHERE id=?", (parent,)).fetchone()), original)
-            self.assertEqual({table: [tuple(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')] for table in tables}, before)
+            self.assertEqual({table: preserved_rows(connection, table) for table in tables}, before)
+            events = [dict(row) for row in connection.execute("SELECT * FROM user_activity")]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(set(events[0]), {"id", "username", "timestamp", "action", "result"})
+            self.assertEqual((events[0]["username"], events[0]["action"], events[0]["result"]),
+                             ("user-alpha", "lecture_created", "completed"))
+            for private in (parent, child, "합성 원문", "표시 이름", "분류", "학기"):
+                self.assertNotIn(private, json.dumps(events, ensure_ascii=False))
 
     def test_unfinalized_parent_with_pending_audio_is_not_finalized_or_mutated(self):
         parent, pending = self.lecture(), str(uuid.uuid4())

@@ -284,7 +284,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(accounts["user-beta"]["activity"], "transcribing")
         self.assertEqual(
             accounts["user-beta"]["jobs"],
-            {"transcription": 1, "imports": 1, "corrections": 1, "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0, "course_reviews": 0, "materials": 0},
+            {"transcription": 1, "imports": 0, "corrections": 1, "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0, "course_reviews": 0, "materials": 0},
         )
         self.assertNotEqual(accounts["user-beta"]["account_id"], "user-beta")
         self.assertEqual(result["recent_audit"], [])
@@ -407,7 +407,7 @@ class AdminApiTests(unittest.TestCase):
                          "summaries": 0, "translations": 0, "questions": 0, "study_notes": 0,
                          "course_reviews": 2, "materials": 3})
         accounts = {row["label"]: row for row in result["accounts"]}
-        for owner, expected in (("user-alpha", (1, 2)), ("user-beta", (1, 1)), ("user-gamma", (0, 0))):
+        for owner, expected in (("user-alpha", (1, 1)), ("user-beta", (1, 1)), ("user-gamma", (0, 0))):
             jobs = accounts[owner]["jobs"]
             self.assertEqual((jobs["course_reviews"], jobs["materials"]), expected)
             self.assertEqual(set(jobs), set(result["queues"]))
@@ -607,18 +607,22 @@ class AdminApiTests(unittest.TestCase):
         finally:
             another_client.close()
 
-    def test_presence_expires_without_persisting_browser_activity(self):
+    def test_presence_expires_but_safe_action_history_remains_separate(self):
         observed_at = time.time()
         response = self.client.post(
             "/presence", json={"activity": "viewing"}, headers=self.headers("user-beta")
         )
         self.assertEqual(response.status_code, 200)
-        with mock.patch("server.app.time.time", return_value=observed_at + 46):
+        before = self.client.get("/admin/overview", headers=self.headers()).json()
+        previous = next(item for item in before["accounts"] if item["label"] == "user-beta")
+        with mock.patch("server.app.time.time", return_value=observed_at + 121):
             overview = self.client.get("/admin/overview", headers=self.headers()).json()
         account = next(item for item in overview["accounts"] if item["label"] == "user-beta")
         self.assertFalse(account["online"])
         self.assertEqual(account["activity"], "offline")
-        self.assertIsNone(account["last_activity_at"])
+        self.assertIsNone(account["last_seen_at"])
+        self.assertEqual(account["last_activity_at"], previous["last_activity_at"])
+        self.assertEqual(account["last_action"], "viewing")
         with self.app.state.database.connect() as connection:
             tables = {
                 row[0]
@@ -627,6 +631,108 @@ class AdminApiTests(unittest.TestCase):
                 ).fetchall()
             }
         self.assertNotIn("presence", tables)
+
+    def test_multiple_browser_tabs_do_not_override_active_work_and_accept_strict_metadata_only(self):
+        headers = self.headers("user-beta")
+        for index in range(20):
+            for tab in range(4):
+                response = self.client.post("/presence", headers=headers,
+                                            json={"activity": "recording" if tab == 0 else "reminder",
+                                                  "tab_id": f"{tab:032x}", "idle_seconds": 600 if tab else 0})
+                self.assertEqual(response.status_code, 200, "four normal heartbeat loops must not share a 60-request limit")
+        overview = self.client.get("/admin/overview", headers=self.headers()).json()
+        beta = next(row for row in overview["accounts"] if row["label"] == "user-beta")
+        self.assertEqual(beta["activities"], ["recording"])
+        self.assertFalse(beta["idle"])
+        self.assertTrue(beta["online"])
+        self.assertEqual(len(overview["recent_activity"]), 1)
+        for extra in ({"idle_seconds": True}, {"idle_seconds": -1}, {"idle_seconds": 86401},
+                      {"idle_seconds": 1.5}, {"tab_id": "PRIVATE-KEY"}, {"filename": "PRIVATE-FILE"}):
+            result = self.client.post("/presence", headers=headers,
+                                      json={"activity": "viewing", "tab_id": "a" * 32, "idle_seconds": 0, **extra})
+            self.assertEqual(result.status_code, 422)
+            self.assertNotIn("PRIVATE", result.text)
+
+    def test_logout_removes_only_its_session_and_restart_retains_events_not_presence(self):
+        headers = self.headers("user-beta")
+        another_token = "synthetic-second-session-" + secrets.token_urlsafe(24)
+        another_headers = {"Authorization": "Bearer " + another_token}
+        with self.app.state.database.connect() as connection:
+            connection.execute("INSERT INTO sessions(token_hash,username,created_at,expires_at) VALUES(?,?,?,?)",
+                               (digest(another_token), "user-beta", time.time(), time.time() + 3600))
+        for request_headers, activity in ((headers, "viewing"), (another_headers, "reminder")):
+            self.assertEqual(self.client.post("/presence", headers=request_headers,
+                                              json={"activity": activity, "tab_id": "a" * 32, "idle_seconds": 0}).status_code, 200)
+        self.assertEqual(self.client.post("/auth/logout", headers=headers).status_code, 200)
+        overview = self.client.get("/admin/overview", headers=self.headers()).json()
+        beta = next(row for row in overview["accounts"] if row["label"] == "user-beta")
+        self.assertTrue(beta["online"])
+        self.assertEqual(beta["activities"], ["reminder"])
+        self.assertEqual(beta["session_count"], 1)
+        restarted = create_app(self.settings, FakeTranscriber())
+        with TestClient(restarted) as client:
+            result = client.get("/admin/overview", headers=self.headers()).json()
+        beta = next(row for row in result["accounts"] if row["label"] == "user-beta")
+        self.assertFalse(beta["online"])
+        self.assertEqual(beta["last_action"], "reminder")
+        self.assertEqual(len(result["recent_activity"]), 2)
+        self.assertEqual(result["recent_audit"], [])
+
+    def test_recent_activity_uses_successful_route_enums_and_does_not_contain_input_or_ids(self):
+        headers = self.headers("user-beta")
+        state = self.client.get("/review/state", headers=headers).json()
+        body = {"request_id": str(uuid.uuid4()), "revision": state["revision"], "action": "item.add",
+                "payload": {"title": "PRIVATE-REMINDER-TITLE", "memo": "PRIVATE-INPUT-TEXT"}}
+        self.assertEqual(self.client.post("/review/actions", headers=headers, json=body).status_code, 200)
+        failed = {**body, "request_id": str(uuid.uuid4())}
+        self.assertEqual(self.client.post("/review/actions", headers=headers, json=failed).status_code, 409)
+        created = self.client.post("/lectures", headers=headers, json={"title": "PRIVATE-LECTURE-TITLE"})
+        self.assertEqual(created.status_code, 201)
+        lecture_id = created.json()["id"]
+        self.client.get("/lectures/" + lecture_id, headers=headers)
+        response = self.client.get("/admin/overview", headers=self.headers())
+        events = response.json()["recent_activity"]
+        self.assertEqual({(row["action"], row["result"]) for row in events},
+                         {("reminder_changed", "completed"), ("lecture_created", "completed")})
+        self.assertTrue(all(set(row) == {"timestamp", "account_id", "label", "action", "result"} for row in events))
+        for private in ("PRIVATE-REMINDER-TITLE", "PRIVATE-INPUT-TEXT", "PRIVATE-LECTURE-TITLE", lecture_id,
+                        body["request_id"], *self.tokens.values(), *(digest(value) for value in self.tokens.values())):
+            self.assertNotIn(private, response.text)
+        self.assertEqual(self.client.get("/admin/overview", headers=headers).status_code, 403)
+
+    def test_abandoned_upload_and_reserved_material_do_not_prevent_five_minute_idle(self):
+        lecture_id = str(uuid.uuid4())
+        import_id, material_id = str(uuid.uuid4()), str(uuid.uuid4())
+        with self.app.state.database.connect() as connection:
+            connection.execute("INSERT INTO lectures(id,username,title,created_at) VALUES(?,'user-beta','PRIVATE-TITLE','now')",
+                               (lecture_id,))
+            connection.execute("INSERT INTO imports(id,username,lecture_id,title,language,filename,file_fingerprint,"
+                               "total_bytes,uploaded_bytes,status,created_at,updated_at) "
+                               "VALUES(?,'user-beta',?,'PRIVATE-TITLE','ko','PRIVATE-NAME.wav',?,100,50,'uploading','now','now')",
+                               (import_id, lecture_id, "a" * 64))
+            connection.execute("INSERT INTO study_materials(id,username,lecture_id,filename,kind,size_bytes,uploaded_bytes,"
+                               "sha256,storage_name,status,error_code,created_at,updated_at) "
+                               "VALUES(?,'user-beta',?,'PRIVATE-NAME.pdf','pdf',100,50,?,?,'processing','awaiting_upload','now','now')",
+                               (material_id, lecture_id, "b" * 64, material_id + ".pdf"))
+        headers = self.headers("user-beta")
+        self.assertEqual(self.client.post("/presence", headers=headers,
+                                          json={"activity": "viewing", "tab_id": "b" * 32, "idle_seconds": 300}).status_code, 200)
+        overview = self.client.get("/admin/overview", headers=self.headers()).json()
+        beta = next(row for row in overview["accounts"] if row["label"] == "user-beta")
+        self.assertTrue(beta["idle"])
+        self.assertEqual(beta["activity"], "away")
+        self.assertEqual((beta["jobs"]["imports"], beta["jobs"]["materials"]), (0, 0))
+        self.assertEqual((overview["queues"]["imports"], overview["queues"]["materials"]), (1, 1))
+        with self.app.state.database.connect() as connection:
+            connection.execute("UPDATE imports SET status='queued' WHERE id=?", (import_id,))
+            connection.execute("UPDATE study_materials SET error_code='converting' WHERE id=?", (material_id,))
+        overview = self.client.get("/admin/overview", headers=self.headers()).json()
+        beta = next(row for row in overview["accounts"] if row["label"] == "user-beta")
+        self.assertFalse(beta["idle"])
+        self.assertEqual(beta["activities"], ["transcribing", "materials"])
+        self.assertEqual((beta["jobs"]["imports"], beta["jobs"]["materials"]), (1, 1))
+        for private in (lecture_id, import_id, material_id, "PRIVATE-TITLE", "PRIVATE-NAME"):
+            self.assertNotIn(private, str(overview))
 
     def test_access_and_tunnel_actions_have_bounded_safe_audit_records(self):
         for enabled in (False, False, True):

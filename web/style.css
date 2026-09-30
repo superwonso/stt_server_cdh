@@ -2214,7 +2214,11 @@ button {
 
 .admin-account-activity strong {
   color: var(--forest-700);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
+
+.admin-account-activity small { overflow-wrap: anywhere; }
 
 .admin-account button {
   min-height: 38px;

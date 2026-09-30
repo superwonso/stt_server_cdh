@@ -25,12 +25,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StringConstraints
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .db import Database
+from .activity import ActivityMiddleware, ActivityTracker
 from .review_service import install_review
 from .review_parse import TimetableRecognizer
 from .drive_archive import DriveArchiveManager
@@ -173,12 +174,16 @@ PresenceActivity = Literal[
     "transcribing",
     "correcting",
     "away",
+    "reminder", "admin", "paused", "summarizing", "translating", "questioning",
+    "study_notes", "course_review", "materials",
 ]
 
 
 class PresenceBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     activity: PresenceActivity
+    tab_id: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")] | None = None
+    idle_seconds: Annotated[StrictInt, Field(ge=0, le=86400)] | None = None
 
 
 class AdminAccessBody(BaseModel):
@@ -459,11 +464,7 @@ def create_app(
     correction_worker_shutdown = threading.Event()
     correction_worker_thread: threading.Thread | None = None
     process_started_at = time.monotonic()
-    presence_lock = threading.Lock()
-    # Presence is deliberately ephemeral.  It contains no address, user-agent,
-    # lesson metadata, or transcript and disappears whenever this process exits.
-    presence: dict[str, tuple[str, float]] = {}
-    presence_ttl_seconds = 45.0
+    activity_tracker = ActivityTracker(database, clock=lambda: time.time())
     account_ids = {username: secrets.token_urlsafe(24) for username in settings.accounts}
 
     @asynccontextmanager
@@ -540,6 +541,7 @@ def create_app(
     app = FastAPI(title="Classroom Transcription", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings = settings
     app.state.database = database
+    app.state.activity_tracker = activity_tracker
     app.state.timetable_recognizer = timetable_recognizer
     app.state.transcriber = engine
     app.state.clova_transcriber = clova_engine
@@ -570,6 +572,7 @@ def create_app(
             headers=error.headers,
         )
 
+    app.add_middleware(ActivityMiddleware, tracker=activity_tracker)
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_bytes)
     app.add_middleware(
         CORSMiddleware,
@@ -630,7 +633,7 @@ def create_app(
             )
         return {"token": token, "user": {"username": username}, "session_expires_at": expires_at}
 
-    def identity(authorization: str | None = Header(default=None)) -> dict:
+    def identity(request: Request, authorization: str | None = Header(default=None)) -> dict:
         scheme, _, token = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not token or len(token) > 200:
             raise HTTPException(401, "로그인이 필요합니다.", headers={"WWW-Authenticate": "Bearer"})
@@ -641,8 +644,10 @@ def create_app(
             ).fetchone()
         if session is None or session["username"] not in accounts:
             raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인하세요.", headers={"WWW-Authenticate": "Bearer"})
-        return {"username": session["username"], "token_hash": token_hash,
+        user = {"username": session["username"], "token_hash": token_hash,
                 "session_expires_at": session["expires_at"]}
+        request.state.activity_actor = user
+        return user
 
     def admin_identity(user: dict = Depends(identity)) -> dict:
         administrator = settings.admin_username
@@ -920,25 +925,10 @@ def create_app(
 
     @app.post("/presence")
     def heartbeat(body: PresenceBody, user: dict = Depends(identity)):
-        if not limiter.allow(("presence", user["username"]), 60, 300):
+        if (not limiter.allow(("presence-account", user["username"]), 360, 300)
+                or not limiter.allow(("presence-tab", user["token_hash"], body.tab_id), 60, 300)):
             raise HTTPException(429, "상태 요청이 너무 많습니다.", headers={"Retry-After": "15"})
-        with presence_lock:
-            # identity() may have completed just before an administrator
-            # revoked this account.  Revalidate while holding the same lock
-            # used to clear presence so that a late heartbeat cannot recreate
-            # a short-lived ghost-online state.
-            with database.connect() as connection:
-                live = connection.execute(
-                    "SELECT 1 FROM sessions WHERE token_hash = ? AND username = ? AND expires_at > ?",
-                    (user["token_hash"], user["username"], time.time()),
-                ).fetchone()
-            if live is None:
-                raise HTTPException(
-                    401,
-                    "로그인이 만료되었습니다. 다시 로그인하세요.",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            presence[user["username"]] = (body.activity, time.time())
+        activity_tracker.observe(user, body.activity, body.tab_id, body.idle_seconds)
         return {"status": "ok"}
 
     @app.get("/admin/overview")
@@ -955,7 +945,7 @@ def create_app(
                     "(SELECT COUNT(*) FROM chunks c JOIN lectures l ON l.id = c.lecture_id "
                     " WHERE l.username = u.username AND c.status = 'pending') AS transcription_jobs, "
                     "(SELECT COUNT(*) FROM imports i WHERE i.username = u.username "
-                    " AND i.status IN ('uploading', 'queued', 'processing')) AS import_jobs, "
+                    " AND i.status IN ('queued', 'processing')) AS import_jobs, "
                     "(SELECT COUNT(*) FROM transcript_corrections tc "
                     " JOIN lectures l2 ON l2.id = tc.lecture_id "
                     " WHERE l2.username = u.username AND tc.status IN ('queued', 'processing')) "
@@ -972,7 +962,8 @@ def create_app(
                     " WHERE l5.username=u.username AND sn.username=u.username "
                     " AND sn.status IN ('queued','processing')) AS study_note_jobs, "
                     "(SELECT COUNT(*) FROM course_review_jobs cr WHERE cr.username=u.username AND cr.status IN ('queued','processing')) AS course_review_jobs, "
-                    "(SELECT COUNT(*) FROM study_materials sm WHERE sm.username=u.username AND sm.status='processing') AS material_jobs "
+                    "(SELECT COUNT(*) FROM study_materials sm WHERE sm.username=u.username AND sm.status='processing' "
+                    " AND sm.error_code='converting') AS material_jobs "
                     "FROM users u",
                     (current_time,),
                 ).fetchall()
@@ -1016,31 +1007,22 @@ def create_app(
                     "ORDER BY timestamp DESC, id DESC LIMIT 20"
                 ).fetchall()
             ]
-        with presence_lock:
-            expired_accounts = [
-                username
-                for username, (_, observed_at) in presence.items()
-                if current_time - observed_at > presence_ttl_seconds
-            ]
-            for username in expired_accounts:
-                presence.pop(username, None)
-            presence_snapshot = dict(presence)
+        observations, recent_activity = activity_tracker.snapshot()
         account_results = []
         for username in settings.accounts:
             row = account_rows[username]
-            activity, last_activity = presence_snapshot.get(username, ("offline", None))
-            online = last_activity is not None and current_time - last_activity <= presence_ttl_seconds
-            if not online:
-                activity = "offline"
+            jobs = {"transcription": row["transcription_jobs"], "imports": row["import_jobs"],
+                    "corrections": row["correction_jobs"], "summaries": row["summary_jobs"],
+                    "translations": row["translation_jobs"], "questions": row["question_jobs"],
+                    "study_notes": row["study_note_jobs"], "course_reviews": row["course_review_jobs"],
+                    "materials": row["material_jobs"]}
             account_results.append(
                 {
                     "account_id": account_ids[username],
                     "label": username,
                     "is_self": secrets.compare_digest(username, user["username"]),
                     "activated": bool(row["activated"]),
-                    "online": online,
-                    "activity": activity,
-                    "last_activity_at": epoch_text(last_activity) if last_activity is not None else None,
+                    **activity_tracker.account(username, observations, recent_activity, jobs),
                     "session_count": row["session_count"],
                     "jobs": {
                         "transcription": row["transcription_jobs"],
@@ -1078,6 +1060,11 @@ def create_app(
             "tunnel": sanitized_tunnel_status(),
             "accounts": account_results,
             "recent_audit": recent_audit,
+            "recent_activity": [
+                {"timestamp": row["timestamp"], "account_id": account_ids[row["username"]],
+                 "label": row["username"], "action": row["action"], "result": row["result"]}
+                for row in recent_activity[:50] if row["username"] in account_ids
+            ],
         }
 
     @app.post("/admin/drive/refresh", status_code=202)
@@ -1121,8 +1108,7 @@ def create_app(
             revoked = connection.execute("DELETE FROM sessions WHERE username = ?", (target,)).rowcount
             audit(connection, "sessions_revoked", "success", target)
         purge_account_download_tickets(target)
-        with presence_lock:
-            presence.pop(target, None)
+        activity_tracker.remove(username=target)
         return {"status": "ok", "revoked_sessions": revoked}
 
     @app.post("/admin/tunnel/restart", status_code=202)
@@ -1245,8 +1231,7 @@ def create_app(
         with database.connect() as connection:
             connection.execute("DELETE FROM sessions WHERE token_hash = ?", (user["token_hash"],))
         purge_session_download_tickets(user["token_hash"])
-        with presence_lock:
-            presence.pop(user["username"], None)
+        activity_tracker.remove(session=user["token_hash"])
         return {"status": "ok"}
 
     @app.get("/status")
@@ -3956,8 +3941,7 @@ def create_app(
     manual_notes.install(app, settings, database, identity=data_identity, owned_lecture=owned_lecture,
                          limiter=limiter, raw_segments=raw_segments, transcript_revision=transcript_revision)
     def purge_account_presence(username):
-        with presence_lock:
-            presence.pop(username, None)
+        activity_tracker.remove(username=username)
 
     account_recovery.install(app, database, admin_identity=admin_identity, account_ids=account_ids,
                              administrator=settings.admin_username, auth_limit=auth_limit,

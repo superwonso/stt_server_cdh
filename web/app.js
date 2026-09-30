@@ -95,6 +95,9 @@ let adminSequence = 0, adminRefreshTimer = null, adminProbeTimer = null, adminCo
 let tunnelRecoveryTimer = null, tunnelRecoveryDeadline = 0, tunnelRecoveryContext = null;
 let presenceSequence = 0, presenceTimer = null, presenceIdleTimer = null, presenceSending = false;
 let presenceLastSent = '', presenceQueued = '', lastPresenceInteraction = Date.now();
+const presenceTabId = crypto.randomUUID().replaceAll('-','');
+let presenceLegacy = false;
+const presenceRequests = new Map();
 let connectionState = 'unverified', verifiedApiUrl = '', verifiedApiExpiresAt = 0;
 let connectionGeneration = 0, connectionController = null, connectionLeaseTimer = null, leaseRefreshPromise = null;
 let transcriptionProviders = {qwen:{configured:true},clova:{configured:false}};
@@ -1097,6 +1100,7 @@ function nativeDownloadUrl(value, server = apiUrl) {
 }
 function setServer(value) {
   const next = normalizeUrl(value);
+  const restartPresence = next !== apiUrl && presenceTimer !== null;
   if (next !== apiUrl) {
     closeAdminRecovery();
     resetAdminUsage();
@@ -1106,6 +1110,7 @@ function setServer(value) {
     resetRecordingReview(); resetLibraryWorkspace();
   }
   apiUrl = next; storage.set(apiUrl); $('server-label').textContent = new URL(apiUrl).host; $('api-url').value = apiUrl;
+  if (restartPresence) startPresence({preserveInteraction:true});
 }
 function clearActiveAuthExpiry() {
   if (authSessionExpiryTimer !== null) clearTimeout(authSessionExpiryTimer);
@@ -1181,6 +1186,7 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
   const requestToken = anonymous ? '' : token, requestServer = baseUrl;
   if (requestToken) headers.set('Authorization', `Bearer ${requestToken}`);
   if (requestOptions.body && !(requestOptions.body instanceof Blob)) headers.set('Content-Type', 'application/json');
+  const finishPresenceRequest = trackPresenceRequest(path,requestOptions.method,anonymous);
   try {
     const response = await fetch(baseUrl + path, {...requestOptions, headers, signal:controller.signal, credentials:'omit', cache:'no-store', referrerPolicy:'no-referrer'});
     if (response.ok && responseType === 'recording-clip') return await readRecordingClip(response);
@@ -1227,6 +1233,7 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
   } finally {
     clearTimeout(deadline);
     callerSignal?.removeEventListener?.('abort', abortFromCaller);
+    finishPresenceRequest();
   }
 }
 function updateAuthControls() {
@@ -3064,6 +3071,7 @@ function scrubAdminDom() {
   // server changes, rather than relying on `hidden` or a closed dialog.
   $('admin-accounts').replaceChildren();
   $('admin-audit').replaceChildren();
+  $('admin-recent-activity').replaceChildren();
   $('admin-error').textContent = ''; $('admin-error').hidden = true;
   $('admin-updated').textContent = '상태를 불러오는 중입니다.';
   $('admin-access-detail').textContent = '현재 운영 접속 상태를 확인하고 있어요.';
@@ -3319,19 +3327,54 @@ function queueLabel(value) {
   return `${queued} · ${processing}`;
 }
 function adminActivityLabel(account) {
-  if (typeof account?.activity_label === 'string' && account.activity_label.trim()) return account.activity_label.trim();
-  return ({
-    offline:'오프라인',idle:'사용하지 않는 중',viewing:'기록 확인 중',recording:'녹음 중',uploading:'파일 업로드 중',
-    transcribing:'받아쓰기 처리 중',correcting:'AI 후보정 중',away:'자리 비움',
-  })[account?.activity] || (account?.online ? '접속 중' : '오프라인');
+  const values = Array.isArray(account?.activities) ? account.activities.slice(0,24) : [account?.activity];
+  const jobLabels = {transcription:'받아쓰기 처리 중',imports:'파일 변환 중',corrections:'AI 후보정 중',summaries:'AI 요약 중',
+    translations:'AI 번역 중',questions:'AI 질문 처리 중',study_notes:'AI 수업 정리 중',course_reviews:'AI 강의 복습 정리 중',materials:'자료 변환 중'};
+  const activityJob = {transcribing:'transcription',correcting:'corrections',summarizing:'summaries',translating:'translations',
+    questioning:'questions',study_notes:'study_notes',course_review:'course_reviews',materials:'materials'};
+  const labels = [...new Set(values.filter(value => Object.hasOwn(ADMIN_ACTIVITY_LABELS,value)
+    && !['offline','idle','away'].includes(value)).map(value => {
+      if (value === 'transcribing' && adminJobCount(account?.jobs?.imports) && !adminJobCount(account?.jobs?.transcription)) return jobLabels.imports;
+      const key = activityJob[value];
+      return key && adminJobCount(account?.jobs?.[key]) ? jobLabels[key] : ADMIN_ACTIVITY_LABELS[value];
+    }))];
+  for (const [key,label] of Object.entries(jobLabels)) if (adminJobCount(account?.jobs?.[key]) && !labels.includes(label)) labels.push(label);
+  if (!account?.online) labels.unshift('오프라인');
+  else if (account.idle === true || ['idle','away'].includes(account.activity)) labels.unshift('자리 비움 · 5분 이상 무활동');
+  return labels.join(' · ') || (account?.online ? '접속 중' : '오프라인');
+}
+const ADMIN_ACTIVITY_LABELS = Object.freeze({
+  offline:'오프라인',idle:'자리 비움',away:'자리 비움',viewing:'수업 기록 확인 중',
+  recording:'녹음 중',paused:'녹음 일시정지',uploading:'음성 파일 업로드 중',transcribing:'받아쓰기 처리 중',
+  correcting:'AI 후보정 중',summarizing:'AI 요약 중',translating:'AI 번역 중',questioning:'AI 질문 처리 중',
+  study_notes:'AI 수업 정리 중',course_review:'강의 복습 확인 중',materials:'강의자료 작업 중',
+  reminder:'리마인더 사용 중',admin:'관리 화면 확인 중',
+});
+const ADMIN_ACTION_LABELS = Object.freeze({
+  viewing:'수업 기록 확인',recording:'녹음 시작·재개',paused:'녹음 일시정지',uploading:'음성 파일 업로드',
+  transcribing:'받아쓰기 처리',correcting:'AI 후보정',summarizing:'AI 요약',translating:'AI 번역',questioning:'AI 질문',
+  study_notes:'AI 수업 정리',course_review:'강의 복습',materials:'강의자료 처리',reminder:'리마인더 확인',admin:'관리 화면 확인',
+  lecture_created:'수업 만들기',recording_saved:'음성 저장',recording_finished:'녹음 마무리',
+  file_import:'녹음 파일 가져오기',import_cancelled:'파일 가져오기 취소',timetable_recognition:'시간표 인식',
+  reminder_changed:'리마인더 기록 변경',note_saved:'필기 저장',
+});
+function adminActionLabel(value) {
+  return typeof value === 'string' && Object.hasOwn(ADMIN_ACTION_LABELS,value) ? ADMIN_ACTION_LABELS[value] : '사용자 활동';
+}
+function adminJobCount(value) {
+  const count = number => Number.isFinite(number) && number > 0 ? Math.min(100000,Math.floor(number)) : 0;
+  return typeof value === 'number' ? count(value) : count(value?.queued) + count(value?.processing);
 }
 function accountJobLabel(jobs) {
-  const values = [jobs?.transcription,jobs?.imports,jobs?.corrections,jobs?.summaries,jobs?.translations,jobs?.questions,jobs?.study_notes,jobs?.course_reviews,jobs?.materials].map(value => {
-    if (typeof value === 'number') return Math.max(0,Math.floor(value));
-    return Math.max(0,Math.floor(Number(value?.queued) || 0)) + Math.max(0,Math.floor(Number(value?.processing) || 0));
-  });
-  const total = values.reduce((sum,value) => sum + value,0);
-  return total ? `진행 작업 ${total}개` : '';
+  const count = value => Number.isFinite(value) && value > 0 ? Math.min(100000,Math.floor(value)) : 0;
+  return Object.entries({transcription:'받아쓰기',imports:'파일 전사',corrections:'후보정',summaries:'요약',
+    translations:'번역',questions:'질문',study_notes:'수업 정리본',course_reviews:'강의 복습',materials:'자료 변환'})
+    .flatMap(([key,label]) => {
+      const value = jobs?.[key];
+      if (typeof value === 'number') return count(value) ? [`${label} ${count(value)}개`] : [];
+      const queued = count(value?.queued), processing = count(value?.processing);
+      return queued || processing ? [`${label} ${[queued ? `대기 ${queued}` : '',processing ? `처리 ${processing}` : ''].filter(Boolean).join(' · ')}개`] : [];
+    }).join(' / ');
 }
 function renderAdminAccounts(accounts) {
   const container = $('admin-accounts');
@@ -3355,7 +3398,12 @@ function renderAdminAccounts(accounts) {
     const sessions = Math.max(0,Math.floor(Number(account?.session_count) || 0));
     const jobText = accountJobLabel(account?.jobs);
     const detail = document.createElement('small');
-    detail.textContent = [`세션 ${sessions}개`,jobText,`최근 활동 ${adminDateTime(account?.last_activity_at)}`].filter(Boolean).join(' · ');
+    const enhanced = Object.hasOwn(account || {},'last_seen_at');
+    detail.textContent = [`세션 ${sessions}개`,jobText,
+      enhanced ? `최근 입력·작업 ${adminDateTime(account?.last_activity_at)}` : `최근 접속 확인 ${adminDateTime(account?.last_activity_at)}`,
+      enhanced ? `접속 확인 ${adminDateTime(account.last_seen_at)}` : '',
+      account?.last_action ? `최근: ${adminActionLabel(account.last_action)} · ${adminDateTime(account.last_action_at)}` : '',
+    ].filter(Boolean).join(' · ');
     activity.append(activityText,detail);
     const self = account?.is_self === true || account?.label === user;
     let action;
@@ -3375,6 +3423,27 @@ function renderAdminAccounts(accounts) {
       recovery.onclick = () => openAdminRecovery(account);
       row.append(recovery);
     }
+  }
+}
+function renderAdminRecentActivity(entries) {
+  const container = $('admin-recent-activity'); container.replaceChildren();
+  const supported = Array.isArray(entries), safeEntries = supported ? entries.slice(0,50) : [];
+  if (!safeEntries.length) {
+    const empty = document.createElement('p'); empty.className = 'admin-empty';
+    empty.textContent = supported ? '최근 사용자 활동이 없습니다.' : '이 서버는 최근 사용자 활동 목록을 제공하지 않습니다.';
+    container.append(empty); return;
+  }
+  const results = {observed:'상태 확인',requested:'요청 접수',completed:'완료'};
+  for (const entry of safeEntries) {
+    const row = document.createElement('article'); row.className = 'admin-audit-entry';
+    const copy = document.createElement('div'), title = document.createElement('strong'), detail = document.createElement('small');
+    title.textContent = adminActionLabel(entry?.action);
+    const label = typeof entry?.label === 'string' ? entry.label.slice(0,120) : '계정';
+    detail.textContent = `${label} · ${adminDateTime(entry?.timestamp)}`;
+    const result = document.createElement('span'); result.className = 'admin-badge';
+    result.textContent = Object.hasOwn(results,entry?.result) ? results[entry.result] : '확인되지 않음';
+    result.setAttribute('data-state',entry?.result === 'completed' ? 'ready' : 'unknown');
+    copy.append(title,detail); row.append(copy,result); container.append(row);
   }
 }
 function renderAdminAudit(entries) {
@@ -3503,6 +3572,7 @@ function renderAdminOverview() {
   $('admin-tunnel-restart').textContent = adminAction === 'tunnel' ? '요청 중…' : tunnelRestarting ? '재연결 중…' : '터널 재연결';
 
   renderAdminAccounts(overview.accounts);
+  renderAdminRecentActivity(overview.recent_activity);
   renderAdminAudit(overview.recent_audit);
 }
 async function refreshAdminDrive() {
@@ -3579,13 +3649,15 @@ function closeAdminDialog() {
   closeAdminRecovery();
   clearAdminRefresh();
   if ($('admin-dialog').open) $('admin-dialog').close();
+  notePresenceStateChange();
 }
 $('admin-open').onclick = () => {
   if (!adminAuthorized || !token) return;
   renderAdminOverview(); $('admin-dialog').showModal(); $('admin-close').focus(); void loadAdminOverview(); void loadAdminUsage();
+  notePresenceStateChange();
 };
 $('admin-close').onclick = closeAdminDialog;
-$('admin-dialog').oncancel = () => { resetAdminUsage(); closeAdminRecovery(); clearAdminRefresh(); };
+$('admin-dialog').oncancel = closeAdminDialog;
 $('admin-refresh').onclick = () => { if (!adminLoading && !adminAction) void loadAdminOverview(); };
 function clearAdminRecoveryLink() {
   if (adminRecoveryExpiryTimer !== null) clearTimeout(adminRecoveryExpiryTimer);
@@ -3804,17 +3876,53 @@ function clearPresenceTimers() {
   if (presenceIdleTimer !== null) clearTimeout(presenceIdleTimer);
   presenceTimer = null; presenceIdleTimer = null;
 }
-function resetPresence() {
+function resetPresence({preserveInteraction = false} = {}) {
   ++presenceSequence; clearPresenceTimers();
-  presenceSending = false; presenceLastSent = ''; presenceQueued = ''; lastPresenceInteraction = Date.now();
+  presenceSending = false; presenceLastSent = ''; presenceQueued = '';
+  if (!preserveInteraction) lastPresenceInteraction = Date.now();
+  presenceLegacy = false; presenceRequests.clear();
+}
+function presenceIdleSeconds() {
+  return Math.min(86400,Math.max(0,Math.floor((Date.now() - lastPresenceInteraction) / 1000)));
+}
+function trackPresenceRequest(path,method,anonymous) {
+  if (anonymous || presenceTimer === null || !token || !['POST','PUT'].includes(method)) return () => {};
+  let activity = '';
+  if (/^\/courses\/[^/]+\/reviews$/.test(path)) activity = 'course_review';
+  else if (/^\/study-materials(?:$|\/[^/]+\/(?:content|convert)$)/.test(path)) activity = 'materials';
+  else {
+    const match = /^\/lectures\/[^/]+\/(summary|translation|questions|study-note)$/.exec(path);
+    if (match) activity = ({summary:'summarizing',translation:'translating',questions:'questioning','study-note':'study_notes'})[match[1]];
+  }
+  if (!activity) return () => {};
+  const sequence = presenceSequence, owner = user, sessionToken = token, server = apiUrl;
+  presenceRequests.set(activity,(presenceRequests.get(activity) || 0) + 1); notePresenceStateChange();
+  return () => {
+    if (sequence !== presenceSequence || owner !== user || sessionToken !== token || server !== apiUrl) return;
+    const count = presenceRequests.get(activity) || 0;
+    if (count > 1) presenceRequests.set(activity,count - 1); else presenceRequests.delete(activity);
+    // Let the caller accept its queued/processing result before choosing the next state.
+    setTimeout(() => { if (sequence === presenceSequence && owner === user && sessionToken === token && server === apiUrl) notePresenceStateChange(); },0);
+  };
 }
 function presenceActivity() {
-  if (document.hidden) return 'away';
-  if (recording || paused || starting || pausing || resuming) return 'recording';
-  if (importStarting || importJob?.status === 'uploading') return 'uploading';
-  if (sending || activePendingCount() || ['queued','processing'].includes(importJob?.status)) return 'transcribing';
+  if (recording || starting || resuming) return 'recording';
+  if (importTransportBusy()) return 'uploading';
+  if (sending || (!sendError && activePendingCount()) || ['queued','processing'].includes(importJob?.status)) return 'transcribing';
   if (correctionStarting || ['queued','processing'].includes(correction?.status)) return 'correcting';
+  for (const activity of ['study_notes','course_review','materials','summarizing','translating','questioning']) {
+    if (presenceRequests.has(activity)) return activity;
+  }
+  if (studyNotePending()) return 'study_notes';
+  if (summaryPending()) return 'summarizing';
+  if (translationPending()) return 'translating';
+  if (questionView.page?.questions?.some(row => ['queued','processing'].includes(row.status))) return 'questioning';
   if (Date.now() - lastPresenceInteraction >= PRESENCE_IDLE_MS) return 'idle';
+  if (paused || pausing) return 'paused';
+  if (adminAuthorized && $('admin-dialog').open) return 'admin';
+  if ($('course-dialog').open) return 'course_review';
+  if ($('study-material-details').open) return 'materials';
+  if (activeService === 'reminder') return 'reminder';
   return 'viewing';
 }
 function schedulePresenceIdle() {
@@ -3835,7 +3943,14 @@ async function sendPresence(force = false) {
   const owner = user, sessionToken = token, server = apiUrl, sequence = presenceSequence;
   presenceSending = true; presenceQueued = '';
   try {
-    await api('/presence',{method:'POST',body:JSON.stringify({activity})},10000);
+    const legacyActivity = ['idle','viewing','recording','uploading','transcribing','correcting','away'].includes(activity) ? activity : 'viewing';
+    const body = presenceLegacy ? {activity:legacyActivity} : {activity,tab_id:presenceTabId,idle_seconds:presenceIdleSeconds()};
+    try { await api('/presence',{method:'POST',body:JSON.stringify(body)},10000); }
+    catch (error) {
+      if (error?.status !== 422 || presenceLegacy || sequence !== presenceSequence || owner !== user || sessionToken !== token || server !== apiUrl) throw error;
+      await api('/presence',{method:'POST',body:JSON.stringify({activity:legacyActivity})},10000);
+      if (sequence === presenceSequence && owner === user && sessionToken === token && server === apiUrl) presenceLegacy = true;
+    }
     if (sequence === presenceSequence && owner === user && sessionToken === token && server === apiUrl) presenceLastSent = activity;
   } catch (error) {
     if (sequence === presenceSequence && owner === user && sessionToken === token && server === apiUrl
@@ -3852,13 +3967,14 @@ function notePresenceStateChange() {
   const activity = presenceActivity();
   if (activity !== presenceLastSent) void sendPresence();
 }
-function notePresenceInteraction() {
+function notePresenceInteraction(event) {
+  if (event?.isTrusted === false || !token || presenceTimer === null) return;
   const wasIdle = presenceActivity() === 'idle';
   lastPresenceInteraction = Date.now(); schedulePresenceIdle();
   if (wasIdle) notePresenceStateChange();
 }
-function startPresence() {
-  resetPresence();
+function startPresence({preserveInteraction = false} = {}) {
+  resetPresence({preserveInteraction});
   const sequence = presenceSequence;
   presenceTimer = setInterval(() => { if (sequence === presenceSequence) void sendPresence(true); },PRESENCE_INTERVAL_MS);
   schedulePresenceIdle();
@@ -3866,6 +3982,9 @@ function startPresence() {
 }
 document.addEventListener('pointerdown',notePresenceInteraction,{passive:true});
 document.addEventListener('keydown',notePresenceInteraction);
+document.addEventListener('input',notePresenceInteraction,{passive:true});
+document.addEventListener('change',notePresenceInteraction,{passive:true});
+document.addEventListener('wheel',notePresenceInteraction,{passive:true});
 
 let reviewView = {scope:'',query:'',bookmarks:[],loaded:false,loading:false,busy:false,error:'',pending:null,rendered:''};
 let reviewPlayer = null, reviewAbort = null;
@@ -4247,6 +4366,7 @@ function renderQuestions() {
   const scope = recordingReviewScope();
   if (questionView.scope !== scope) { resetQuestionWorkspace(); questionView.scope = scope; }
   const view = questionView, eligible = questionIsCurrent(view), page = view.page;
+  notePresenceStateChange();
   $('question-panel').hidden = !eligible;
   $('question-text').disabled = !eligible || view.busy || !!view.pending;
   $('question-submit').disabled = !eligible || view.busy || (!view.pending && (!page?.configured || page.total >= 100));
@@ -4409,6 +4529,7 @@ function renderSummary() {
   const scope = summaryScope();
   if (summaryView.scope !== scope) { resetSummaryView(); summaryView.scope = scope; }
   const view = summaryView;
+  notePresenceStateChange();
   $('summary-panel').hidden = !current || !token;
   const eligible = summaryEligible(), pendingSummary = summaryPending();
   const documentValue = view.row?.status === 'completed' ? summaryDocument(view.row.document) : null;
@@ -4568,6 +4689,7 @@ function renderTranslation() {
   const scope = translationScope();
   if (translationView.scope !== scope) { resetTranslationView(); translationView.scope = scope; }
   const view = translationView, eligible = translationEligible(), pendingTranslation = translationPending();
+  notePresenceStateChange();
   const segments = translatedSegments(), draft = translationDraft(), completed = !!(segments || draft);
   $('translation-panel').hidden = !current || !token;
   $('translation-state').textContent = view.error || (!eligible
@@ -4782,6 +4904,7 @@ function renderStudyNote() {
     $('study-note-download').download = `${safeFilename(lectureTitle(current))}_수업 정리본.md`;
   } else clearStudyNoteDownload(view);
   renderStudyNoteDocument(view);
+  notePresenceStateChange();
 }
 function scheduleStudyNotePoll(view) {
   clearTimeout(studyNotePollTimer); studyNotePollTimer = null;
@@ -4910,6 +5033,7 @@ function selectService(name) {
     if (!reminderWorkspace) reminderWorkspace = createReminder({container:$('reminder-panel'),api,scopeKey:learningScopeKey});
     void reminderWorkspace.open();
   } else { reminderWorkspace?.hide(); void timetableCatalog.load({force:true}); }
+  notePresenceStateChange();
 }
 $('service-yeobaek').onclick = () => selectService('yeobaek');
 $('service-reminder').onclick = () => selectService('reminder');
@@ -4929,7 +5053,7 @@ function resetLearningWorkspace(){
   if($('course-dialog').open)$('course-dialog').close();
   $('study-material-details').open=false;
 }
-function closeCourseWorkspace(){courseWorkspace?.reset();$('course-dialog').close();}
+function closeCourseWorkspace(){courseWorkspace?.reset();$('course-dialog').close();notePresenceStateChange();}
 $('course-open').onclick=()=>{
   if(!user||!token||expireActiveAuthSession())return;
   if(!courseWorkspace)courseWorkspace=createCourseWorkspace({container:$('course-workspace'),api,scopeKey:learningScopeKey,
@@ -4940,9 +5064,11 @@ $('course-open').onclick=()=>{
       renderCurrent();renderHistory();
     },onSelectLecture:async id=>{closeCourseWorkspace();await selectLecture({id});}});
   $('course-dialog').showModal();void courseWorkspace.open();
+  notePresenceStateChange();
 };
 $('course-close').onclick=closeCourseWorkspace;$('course-dialog').oncancel=closeCourseWorkspace;
 $('study-material-details').ontoggle=()=>{
+  notePresenceStateChange();
   if(!$('study-material-details').open||!current||!token){studyMaterialPanel?.reset();return;}
   if(!studyMaterialPanel)studyMaterialPanel=createMaterialPanel({container:$('study-materials'),api,scopeKey:learningScopeKey,
     onChanged(){if($('study-note-details').open)void fetchStudyNote(false,true);}});
