@@ -1,7 +1,7 @@
 .reminder {
   --rv-bg: #f4f0e7; --rv-surface: #fffdf9; --rv-soft: #eeeade;
   --rv-ink: #20332a; --rv-muted: #667369; --rv-line: #d9ddd1;
-  --rv-green: #396650; --rv-tint: #e6efdf; --rv-warn: #9b542f;
+  --rv-green: #396650; --rv-tint: #e6efdf; --rv-warn: #9b542f; --rv-sunday: #b54343;
   color: var(--rv-ink); background: var(--rv-bg); padding: 18px 20px 40px;
   box-sizing: border-box; border-radius: 20px; max-width: 1180px; margin: 18px auto; line-height: 1.55;
   overflow-wrap: anywhere; color-scheme: light;
@@ -61,6 +61,7 @@
 .rv-weekday { text-align: center; font-size: 12px; color: var(--rv-muted); }
 .reminder .rv-day { min-height: 60px; padding: 5px 6px; display: flex; flex-direction: column; align-items: flex-start; gap: 5px; border-radius: 8px; }
 .rv-day.rv-outside { opacity: .45; }.rv-day.rv-holiday { color: var(--rv-warn); }.rv-day.rv-selected { box-shadow: inset 0 0 0 2px var(--rv-green); }
+.rv-weekday.rv-sunday,.reminder .rv-day.rv-sunday { color: var(--rv-sunday); }
 .rv-dragging .rv-day { border-style: dashed; border-color: var(--rv-green); }.rv-day.rv-drop { background: var(--rv-tint); box-shadow: inset 0 0 0 2px var(--rv-green); }
 .rv-markers { display: flex; flex-wrap: wrap; gap: 3px; max-width: 100%; font-size: 9px; line-height: 1; }
 .rv-marker { color: var(--rv-green); }.rv-marker.rv-warning { color: var(--rv-warn); }.rv-marker.rv-routine { width: 16px; height: 3px; background: var(--rv-line); }.rv-marker.rv-routine.rv-done { background: var(--rv-green); }.rv-marker.rv-routine.rv-warning { background: var(--rv-warn); }
@@ -89,9 +90,9 @@
 .rv-class-row { display: grid; grid-template-columns: 1.4fr .7fr 1fr 1fr 1fr auto; gap: 6px; align-items: end; padding: 10px 0; border-bottom: 1px solid var(--rv-line); }
 .rv-catchup-week { display: flex; flex-wrap: wrap; gap: 6px; }.rv-catchup-week .rv-check { border: 1px solid var(--rv-line); border-radius: 8px; padding: 6px; }
 .rv-toast { position: sticky; bottom: 16px; z-index: 5; margin-top: 18px; padding: 12px 16px; border: 1px solid var(--rv-green); border-radius: 12px; background: var(--rv-tint); box-shadow: 0 8px 28px #17221e22; }
-.rv-dark { --rv-bg:#17221e;--rv-surface:#21312a;--rv-soft:#2d4036;--rv-ink:#edece2;--rv-muted:#b5c3b7;--rv-line:#45574b;--rv-green:#accdb1;--rv-tint:#354d3d;--rv-warn:#eeb991;color-scheme:dark; }
+.rv-dark { --rv-bg:#17221e;--rv-surface:#21312a;--rv-soft:#2d4036;--rv-ink:#edece2;--rv-muted:#b5c3b7;--rv-line:#45574b;--rv-green:#accdb1;--rv-tint:#354d3d;--rv-warn:#eeb991;--rv-sunday:#f3a3a3;color-scheme:dark; }
 .rv-dark .rv-primary,.rv-dark button[aria-pressed="true"] { color:#17221e; }
-@media(prefers-color-scheme:dark) { .reminder:not(.rv-light) { --rv-bg:#17221e;--rv-surface:#21312a;--rv-soft:#2d4036;--rv-ink:#edece2;--rv-muted:#b5c3b7;--rv-line:#45574b;--rv-green:#accdb1;--rv-tint:#354d3d;--rv-warn:#eeb991;color-scheme:dark; }.reminder:not(.rv-light) .rv-primary,.reminder:not(.rv-light) button[aria-pressed="true"] { color:#17221e; } }
+@media(prefers-color-scheme:dark) { .reminder:not(.rv-light) { --rv-bg:#17221e;--rv-surface:#21312a;--rv-soft:#2d4036;--rv-ink:#edece2;--rv-muted:#b5c3b7;--rv-line:#45574b;--rv-green:#accdb1;--rv-tint:#354d3d;--rv-warn:#eeb991;--rv-sunday:#f3a3a3;color-scheme:dark; }.reminder:not(.rv-light) .rv-primary,.reminder:not(.rv-light) button[aria-pressed="true"] { color:#17221e; } }
 @media(max-width:920px) { .rv-workbench { display:flex;flex-direction:column; }.rv-column { display:contents; }.rv-column > * { width:100%; }.rv-today{order:0}.rv-calendar{order:1}.rv-add{order:2}.rv-next{order:3}.rv-class-row{grid-template-columns:repeat(3,minmax(0,1fr));} }
 @media(max-width:780px) { .rv-records .rv-card { grid-template-columns:minmax(0,1fr); }.rv-records .rv-card > .rv-actions { grid-column:1;grid-row:auto;justify-content:flex-start; } }
 @media(max-width:640px) { .rv-settings-grid { grid-template-columns:minmax(0,1fr);gap:16px; }.rv-routine-row { grid-template-columns:minmax(0,1fr) auto; }.rv-routine-main { grid-column:1 / -1; }.rv-record-tools > input { flex:1 1 180px; }.rv-semester > label { flex-wrap:wrap; } }
