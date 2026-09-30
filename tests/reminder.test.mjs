@@ -17,7 +17,7 @@ class Element {
   setAttribute(key,value){this.attributes[key]=String(value);}
   remove(){if(this.parent)this.parent.children=this.parent.children.filter(child=>child!==this);}
   focus(){this.ownerDocument.activeElement=this;}
-  scrollIntoView(){}
+  scrollIntoView(options){(this.scrollCalls??=[]).push(options);}
   addEventListener(name,fn){(this.listeners[name]??=[]).push(fn);}
   removeEventListener(name,fn){this.listeners[name]=(this.listeners[name]||[]).filter(x=>x!==fn);}
   async event(name,extra={}){const event={target:this,key:'',preventDefault(){this.prevented=true;},...extra};await this['on'+name]?.(event);for(const fn of this.listeners[name]||[])await fn(event);return event;}
@@ -210,8 +210,44 @@ test('new KST day on visibility refresh updates today without discarding manual 
   const h=harness(t);await h.controller.open();const learned=field(section(h.container,'새로 공부한 내용'),'공부한 날');learned.value='2026-09-22';h.state.today='2026-09-30';h.listeners.visibilitychange();await settle();assert.match(h.container.textContent,/2026\.09\.30 수요일/);assert.equal(learned.value,'2026-09-22');
 });
 
-test('skip is omitted from today, available through the skipped filter, and reversible without deleting it',async t=>{
-  const state=baseState();state.items=[item()];const h=harness(t,state);await h.controller.open();await h.click('복습 안 함',section(h.container,'오늘의 복습'));assert.equal(h.state.items[0].skipped,TODAY);assert.match(section(h.container,'오늘의 복습').textContent,/오늘 복습할 내용이 없어요/);await h.click('안 함',section(h.container,'전체 기록'));await h.click('되살리기',section(h.container,'전체 기록'));assert.equal(h.state.items[0].skipped,null);
+test('skipped reviews remain discoverable through refresh and resume their original partially completed schedule',async t=>{
+  const original=item({learned:'2026-09-25',base:'2026-09-25',reviews:['2026-09-25'],history:[{date:'2026-09-25',type:'review',stage:0}]}),state=baseState();state.items=[original];const h=harness(t,state);await h.controller.open();
+  assert.ok(tagged(h.container,'button','건너뛴 복습 0'));
+  await h.click('복습 건너뛰기',section(h.container,'오늘의 복습'));
+  assert.equal(h.state.items[0].skipped,TODAY);assert.deepEqual(h.state.items[0].reviews,original.reviews);
+  assert.match(section(h.container,'오늘의 복습').textContent,/오늘 복습할 내용이 없어요/);
+  const shortcut=tagged(h.container,'button','건너뛴 복습 1'),records=section(h.container,'전체 기록');
+  assert.equal(shortcut.attributes['aria-label'],'건너뛴 복습 1개 보기');
+  const calls=h.calls.length;await h.click('건너뛴 복습 1');assert.equal(h.calls.length,calls,'opening the existing skipped list needs no GET or POST');
+  let skippedFilter=tagged(records,'button','건너뛴 복습');
+  assert.equal(skippedFilter.attributes['aria-pressed'],'true');assert.equal(h.document.activeElement,skippedFilter);assert.equal(records.scrollCalls.length,1);
+  let card=descendants(records).find(node=>node.tagName==='article'&&node.dataset.item===ID);
+  assert.ok(card);assert.match(card.textContent,/건너뜀/);assert.equal(tagged(card,'button','기록 보기'),undefined,'a skipped card cannot open another items curve');
+  assert.match(records.textContent,/남은 복습 일정에서 제외한 항목이에요\. 복습 다시 시작을 누르면 원래 일정으로 돌아갑니다\./);
+  h.state.revision++;await h.controller.refresh();
+  skippedFilter=tagged(records,'button','건너뛴 복습');assert.equal(skippedFilter.attributes['aria-pressed'],'true');
+  card=descendants(records).find(node=>node.tagName==='article'&&node.dataset.item===ID);assert.ok(card);
+  await h.click('복습 다시 시작',card);
+  assert.equal(h.state.items.length,1);assert.equal(h.state.items[0].skipped,null);
+  for(const key of ['learned','base','offsets','reviews'])assert.deepEqual(h.state.items[0][key],original[key],key);
+  assert.deepEqual(h.state.items[0].history[0],original.history[0]);assert.equal(schedule.nextDue(h.state.items[0]),'2026-09-26');
+  assert.ok(descendants(section(h.container,'오늘의 복습')).some(node=>node.tagName==='article'&&node.dataset.item===ID));
+  assert.ok(tagged(h.container,'button','건너뛴 복습 0'));assert.match(records.textContent,/건너뛴 복습이 없어요\./);assert.doesNotMatch(records.textContent,/조건에 맞는/);
+  assert.deepEqual(h.calls.filter(call=>call.method==='POST').map(call=>JSON.parse(call.body).action),['item.skip','item.unskip']);
+});
+
+test('the skipped shortcut reveals stored skipped records by clearing search and subject filters without a request',async t=>{
+  const state=baseState();state.items=[item({title:'보관한 역사 복습',subject:'역사',skipped:'2026-09-28'}),item({id:SECOND,title:'보관한 과학 복습',subject:'과학',skipped:TODAY}),item({id:webcrypto.randomUUID(),title:'진행 중 수학',subject:'수학'})];const h=harness(t,state);await h.controller.open();
+  const records=section(h.container,'전체 기록'),search=descendants(records).find(node=>node.attributes['aria-label']==='전체 기록 검색');
+  const ids=()=>descendants(records).filter(node=>node.tagName==='article'&&node.dataset.item).map(node=>node.dataset.item).sort();
+  assert.equal(ids().length,1);assert.ok(tagged(h.container,'button','건너뛴 복습 2'),'existing saved skips are counted without another action');
+  await h.click('수학',records);search.value='일치하지 않는 검색';await search.event('input');assert.deepEqual(ids(),[]);
+  const calls=h.calls.length;await h.click('건너뛴 복습 2');
+  assert.equal(h.calls.length,calls);assert.equal(search.value,'');assert.deepEqual(ids(),[ID,SECOND]);
+  assert.equal(tagged(records,'button','수학').attributes['aria-pressed'],'false');assert.equal(h.document.activeElement,tagged(records,'button','건너뛴 복습'));
+  search.value='없는 복습';await search.event('input');assert.match(records.textContent,/조건에 맞는 건너뛴 복습이 없어요\./);
+  search.value='';await search.event('input');await h.click('수학',records);assert.match(records.textContent,/조건에 맞는 건너뛴 복습이 없어요\./);
+  await h.click('건너뛴 복습 2');assert.deepEqual(ids(),[ID,SECOND]);assert.equal(h.calls.length,calls);assert.deepEqual(h.state,state);
 });
 
 test('generation capacity warning retains existing records and normal read actions',async t=>{
