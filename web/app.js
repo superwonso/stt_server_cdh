@@ -92,6 +92,7 @@ const ADMIN_USAGE_SCOPE = Object.freeze({basis:'retained_lectures',date_field:'l
   excludes_permanently_deleted:true,excludes_deleting:true,ai_counts:'latest_saved_state_except_question_rows',
   imports:'linked_retained_lectures',duration:'finalized_archive_or_completed_import_metadata'});
 let adminSequence = 0, adminRefreshTimer = null, adminProbeTimer = null, adminConfirmation = null;
+let adminModelUnconfirmed = false;
 let tunnelRecoveryTimer = null, tunnelRecoveryDeadline = 0, tunnelRecoveryContext = null;
 let presenceSequence = 0, presenceTimer = null, presenceIdleTimer = null, presenceSending = false;
 let presenceLastSent = '', presenceQueued = '', lastPresenceInteraction = Date.now();
@@ -1102,8 +1103,7 @@ function setServer(value) {
   const next = normalizeUrl(value);
   const restartPresence = next !== apiUrl && presenceTimer !== null;
   if (next !== apiUrl) {
-    closeAdminRecovery();
-    resetAdminUsage();
+    resetAdminState();
     // The first anonymously verified origin may bind an incoming link. A
     // later origin change must never carry its recovery credentials across.
     if (apiUrl && passwordReset) setActivation(false);
@@ -3079,6 +3079,9 @@ function scrubAdminDom() {
   document.querySelector('.admin-access').setAttribute('data-state','unknown');
   $('admin-server-state').textContent = '확인 중'; $('admin-server-state').setAttribute('data-state','unknown');
   $('admin-server-detail').textContent = '서버 가동 시간을 확인하고 있어요.';
+  $('admin-model-state').textContent = '확인 중'; $('admin-model-state').setAttribute('data-state','unknown');
+  $('admin-model-detail').textContent = 'Qwen 상태를 확인하고 있어요.';
+  $('admin-model-restart').textContent = 'Qwen 다시 시작'; $('admin-model-restart').disabled = true;
   for (const prefix of ['gpu','ram','disk']) {
     $(`admin-${prefix}-value`).textContent = '확인 중';
     $(`admin-${prefix}-progress`).removeAttribute('value');
@@ -3099,6 +3102,7 @@ function resetAdminState() {
   ++adminSequence;
   clearAdminRefresh(); clearAdminProbe(); clearTunnelRecovery();
   adminAuthorized = false; adminOverview = null; adminLoading = false; adminError = ''; adminAction = ''; adminConfirmation = null;
+  adminModelUnconfirmed = false;
   $('admin-open').hidden = true;
   if ($('admin-dialog').open) $('admin-dialog').close();
   if ($('admin-confirm-dialog').open) $('admin-confirm-dialog').close();
@@ -3454,10 +3458,10 @@ function renderAdminAudit(entries) {
   }
   const actionLabels = {
     access_open:'원격 접속 열기',access_close:'원격 접속 닫기',access_changed:'원격 접속 변경',
-    tunnel_restart:'터널 재연결',tunnel_restarted:'터널 재연결',sessions_revoke:'세션 종료',sessions_revoked:'세션 종료',
+    tunnel_restart:'터널 재연결',tunnel_restarted:'터널 재연결',model_restarted:'Qwen 다시 시작',sessions_revoke:'세션 종료',sessions_revoked:'세션 종료',
   };
   const resultLabels = {success:'완료',failed:'실패',accepted:'요청됨'};
-  const targetLabels = {service:'운영 접속',tunnel:'터널'};
+  const targetLabels = {service:'운영 접속',tunnel:'터널',model:'Qwen'};
   for (const entry of safeEntries) {
     const row = document.createElement('article'); row.className = 'admin-audit-entry';
     const copy = document.createElement('div');
@@ -3472,6 +3476,42 @@ function renderAdminAudit(entries) {
     result.className = 'admin-badge';
     copy.append(title,detail); row.append(copy,result); container.append(row);
   }
+}
+function validAdminModelControl(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && typeof value.supported === 'boolean' && typeof value.restart_available === 'boolean'
+    && ['idle','restarting','restart_succeeded','restart_failed'].includes(value.operation)
+    && ['ready','error','offline','loading','unknown'].includes(value.state)
+    && typeof value.message === 'string' && value.message.length <= 500;
+}
+function canRestartAdminModel() {
+  const model = adminOverview?.model_control;
+  return adminAuthorized && !!token && !adminLoading && !adminAction && !adminModelUnconfirmed
+    && validAdminModelControl(model) && model.supported && model.restart_available
+    && model.operation !== 'restarting' && ['error','offline'].includes(model.state);
+}
+function renderAdminModelControl() {
+  const model = adminOverview?.model_control;
+  const valid = validAdminModelControl(model);
+  const supported = valid && model.supported;
+  const restarting = supported && model.operation === 'restarting';
+  const labels = {ready:'준비됨',error:'확인 필요',offline:'중지됨',loading:'준비 중',unknown:'상태 확인 필요'};
+  let label = supported ? labels[model.state] : '사용할 수 없음';
+  let state = supported ? model.state : 'unknown';
+  let message = supported ? model.message : '이 서버에서는 Qwen 원격 재시작을 지원하지 않습니다.';
+  if (supported && model.operation === 'restart_failed') { label = '다시 시작 실패'; state = 'error'; }
+  if (supported && model.operation === 'restart_succeeded' && model.state === 'ready') label = '다시 시작 완료';
+  if (restarting) { label = '다시 시작 중'; state = 'starting'; }
+  if (adminModelUnconfirmed) {
+    label = adminAction === 'model' ? '요청 중' : '요청 상태 확인 중'; state = 'unknown';
+    message = 'Qwen 재시작 요청의 처리 상태를 확인하고 있어요. 다시 요청하지 않고 상태를 조회합니다.';
+  }
+  $('admin-model-state').textContent = label;
+  $('admin-model-state').setAttribute('data-state',state);
+  $('admin-model-detail').textContent = message;
+  $('admin-model-restart').disabled = !canRestartAdminModel();
+  $('admin-model-restart').textContent = adminAction === 'model' ? '요청 중…'
+    : adminModelUnconfirmed ? '상태 확인 중…' : restarting ? '다시 시작 중…' : 'Qwen 다시 시작';
 }
 function renderAdminOverview() {
   $('admin-open').hidden = !adminAuthorized;
@@ -3517,6 +3557,7 @@ function renderAdminOverview() {
     typeof server.device === 'string' && server.device ? `장치 ${server.device}` : '',
     loadValues.length ? `시스템 부하 ${loadValues.map(value => value.toFixed(2)).join(' / ')}` : '',
   ].filter(Boolean).join(' · ') || '서버 상태 세부 정보가 없습니다.';
+  renderAdminModelControl();
 
   const resources = overview.resources || {};
   const gpu = resources.gpu || {};
@@ -3625,6 +3666,7 @@ async function loadAdminOverview({probe = false} = {}) {
     if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
     clearAdminProbe();
     adminAuthorized = true; adminOverview = result && typeof result === 'object' ? result : {};
+    if (validAdminModelControl(adminOverview.model_control)) adminModelUnconfirmed = false;
     adminError = ''; renderAdminOverview();
   } catch (error) {
     if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
@@ -3777,13 +3819,15 @@ function closeAdminConfirmation() {
 }
 function openAdminConfirmation(type, account = null) {
   if (!adminAuthorized || adminAction || account?.is_self) return;
+  if (type === 'model-restart' && !canRestartAdminModel()) return;
   const copies = {
     'access-close':['운영 접속을 닫을까요?','새 수업·조회·업로드·다운로드를 포함한 모든 수업 데이터 요청이 일시 중지됩니다. 진행 중인 전송에도 영향을 줄 수 있으며, 현재 관리자 연결에서는 다시 열 수 있습니다.','운영 접속 닫기'],
     'tunnel-restart':['터널을 재연결할까요?','외부 주소가 바뀌며 이 페이지 연결이 끊길 수 있습니다. 재연결 뒤 자동 주소가 게시될 때까지 기다린 다음 다시 로그인해야 할 수 있습니다.','터널 재연결'],
+    'model-restart':['Qwen을 다시 시작할까요?','Qwen 음성 인식만 다시 시작합니다. API와 수업 조회는 유지되며, Qwen이 준비될 때까지 받아쓰기는 잠시 기다려야 합니다. 이 버튼은 유료 AI 작업을 다시 요청하지 않습니다.','Qwen 다시 시작'],
     'session-revoke':['계정 세션을 종료할까요?',`${String(account?.label || '선택한 계정')}의 모든 로그인 세션을 종료합니다. 해당 기기에서 다시 로그인해야 합니다.`,'세션 종료'],
   };
   const copy = copies[type]; if (!copy) return;
-  adminConfirmation = {type,accountId:account?.account_id || '',label:account?.label || ''};
+  adminConfirmation = {type,accountId:account?.account_id || '',label:account?.label || '',owner:user,sessionToken:token,server:apiUrl};
   $('admin-confirm-title').textContent = copy[0]; $('admin-confirm-description').textContent = copy[1]; $('admin-confirm-accept').textContent = copy[2];
   $('admin-confirm-dialog').showModal(); $('admin-confirm-cancel').focus();
 }
@@ -3792,15 +3836,25 @@ $('admin-confirm-cancel').onclick = closeAdminConfirmation;
 $('admin-confirm-dialog').oncancel = () => { adminConfirmation = null; };
 async function runAdminAction(type, payload) {
   if (!adminAuthorized || adminAction || !token) return;
-  const endpoints = {access:'/admin/access',tunnel:'/admin/tunnel/restart',sessions:'/admin/sessions/revoke'};
+  if (type === 'model' && !canRestartAdminModel()) return;
+  const endpoints = {access:'/admin/access',tunnel:'/admin/tunnel/restart',model:'/admin/model/restart',sessions:'/admin/sessions/revoke'};
   const path = endpoints[type]; if (!path) return;
   const owner = user, sessionToken = token, server = apiUrl, sequence = ++adminSequence;
-  clearAdminRefresh(); adminAction = type; adminError = ''; renderAdminOverview();
+  clearAdminRefresh(); adminAction = type; adminError = '';
+  if (type === 'model') adminModelUnconfirmed = true;
+  renderAdminOverview();
   try {
-    await api(path,{method:'POST',body:JSON.stringify(payload || {})},30000);
+    const result = await api(path,{method:'POST',body:JSON.stringify(payload || {})},30000);
     if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
+    if (type === 'model') {
+      if (!validAdminModelControl(result?.model_control) || result.model_control.operation === 'idle') {
+        throw new Error('Qwen 재시작 요청의 처리 상태를 확인하지 못했어요.');
+      }
+      adminOverview = {...adminOverview,model_control:result.model_control}; adminModelUnconfirmed = false;
+    }
     if (type === 'access') notice(payload.enabled ? '새 수업 데이터 요청을 다시 받습니다.' : '새 수업 데이터 요청을 일시 중지했어요.');
     else if (type === 'sessions') notice('선택한 계정의 로그인 세션을 종료했어요.');
+    else if (type === 'model') notice('Qwen 재시작 요청을 접수했어요. 준비 결과를 확인하고 있습니다.');
     else notice('터널 재연결을 요청했어요. 외부 주소가 바뀌면 다시 로그인해 주세요.');
     adminAction = '';
     if (type === 'tunnel') {
@@ -3813,6 +3867,18 @@ async function runAdminAction(type, payload) {
     if (!adminOperationIsCurrent(sequence,owner,sessionToken,server)) return;
     adminAction = '';
     if (error?.status === 403) { resetAdminState(); return; }
+    if (type === 'model') {
+      adminModelUnconfirmed = true;
+      adminError = 'Qwen 재시작 요청의 처리 상태를 확인하지 못했어요. 새로고침으로 상태를 확인해 주세요.';
+      renderAdminOverview();
+      const refreshSequence = adminSequence + 1;
+      await loadAdminOverview();
+      if (error?.status >= 400 && error.status < 500
+          && adminOperationIsCurrent(refreshSequence,owner,sessionToken,server) && adminAuthorized) {
+        adminError = errorText(error); renderAdminOverview();
+      }
+      return;
+    }
     adminError = errorText(error); renderAdminOverview();
   } finally {
     if (adminOperationIsCurrent(sequence,owner,sessionToken,server)) {
@@ -3861,11 +3927,13 @@ $('admin-access-toggle').onclick = () => {
   else void runAdminAction('access',{enabled:true});
 };
 $('admin-tunnel-restart').onclick = () => openAdminConfirmation('tunnel-restart');
+$('admin-model-restart').onclick = () => openAdminConfirmation('model-restart');
 $('admin-confirm-accept').onclick = () => {
   const pendingAction = adminConfirmation; closeAdminConfirmation();
-  if (!pendingAction) return;
+  if (!pendingAction || pendingAction.owner !== user || pendingAction.sessionToken !== token || pendingAction.server !== apiUrl) return;
   if (pendingAction.type === 'access-close') void runAdminAction('access',{enabled:false});
   else if (pendingAction.type === 'tunnel-restart') void runAdminAction('tunnel',{});
+  else if (pendingAction.type === 'model-restart') void runAdminAction('model',{});
   else if (pendingAction.type === 'session-revoke' && pendingAction.accountId) {
     void runAdminAction('sessions',{account_id:pendingAction.accountId});
   }

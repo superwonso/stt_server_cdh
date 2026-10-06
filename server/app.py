@@ -71,6 +71,7 @@ from .platform_files import ensure_private_directory, open_file, validate_privat
 from .transcriber import LocalTranscriber
 from .remote_transcriber import RemoteTranscriber
 from .model_protocol import ModelUnavailableError
+from .model_control import ModelControlError, create_model_control, sanitized_status as sanitized_model_control_status
 
 log = logging.getLogger("classroom")
 Username = Annotated[str, StringConstraints(min_length=1, max_length=32)]
@@ -377,9 +378,11 @@ def create_app(
     drive_storage=None,
     tunnel_status=None,
     tunnel_restart=None,
+    model_control=None,
 ) -> FastAPI:
     production_factory = settings is None
     settings = settings or Settings.from_env()
+    model_control = model_control or create_model_control(settings, enabled=production_factory)
     if production_factory and (tunnel_status is None or tunnel_restart is None):
         # The uvicorn factory calls create_app() without arguments.  Importing
         # these lazy wrappers wires production control without inspecting any
@@ -511,6 +514,7 @@ def create_app(
             course_review_service.request_shutdown()
             archive_manager.request_shutdown()
             lease_renewer.request_shutdown()
+            model_control.request_shutdown()
             if backup_scheduler is not None:
                 backup_scheduler.request_shutdown()
             shutdown_deadline = time.monotonic() + 18
@@ -526,6 +530,7 @@ def create_app(
                 timeout=max(0.0, shutdown_deadline - time.monotonic())
             )
             lease_renewer.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
+            model_control.stop(timeout=min(1.0, max(0.0, shutdown_deadline - time.monotonic())))
             if backup_scheduler is not None:
                 backup_scheduler.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             if hasattr(clova_engine, "close"):
@@ -541,6 +546,7 @@ def create_app(
     app = FastAPI(title="Classroom Transcription", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings = settings
     app.state.database = database
+    app.state.model_control = model_control
     app.state.activity_tracker = activity_tracker
     app.state.timetable_recognizer = timetable_recognizer
     app.state.transcriber = engine
@@ -650,8 +656,7 @@ def create_app(
         return user
 
     def admin_identity(user: dict = Depends(identity)) -> dict:
-        administrator = settings.admin_username
-        if administrator is None or not secrets.compare_digest(user["username"], administrator):
+        if not settings.is_admin(user["username"]):
             # The same response covers a missing setting and a non-admin user,
             # so the private account configuration cannot be enumerated.
             raise HTTPException(403, "관리자 권한이 필요합니다.")
@@ -688,10 +693,10 @@ def create_app(
         return user
 
     def audit(connection, action: str, result: str, target: str) -> None:
-        allowed_actions = {"access_changed", "sessions_revoked", "tunnel_restarted",
+        allowed_actions = {"access_changed", "sessions_revoked", "tunnel_restarted", "model_restarted",
                            "password_reset_issued", "password_reset_revoked", "password_reset_completed"}
         allowed_results = {"success", "failed", "accepted"}
-        allowed_targets = {"service", "tunnel", *settings.accounts}
+        allowed_targets = {"service", "tunnel", "model", *settings.accounts}
         if action not in allowed_actions or result not in allowed_results or target not in allowed_targets:
             raise RuntimeError("Unsafe administrator audit metadata")
         connection.execute(
@@ -706,6 +711,12 @@ def create_app(
 
     def epoch_text(value: float) -> str:
         return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def model_control_status() -> dict:
+        try:
+            return sanitized_model_control_status(model_control.status())
+        except Exception:
+            return sanitized_model_control_status(None)
 
     def safe_engine_status() -> dict:
         fallback = {
@@ -1058,6 +1069,7 @@ def create_app(
             "api_address": lease_renewer.status(),
             "backup": backup_scheduler.status() if backup_scheduler is not None else {"configured": False, "enabled": False, "running": False},
             "tunnel": sanitized_tunnel_status(),
+            "model_control": model_control_status(),
             "accounts": account_results,
             "recent_audit": recent_audit,
             "recent_activity": [
@@ -1110,6 +1122,40 @@ def create_app(
         purge_account_download_tickets(target)
         activity_tracker.remove(username=target)
         return {"status": "ok", "revoked_sessions": revoked}
+
+    @app.post("/admin/model/restart", status_code=202)
+    def restart_admin_model(user: dict = Depends(admin_identity)):
+        # A service-wide cap covers multiple administrators and browser tabs.
+        if not limiter.allow(("admin-model-restart", "model"), 3, 300):
+            raise HTTPException(429, "로컬 음성 모델 재시작 요청이 너무 많습니다.", headers={"Retry-After": "300"})
+
+        def record_result(result):
+            with database.connect() as connection:
+                audit(connection, "model_restarted", result, "model")
+
+        def still_authorized():
+            if not settings.is_admin(user["username"]):
+                return False
+            with database.connect() as connection:
+                return connection.execute(
+                    "SELECT 1 FROM sessions WHERE token_hash = ? AND username = ? AND expires_at > ?",
+                    (user["token_hash"], user["username"], time.time()),
+                ).fetchone() is not None
+
+        try:
+            result = model_control.request_restart(audit=record_result, authorize=still_authorized)
+        except ModelControlError as error:
+            if error.code in {"unsupported", "busy", "state_changed"}:
+                messages = {
+                    "unsupported": "이 실행 환경에서는 로컬 음성 모델 재시작을 지원하지 않습니다.",
+                    "busy": "다른 모델 재시작 작업이 진행 중입니다. 잠시 후 다시 확인하세요.",
+                    "state_changed": "오류 상태이거나 꺼진 로컬 음성 모델만 다시 시작할 수 있습니다. 현재 상태를 확인하세요.",
+                }
+                raise HTTPException(409, messages[error.code]) from None
+            raise HTTPException(503, "로컬 음성 모델 재시작 요청을 확인하지 못했습니다.") from None
+        except Exception:
+            raise HTTPException(503, "로컬 음성 모델 재시작 요청을 확인하지 못했습니다.") from None
+        return {"model_control": sanitized_model_control_status(result)}
 
     @app.post("/admin/tunnel/restart", status_code=202)
     def restart_admin_tunnel(user: dict = Depends(admin_identity)):
@@ -3944,7 +3990,7 @@ def create_app(
         activity_tracker.remove(username=username)
 
     account_recovery.install(app, database, admin_identity=admin_identity, account_ids=account_ids,
-                             administrator=settings.admin_username, auth_limit=auth_limit,
+                             administrator=settings.administrator_usernames, auth_limit=auth_limit,
                              purge_tickets=purge_account_download_tickets,
                              purge_presence=purge_account_presence, audit=audit)
     admin_usage.install(app, database, admin_identity=admin_identity, account_ids=account_ids, limiter=limiter)

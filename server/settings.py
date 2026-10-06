@@ -4,6 +4,7 @@ import io
 import math
 import os
 import re
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -110,6 +111,7 @@ class Settings:
     # repr prevents an otherwise convenient Settings log/debug statement from
     # publishing a real account ID.
     admin_username: str | None = field(default=None, repr=False)
+    additional_admin_usernames: tuple[str, ...] = field(default=(), repr=False)
     site_origins: tuple[str, ...] = ()
     model: str = "Qwen3-ASR-1.7B"
     aligner: str = "Qwen3-ForcedAligner-0.6B"
@@ -197,11 +199,18 @@ class Settings:
         if account_usernames(",".join(self.accounts)) != self.accounts:
             raise ValueError("Settings.accounts must contain 2-10 normalized account IDs")
         if self.admin_username is not None and (
-            ACCOUNT_USERNAME.fullmatch(self.admin_username) is None
+            not isinstance(self.admin_username, str)
+            or ACCOUNT_USERNAME.fullmatch(self.admin_username) is None
             or self.admin_username not in self.accounts
         ):
             # Do not reflect a possibly secret/mistyped account ID.
             raise ValueError("ADMIN_USERNAME must identify one configured account")
+        if (not isinstance(self.additional_admin_usernames, tuple)
+                or len(self.additional_admin_usernames) > len(self.accounts)
+                or any(not isinstance(value, str) or value not in self.accounts
+                       for value in self.additional_admin_usernames)
+                or len(set(self.additional_admin_usernames)) != len(self.additional_admin_usernames)):
+            raise ValueError("ADDITIONAL_ADMIN_USERNAMES must identify distinct configured accounts")
         normalized_gateway = mindlogic_gateway_base_url(self.mindlogic_base_url)
         object.__setattr__(self, "mindlogic_base_url", normalized_gateway)
         if self.clova_speech_secret_key is not None and (
@@ -218,6 +227,16 @@ class Settings:
                 "GOOGLE_DRIVE_UPLOAD_CHUNK_BYTES must be a 256 KiB multiple "
                 "between 256 KiB and 32 MiB"
             )
+
+    @property
+    def administrator_usernames(self) -> tuple[str, ...]:
+        primary = (self.admin_username,) if self.admin_username is not None else ()
+        return tuple(dict.fromkeys((*primary, *self.additional_admin_usernames)))
+
+    def is_admin(self, username: str) -> bool:
+        if not isinstance(username, str) or not username.isascii():
+            return False
+        return any(secrets.compare_digest(username, candidate) for candidate in self.administrator_usernames)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -256,6 +275,8 @@ class Settings:
             model_cache_dir=_path(os.getenv("MODEL_CACHE_DIR", ".models")),
             accounts=accounts,
             admin_username=(os.getenv("ADMIN_USERNAME") or "").strip() or None,
+            additional_admin_usernames=tuple(part.strip() for part in os.getenv("ADDITIONAL_ADMIN_USERNAMES", "").split(","))
+            if os.getenv("ADDITIONAL_ADMIN_USERNAMES", "").strip() else (),
             site_origins=origins,
             model=os.getenv("ASR_MODEL", os.getenv("WHISPER_MODEL", "Qwen3-ASR-1.7B")),
             aligner=os.getenv("ASR_ALIGNER", "Qwen3-ForcedAligner-0.6B"),

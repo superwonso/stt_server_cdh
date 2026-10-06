@@ -234,6 +234,10 @@ test('admin controls are hidden by default, accessible, and contain no embedded 
   assert.match(html, /<p\b[^>]*\bid="admin-error"[^>]*\brole="alert"[^>]*\bhidden/i);
   assert.match(html, /<button\b[^>]*\bid="admin-access-toggle"[^>]*\bdisabled/i);
   assert.match(html, /<button\b[^>]*\bid="admin-tunnel-restart"[^>]*\bdisabled/i);
+  assert.match(html, /<button\b[^>]*\bid="admin-model-restart"[^>]*\baria-describedby="admin-model-help"[^>]*\bdisabled/i);
+  assert.match(html, /<p\b[^>]*\bid="admin-model-detail"[^>]*\brole="status"/i);
+  const modelHelp = html.match(/<p\b[^>]*id="admin-model-help"[^>]*>([\s\S]*?)<\/p>/)?.[1];
+  for (const explanation of [/오류/,/중지/,/API.*수업 조회.*유지/,/유료 AI/,/외부 연결/,/사용할 수 없/]) assert.match(modelHelp,explanation);
   assert.match(html, /<dialog\b[^>]*\bid="admin-confirm-dialog"[^>]*\baria-labelledby="admin-confirm-title"[^>]*\baria-describedby="admin-confirm-description"/i);
   assert.match(html, /<div\b[^>]*\bid="admin-accounts"[^>]*><\/div>/i);
   const accounts = html.match(/<section\b[^>]*aria-labelledby="admin-accounts-title"[^>]*>([\s\S]*?)<\/section>/i)?.[1];

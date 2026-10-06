@@ -3058,6 +3058,158 @@ test('admin distinguishes a reachable API from an offline local model without di
   assert.equal(app.element('admin-refresh').disabled,false);
 });
 
+function adminModelFixture(overrides={}) {
+  return {supported:true,restart_available:true,operation:'idle',state:'error',
+    message:'Qwen 음성 인식을 다시 시작할 수 있습니다.',...overrides};
+}
+function openAdminModelFixture(app, model=adminModelFixture()) {
+  app.run(`adminAuthorized=true; adminOverview=${JSON.stringify(adminOverviewFixture({model_control:model}))};
+    $('admin-dialog').showModal(); renderAdminOverview();`);
+}
+
+test('Qwen restart is offered only for a supported available error or offline model',()=>{
+  for(const [model,enabled] of [
+    [undefined,false],[adminModelFixture(),true],[adminModelFixture({state:'offline'}),true],
+    ...['ready','loading','unknown'].map(state=>[adminModelFixture({state}),false]),
+    [adminModelFixture({supported:false}),false],[adminModelFixture({restart_available:false}),false],
+    [adminModelFixture({operation:'restarting'}),false],
+    [adminModelFixture({restart_available:'true'}),false],[adminModelFixture({state:'PRIVATE-INTERNAL-STATE'}),false],
+  ]){
+    const calls=[];const app=setup(async(url,options={})=>{calls.push({url,options});return response({});});
+    openAdminModelFixture(app,model);
+    if(model===undefined)app.run('delete adminOverview.model_control; renderAdminOverview()');
+    assert.equal(app.element('admin-model-restart').disabled,!enabled);
+    app.element('admin-model-restart').onclick();
+    assert.equal(app.element('admin-confirm-dialog').open,enabled);
+    assert.equal(calls.length,0);
+    assert.doesNotMatch(app.element('admin-model-detail').textContent,/PRIVATE/);
+  }
+});
+
+test('Qwen restart confirms its scope, sends once, and polls through loading to ready without changing the API',async()=>{
+  const calls=[],gate=deferred();let model=adminModelFixture();
+  const app=setup(async(url,options={})=>{
+    calls.push({url,method:options.method||'GET',body:options.body});
+    if(url.endsWith('/admin/model/restart'))return gate.promise;
+    return response(adminOverviewFixture({model_control:model}));
+  });
+  openAdminModelFixture(app);
+  app.element('admin-model-restart').onclick();
+  assert.match(app.element('admin-confirm-description').textContent,/API와 수업 조회는 유지/);
+  assert.match(app.element('admin-confirm-description').textContent,/유료 AI 작업을 다시 요청하지/);
+  app.element('admin-confirm-cancel').onclick();assert.equal(calls.length,0);
+  app.element('admin-model-restart').onclick();app.element('admin-confirm-accept').onclick();
+  await tick();
+  assert.equal(app.element('admin-model-restart').disabled,true);
+  app.element('admin-confirm-accept').onclick();await app.run('runAdminAction("model",{})');
+  assert.equal(calls.filter(call=>call.method==='POST').length,1);
+  model=adminModelFixture({restart_available:false,operation:'restarting',state:'loading',message:'Qwen을 다시 시작하고 있습니다.'});
+  gate.resolve(response({model_control:model},202));await until(()=>!app.run('adminAction')&&!app.run('adminLoading'));
+  assert.match(app.element('admin-model-state').textContent,/다시 시작 중/);
+  assert.equal(app.element('admin-dialog').open,true);
+  assert.equal(app.run('apiUrl'),'https://classroom.example');assert.equal(app.run('token'),'old-token');
+  assert.equal(app.run('tunnelRecoveryTimer'),null);
+  model=adminModelFixture({restart_available:false,operation:'restart_succeeded',state:'ready',message:'Qwen이 준비되었습니다.'});
+  await app.runTimeout(10000);
+  assert.equal(app.element('admin-model-state').textContent,'다시 시작 완료');
+  assert.equal(app.element('admin-model-restart').disabled,true);
+  const post=calls.find(call=>call.method==='POST');assert.deepEqual(JSON.parse(post.body),{});
+  assert.ok(calls.every(call=>/\/admin\/(?:overview|model\/restart)$/.test(call.url)));
+});
+
+test('a confirmed restart failure is displayed and permits only a new explicit request',async()=>{
+  const calls=[];const failed=adminModelFixture({operation:'restart_failed',message:'Qwen을 다시 시작하지 못했습니다.'});
+  const app=setup(async(url,options={})=>{calls.push({url,method:options.method||'GET'});
+    return response(url.endsWith('/admin/model/restart')?{model_control:failed}:adminOverviewFixture({model_control:failed}),url.endsWith('/restart')?202:200);});
+  openAdminModelFixture(app);await app.run('runAdminAction("model",{})');
+  assert.equal(app.element('admin-model-state').textContent,'다시 시작 실패');
+  assert.equal(app.element('admin-model-restart').disabled,false);
+  await app.runTimeout(10000);
+  assert.equal(calls.filter(call=>call.method==='POST').length,1);
+});
+
+test('an ambiguous Qwen restart acknowledgment is reconciled only by GET before another request can be offered',async()=>{
+  for(const acknowledgement of ['lost','malformed']){
+    let readable=false;const calls=[];
+    const app=setup(async(url,options={})=>{
+      const method=options.method||'GET';calls.push({url,method});
+      if(method==='POST'){
+        if(acknowledgement==='lost')throw new TypeError('synthetic lost response');
+        return response({model_control:{message:'PRIVATE-DIAGNOSTIC'}},202);
+      }
+      if(!readable)throw new TypeError('synthetic unavailable read');
+      return response(adminOverviewFixture({model_control:adminModelFixture({operation:'restarting',state:'loading',restart_available:false})}));
+    });
+    openAdminModelFixture(app);await app.run('runAdminAction("model",{})');
+    assert.equal(app.run('adminModelUnconfirmed'),true);assert.equal(app.element('admin-model-restart').disabled,true);
+    assert.match(app.element('admin-model-detail').textContent,/다시 요청하지 않고 상태를 조회/);
+    assert.doesNotMatch(app.element('admin-model-detail').textContent,/PRIVATE/);
+    await app.run('runAdminAction("model",{})');
+    readable=true;await app.runTimeout(10000);
+    assert.equal(app.run('adminModelUnconfirmed'),false);
+    assert.equal(app.element('admin-model-state').textContent,'다시 시작 중');
+    assert.equal(calls.filter(call=>call.method==='POST').length,1);
+  }
+});
+
+test('Qwen confirmation rechecks state and cannot cross identity or server boundaries',async()=>{
+  for(const change of ['adminOverview.model_control.state="ready"','adminOverview.model_control.restart_available=false',
+    'user="replacement"','token="replacement-token"','apiUrl="https://replacement.example"']){
+    const calls=[];const app=setup(async(url)=>{calls.push(url);return response({});});
+    openAdminModelFixture(app);app.element('admin-model-restart').onclick();app.run(change);
+    app.element('admin-confirm-accept').onclick();await tick();
+    assert.equal(calls.length,0,change);
+  }
+});
+
+test('late Qwen restart responses cannot restore controls after logout session owner or server replacement',async()=>{
+  for(const change of ['showLogin()','user="replacement";resetAdminState()',
+    'token="replacement-token";resetAdminState()','setServer("https://replacement.trycloudflare.com")']){
+    const gate=deferred(),calls=[];const app=setup(async(url)=>{calls.push(url);return gate.promise;});
+    openAdminModelFixture(app);const request=app.run('runAdminAction("model",{})');await tick();app.run(change);
+    gate.resolve(response({model_control:adminModelFixture({operation:'restart_succeeded',state:'ready',message:'PRIVATE-OLD-RESULT'})},202));
+    await request;
+    assert.equal(app.run('adminOverview'),null);assert.equal(app.run('adminAuthorized'),false);
+    assert.equal(app.run('adminModelUnconfirmed'),false);assert.equal(app.element('admin-model-restart').disabled,true);
+    assert.doesNotMatch(app.element('admin-model-detail').textContent,/PRIVATE/);assert.equal(calls.length,1);
+  }
+});
+
+test('Qwen restart authorization failures scrub administrator controls and never retry',async()=>{
+  for(const status of [401,403]){
+    const calls=[];const app=setup(async(url,options={})=>{calls.push(url);return response({detail:'권한을 확인해 주세요.'},status);});
+    openAdminModelFixture(app);await app.run('runAdminAction("model",{})');
+    assert.equal(app.run('adminAuthorized'),false);assert.equal(app.run('adminOverview'),null);
+    assert.equal(app.element('admin-model-restart').disabled,true);assert.equal(calls.length,1);
+    assert.equal(app.run('adminRefreshTimer'),null);
+  }
+});
+
+test('Qwen restart rejection remains visible after refreshing authoritative state without retrying',async()=>{
+  for(const status of [409,429]){
+    let posts=0;const app=setup(async(url,options={})=>{
+      if(options.method==='POST'){posts++;return response({detail:'지금은 다시 시작할 수 없습니다. 잠시 후 확인해 주세요.'},status);}
+      return response(adminOverviewFixture({model_control:adminModelFixture({restart_available:false,state:'loading'})}));
+    });
+    openAdminModelFixture(app);await app.run('runAdminAction("model",{})');
+    assert.equal(posts,1);assert.equal(app.run('adminAuthorized'),true);
+    assert.equal(app.element('admin-model-restart').disabled,true);
+    assert.equal(app.element('admin-error').hidden,false);
+    assert.match(app.element('admin-error').textContent,/지금은 다시 시작할 수 없습니다/);
+  }
+});
+
+test('Qwen restart audit and fixed status messages are rendered as inert text',()=>{
+  const app=setup(async()=>response({}));
+  openAdminModelFixture(app,adminModelFixture({message:'<img src=x onerror=alert(1)>'}));
+  assert.equal(app.element('admin-model-detail').textContent,'<img src=x onerror=alert(1)>');
+  assert.equal(app.createdAll('img').length,0);
+  app.run('renderAdminAudit([{action:"model_restarted",target:"model",result:"accepted",timestamp:"2026-10-06T00:00:00Z"}])');
+  const row=app.element('admin-audit').children[0];
+  assert.equal(row.children[0].children[0].textContent,'Qwen 다시 시작');
+  assert.match(row.children[0].children[1].textContent,/Qwen/);assert.equal(row.children[1].textContent,'요청됨');
+});
+
 test('admin discovery stays hidden after 403 and ignores an overview from an old session', async () => {
   const denied = setup(async () => response({detail:'관리자 권한이 필요합니다.'},403));
   await denied.run('loadAdminOverview({probe:true})');

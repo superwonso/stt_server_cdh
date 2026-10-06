@@ -580,7 +580,7 @@ class ReviewServiceTests(unittest.TestCase):
         self.database.initialize()
         with self.database.connect() as connection:
             self.assertEqual([tuple(row) for row in connection.execute("SELECT * FROM users ORDER BY username")], before)
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 25)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
             self.assertIsNone(connection.execute("PRAGMA foreign_key_check").fetchone())
 
     def test_account_deletion_cascades_every_reminder_table_only_for_owner(self):

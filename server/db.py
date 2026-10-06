@@ -506,7 +506,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
                     action TEXT NOT NULL CHECK (
-                        action IN ('access_changed', 'sessions_revoked', 'tunnel_restarted',
+                        action IN ('access_changed', 'sessions_revoked', 'tunnel_restarted', 'model_restarted',
                                    'password_reset_issued', 'password_reset_revoked', 'password_reset_completed')
                     ),
                     result TEXT NOT NULL CHECK (result IN ('success', 'failed', 'accepted')),
@@ -518,7 +518,7 @@ class Database:
             audit_sql = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='admin_audit'"
             ).fetchone()[0]
-            if "password_reset_issued" not in audit_sql:
+            if "model_restarted" not in audit_sql:
                 # SQLite cannot extend a CHECK in place. Rebuild only this
                 # bounded metadata table, preserving every row and its IDs.
                 connection.execute("BEGIN IMMEDIATE")
@@ -526,19 +526,19 @@ class Database:
                     "SELECT seq FROM sqlite_sequence WHERE name='admin_audit'"
                 ).fetchone()
                 connection.execute("""
-                    CREATE TABLE admin_audit_v19 (
+                    CREATE TABLE admin_audit_v26 (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         timestamp TEXT NOT NULL,
                         action TEXT NOT NULL CHECK (action IN (
-                            'access_changed','sessions_revoked','tunnel_restarted',
+                            'access_changed','sessions_revoked','tunnel_restarted','model_restarted',
                             'password_reset_issued','password_reset_revoked','password_reset_completed')),
                         result TEXT NOT NULL CHECK (result IN ('success','failed','accepted')),
                         target TEXT NOT NULL CHECK (length(target) BETWEEN 1 AND 64)
                     )
                 """)
-                connection.execute("INSERT INTO admin_audit_v19 SELECT * FROM admin_audit")
+                connection.execute("INSERT INTO admin_audit_v26 SELECT * FROM admin_audit")
                 connection.execute("DROP TABLE admin_audit")
-                connection.execute("ALTER TABLE admin_audit_v19 RENAME TO admin_audit")
+                connection.execute("ALTER TABLE admin_audit_v26 RENAME TO admin_audit")
                 connection.execute("CREATE INDEX admin_audit_recent ON admin_audit(timestamp DESC,id DESC)")
                 if sequence is not None:
                     connection.execute("UPDATE sqlite_sequence SET seq=max(seq,?) WHERE name='admin_audit'", (sequence[0],))
@@ -665,5 +665,5 @@ class Database:
             migrate_review_schema(connection)
             from .activity import migrate_activity_schema
             migrate_activity_schema(connection)
-            if schema_version < 25:
-                connection.execute("PRAGMA user_version = 25")
+            if schema_version < 26:
+                connection.execute("PRAGMA user_version = 26")

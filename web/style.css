@@ -1983,6 +1983,11 @@ button {
   font-size: 11px;
 }
 
+.admin-model-control { margin-top: 14px; }
+.admin-model-control > div:first-child { min-width: 0; }
+.admin-model-control h4 { margin: 0; font-size: 13px; }
+.admin-model-control p { margin: 5px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
 .admin-resource-grid,
 .admin-queue-grid {
   display: grid;

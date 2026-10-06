@@ -75,6 +75,7 @@ class CompleteResetBody(BaseModel):
 def install(app, database, *, admin_identity, account_ids, administrator, auth_limit,
             purge_tickets, purge_presence, audit) -> None:
     accounts = frozenset(account_ids)
+    administrators = frozenset((administrator,) if isinstance(administrator, str) else (administrator or ()))
 
     def reauthenticate(body, request, user):
         auth_limit(request, user["username"], "password-reset-admin")
@@ -100,7 +101,7 @@ def install(app, database, *, admin_identity, account_ids, administrator, auth_l
             "WHERE s.token_hash=? AND s.username=? AND s.expires_at>?",
             (user["token_hash"], user["username"], time.time()),
         ).fetchone()
-        if (not administrator or user["username"] != administrator or row is None
+        if (user["username"] not in administrators or row is None
                 or not row["password_hash"] or not secrets.compare_digest(row["password_hash"], encoded)):
             raise HTTPException(401, REAUTH_INVALID)
 

@@ -24,6 +24,7 @@ from .model_protocol import ModelUnavailableError
 
 DEFAULT_RUNTIME = PROJECT_DIR / ".data" / "model-server-windows"
 DEFAULT_PORT = 18765
+_ANY_RECORD = object()
 
 if os.name == "nt":
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -240,10 +241,13 @@ class WindowsModelController:
             raise ModelProcessError("실행 중인 모델 기록은 정리하지 않습니다.")
         _cleanup(self.directory, record)
 
-    def start(self, *, warmup=True, env_file=None, inherited=None, wait_ready=False, timeout=60):
+    def start(self, *, warmup=True, env_file=None, inherited=None, wait_ready=False, timeout=60,
+              expected_record=_ANY_RECORD):
         runtime_path(self.directory, create=True)
         with process_lock(self.lock_file):
             record = self.record()
+            if expected_record is not _ANY_RECORD and (record != expected_record or (record and self.matching(record))):
+                raise ModelProcessError("모델 상태가 바뀌어 시작하지 않았습니다.")
             if record and self.matching(record):
                 result = self.status()
             else:
@@ -302,12 +306,16 @@ class WindowsModelController:
                 raise ModelProcessError("모델 준비 대기 시간이 지났습니다. 프로세스는 유지합니다.")
         return result
 
-    def stop(self, *, timeout=20):
+    def stop(self, *, timeout=20, expected_record=_ANY_RECORD, require_error=False):
         import httpx
         if not self.directory.exists():
+            if expected_record is not _ANY_RECORD and expected_record is not None:
+                raise ModelProcessError("모델 실행 기록이 바뀌어 종료하지 않았습니다.")
             return self.status()
         with process_lock(self.lock_file):
             record = self.record()
+            if expected_record is not _ANY_RECORD and record != expected_record:
+                raise ModelProcessError("모델 실행 기록이 바뀌어 종료하지 않았습니다.")
             if record is None:
                 return self.status()
             try:
@@ -316,6 +324,8 @@ class WindowsModelController:
                     if live is not None:
                         if any(live[key] != record[key] for key in live):
                             raise ModelProcessError("PID가 다른 프로세스를 가리켜 종료하지 않았습니다.")
+                        if require_error and (self.health(record) or {}).get("model_state") != "error":
+                            raise ModelProcessError("오류 상태를 확인하지 못하여 모델을 종료하지 않았습니다.")
                         try:
                             self.request(record, "POST", "/shutdown")
                         except (httpx.HTTPError, ModelUnavailableError, OSError, ValueError):

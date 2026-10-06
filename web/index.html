@@ -600,6 +600,17 @@
           <span id="admin-server-state" class="admin-badge" data-state="unknown">확인 중</span>
         </div>
         <p id="admin-server-detail" class="admin-section-detail">서버 가동 시간을 확인하고 있어요.</p>
+        <div class="admin-operation-row admin-model-control">
+          <div>
+            <h4>Qwen 음성 인식</h4>
+            <p id="admin-model-detail" role="status">Qwen 상태를 확인하고 있어요.</p>
+          </div>
+          <div class="admin-operation-actions">
+            <span id="admin-model-state" class="admin-badge" data-state="unknown">확인 중</span>
+            <button id="admin-model-restart" class="secondary-button" type="button" aria-describedby="admin-model-help" disabled>Qwen 다시 시작</button>
+          </div>
+        </div>
+        <p id="admin-model-help" class="admin-section-detail">오류가 나거나 중지된 Qwen만 다시 시작합니다. API·수업 조회는 유지하며, 유료 AI 작업은 각 수업에서 다시 요청해 주세요. API가 꺼졌거나 외부 연결이 완전히 끊기면 이 버튼을 사용할 수 없습니다.</p>
         <div class="admin-resource-grid">
           <article class="admin-metric">
             <span>GPU · VRAM</span>

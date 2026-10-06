@@ -105,6 +105,89 @@ class AdminApiTests(unittest.TestCase):
     def headers(self, username: str = "user-alpha") -> dict[str, str]:
         return {"Authorization": f"Bearer {self.tokens[username]}"}
 
+    def test_model_restart_is_admin_only_and_respects_origin_and_profile(self):
+        control = self.app.state.model_control
+        with mock.patch.object(control, "request_restart") as restart:
+            self.assertEqual(self.client.post("/admin/model/restart").status_code, 401)
+            self.assertEqual(self.client.post("/admin/model/restart", headers=self.headers("user-beta")).status_code, 403)
+            self.assertEqual(self.client.post("/admin/model/restart", headers={**self.headers(), "Origin": "https://untrusted.example"}).status_code, 403)
+            restart.assert_not_called()
+        self.assertEqual(self.client.post("/admin/model/restart", headers=self.headers()).status_code, 409)
+        status = self.client.get("/admin/overview", headers=self.headers()).json()["model_control"]
+        self.assertFalse(status["supported"])
+        self.assertFalse(status["restart_available"])
+        self.assertNotIn("model_control", self.client.get("/status", headers=self.headers("user-beta")).json())
+
+    def test_model_restart_async_duplicate_and_safe_audit_preserves_api(self):
+        control = self.app.state.model_control
+        backend = mock.Mock()
+        current = {"state": "error", "record": {"instance": "synthetic"}}
+        backend.inspect.side_effect = lambda: dict(current)
+        entered, release = threading.Event(), threading.Event()
+        def restart_model(snapshot, cancelled):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("Synthetic restart was not released")
+            current["state"] = "ready"
+        backend.restart.side_effect = restart_model
+        control.backend = backend
+        try:
+            result = self.client.post("/admin/model/restart", headers=self.headers())
+            self.assertEqual(result.status_code, 202)
+            self.assertEqual(result.json()["model_control"]["operation"], "restarting")
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(self.client.post("/admin/model/restart", headers=self.headers()).status_code, 409)
+            self.assertEqual(self.client.get("/health").status_code, 200)
+            self.assertEqual(self.client.get("/lectures", headers=self.headers("user-beta")).status_code, 200)
+            self.assertFalse(self.client.get("/admin/overview", headers=self.headers()).json()["model_control"]["restart_available"])
+        finally:
+            release.set()
+            self.assertTrue(control.stop(3))
+        overview = self.client.get("/admin/overview", headers=self.headers()).json()
+        self.assertEqual(overview["model_control"]["state"], "ready")
+        self.assertEqual(overview["model_control"]["operation"], "restart_succeeded")
+        events = [item for item in overview["recent_audit"] if item["action"] == "model_restarted"]
+        self.assertEqual([item["result"] for item in events], ["success", "accepted"])
+        self.assertTrue(all(item["target"] == "model" for item in events))
+        backend.restart.assert_called_once()
+
+    def test_model_ready_refusal_and_rate_limit_are_service_wide(self):
+        control = self.app.state.model_control
+        backend = mock.Mock()
+        backend.inspect.return_value = {"state": "ready", "record": None}
+        control.backend = backend
+        for _ in range(3):
+            self.assertEqual(self.client.post("/admin/model/restart", headers=self.headers()).status_code, 409)
+        limited = self.client.post("/admin/model/restart", headers=self.headers())
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.headers["retry-after"], "300")
+        backend.restart.assert_not_called()
+        with self.app.state.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM admin_audit WHERE action='model_restarted'").fetchone()[0], 0)
+
+    def test_model_status_is_read_only_and_failure_never_reflects_controller_details(self):
+        control = self.app.state.model_control
+        backend = mock.Mock()
+        backend.inspect.return_value = {"state": "error", "record": {"token": "SYNTHETIC-PRIVATE-TOKEN"}}
+        backend.restart.side_effect = RuntimeError("SYNTHETIC-PRIVATE-TOKEN")
+        control.backend = backend
+        with self.app.state.database.connect() as connection:
+            before = [tuple(row) for row in connection.execute("SELECT * FROM admin_audit")]
+        for _ in range(2):
+            result = self.client.get("/admin/overview", headers=self.headers())
+            self.assertEqual(result.status_code, 200)
+            self.assertNotIn("SYNTHETIC-PRIVATE", result.text)
+        backend.restart.assert_not_called()
+        with self.app.state.database.connect() as connection:
+            self.assertEqual([tuple(row) for row in connection.execute("SELECT * FROM admin_audit")], before)
+        self.assertEqual(self.client.post("/admin/model/restart", headers=self.headers()).status_code, 202)
+        self.assertTrue(control.stop(3))
+        result = self.client.get("/admin/overview", headers=self.headers())
+        self.assertEqual(result.json()["model_control"]["operation"], "restart_failed")
+        self.assertNotIn("SYNTHETIC-PRIVATE", result.text)
+        events = [item for item in result.json()["recent_audit"] if item["action"] == "model_restarted"]
+        self.assertEqual([item["result"] for item in events], ["failed", "accepted"])
+
     def test_drive_status_and_refresh_are_admin_only(self):
         manager = self.app.state.archive_manager
         with mock.patch.object(manager, "request_refresh", return_value=True) as refresh:
