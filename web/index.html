@@ -251,6 +251,7 @@
           <div id="import-status" class="import-status" role="status" aria-live="polite" hidden>
             <div class="import-status-row">
               <strong id="import-state">파일을 준비하고 있어요</strong>
+              <button id="import-retry-alignment" type="button" hidden>이 구간 다시 시도</button>
               <button id="import-cancel" type="button">취소</button>
             </div>
             <progress id="import-progress" max="100" value="0">0%</progress>
@@ -348,6 +349,7 @@
               <div id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text"></div>
             </div>
           </div>
+          <section id="transcription-issues" class="transcription-issues" aria-label="확인이 필요한 받아쓰기" aria-live="polite" hidden></section>
           <section id="manual-panel" class="lesson-summary" aria-label="내 필기와 직접 수정" hidden>
             <details id="manual-details">
               <summary>내 필기 · 직접 수정</summary>

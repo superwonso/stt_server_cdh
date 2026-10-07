@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,7 @@ import numpy as np
 
 from server.settings import Settings
 from server.transcriber import LocalTranscriber, aligned_text_slice, contains_speech
+from server.model_protocol import AlignmentUnavailableError, ProtocolError, MAX_PARTIAL_TEXT_CHARACTERS
 
 
 class FakeQwen:
@@ -163,6 +165,62 @@ class TranscriberTests(unittest.TestCase):
                     np.zeros(8 * 16000, dtype=np.float32), "ko", boundary_output=output,
                 )
         self.assertEqual(output, {})
+
+    def test_missing_alignment_is_per_request_and_next_normal_call_still_works(self):
+        for language in ("ko", "en", None):
+            with self.subTest(language=language):
+                model = FakeQwen("임시 synthetic candidate!", [])
+                engine = self.engine(model)
+                context = {"version": 1, "audio_end": 5.0, "tokens": []}
+                before = copy.deepcopy(context)
+                output = {"stale": "must-clear"}
+                with patch("server.transcriber.contains_speech", return_value=True), \
+                     self.assertLogs("server.transcriber", level="WARNING") as logs:
+                    with self.assertRaises(AlignmentUnavailableError) as failure:
+                        engine.transcribe(np.zeros(8000, np.float32), language, final_chunk=True,
+                                          start_seconds=5.0, boundary_context=context, boundary_output=output)
+                self.assertEqual(failure.exception.partial_text, model.text)
+                self.assertEqual(failure.exception.code, "alignment_unavailable")
+                self.assertFalse(failure.exception.retryable)
+                self.assertNotIn(model.text, str(failure.exception))
+                self.assertNotIn(model.text, repr(failure.exception))
+                self.assertNotIn(model.text, "\n".join(logs.output))
+                self.assertEqual(logs.records[0].args, (500, language or "auto", 1, len(model.text), 3, 0))
+                self.assertIsNone(logs.records[0].exc_info)
+                self.assertEqual(engine.status()["model_state"], "ready")
+                self.assertEqual(output, {})
+                self.assertEqual(context, before)
+                model.items = [SimpleNamespace(text=model.text, start_time=.1, end_time=.3)]
+                with patch("server.transcriber.contains_speech", return_value=True):
+                    result = engine.transcribe(np.zeros(8000, np.float32), language, boundary_output={})
+                self.assertEqual(result[0]["text"], model.text)
+                self.assertEqual(len(model.calls), 2)
+
+    def test_punctuation_only_failure_keeps_candidate_without_invented_timing(self):
+        model = FakeQwen("…", [])
+        engine = self.engine(model)
+        output = {}
+        with patch("server.transcriber.contains_speech", return_value=True), \
+             self.assertLogs("server.transcriber", level="WARNING") as logs:
+            with self.assertRaises(AlignmentUnavailableError) as failure:
+                engine.transcribe(np.zeros(1600, np.float32), "ko", final_chunk=True, boundary_output=output)
+        self.assertEqual(len(model.calls[0]["audio"][0]), 8000)
+        self.assertEqual(logs.records[0].args, (100, "ko", 1, 1, 0, 0))
+        self.assertEqual(failure.exception.partial_text, "…")
+        self.assertEqual(output, {})
+        self.assertEqual(engine.status()["model_state"], "ready")
+
+    def test_unknown_inference_error_and_invalid_candidate_remain_fatal(self):
+        for model, exception in (
+            (FakeQwen(error=RuntimeError("synthetic-device-failure")), RuntimeError),
+            (FakeQwen("x" * (MAX_PARTIAL_TEXT_CHARACTERS + 1), []), ProtocolError),
+            (FakeQwen("synthetic\x00candidate", []), ProtocolError),
+        ):
+            engine = self.engine(model)
+            with patch("server.transcriber.contains_speech", return_value=True):
+                with self.assertRaises(exception):
+                    engine.transcribe(np.zeros(16000, np.float32), "ko")
+            self.assertEqual(engine.status()["model_state"], "error")
 
     def test_warmup_failure_sets_error_state(self):
         engine = self.engine(FakeQwen(error=RuntimeError("warmup failed")))

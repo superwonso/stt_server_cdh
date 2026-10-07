@@ -22,6 +22,8 @@ MAX_RESPONSE_BYTES = 1048576
 MAX_STATUS_BYTES = 8192
 MAX_SEGMENTS = 4096
 MAX_TEXT_CHARACTERS = 262144
+MAX_PARTIAL_TEXT_CHARACTERS = 8192
+MAX_PARTIAL_TEXT_BYTES = 32768
 
 
 class ModelUnavailableError(RuntimeError):
@@ -42,6 +44,56 @@ class ModelUnavailableError(RuntimeError):
 class ProtocolError(ValueError):
     def __init__(self):
         super().__init__("Invalid local model protocol")
+
+
+def validate_partial_text(value: str) -> str:
+    """Bound an exact provisional transcript; never truncate or make segments."""
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or len(value) > MAX_PARTIAL_TEXT_CHARACTERS
+            or any((ord(ch) < 32 and ch not in "\t\r\n") or ord(ch) == 127 for ch in value)):
+        raise ProtocolError()
+    try:
+        if len(value.encode("utf-8")) > MAX_PARTIAL_TEXT_BYTES:
+            raise ProtocolError()
+    except UnicodeError:
+        raise ProtocolError() from None
+    return value
+
+
+class AlignmentUnavailableError(RuntimeError):
+    """This request has provisional text, not trustworthy timing or success.
+
+    The body belongs only to the authenticated request. str/repr/args are fixed
+    so normal exception formatting cannot log a private transcript.
+    """
+    code = "alignment_unavailable"
+    retryable = False
+    _message = "이 음성의 시간 정보를 만들지 못했습니다. 임시 인식 결과와 원본을 확인해 주세요."
+
+    def __init__(self, partial_text: str):
+        self.partial_text = validate_partial_text(partial_text)
+        super().__init__(self._message)
+
+    def __str__(self):
+        return self._message
+
+    def __repr__(self):
+        return "AlignmentUnavailableError()"
+
+
+def make_alignment_failure(request_id: str, partial_text: str) -> dict:
+    return {"version": PROTOCOL_VERSION, "request_id": _request_id(request_id),
+            "code": "alignment_unavailable", "retryable": False,
+            "partial_text": validate_partial_text(partial_text)}
+
+
+def read_alignment_failure(value, request_id: str) -> AlignmentUnavailableError:
+    if (not isinstance(value, dict) or set(value) != {"version", "request_id", "code", "retryable", "partial_text"}
+            or type(value["version"]) is not int or value["version"] != PROTOCOL_VERSION
+            or _request_id(value["request_id"]) != _request_id(request_id)
+            or value["code"] != "alignment_unavailable" or value["retryable"] is not False):
+        raise ProtocolError()
+    return AlignmentUnavailableError(value["partial_text"])
 
 
 def _reject_constant(_):

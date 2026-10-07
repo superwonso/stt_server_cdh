@@ -18,8 +18,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse, Response
 
 from .model_protocol import (
-    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, ModelUnavailableError, ProtocolError,
-    dump_json, load_json, make_result, read_request, safe_status,
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, AlignmentUnavailableError, ModelUnavailableError, ProtocolError,
+    dump_json, load_json, make_alignment_failure, make_result, read_request, safe_status,
 )
 
 
@@ -187,16 +187,23 @@ def create_model_app(settings, transcriber=None, *, shutdown=None) -> FastAPI:
     def infer(value):
         try:
             output = {} if value["boundary_requested"] else None
-            segments = engine.transcribe(
-                value["samples"], value["language"], value["overlap_seconds"], value["final_chunk"],
-                start_seconds=value["start_seconds"], boundary_context=value["boundary_context"],
-                boundary_output=output,
-            )
+            try:
+                segments = engine.transcribe(
+                    value["samples"], value["language"], value["overlap_seconds"], value["final_chunk"],
+                    start_seconds=value["start_seconds"], boundary_context=value["boundary_context"],
+                    boundary_output=output,
+                )
+            except AlignmentUnavailableError as error:
+                # Only this typed, fully validated request failure is nonfatal.
+                # Invalid exception bodies still hit the fatal ProtocolError path.
+                encoded = dump_json(make_alignment_failure(value["request_id"], error.partial_text), MAX_RESPONSE_BYTES)
+                set_state("ready")
+                return 422, encoded
             result = make_result(value["request_id"], segments, output, len(value["samples"]))
             encoded = dump_json(result, MAX_RESPONSE_BYTES)
             refresh_gpu()
             set_state("ready")
-            return encoded
+            return 200, encoded
         except ProtocolError as error:
             # Invalid output is not an ordinary model-busy retry.
             _log_model_failure("infer_protocol", error)
@@ -281,10 +288,10 @@ def create_model_app(settings, transcriber=None, *, shutdown=None) -> FastAPI:
                 return failure("model_unavailable", 503)
             worker_owns_lock = True
             try:
-                encoded = await completed
+                status_code, encoded = await completed
             except ModelUnavailableError as error:
                 return failure(error.code, 503)
-            return Response(encoded, media_type="application/json",
+            return Response(encoded, status_code=status_code, media_type="application/json",
                             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
         finally:
             if not worker_owns_lock:

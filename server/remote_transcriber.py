@@ -11,8 +11,8 @@ from pathlib import Path
 import httpx
 
 from .model_protocol import (
-    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_STATUS_BYTES, ModelUnavailableError,
-    ProtocolError, dump_json, load_json, make_request, read_result, safe_status,
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_STATUS_BYTES, AlignmentUnavailableError, ModelUnavailableError,
+    ProtocolError, dump_json, load_json, make_request, read_alignment_failure, read_result, safe_status,
 )
 
 
@@ -101,7 +101,7 @@ class RemoteTranscriber:
                 )
             return self._client
 
-    def _request(self, method, path, *, body=None, maximum=MAX_RESPONSE_BYTES, status=False):
+    def _request(self, method, path, *, body=None, maximum=MAX_RESPONSE_BYTES, status=False, request_id=None):
         try:
             deadline = time.monotonic() + (0.8 if status else self._timeout)
             client = self._get_client()
@@ -131,6 +131,7 @@ class RemoteTranscriber:
                     verify_response(token, endpoint, nonce, response, bytes(payload))
                 if response.status_code != 200:
                     code = "model_busy" if response.status_code == 429 else "model_unavailable"
+                    failed = None
                     try:
                         failed = load_json(bytes(payload), maximum)
                         if isinstance(failed, dict) and isinstance(failed.get("code"), str) and failed["code"] in {
@@ -138,7 +139,17 @@ class RemoteTranscriber:
                         }:
                             code = failed["code"]
                     except ProtocolError:
-                        pass
+                        if response.status_code == 422:
+                            raise
+                    if isinstance(failed, dict) and failed.get("code") == "alignment_unavailable":
+                        if (response.status_code != 422 or method != "POST" or path != "/transcribe"
+                                or request_id is None or status
+                                or response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"):
+                            raise ProtocolError()
+                        # HMAC (native Windows) or private UDS ownership was
+                        # verified first. Bind this provisional text to exactly
+                        # the pending request; never accept it as normal success.
+                        raise read_alignment_failure(failed, request_id) from None
                     raise ModelUnavailableError(code)
                 if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
                     raise ProtocolError()
@@ -149,6 +160,8 @@ class RemoteTranscriber:
             raise ModelUnavailableError() from None
         except ModelUnavailableError:
             raise
+        except AlignmentUnavailableError as error:
+            raise error from None
         except RuntimeError:
             # HTTPX client-close races are not application tracebacks.
             raise ModelUnavailableError() from None
@@ -204,7 +217,7 @@ class RemoteTranscriber:
                                    boundary_requested=boundary_context is not None or boundary_output is not None,
                                    request_id=request_id)
             body = dump_json(request, MAX_REQUEST_BYTES)
-            response = self._request("POST", "/transcribe", body=body)
+            response = self._request("POST", "/transcribe", body=body, request_id=request_id)
             segments, output = read_result(response, request_id, len(samples))
             if (output is not None) != request["boundary_requested"]:
                 raise ProtocolError()

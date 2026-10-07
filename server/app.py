@@ -70,7 +70,9 @@ from .settings import Settings
 from .platform_files import ensure_private_directory, open_file, validate_private_path
 from .transcriber import LocalTranscriber
 from .remote_transcriber import RemoteTranscriber
-from .model_protocol import ModelUnavailableError
+from .model_protocol import AlignmentUnavailableError, ModelUnavailableError
+from . import transcription_issues
+from .transcription_issues import AlignmentChunkError
 from .model_control import ModelControlError, create_model_control, sanitized_status as sanitized_model_control_status
 
 log = logging.getLogger("classroom")
@@ -578,6 +580,11 @@ def create_app(
             headers=error.headers,
         )
 
+    @app.exception_handler(AlignmentChunkError)
+    async def alignment_chunk_error(request: Request, error: AlignmentChunkError):
+        return JSONResponse(error.response(), status_code=422,
+                            headers={"Cache-Control": "no-store", "X-Local-Model-Retryable": "0"})
+
     app.add_middleware(ActivityMiddleware, tracker=activity_tracker)
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_bytes)
     app.add_middleware(
@@ -593,6 +600,7 @@ def create_app(
             "X-Start-Seconds",
             "X-Overlap-Seconds",
             "X-Final-Chunk",
+            "X-Qwen-Retry",
             "X-Lecture-Id",
             "X-Import-Id",
             "X-Upload-Offset",
@@ -1231,6 +1239,9 @@ def create_app(
         )
         if segments is not None:
             result["segments"] = segments
+            with database.connect() as connection:
+                result["transcription_issues"] = transcription_issues.public_issues(
+                    connection, lecture["id"], lecture["username"])
         return result
 
     @app.get("/health")
@@ -1817,7 +1828,14 @@ def create_app(
         lecture_id: str,
         *,
         exclude_chunk_id: str | None = None,
+        retry_issue_chunk_id: str | None = None,
     ) -> None:
+        issue = connection.execute('SELECT * FROM transcription_issues WHERE lecture_id=?', (lecture_id,)).fetchone()
+        # Before claiming a retry, allow its saved issue but still reject an
+        # in-flight guard. Only the request owning that claim may exclude the
+        # pending chunk while committing its result.
+        if issue is not None and issue['chunk_id'] != (retry_issue_chunk_id or exclude_chunk_id):
+            raise AlignmentChunkError(dict(issue))
         raw_state = connection.execute(
             "SELECT audio_finalized FROM lectures WHERE id=? AND EXISTS "
             "(SELECT 1 FROM recording_chunks WHERE lecture_id=lectures.id)", (lecture_id,),
@@ -1875,7 +1893,9 @@ def create_app(
         return segments, serialized
 
     @app.post("/lectures/{lecture_id}/recording-finalize")
-    def finalize_received_recording(lecture_id: str, user: dict = Depends(data_identity)):
+    def finalize_received_recording(lecture_id: str,
+                                   x_qwen_retry: Annotated[Literal["0", "1"], Header()] = "0",
+                                   user: dict = Depends(data_identity)):
         """Close an interrupted lesson and recover its withheld final ASR guard."""
 
         lecture = owned_lecture(lecture_id, user["username"])
@@ -1919,7 +1939,7 @@ def create_app(
                     user["username"],
                 )
             else:
-                ensure_recording_can_finalize(connection, lecture_id)
+                ensure_recording_can_finalize(connection, lecture_id, retry_issue_chunk_id=guard_chunk_id)
                 segments = None
         if segments is not None:
             queue_completed_recording(user["username"], lecture_id)
@@ -1962,7 +1982,10 @@ def create_app(
                         user["username"],
                     )
                 else:
-                    ensure_recording_can_finalize(connection, lecture_id)
+                    ensure_recording_can_finalize(connection, lecture_id, retry_issue_chunk_id=guard_chunk_id)
+                    transcription_issues.check(connection, lecture, guard_chunk_id, payload_hash,
+                        snapshot["start_seconds"], snapshot["duration_seconds"], True,
+                        kind="finalize", allow_retry=x_qwen_retry == "1")
                     connection.execute(
                         "INSERT INTO chunks(lecture_id, chunk_id, payload_hash, start_seconds, "
                         "overlap_seconds, final_chunk, status) "
@@ -2084,6 +2107,7 @@ def create_app(
                                     "마지막 음성 처리 상태가 바뀌었습니다. 잠시 후 다시 마무리하세요.",
                                     headers={"Retry-After": "2"},
                                 )
+                            transcription_issues.clear(connection, lecture_id, guard_chunk_id)
                         connection.execute(
                             "UPDATE lectures SET recording_finalized = 1 "
                             "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
@@ -2096,6 +2120,23 @@ def create_app(
             }
         except HTTPException:
             raise
+        except AlignmentUnavailableError as error:
+            # Like a successful guard, an unresolved result belongs to exactly
+            # the recording snapshot used for inference. Do not pin a changed
+            # recording to an old hash that no later retry can reproduce.
+            with recording_store.lock:
+                current_recording = recording_store.info(user["username"], lecture_id)
+                frames = None if current_recording is None else round(current_recording["duration_seconds"] * SAMPLE_RATE)
+                if frames != snapshot["total_frames"]:
+                    raise HTTPException(409, "새 음성이 저장되어 녹음 상태가 바뀌었습니다. 잠시 후 다시 마무리하세요.",
+                                        headers={"Retry-After": "2"}) from None
+                with database.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    ensure_recording_can_finalize(connection, lecture_id, exclude_chunk_id=guard_chunk_id)
+                    issue = transcription_issues.save(connection, lecture, guard_chunk_id, payload_hash,
+                        snapshot["start_seconds"], snapshot["duration_seconds"], snapshot["duration_seconds"],
+                        True, error.partial_text, now_text(), kind="finalize")
+            raise AlignmentChunkError(issue) from None
         except ModelUnavailableError as error:
             raise local_model_retry_error(error) from None
         except Exception as error:
@@ -2439,6 +2480,7 @@ def create_app(
         final_chunk: bool,
         payload: bytes,
         interrupted=None,
+        allow_alignment_retry=False,
     ):
         samples, duration, pcm = decode_wav(payload)
         if overlap_seconds > duration or (not final_chunk and overlap_seconds >= duration):
@@ -2458,6 +2500,9 @@ def create_app(
             )
         if replay is not None:
             return replay_response(lecture_id, chunk_id, replay)
+        with database.connect() as connection:
+            transcription_issues.check(connection, lecture, chunk_id, payload_hash,
+                start_seconds, overlap_seconds, final_chunk, allow_retry=allow_alignment_retry)
         if not capacity.acquire(blocking=False):
             raise ChunkNotStartedError()
         admission_key = (lecture["username"], lecture_id)
@@ -2492,6 +2537,8 @@ def create_app(
                         raise HTTPException(409, "이미 종료된 수업에는 음성을 더 추가할 수 없습니다.")
                     require_asr_receipt(connection, still_owned, chunk_id, payload_hash,
                                         start_seconds, duration, overlap_seconds, final_chunk)
+                    transcription_issues.check(connection, lecture, chunk_id, payload_hash,
+                        start_seconds, overlap_seconds, final_chunk, allow_retry=allow_alignment_retry)
                     connection.execute(
                         "INSERT INTO chunks(lecture_id, chunk_id, payload_hash, start_seconds, overlap_seconds, final_chunk, status) "
                         "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
@@ -2587,6 +2634,7 @@ def create_app(
                         "WHERE lecture_id = ? AND chunk_id = ?",
                         (processing_seconds, boundary_json, lecture_id, chunk_id),
                     )
+                    transcription_issues.clear(connection, lecture_id, chunk_id)
                     # An opted-in raw lane may be ahead/behind ASR. Never let
                     # an ASR final race close a still-growing raw recording.
                     raw_started = connection.execute(
@@ -2622,6 +2670,12 @@ def create_app(
                 424,
                 "CLOVA Speech 응답을 안전하게 확정하지 못했습니다. 다시 보내면 같은 음성이 중복 기록될 수 있습니다.",
             ) from None
+        except AlignmentUnavailableError as error:
+            with database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                issue = transcription_issues.save(connection, lecture, chunk_id, payload_hash,
+                    start_seconds, overlap_seconds, duration, final_chunk, error.partial_text, now_text())
+            raise AlignmentChunkError(issue) from None
         except ModelUnavailableError as error:
             # Local inference has no provider-side commit. Only the API commits
             # a validated result, so retrying the same chunk ID/context is safe.
@@ -2706,6 +2760,7 @@ def create_app(
         x_start_seconds: Annotated[str, Header(max_length=40)],
         x_overlap_seconds: Annotated[str, Header(max_length=40)] = "0",
         x_final_chunk: Annotated[str, Header(max_length=8)] = "true",
+        x_qwen_retry: Annotated[Literal["0", "1"], Header()] = "0",
         user: dict = Depends(data_identity),
     ):
         lecture = await run_in_threadpool(owned_lecture, lecture_id, user["username"])
@@ -2731,7 +2786,8 @@ def create_app(
                 raise HTTPException(413, "음성 조각이 너무 큽니다.")
             payload.extend(part)
         return await run_in_threadpool(
-            process_chunk, lecture, chunk_id, start_seconds, overlap_seconds, final_chunk, bytes(payload)
+            process_chunk, lecture, chunk_id, start_seconds, overlap_seconds, final_chunk, bytes(payload),
+            allow_alignment_retry=x_qwen_retry == "1",
         )
 
     def now_text() -> str:
@@ -2786,6 +2842,8 @@ def create_app(
             raise HTTPException(404, "파일 변환 작업을 찾을 수 없습니다.")
 
     def import_result(job: dict) -> dict:
+        with database.connect() as connection:
+            issues = transcription_issues.public_issues(connection, job["lecture_id"], job["username"]) if job["lecture_id"] else []
         return {
             "id": job["id"],
             "lecture_id": job["lecture_id"],
@@ -2807,6 +2865,8 @@ def create_app(
             # Never tell the browser that private source media is gone until an
             # unlink (or an already-missing file) has been confirmed.
             "raw_deleted": bool(job["raw_deleted"]),
+            "needs_review": bool(job.get("alignment_held")),
+            "transcription_issues": issues,
         }
 
     def complete_file_fingerprint(path, size: int) -> str:
@@ -2838,7 +2898,7 @@ def create_app(
             return False
         with database.connect() as connection:
             connection.execute(
-                "UPDATE imports SET raw_deleted = 1, updated_at = ? WHERE id = ?",
+                "UPDATE imports SET raw_deleted = 1, alignment_held = 0, alignment_retry_pending = 0, updated_at = ? WHERE id = ?",
                 (now_text(), job["id"]),
             )
         return True
@@ -2846,13 +2906,13 @@ def create_app(
     def reconcile_terminal_upload(job: dict) -> dict:
         """Return terminal state only after one truthful raw-file cleanup attempt."""
 
-        if job["status"] not in {"completed", "failed", "cancelled"} or job["raw_deleted"]:
+        if job["status"] not in {"completed", "failed", "cancelled"} or job["raw_deleted"] or job.get("alignment_held"):
             return job
         with import_fs_lock:
             current = fetch_import(job["id"])
             if current is None:
                 return job
-            if current["status"] in {"completed", "failed", "cancelled"} and not current["raw_deleted"]:
+            if current["status"] in {"completed", "failed", "cancelled"} and not current["raw_deleted"] and not current.get("alignment_held"):
                 remove_private_upload(current)
                 current = fetch_import(job["id"])
             return current or job
@@ -3089,7 +3149,7 @@ def create_app(
                 if current is None or current["status"] == "completed":
                     return
                 connection.execute(
-                    "UPDATE imports SET status = ?, cancel_requested = 0, error = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE imports SET status = ?, cancel_requested = 0, alignment_held = 0, alignment_retry_pending = 0, error = ?, updated_at = ? WHERE id = ?",
                     (status, message, now_text(), import_id),
                 )
                 if current["lecture_id"]:
@@ -3132,7 +3192,7 @@ def create_app(
                     dict(row)
                     for row in connection.execute(
                         "SELECT * FROM imports WHERE status IN ('completed', 'failed', 'cancelled') "
-                        "AND raw_deleted = 0"
+                        "AND raw_deleted = 0 AND alignment_held = 0"
                     ).fetchall()
                 ]
             for job in terminal:
@@ -3173,7 +3233,7 @@ def create_app(
 
             for job in rows:
                 path = import_path(job["username"], job["id"], create_parent=True)
-                if job["status"] in {"completed", "failed", "cancelled"}:
+                if job["status"] in {"completed", "failed", "cancelled"} and not job.get("alignment_held"):
                     continue
                 if path.is_symlink() or not path.is_file():
                     abandon_import(
@@ -3213,7 +3273,7 @@ def create_app(
             expected_uploads = {
                 import_path(job["username"], job["id"])
                 for job in rows
-                if job["status"] in {"uploading", "queued", "processing"}
+                if job["status"] in {"uploading", "queued", "processing"} or job.get("alignment_held")
             }
             for username in settings.accounts:
                 account_directory = import_directory / username
@@ -3283,6 +3343,7 @@ def create_app(
                             chunk.final,
                             chunk.payload,
                             interrupted=interrupted,
+                            allow_alignment_retry=bool(job.get("alignment_retry_pending")),
                         )
                         break
                     except HTTPException as error:
@@ -3321,7 +3382,7 @@ def create_app(
             with database.connect() as connection:
                 result = connection.execute(
                     "UPDATE imports SET status = 'completed', duration_seconds = ?, processed_seconds = ?, "
-                    "cancel_requested = 0, error = NULL, updated_at = ? "
+                    "cancel_requested = 0, alignment_held = 0, alignment_retry_pending = 0, error = NULL, updated_at = ? "
                     "WHERE id = ? AND status = 'processing' AND cancel_requested = 0",
                     (round(duration, 3), round(duration, 3), now_text(), job["id"]),
                 )
@@ -3340,6 +3401,19 @@ def create_app(
                         "UPDATE imports SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'processing'",
                         (now_text(), job["id"]),
                     )
+        except AlignmentChunkError:
+            # A request-scoped alignment failure is not a failed media upload.
+            # Keep the source file, previous transcript and unresolved output;
+            # the worker must move on without repeatedly sending this chunk.
+            with import_fs_lock:
+                if import_was_cancelled(job["id"]):
+                    abandon_import(job["id"], "cancelled", None)
+                else:
+                    with database.connect() as connection:
+                        connection.execute("UPDATE imports SET status='failed',alignment_held=1,alignment_retry_pending=0,"
+                            "error=?,updated_at=? WHERE id=? AND status='processing' AND cancel_requested=0",
+                            ("확인이 필요한 음성 구간이 있습니다. 업로드 원본·처리된 부분·임시 텍스트를 보관했습니다. 확인 후 다시 시도해 주세요.",
+                             now_text(), job["id"]))
         except ImportDurationError:
             abandon_import(
                 job["id"],
@@ -3734,14 +3808,14 @@ def create_app(
                     require_visible_import_lecture(connection, existing)
                     return import_result(dict(existing))
                 active = connection.execute(
-                    "SELECT id FROM imports WHERE username = ? AND status IN ('uploading', 'queued', 'processing')",
+                    "SELECT id FROM imports WHERE username = ? AND (status IN ('uploading', 'queued', 'processing') OR alignment_held=1)",
                     (user["username"],),
                 ).fetchone()
                 if active is not None:
                     raise HTTPException(409, "먼저 진행 중인 파일 변환을 완료하거나 취소하세요.")
                 reserved = connection.execute(
                     "SELECT COALESCE(SUM(total_bytes - uploaded_bytes), 0) FROM imports "
-                    "WHERE status IN ('uploading', 'queued', 'processing')"
+                    "WHERE status IN ('uploading', 'queued', 'processing') OR alignment_held=1"
                 ).fetchone()[0]
                 free = shutil.disk_usage(import_directory).free
                 if body.size + reserved + 256 * 1024 * 1024 > free:
@@ -3923,10 +3997,48 @@ def create_app(
         import_worker_wake.set()
         return result
 
+    @app.post("/imports/{import_id}/retry-alignment")
+    def retry_import_alignment(import_id: str, user: dict = Depends(data_identity)):
+        with import_fs_lock:
+            job = owned_import(import_id, user["username"])
+            if job["status"] in {"queued", "processing", "completed"}:
+                return import_result(job)
+            if job["status"] != "failed" or not job.get("alignment_held") or job["raw_deleted"]:
+                raise HTTPException(409, "다시 확인할 음성 구간이 없습니다.")
+            if not limiter.allow(("alignment-import-retry", user["username"]), 6, 60):
+                raise HTTPException(429, "잠시 후 음성 구간을 다시 확인해 주세요.")
+            path = import_path(user["username"], job["id"])
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != job["total_bytes"]:
+                raise HTTPException(409, "업로드 원본을 확인하지 못했습니다. 원본 파일을 다시 올려 주세요.")
+            if os.name == "nt":
+                validate_private_path(path)
+            if not secrets.compare_digest(complete_file_fingerprint(path, job["total_bytes"]), job["file_fingerprint"]):
+                raise HTTPException(409, "보관된 업로드 원본이 달라졌습니다. 원본 파일을 다시 올려 주세요.")
+            with database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                require_visible_import_lecture(connection, job)
+                if transcription_issues.find(connection, job["lecture_id"], user["username"]) is None:
+                    raise HTTPException(409, "확인이 필요한 음성 구간의 상태가 바뀌었습니다.")
+                if connection.execute("SELECT 1 FROM imports WHERE username=? AND id!=? "
+                        "AND status IN ('uploading','queued','processing')", (user["username"], job["id"])).fetchone():
+                    raise HTTPException(409, "진행 중인 파일 변환이 끝난 뒤 다시 시도해 주세요.")
+                changed = connection.execute("UPDATE imports SET status='queued',alignment_held=0,alignment_retry_pending=1,"
+                    "error=NULL,updated_at=? WHERE id=? AND status='failed' AND alignment_held=1 AND raw_deleted=0",
+                    (now_text(), job["id"])).rowcount
+                if changed != 1:
+                    raise HTTPException(409, "파일 변환 상태가 바뀌었습니다.")
+            result = import_result(owned_import(job["id"], user["username"]))
+        ensure_import_worker()
+        import_worker_wake.set()
+        return result
+
     @app.post("/imports/{import_id}/cancel")
     def cancel_import(import_id: str, user: dict = Depends(data_identity)):
         with import_fs_lock:
             job = owned_import(import_id, user["username"])
+            if job.get("alignment_held"):
+                abandon_import(job["id"], "cancelled", None)
+                return import_result(owned_import(job["id"], user["username"]))
             if job["status"] in {"completed", "failed", "cancelled"}:
                 return import_result(reconcile_terminal_upload(job))
             if job["status"] == "processing":

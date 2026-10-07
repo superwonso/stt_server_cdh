@@ -5707,6 +5707,175 @@ test('CLOVA provider failures including HTTP 424 remain manual while Qwen retry 
   assert.equal(app.run("retryableUpload({transient:true})"),true);
 });
 
+function alignmentFailure(partial='합성 미확정 문장') {
+  return response({detail:'이 구간의 결과를 확인해 주세요.',code:'alignment_unavailable',retryable:false,partial_text:partial},422);
+}
+function alignmentApp({partial,reply}={}) {
+  const calls=[];
+  const app=setup(async(url,options={})=>{
+    if(url.endsWith('/lectures')&&options.method==='POST') {
+      const body=JSON.parse(options.body);
+      return response({id:options.headers.get('X-Lecture-Id'),title:'합성 수업',language:body.language,
+        asr_provider:body.asr_provider,created_at:'2026-01-01T00:00:00Z',segments:[]},201);
+    }
+    if(url.endsWith('/chunks')) {
+      const call={id:options.headers.get('X-Chunk-Id'),retry:options.headers.get('X-Qwen-Retry'),body:options.body,
+        lectureId:url.split('/').at(-2)};calls.push(call);
+      return reply ? reply(call,calls.length) : alignmentFailure(partial);
+    }
+    return response({});
+  });
+  return {app,calls};
+}
+test('Qwen alignment failure preserves the exact audio and final tail without retries or confirmed text',async()=>{
+  const {app,calls}=alignmentApp({partial:'<img src=x onerror=alert(1)> 합성 미확정'});
+  await app.run('startRecording()');app.microphone().tail=chunk(6,2.2,2,true);
+  app.microphone().callbacks.onChunk(chunk(0));
+  await until(()=>app.run('!!sendError&&!sending'),'alignment manual gate');
+  const original=app.run('pending[0]'),stored=await app.run('liveQueue.getChunk(user,pending[0].id)');
+  assert.equal(calls.length,1);assert.equal(calls[0].retry,null);assert.equal(app.run('retryTimer'),null);
+  assert.equal(stored.state,'blocked');assert.equal(stored.errorKind,'alignment_unavailable');
+  assert.equal(app.run('current.segments.length'),0);assert.equal(app.run('recording'),true);
+  assert.match(app.run('sendError'),/이 구간/);assert.doesNotMatch(app.run('sendError'),/연결을 기다/);
+  assert.equal(app.element('transcription-issues').hidden,false);
+  assert.equal(app.element('transcription-issues').children.at(-1).textContent,'<img src=x onerror=alert(1)> 합성 미확정');
+  assert.equal(app.element('transcription-issues').children.at(-1).children.length,0);
+  assert.doesNotMatch(app.run("exportText(current,'text')"),/합성 미확정|onerror/);
+  await app.run('stopRecording()');await until(()=>app.run('pending.length===2&&pending.every(row=>row.durable)'));
+  await app.run('retryPending({manual:false})');await until(()=>app.run('!!sendError&&!sending'));
+  assert.equal(calls.length,1);assert.equal(app.run('pending[0]'),original);assert.equal(app.run('pending[1].final'),true);
+  assert.equal(app.run('current.recording_finalized'),undefined);
+  app.run(`pending[0].errorKind="";liveQueue.recoverOwner=async()=>({sessions:[...liveQueue.sessions.values()],
+    chunks:[...liveQueue.chunks.values()],snapshots:[],stats:{bytes:0}})`);
+  await app.run('recoverDurableLiveAudio(user)');
+  assert.equal(app.run('pending[0].errorKind'),'alignment_unavailable');assert.equal(calls.length,1);
+});
+test('explicit Qwen alignment retry grants one request with unchanged ID and WAV then clears only the resolved issue',async()=>{
+  const {app,calls}=alignmentApp({reply:(_,attempt)=>attempt===1?alignmentFailure():response({segments:[{id:webcrypto.randomUUID(),start:0,end:8,text:'확정된 합성 결과'}]})});
+  await app.run('startRecording()');app.microphone().callbacks.onChunk(chunk(0));
+  await until(()=>app.run('!!sendError&&!sending'));
+  await app.run('retryPending()');await until(()=>app.run('pending.length===0&&!sending'));
+  assert.equal(calls.length,2);assert.equal(calls[1].retry,'1');assert.equal(calls[0].id,calls[1].id);
+  assert.deepEqual(new Uint8Array(await calls[0].body.arrayBuffer()),new Uint8Array(await calls[1].body.arrayBuffer()));
+  assert.equal(app.element('transcription-issues').hidden,true);assert.equal(app.run('current.segments.length'),1);
+  assert.match(app.run("exportText(current,'text')"),/확정된 합성 결과/);
+});
+test('a lost explicit Qwen retry response never repeats its retry authorization automatically',async()=>{
+  const {app,calls}=alignmentApp({reply:(_,attempt)=>{
+    if(attempt===2)throw Object.assign(new Error('synthetic lost response'),{transient:true});return alignmentFailure();
+  }});
+  await app.run('startRecording()');app.microphone().callbacks.onChunk(chunk(0));await until(()=>app.run('!!sendError&&!sending'));
+  await app.run('retryPending()');await until(()=>app.run('retryTimer!==null&&!sending'));
+  await app.runTimeout(1000);await until(()=>app.run('!!sendError&&!sending'));
+  assert.equal(calls.length,3);assert.deepEqual(calls.map(row=>row.retry),[null,'1',null]);
+  assert.equal(new Set(calls.map(row=>row.id)).size,1);assert.equal(app.run('pending.length'),1);
+});
+test('a lost first alignment rejection is recovered by same-ID cached POST without an automatic retry grant',async()=>{
+  let modelAttempts=0;const {app,calls}=alignmentApp({reply:(call,attempt)=>{
+    if(attempt===1){modelAttempts++;throw Object.assign(new Error('lost first 422 ACK'),{transient:true});}
+    if(call.retry==='1')modelAttempts++;
+    return alignmentFailure('저장된 합성 미확정');
+  }});
+  await app.run('startRecording()');app.microphone().callbacks.onChunk(chunk(0));await until(()=>app.run('retryTimer!==null&&!sending'));
+  await app.runTimeout(1000);await until(()=>app.run('!!sendError&&!sending'));
+  assert.equal(modelAttempts,1);assert.equal(calls.length,2);assert.deepEqual(calls.map(row=>row.retry),[null,null]);
+  assert.equal(calls[0].id,calls[1].id);assert.equal(app.run('pending.length'),1);assert.equal(app.run('retryTimer'),null);
+  assert.equal(app.element('transcription-issues').children.at(-1).textContent,'저장된 합성 미확정');
+  await app.run('retryPending()');await until(()=>calls.length===3&&!app.run('sending'));
+  assert.equal(calls[2].retry,'1');assert.equal(modelAttempts,2);assert.equal(app.run('pending.length'),1);
+});
+test('alignment error text is bounded and stale account responses cannot expose a provisional result',async()=>{
+  const gate=deferred(),{app}=alignmentApp({reply:()=>gate.promise});
+  await app.run('startRecording()');app.microphone().callbacks.onChunk(chunk(0));await until(()=>app.run('sending'));
+  app.run("user='user-beta';token='beta-token';current=null;showLogin(false)");
+  gate.resolve(alignmentFailure('이전 계정의 합성 미확정'));await until(()=>app.run('!sending'));
+  assert.equal(app.element('transcription-issues').hidden,true);assert.equal(app.element('transcription-issues').children.length,0);
+  assert.equal(app.run("validAlignmentPartialText('😀'.repeat(8192))"),true);
+  assert.equal(app.run("validAlignmentPartialText('가'.repeat(8193))"),false);
+  assert.equal(app.run('validAlignmentPartialText({})'),false);
+});
+test('holding an alignment-blocked lesson lets a new lesson proceed without replaying or deleting the first audio',async()=>{
+  let failedLecture='';const {app,calls}=alignmentApp({reply:call=>{
+    failedLecture ||= call.lectureId;
+    return call.lectureId===failedLecture?alignmentFailure():response({segments:[]});
+  }});
+  await app.run('startRecording()');app.microphone().callbacks.onChunk(chunk(0));await until(()=>app.run('!!sendError&&!sending'));
+  const retainedId=app.run('pending[0].id');await app.run('prepareIndependentLesson()');
+  assert.equal(app.run(`isHeldCapture(${JSON.stringify(failedLecture)})`),true);
+  await app.run('startRecording()');app.microphone().callbacks.onChunk(chunk(0));
+  await until(()=>calls.length===2&&!app.run('sending'));
+  assert.notEqual(calls[1].lectureId,failedLecture);assert.equal(calls[1].retry,null);
+  assert.ok(await app.run(`liveQueue.getChunk(user,${JSON.stringify(retainedId)})`));
+  assert.equal(app.run('pending[0].id'),retainedId);assert.equal(app.element('transcription-issues').hidden,true);
+});
+test('final guard alignment failure fetches its detached issue and an explicit retry is authorized only once',async()=>{
+  const id=webcrypto.randomUUID(),guard='server:recording-finalize-guard:v1',calls=[];
+  const issue={kind:'finalize',code:'alignment_unavailable',chunk_id:guard,start_seconds:8,final_chunk:true,partial_text:'미확정 마지막 음성'};
+  let phase='failure';const app=setup((url,options={})=>{
+    if(url.endsWith('/recording-finalize')) {
+      calls.push(options.headers.get('X-Qwen-Retry'));
+      if(phase==='failure')return alignmentFailure();
+      if(calls.length===2)throw Object.assign(new Error('synthetic lost response'),{transient:true});
+      return response({segments:[],recording_finalized:true});
+    }
+    return response({id,transcription_issues:[issue]});
+  });
+  app.run(`current={id:${JSON.stringify(id)},title:'합성 마지막 음성',segments:[]};renderCurrent()`);
+  await assert.rejects(app.run(`requestRecordingFinalization(${JSON.stringify(id)},()=>true)`));
+  assert.equal(app.element('transcription-issues').hidden,false);assert.equal(app.run('current.segments.length'),0);
+  phase='success';await app.run(`requestRecordingFinalization(${JSON.stringify(id)},()=>true,{manualAlignmentRetry:true})`);
+  assert.deepEqual(calls,[null,'1',null]);
+});
+test('held alignment imports recover without processing and allow a single explicit retry',async()=>{
+  const id=webcrypto.randomUUID(),lectureId=webcrypto.randomUUID(),gate=deferred(),calls=[];
+  const held={id,lecture_id:lectureId,status:'failed',needs_review:true,filename:'synthetic.wav',raw_deleted:false};
+  const issue={kind:'chunk',code:'alignment_unavailable',chunk_id:webcrypto.randomUUID(),start_seconds:8,final_chunk:false,partial_text:'새로 불러온 미확정 결과'};
+  class WatchingUploader { detach(){} recover(state){this.recovered=state;return new Promise(()=>{});} }
+  const app=setup((url,options={})=>{
+    calls.push({url,method:options.method||'GET'});
+    if(url.endsWith('/imports'))return response({imports:[held]});
+    if(url.endsWith('/retry-alignment'))return gate.promise;
+    if(url.endsWith('/lectures'))return response([{id:lectureId,title:'합성 변환 수업',created_at:'2026-01-01T00:00:00Z',segments:[]}]);
+    return response({id:lectureId,title:'합성 변환 수업',created_at:'2026-01-01T00:00:00Z',segments:[],transcription_issues:[issue]});
+  },{FileUploader:WatchingUploader});
+  await app.run('recoverFileImport()');assert.equal(calls.filter(row=>row.method==='POST').length,0);
+  assert.match(app.element('import-state').textContent,/확인 필요/);assert.doesNotMatch(app.element('import-detail').textContent,/삭제됨/);
+  assert.equal(app.element('import-retry-alignment').hidden,false);assert.equal(app.element('import-cancel').hidden,false);
+  assert.match(app.element('import-cancel').textContent,/원본 삭제/);
+  assert.equal(app.element('transcription-issues').hidden,false);
+  assert.equal(app.element('transcription-issues').children.at(-1).textContent,issue.partial_text);
+  assert.doesNotMatch(app.run("exportText(current,'text')"),/미확정 결과/);
+  const first=app.run('retryAlignmentImport()');await tick();await app.run('retryAlignmentImport()');
+  assert.equal(calls.filter(row=>row.method==='POST').length,1);gate.resolve(response({...held,status:'queued',needs_review:false}));await first;
+  assert.equal(app.run('fileUploader.recovered.id'),id);assert.equal(app.element('import-retry-alignment').hidden,true);
+});
+test('a held alignment import is removed only by its explicit cancel action even after reload without a watcher',async()=>{
+  const id=webcrypto.randomUUID(),calls=[],app=setup((url,options={})=>{
+    calls.push({url,method:options.method||'GET'});
+    if(url.endsWith('/cancel'))return response({id,status:'cancelled',filename:'synthetic.wav',raw_deleted:true,lecture_id:null});
+    return response([]);
+  });
+  app.run(`importJob={id:${JSON.stringify(id)},status:'failed',needs_review:true,filename:'synthetic.wav'};fileUploader=null;updateControls()`);
+  assert.equal(calls.length,0);await app.run('cancelFileImport()');
+  assert.equal(calls.filter(row=>row.method==='POST').length,1);assert.ok(calls[0].url.endsWith(`/imports/${id}/cancel`));
+  assert.equal(app.run('importJob.status'),'cancelled');assert.equal(app.element('import-retry-alignment').hidden,true);
+});
+test('a malformed held-import retry reply cannot replace the held job or leave the retry button locked',async()=>{
+  const app=setup(()=>response({id:'different-import',status:'queued'}));
+  app.run("importJob={id:'synthetic-job',status:'failed',needs_review:true};updateControls()");
+  await app.run('retryAlignmentImport()');
+  assert.equal(app.run('importJob.id'),'synthetic-job');assert.equal(app.run('importJob.status'),'failed');
+  assert.equal(app.run('importAlignmentRetrying'),false);assert.equal(app.element('import-retry-alignment').disabled,false);
+  assert.match(app.run('importError'),/상태를 확인하지 못/);
+});
+test('late held-import retry result cannot replace a different account import',async()=>{
+  const gate=deferred(),app=setup(()=>gate.promise);app.run("importJob={id:'synthetic-job',status:'failed',needs_review:true};updateControls()");
+  const task=app.run('retryAlignmentImport()');await tick();
+  app.run("showLogin();user='user-beta';token='beta-token';importJob={id:'other-job',status:'processing'}");
+  gate.resolve(response({id:'synthetic-job',status:'queued'}));await task;
+  assert.equal(app.run('importJob.id'),'other-job');assert.equal(app.run('importAlignmentRetrying'),false);
+});
+
 test('an in-flight idempotent 409 retries while a changed-payload 409 remains manual', async () => {
   let attempt = 0;
   const ids = [];

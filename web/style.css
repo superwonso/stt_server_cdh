@@ -2979,6 +2979,9 @@ button {
 
 .ai-result-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .ai-result-warning { margin: 20px 0 0; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: .82rem; line-height: 1.6; }
+.transcription-issues { margin-top: 20px; padding: 20px; border: 1px solid var(--line); border-radius: 16px; line-height: 1.6; }
+.transcription-issues p { margin: 8px 0 0; font-size: .88rem; }
+.transcription-partial-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* Unified notes and explicitly grouped courses. */
 .course-dialog{width:min(960px,calc(100vw - 32px));max-height:90dvh;overflow:auto;padding:24px;border:1px solid #ddd4c8;border-radius:18px;background:#fffdf9;color:#292621}

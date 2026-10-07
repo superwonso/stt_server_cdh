@@ -45,6 +45,61 @@ function job(overrides = {}) {
   };
 }
 
+function heldAlignmentJob(overrides={}) {
+  return job({status:'failed',needs_review:true,raw_deleted:false,total_bytes:100,uploaded_bytes:100,
+    file_fingerprint:'a'.repeat(64),error:'이 구간을 확인해 주세요.',
+    transcription_issues:[{kind:'chunk',code:'alignment_unavailable',chunk_id:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      start_seconds:8,final_chunk:true,partial_text:'합성 미확정 결과'}],...overrides});
+}
+test('real uploader retains failed alignment lecture and source on GET, then watches an explicitly retried job to completion',async()=>{
+  const held=heldAlignmentJob(),queued={...held,status:'queued',needs_review:false},completed={...held,status:'completed',needs_review:false,raw_deleted:true,transcription_issues:[],processed_seconds:10,duration_seconds:10};
+  let manuallyRetried=false;const calls=[],seen=[];
+  const request=async(path,options={})=>{
+    calls.push({path,method:options.method||'GET'});
+    if(path===`/imports/${IMPORT_ID}/retry-alignment`&&options.method==='POST') { manuallyRetried=true;return queued; }
+    assert.equal(path,`/imports/${IMPORT_ID}`);assert.equal(options.method,undefined);
+    return manuallyRetried?completed:held;
+  };
+  const uploader=new RecordingFileUploader({request,onState:state=>seen.push(state),sleep:async()=>{}});
+  await assert.rejects(uploader.recover(queued),error=>{
+    assert.equal(error.importState,held);assert.equal(error.importState.lecture_id,queued.lecture_id);
+    assert.equal(error.importState.raw_deleted,false);assert.equal(error.importState.transcription_issues[0].partial_text,'합성 미확정 결과');
+    return true;
+  });
+  assert.equal(uploader.state,held);assert.equal(uploader.running,false);assert.equal(uploader.file,null);
+  assert.equal(calls.length,1);assert.equal(calls[0].method,'GET');assert.equal(seen.at(-1),held);
+  // Only the UI's explicit action POSTs a retry. The actual uploader performs
+  // status reads after this acknowledgment and never reuploads/restarts it.
+  const retried=await request(`/imports/${IMPORT_ID}/retry-alignment`,{method:'POST'});
+  const result=await uploader.recover(retried);assert.equal(result,completed);
+  assert.equal(calls.filter(row=>row.method==='POST').length,1);assert.equal(calls.length,3);
+});
+test('real uploader rejects malformed held states without relaxing ordinary terminal ownership and deletion rules',async()=>{
+  const original=heldAlignmentJob();
+  const mutations=[
+    {needs_review:false},{needs_review:'true'},{raw_deleted:true},{lecture_id:null},{lecture_id:'wrong'},
+    {status:'cancelled'},{status:'processing'},{transcription_issues:[]},
+    {transcription_issues:[original.transcription_issues[0],original.transcription_issues[0]]},
+    ...[{code:'unknown'},{kind:'finalize'},{chunk_id:'wrong'},{start_seconds:-1},{start_seconds:Infinity},
+       {final_chunk:'true'},{partial_text:null},{partial_text:'가'.repeat(8193)}]
+      .map(change=>({transcription_issues:[{...original.transcription_issues[0],...change}]})),
+  ];
+  for(const mutation of mutations) {
+    let reads=0;const uploader=new RecordingFileUploader({request:async()=>{reads++;return original;}});
+    assert.throws(()=>uploader.recover({...original,...mutation}));
+    assert.equal(reads,0);assert.equal(uploader.state,null);
+  }
+  for(const status of ['failed','cancelled']) {
+    const normal=job({status,lecture_id:null,total_bytes:100,uploaded_bytes:100,file_fingerprint:'a'.repeat(64)});
+    const uploader=new RecordingFileUploader({request:async()=>normal});
+    await assert.rejects(uploader.recover(normal),error=>status==='cancelled'
+      ? error instanceof FileImportCancelledError : error.importState===normal);
+    assert.equal(uploader.state,normal);
+    const invalid=new RecordingFileUploader({request:async()=>normal});
+    assert.throws(()=>invalid.recover({...normal,lecture_id:original.lecture_id}));
+  }
+});
+
 test('file parts are hashed, uploaded sequentially, completed, and polled without buffering the whole file', async () => {
   const { file, bytes } = recordingFile(IMPORT_PART_BYTES * 2 + 37);
   let serverOffset = 0;

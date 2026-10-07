@@ -266,7 +266,7 @@ class ModelAuditMigrationTests(unittest.TestCase):
                 # Rebuilding the table can change sqlite_sequence row order only.
                 self.assertEqual(sorted(after.pop("sqlite_sequence")), sorted(before.pop("sqlite_sequence")))
                 self.assertEqual(after, before)
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
                 self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
                 cursor = connection.execute("INSERT INTO admin_audit(timestamp,action,result,target) "

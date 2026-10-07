@@ -23,8 +23,9 @@ from fastapi.testclient import TestClient
 
 from server.model_protocol import (
     MAX_CONTEXT_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_SAMPLES,
-    ModelUnavailableError, ProtocolError, dump_json, load_json, make_request,
+    AlignmentUnavailableError, ModelUnavailableError, ProtocolError, dump_json, load_json, make_request,
     make_result, read_request, read_result, safe_status,
+    MAX_PARTIAL_TEXT_CHARACTERS, MAX_PARTIAL_TEXT_BYTES, make_alignment_failure, read_alignment_failure,
 )
 from server.model_server import _log_model_failure, create_model_app
 from server.remote_transcriber import RemoteTranscriber, validate_socket_path
@@ -162,6 +163,36 @@ def mock_remote(handler):
 
 
 class ModelProtocolTests(unittest.TestCase):
+    def test_alignment_failure_is_bounded_request_bound_and_never_a_success(self):
+        rid = str(uuid.uuid4())
+        text = "임시 synthetic candidate!"
+        envelope = make_alignment_failure(rid, text)
+        error = read_alignment_failure(load_json(dump_json(envelope, MAX_RESPONSE_BYTES), MAX_RESPONSE_BYTES), rid)
+        self.assertIsInstance(error, AlignmentUnavailableError)
+        self.assertNotIsInstance(error, ModelUnavailableError)
+        self.assertEqual(error.partial_text, text)
+        self.assertFalse(error.retryable)
+        self.assertNotIn(text, str(error))
+        self.assertNotIn(text, repr(error))
+        error.args = (text,)
+        self.assertNotIn(text, str(error))
+        self.assertNotIn(text, repr(error))
+        with self.assertRaises(ProtocolError):
+            read_result(envelope, rid, 16000)
+        maximum = "😀" * MAX_PARTIAL_TEXT_CHARACTERS
+        self.assertEqual(len(maximum.encode()), MAX_PARTIAL_TEXT_BYTES)
+        self.assertEqual(read_alignment_failure(make_alignment_failure(rid, maximum), rid).partial_text, maximum)
+        for changed in (
+            {"version": 2}, {"version": True}, {"request_id": str(uuid.uuid4())},
+            {"code": "model_unavailable"}, {"retryable": 0}, {"retryable": True},
+            {"partial_text": ""}, {"partial_text": " padded "}, {"partial_text": None},
+            {"partial_text": "x" * (MAX_PARTIAL_TEXT_CHARACTERS + 1)},
+            {"partial_text": "x\x00y"}, {"partial_text": "x\ud800y"},
+            {"segments": []}, {"boundary_output": {}},
+        ):
+            with self.subTest(changed=list(changed)), self.assertRaises(ProtocolError):
+                read_alignment_failure({**envelope, **changed}, rid)
+
     def test_float32_pcm_is_byte_exact_including_negative_zero_and_small_values(self):
         samples = np.array([-1, 1, -0.0, 0, .12345679, 1e-38], dtype=np.float32)
         decoded = read_request(request(samples))
@@ -250,6 +281,51 @@ class ModelProtocolTests(unittest.TestCase):
 
 
 class ModelServerTests(unittest.TestCase):
+    def test_alignment_failure_is_422_without_poisoning_or_replaying_the_worker(self):
+        engine = FakeEngine()
+        calls = []
+        healthy = engine.transcribe
+        def transcribe(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 1:
+                raise AlignmentUnavailableError("synthetic provisional") from None
+            return healthy(*args, **kwargs)
+        engine.transcribe = transcribe
+        with TestClient(create_model_app(settings(), engine)) as client:
+            first = request(boundary_requested=True)
+            failed = client.post("/transcribe", json=first)
+            self.assertEqual(failed.status_code, 422)
+            failure = read_alignment_failure(failed.json(), first["request_id"])
+            self.assertEqual(failure.partial_text, "synthetic provisional")
+            self.assertNotIn("Retry-After", failed.headers)
+            self.assertNotIn("segments", failed.json())
+            self.assertEqual(client.get("/health").json()["model_state"], "ready")
+            self.assertNotIn("synthetic provisional", client.get("/status").text)
+            second = request(boundary_requested=True)
+            success = client.post("/transcribe", json=second)
+            self.assertEqual(success.status_code, 200)
+            segments, context = read_result(success.json(), second["request_id"], 16000)
+            self.assertEqual(len(segments), 1)
+            self.assertIsNotNone(context)
+            self.assertEqual(len(calls), 2)
+
+    def test_tampered_alignment_exception_still_latches_protocol_failure(self):
+        engine = FakeEngine()
+        def fail(*args, **kwargs):
+            error = AlignmentUnavailableError("synthetic-safe")
+            error.partial_text = "synthetic-secret\x00"
+            raise error
+        engine.transcribe = fail
+        with self.assertLogs("server.model_server", level="ERROR") as logs:
+            with TestClient(create_model_app(settings(), engine)) as client:
+                response = client.post("/transcribe", json=request())
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.json()["code"], "model_protocol_error")
+                self.assertEqual(client.get("/health").json()["model_state"], "error")
+                self.assertEqual(client.post("/transcribe", json=request()).status_code, 503)
+                self.assertNotIn("synthetic-secret", response.text)
+        self.assertNotIn("synthetic-secret", "\n".join(logs.output))
+
     def test_failure_log_only_contains_allowlisted_origin_and_sanitized_class(self):
         for filename, error_type, stage, expected_origin, expected_kind in (
             (r"C:\synthetic-path-secret\transcriber.py", RuntimeError,
@@ -419,6 +495,82 @@ class ModelServerTests(unittest.TestCase):
 
 
 class RemoteModelTests(unittest.TestCase):
+    def test_signed_alignment_failure_binds_candidate_and_rejects_tampering(self):
+        from server.win_model_transport import AUTH_HEADER, RESPONSE_HEADER, response_auth
+        token = "a" * 64
+        endpoint = {"version": 1, "host": "127.0.0.1", "port": 18765, "instance": "b" * 32,
+                    "token_sha256": "synthetic-unused-by-mock"}
+        text = "synthetic-private-provisional"
+        for damage in (None, "signature", "request_id", "version", "retryable", "oversize", "extra",
+                       "mime", "status", "success", "duplicate_keys", "control", "unicode"):
+            with self.subTest(damage=damage):
+                def reply(incoming):
+                    sent = json.loads(incoming.content)
+                    envelope = make_alignment_failure(sent["request_id"], text)
+                    status, mime = 422, "application/json"
+                    if damage == "request_id":
+                        envelope["request_id"] = str(uuid.uuid4())
+                    elif damage == "version":
+                        envelope["version"] = 2
+                    elif damage == "retryable":
+                        envelope["retryable"] = 0
+                    elif damage == "oversize":
+                        envelope["partial_text"] = "x" * (MAX_PARTIAL_TEXT_CHARACTERS + 1)
+                    elif damage == "extra":
+                        envelope["segments"] = []
+                    elif damage == "mime":
+                        mime = "text/plain"
+                    elif damage == "status":
+                        status = 503
+                    elif damage == "success":
+                        status = 200
+                    elif damage == "control":
+                        envelope["partial_text"] = "private\x00"
+                    elif damage == "unicode":
+                        envelope["partial_text"] = "private\ud800"
+                    body = json.dumps(envelope).encode()
+                    if damage == "duplicate_keys":
+                        body = body[:-1] + b',"retryable":false}'
+                    nonce = incoming.headers[AUTH_HEADER].split(":")[1]
+                    signature = response_auth(token, endpoint["instance"], nonce, status, body)
+                    if damage == "signature":
+                        signature = "0" * 64
+                    return httpx.Response(status, stream=httpx.ByteStream(body),
+                                          headers={"Content-Type": mime, RESPONSE_HEADER: signature})
+                remote = RemoteTranscriber(settings(local_model_runtime=Path(__file__).resolve().parent / "synthetic-unopened-runtime"))
+                remote._client = httpx.Client(transport=httpx.MockTransport(reply))
+                output = {"committed": "unchanged"}
+                try:
+                    with patch("server.win_model_transport.read_endpoint", return_value=(endpoint, token)):
+                        if damage is None:
+                            with self.assertRaises(AlignmentUnavailableError) as failure:
+                                remote.transcribe(np.zeros(16000, np.float32), "ko", boundary_output=output)
+                            self.assertEqual(failure.exception.partial_text, text)
+                            self.assertFalse(failure.exception.retryable)
+                            self.assertNotIn(text, str(failure.exception))
+                            self.assertNotIn(text, repr(failure.exception))
+                        else:
+                            with self.assertRaises(ModelUnavailableError) as failure:
+                                remote.transcribe(np.zeros(16000, np.float32), "ko", boundary_output=output)
+                            self.assertEqual(failure.exception.code, "model_protocol_error")
+                            self.assertFalse(hasattr(failure.exception, "partial_text"))
+                    self.assertEqual(output, {"committed": "unchanged"})
+                    self.assertNotIn(text, str(remote._cached_status))
+                finally:
+                    remote.close()
+
+    def test_private_transport_alignment_candidate_cannot_escape_a_status_request(self):
+        rid = str(uuid.uuid4())
+        envelope = make_alignment_failure(rid, "synthetic-private-provisional")
+        def reply(incoming):
+            return httpx.Response(422, stream=httpx.ByteStream(json.dumps(envelope).encode()),
+                                  headers={"Content-Type": "application/json"})
+        with mock_remote(reply) as remote:
+            with self.assertRaises(ModelUnavailableError) as failure:
+                remote._request("GET", "/status", status=True, request_id=rid)
+            self.assertEqual(failure.exception.code, "model_protocol_error")
+            self.assertFalse(hasattr(failure.exception, "partial_text"))
+
     @unittest.skipIf(os.name == "nt", "POSIX UDS integration; native loopback has separate tests")
     def test_real_uds_exact_pcm_context_and_independent_requests(self):
         engine = FakeEngine()

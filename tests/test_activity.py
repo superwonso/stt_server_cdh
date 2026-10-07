@@ -101,7 +101,7 @@ class ActivityTests(unittest.TestCase):
         with self.database.connect() as connection:
             columns = [row[1] for row in connection.execute("PRAGMA table_info(user_activity)")]
             self.assertEqual(columns, ["id", "username", "timestamp", "action", "result"])
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
 
     def test_retention_is_seven_days_and_500_entries_without_touching_admin_audit(self):
         with self.database.connect() as connection:

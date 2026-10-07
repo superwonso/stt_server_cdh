@@ -122,6 +122,8 @@ const RAM_AUDIO_WARNING_SECONDS = 300;
 const MAX_RECORDING_FINALIZE_CONTENTION_RETRIES = 8;
 const RETRYABLE_UPLOAD_STATUSES = new Set([408, 425, 429]);
 const PERMANENT_UPLOAD_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 424, 507]);
+const ALIGNMENT_UNAVAILABLE_MESSAGE = '이 구간의 받아쓰기를 확정하지 못했어요. 원본은 보관했습니다. 확인 후 다시 전송하거나 파일 변환으로 보내 주세요.';
+let importAlignmentRetrying = false;
 const UPLOAD_TIMEOUT_MS = 60000;
 const MAX_CLOVA_RESULT_POLLS = 6;
 const CLOVA_RESULT_POLL_DEADLINE_MS = 120000;
@@ -340,6 +342,7 @@ function applyStoredPendingChunk(session, item, stored, server = apiUrl) {
   }
   if (stored.state === 'inflight' || stored.state === 'blocked') {
     item.blocked = true;
+    item.errorKind = stored.errorKind;
     item.inflight = stored.state === 'inflight';
     if (item.asrProvider === 'clova') item.recoveryOnly = true;
   }
@@ -811,6 +814,7 @@ async function markPendingBlocked(chunk, error) {
   if (!chunk?.durable || !liveQueueAvailable || !chunk.owner) return;
   const raw = String(error?.code || error?.status || 'upload_error').toLowerCase();
   const kind = /^[a-z][a-z0-9_-]{0,63}$/.test(raw) ? raw : 'upload_error';
+  chunk.errorKind = kind;
   try { await liveQueue.markChunkBlocked(chunk.owner,chunk.id,kind); }
   catch (storeError) { setLiveQueueWarning(storeError); }
 }
@@ -954,6 +958,7 @@ async function performDurableLiveAudioRecovery(owner) {
       existing.sessionCreatedAt = stored.sessionCreatedAt;
       existing.byteLength = stored.byteLength;
       existing.blocked = stored.state === 'blocked' || stored.state === 'inflight';
+      existing.errorKind = stored.errorKind;
       existing.inflight = stored.state === 'inflight';
       existing.recoveryOnly = stored.asrProvider === 'clova' && existing.blocked;
       if (existing.recoveryOnly) { existing.resultPolls = 0; existing.resultPollDeadline = 0; }
@@ -984,6 +989,7 @@ async function performDurableLiveAudioRecovery(owner) {
       downloadRequested:stored.downloadRequested,
       persistPromise:Promise.resolve(),
       blocked:stored.state === 'blocked' || stored.state === 'inflight',
+      errorKind:stored.errorKind,
       inflight:stored.state === 'inflight',
       recoveryOnly:stored.asrProvider === 'clova' && ['blocked','inflight'].includes(stored.state),
     });
@@ -1060,6 +1066,7 @@ async function performDurableLiveAudioRecovery(owner) {
       ? '브라우저가 닫히기 직전에 보낸 CLOVA 음성은 처리 여부를 확인할 수 없어 자동 재전송하지 않았어요.'
       : blocked.asrProvider === 'clova'
       ? '기기에 보관된 CLOVA 음성 조각은 이전 응답을 확인하지 못해 자동 재전송하지 않았어요.'
+      : blocked.errorKind === 'alignment_unavailable' ? ALIGNMENT_UNAVAILABLE_MESSAGE
       : '기기에 보관된 음성 조각에 확인이 필요한 오류가 있어요.';
   }
   try {
@@ -1211,6 +1218,10 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
       }
       const error = new Error(message); error.status = response.status;
       error.code = typeof data?.error_code === 'string' ? data.error_code : typeof data?.code === 'string' ? data.code : '';
+      if (response.status === 422 && error.code === 'alignment_unavailable' && data?.retryable === false) {
+        error.alignmentUnavailable = true;
+        error.partialText = validAlignmentPartialText(data.partial_text) ? data.partial_text : '';
+      }
       error.safeToRetry = response.status === 429 && data?.code === 'chunk_not_started' && data?.safe_to_retry === true;
       const retryAfterHeader = response.headers?.get?.('Retry-After');
       const retryAfter = retryAfterHeader === null || retryAfterHeader === undefined || retryAfterHeader.trim() === ''
@@ -1647,6 +1658,7 @@ function importTransportBusy() {
   return importStarting || (!!fileUploader?.running && importJob?.status === 'uploading');
 }
 function detachImportWatcher({ clear = true } = {}) {
+  importAlignmentRetrying = false;
   ++importGeneration;
   ++importLectureSequence;
   fileUploader?.detach();
@@ -1684,6 +1696,7 @@ function scrubAccountWorkspace({ clearLoginIdentity = false } = {}) {
   renderCurrent(); renderHistory();
 }
 function showLogin(clear = true) {
+  $('transcription-issues').replaceChildren(); $('transcription-issues').hidden = true;
   resetReminderWorkspace();
   clearTextExports(); continuationCapability = ''; partialRecordingCapability = '';
   recordingUploadCapability = ''; resetRecordingAudioRetry(); audioUploadError = ''; audioUploadErrorScope = '';
@@ -2066,8 +2079,8 @@ function makeFileUploader(generation) {
         if (firstState) {
           void refreshLectures().catch(error => notice(errorText(error)));
           void refreshImportLecture(state, true, generation);
-        } else if (state.status === 'processing') {
-          void refreshImportLecture(state, false, generation);
+        } else if (state.status === 'processing' || alignmentImportHeld(state)) {
+          void refreshImportLecture(state, alignmentImportHeld(state), generation);
         }
       }
       if (state?.retry_attempt) {
@@ -2091,7 +2104,7 @@ function makeFileUploader(generation) {
   });
 }
 async function refreshImportLecture(state = importJob, force = false, generation = importGeneration) {
-  if (!token || !state?.lecture_id || isTerminalImportState(state) && state.status !== 'completed') return;
+  if (!token || !state?.lecture_id || isTerminalImportState(state) && state.status !== 'completed' && !alignmentImportHeld(state)) return;
   const now = Date.now();
   const shouldSelect = force && (selectImportLecture || current?.id === state.lecture_id);
   if (!shouldSelect && current?.id !== state.lecture_id) return;
@@ -2157,6 +2170,7 @@ async function runFileImport(operation, generation) {
       if (fileUploader) fileUploader.file = null;
       clearRecordingSelection();
       await refreshLectures().catch(() => {});
+      if (alignmentImportHeld(importJob)) await refreshImportLecture(importJob,true,generation);
     }
   } finally {
     if (generation === importGeneration) {
@@ -2177,10 +2191,15 @@ async function recoverFileImport() {
   if (!active) {
     const previous = importJob;
     const previousLecture = previous?.lecture_id;
-    const terminal = previous ? jobs.find(job => job.id === previous.id && isTerminalImportState(job)) : null;
+    const terminal = (previous ? jobs.find(job => job.id === previous.id && isTerminalImportState(job)) : null)
+      || jobs.find(alignmentImportHeld);
     detachImportWatcher();
     const generation = importGeneration;
     if (terminal) importJob = terminal;
+    if (alignmentImportHeld(terminal)) {
+      selectImportLecture = navigationGeneration === requestGeneration && (!current || current.id === terminal.lecture_id);
+      await refreshImportLecture(terminal,true,generation);
+    }
     await refreshLectures();
     if (owner !== user || sessionToken !== token || generation !== importGeneration) return;
     if (previousLecture && current?.id === previousLecture && !lectures.some(lecture => lecture.id === previousLecture)) {
@@ -5143,10 +5162,44 @@ $('study-material-details').ontoggle=()=>{
   studyMaterialPanel.setScope({kind:'lecture',id:current.id});
 };
 
+function validAlignmentPartialText(value) {
+  return typeof value === 'string' && value.length <= 16384 && Array.from(value).length <= 8192
+    && new Blob([value]).size <= 32768;
+}
+function alignmentIssues(lecture) {
+  return Array.isArray(lecture?.transcription_issues) ? lecture.transcription_issues.slice(0,1).filter(issue =>
+    issue?.code === 'alignment_unavailable' && ['chunk','finalize'].includes(issue.kind)
+    && typeof issue.chunk_id === 'string' && (issue.kind === 'finalize'
+      ? issue.chunk_id === 'server:recording-finalize-guard:v1'
+      : /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(issue.chunk_id))
+    && Number.isFinite(issue.start_seconds) && issue.start_seconds >= 0 && issue.start_seconds <= 86400
+    && typeof issue.final_chunk === 'boolean' && validAlignmentPartialText(issue.partial_text)) : [];
+}
+function setAlignmentIssue(lectureId, issue, removeChunkId = '') {
+  const targets = new Set([current?.id === lectureId ? current : null,
+    lectures.find(lecture=>lecture.id === lectureId),liveSessions.get(lectureId)?.lecture].filter(Boolean));
+  for (const lecture of targets) lecture.transcription_issues = issue ? [issue]
+    : alignmentIssues(lecture).filter(row => row.chunk_id !== removeChunkId);
+  renderTranscriptionIssues();
+}
+function renderTranscriptionIssues() {
+  const panel = $('transcription-issues'); panel.replaceChildren(); panel.hidden = true;
+  const owner = current && loadedLectureOwners.get(current);
+  if (!user || !token || !owner || owner.owner !== user || owner.server !== apiUrl) return;
+  for (const issue of alignmentIssues(current)) {
+    const heading = document.createElement('strong'); heading.textContent = `${fmt(issue.start_seconds)} · 확인이 필요한 받아쓰기`;
+    const help = document.createElement('p'); help.textContent = ALIGNMENT_UNAVAILABLE_MESSAGE;
+    const label = document.createElement('p'); label.textContent = '미확정 결과입니다. 받아쓴 본문과 텍스트 내보내기에는 포함되지 않습니다.';
+    const text = document.createElement('p'); text.className = 'transcription-partial-text';
+    text.textContent = issue.partial_text || '표시할 미확정 텍스트가 없습니다. 원본 음성은 보관되어 있습니다.';
+    panel.append(heading,help,label,text); panel.hidden = false;
+  }
+}
 function renderCurrent() {
   const exportIdentity = JSON.stringify([user,token,apiUrl]);
   if (textExportIdentity !== exportIdentity) { clearTextExports(); textExportIdentity = exportIdentity; }
   if (current && user && token && !loadedLectureOwners.has(current)) loadedLectureOwners.set(current,{owner:user,server:apiUrl});
+  renderTranscriptionIssues();
   const lectureId = current?.id || '';
   if (lectureId !== correctionLectureId) {
     resetCorrectionState(lectureId);
@@ -5621,6 +5674,24 @@ async function restoreHeldAudio(captureId) {
     if(isCurrent()&&!session.uploadHeld){if(!session.lecture)void ensureLectureAssigned(session);if(!sendError)void drain();}
   }
 }
+function alignmentImportHeld(state) { return state?.status === 'failed' && state.needs_review === true; }
+async function retryAlignmentImport() {
+  if (!token || !alignmentImportHeld(importJob) || importAlignmentRetrying || importStarting || importCancelling || fileUploader?.running) return;
+  const owner=user, sessionToken=token, server=apiUrl, generation=importGeneration, id=importJob.id;
+  const isCurrent=()=>owner===user && sessionToken===token && server===apiUrl && generation===importGeneration && importJob?.id===id;
+  importAlignmentRetrying=true; importError=''; updateControls();
+  try {
+    const state=await api(`/imports/${encodeURIComponent(id)}/retry-alignment`,{method:'POST'});
+    if (!isCurrent()) return;
+    if (state?.id !== id || !['queued','processing','completed','failed'].includes(state.status))
+      throw new Error('다시 시도한 파일의 상태를 확인하지 못했습니다. 원본은 보관합니다.');
+    importJob=state; fileUploader=makeFileUploader(generation);
+    void runFileImport(fileUploader.recover(state),generation);
+  } catch(error) {
+    if (isCurrent()) { importError=errorText(error); notice(importError); }
+  } finally { if (isCurrent()) { importAlignmentRetrying=false; updateControls(); } }
+}
+$('import-retry-alignment').onclick=()=>{void retryAlignmentImport();};
 function renderImportStatus() {
   const panel = $('import-status');
   const state = importJob?.status;
@@ -5632,7 +5703,7 @@ function renderImportStatus() {
     queued: '업로드 완료 · 서버 변환 대기 중',
     processing: importJob?.cancel_requested ? '취소 요청을 처리하고 있어요' : '서버에서 녹음을 받아쓰고 있어요',
     completed: '녹음 파일 변환 완료',
-    failed: '녹음 파일을 변환하지 못했어요',
+    failed: alignmentImportHeld(importJob) ? '확인 필요 · 변환한 부분과 원본 보관 중' : '녹음 파일을 변환하지 못했어요',
     cancelled: '녹음 파일 변환을 취소했어요',
   };
   $('import-state').textContent = importStarting && !state ? '파일 전체를 안전하게 확인하고 있어요' : labels[state] || '파일 상태를 확인하고 있어요';
@@ -5655,13 +5726,18 @@ function renderImportStatus() {
   } else if (state === 'queued') detail = `${importJob.filename} · 서버에서 순서를 기다립니다. 이제 탭을 닫아도 변환은 계속됩니다.`;
   else if (state === 'processing') detail = `${importJob.filename} · ${fmt(importJob.processed_seconds)} 분량 처리됨 · 탭을 닫아도 서버에서 계속됩니다.`;
   else if (state === 'completed') detail = `${importJob.filename} · ${fmt(importJob.duration_seconds)} 분량 · ${importJob.raw_deleted ? '원본 임시 파일 삭제됨' : '원본 임시 파일 삭제 재시도 중'}`;
-  else if (state === 'failed') detail = `${importJob.filename} · 불완전한 기록 삭제됨 · ${importJob.raw_deleted ? '원본 임시 파일 삭제됨' : '원본 임시 파일 삭제 재시도 중'}`;
+  else if (state === 'failed') detail = alignmentImportHeld(importJob)
+    ? `${importJob.filename} · 자동 재시도를 멈췄습니다. 원본과 변환한 부분은 보관하며, 이 구간을 직접 다시 시도할 수 있습니다.`
+    : `${importJob.filename} · 불완전한 기록 삭제됨 · ${importJob.raw_deleted ? '원본 임시 파일 삭제됨' : '원본 임시 파일 삭제 재시도 중'}`;
   else if (state === 'cancelled') detail = `${importJob.filename} · 불완전한 기록 삭제됨 · ${importJob.raw_deleted ? '원본 임시 파일 삭제됨' : '원본 임시 파일 삭제 재시도 중'}`;
   if (importProgress?.retryAttempt) detail += ` · 연결 오류로 ${Math.ceil((importProgress.retryDelayMs || 0) / 1000)}초 후 재시도 (${importProgress.retryAttempt}/8)`;
   if (importError) detail += `${detail ? ' · ' : ''}${importError}`;
   $('import-detail').textContent = detail;
-  $('import-cancel').hidden = !importIsActive();
-  $('import-cancel').disabled = importCancelling || !!importJob?.cancel_requested;
+  $('import-cancel').hidden = !importIsActive() && !alignmentImportHeld(importJob);
+  $('import-cancel').disabled = importCancelling || importAlignmentRetrying || !!importJob?.cancel_requested;
+  $('import-cancel').textContent = alignmentImportHeld(importJob) ? '변환 취소 · 원본 삭제' : '취소';
+  $('import-retry-alignment').hidden = !alignmentImportHeld(importJob);
+  $('import-retry-alignment').disabled = !token || importAlignmentRetrying || importStarting || importCancelling || !!fileUploader?.running;
 }
 function inputCaptureDescription() {
   const health = capture?.inputHealth;
@@ -6245,17 +6321,18 @@ async function startOrResumeFileImport() {
 }
 $('import-button').onclick = () => { void startOrResumeFileImport(); };
 async function cancelFileImport() {
-  if (!importIsActive() || !fileUploader || importCancelling) return;
-  const owner = user, sessionToken = token, generation = importGeneration, uploader = fileUploader;
+  if (((!importIsActive() || !fileUploader) && !alignmentImportHeld(importJob)) || importCancelling || importAlignmentRetrying) return;
+  const owner = user, sessionToken = token, server=apiUrl, generation = importGeneration, uploader = fileUploader;
   const sessionIsCurrent = () => !!sessionToken && owner === user && sessionToken === token
-    && generation === importGeneration && uploader === fileUploader;
+    && server===apiUrl && generation === importGeneration && uploader === fileUploader;
   importCancelling = true; importError = ''; updateControls();
   try {
-    const state = await uploader.cancel();
+    const state = alignmentImportHeld(importJob)
+      ? await api(`/imports/${encodeURIComponent(importJob.id)}/cancel`,{method:'POST'}) : await uploader.cancel();
     if (!sessionIsCurrent()) return;
     importJob = state;
     if (isTerminalImportState(state)) {
-      uploader.file = null; clearRecordingSelection();
+      if (uploader) uploader.file = null; clearRecordingSelection();
       await refreshLectures();
       if (!sessionIsCurrent()) return;
       if (!state.lecture_id && current) {
@@ -7189,6 +7266,7 @@ async function drain() {
     const coordinated = await liveCoordination.runUploader(drainOwner,async () => {
     while (nextPendingChunk() && token && drainScopeIsCurrent() && !holdingAudio) {
       const chunk = nextPendingChunk();processingChunk=chunk;
+      let qwenRetryForThisRequest = false;
       if (recordingAudioUploadEnabled() && !audioChunkStored(chunk)) {
         void drainRecordingAudio(); break;
       }
@@ -7230,6 +7308,7 @@ async function drain() {
             continue;
           }
           if (stored.state === 'blocked' || stored.state === 'inflight') {
+            qwenRetryForThisRequest = chunk.asrProvider === 'qwen' && stored.errorKind === 'alignment_unavailable';
             await markPendingQueued(chunk);
           } else {
             chunk.blocked = false;
@@ -7246,6 +7325,7 @@ async function drain() {
       if (chunk.blocked && !chunk.recoveryOnly) {
         sendError = chunk.asrProvider === 'clova'
           ? '이 CLOVA 음성 조각은 이전 처리 결과를 확인하지 못해 자동 재전송하지 않았어요.'
+          : chunk.errorKind === 'alignment_unavailable' ? ALIGNMENT_UNAVAILABLE_MESSAGE
           : '이 음성 조각은 이전 오류를 확인한 뒤 직접 재전송해야 해요.';
         break;
       }
@@ -7321,7 +7401,7 @@ async function drain() {
           if (user === drainOwner) sendError = '로그인 또는 수업 연결이 바뀌어 보관된 음성을 보내지 않았어요.';
           break;
         }
-        response = await api(`/lectures/${chunk.lectureId}/chunks`,{method:'POST',body:blob,uploaderAlreadyLocked:true,headers:{'Content-Type':'audio/wav','X-Chunk-Id':chunk.id,'X-Start-Seconds':String(chunk.startSeconds),'X-Overlap-Seconds':String(chunk.overlapSeconds ?? 0),'X-Final-Chunk':chunk.final ? 'true' : 'false'}},UPLOAD_TIMEOUT_MS);
+        response = await api(`/lectures/${chunk.lectureId}/chunks`,{method:'POST',body:blob,uploaderAlreadyLocked:true,headers:{'Content-Type':'audio/wav','X-Chunk-Id':chunk.id,'X-Start-Seconds':String(chunk.startSeconds),'X-Overlap-Seconds':String(chunk.overlapSeconds ?? 0),'X-Final-Chunk':chunk.final ? 'true' : 'false',...(qwenRetryForThisRequest ? {'X-Qwen-Retry':'1'} : {})}},UPLOAD_TIMEOUT_MS);
       } catch (error) {
         if (chunk.asrProvider === 'clova'
             && (error?.connectionChanged === true || error?.connectionLeaseExpired === true)) {
@@ -7362,6 +7442,15 @@ async function drain() {
           chunk.resultPolls = 0; chunk.resultPollDeadline = 0;
           continue;
         }
+        if (error?.alignmentUnavailable === true) {
+          if (!chunkResponseScopeIsCurrent(chunk,session,responseScope)) break;
+          sendError = ALIGNMENT_UNAVAILABLE_MESSAGE;
+          await markPendingBlocked(chunk,error);
+          if (!chunkResponseScopeIsCurrent(chunk,session,responseScope)) break;
+          setAlignmentIssue(chunk.lectureId,{code:'alignment_unavailable',kind:'chunk',chunk_id:chunk.id,
+            start_seconds:chunk.startSeconds,final_chunk:!!chunk.final,partial_text:error.partialText});
+          break;
+        }
         if (retryableUpload(error)) {
           scheduleUploadRetry(error);
           break;
@@ -7377,6 +7466,7 @@ async function drain() {
         break;
       }
       validateChunkResponse(response);
+      setAlignmentIssue(chunk.lectureId,null,chunk.id);
       chunk.serverConfirmed = true;
       applyRecordingFlags(chunk.lectureId,response);
       // The server has already committed this text. Slow local storage cleanup
@@ -7494,6 +7584,8 @@ function applyRecordingFlags(lectureId, result) {
     Object.assign(lecture,merged);
   }
   if (state.recording_finalized) {
+    for (const lecture of targets) lecture.transcription_issues = [];
+    renderTranscriptionIssues();
     recoveryFinalizationRequired.delete(lectureId);
     const recoveredSession = liveSessions.get(lectureId);
     if (recoveredSession?.recovered && !pending.some(chunk => chunk.captureId === lectureId)) {
@@ -7512,15 +7604,27 @@ function applyRecordingFlags(lectureId, result) {
   }
   return state;
 }
-async function requestRecordingFinalization(lectureId, operationIsCurrent) {
+async function requestRecordingFinalization(lectureId, operationIsCurrent, {manualAlignmentRetry=false} = {}) {
   const path = `/lectures/${encodeURIComponent(lectureId)}/recording-finalize`;
   let retriedLostResponse = false;
   let contentionRetries = 0;
   while (operationIsCurrent()) {
+    const headers = manualAlignmentRetry ? {'X-Qwen-Retry':'1'} : {};
+    manualAlignmentRetry = false; // A lost response may be reconciled, never grant a second inference.
     try {
-      return await api(path, {method:'POST',uploaderAlreadyLocked:true},UPLOAD_TIMEOUT_MS);
+      return await api(path, {method:'POST',uploaderAlreadyLocked:true,headers},UPLOAD_TIMEOUT_MS);
     } catch (error) {
       if (!operationIsCurrent()) throw error;
+      if (error?.alignmentUnavailable === true) {
+        try {
+          const lecture = await api(`/lectures/${encodeURIComponent(lectureId)}`);
+          if (operationIsCurrent()) {
+            const issue = alignmentIssues(lecture).find(row=>row.kind==='finalize');
+            if (issue) setAlignmentIssue(lectureId,issue);
+          }
+        } catch { /* Preserve the original failure and all audio if the status read fails. */ }
+        throw error;
+      }
       // A browser timeout can leave the deterministic server-side final guard
       // running. Reconcile one lost response immediately; if that retry sees
       // the guard claim, respect Retry-After instead of starting duplicate GPU
@@ -7692,7 +7796,8 @@ async function downloadRecording({finalize = false} = {}) {
       const result = await runWhenOwnerCaptureIdle(
         owner,
         lectureId,
-        () => requestRecordingFinalization(lectureId,operationIsCurrent),
+        () => requestRecordingFinalization(lectureId,operationIsCurrent,
+          {manualAlignmentRetry:alignmentIssues(current).some(issue=>issue.kind==='finalize')}),
       );
       if (!operationIsCurrent()) return;
       const state = applyRecordingFlags(lectureId,result);

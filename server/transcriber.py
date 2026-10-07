@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import threading
 import unicodedata
 
@@ -9,6 +10,9 @@ import webrtcvad
 
 from .settings import Settings
 from .qwen_boundary import reconcile_tokens
+from .model_protocol import AlignmentUnavailableError
+
+_LOG = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 VAD_FRAME_SAMPLES = 320  # 20 ms
@@ -213,7 +217,15 @@ class LocalTranscriber:
             alignment = transcription.time_stamps
             items = list(alignment.items) if alignment is not None else []
             if text and not items:
-                raise RuntimeError("Forced alignment returned no timestamps")
+                failure = AlignmentUnavailableError(text)
+                # Count whitespace groups containing the aligner's permitted
+                # character categories. This is diagnostic only, not a second
+                # tokenizer or an assertion of semantic/speech content.
+                lexical_count = sum(any(ch == "'" or unicodedata.category(ch).startswith(("L", "N"))
+                                        for ch in token) for token in text.split())
+                _LOG.warning("Local alignment unavailable input_ms=%d language=%s final=%d text_chars=%d lexical_token_count=%d item_count=%d",
+                             round(duration * 1000), language or "auto", int(final_chunk), len(text), lexical_count, len(items))
+                raise failure from None
             if not text:
                 partition([], [])
                 self._set_state("ready")
@@ -245,6 +257,11 @@ class LocalTranscriber:
                         "text": selected_text,
                     })
             return result
+        except AlignmentUnavailableError as error:
+            # This known result-quality failure does not poison the shared GPU
+            # worker. No timestamps/frontier/segments were manufactured above.
+            self._set_state("ready")
+            raise error from None
         except Exception:
             self._set_state("error")
             raise

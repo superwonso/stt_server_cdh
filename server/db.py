@@ -665,5 +665,7 @@ class Database:
             migrate_review_schema(connection)
             from .activity import migrate_activity_schema
             migrate_activity_schema(connection)
-            if schema_version < 26:
-                connection.execute("PRAGMA user_version = 26")
+            from .transcription_issues import migrate as migrate_transcription_issues
+            migrate_transcription_issues(connection)
+            if schema_version < 27:
+                connection.execute("PRAGMA user_version = 27")

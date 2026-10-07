@@ -86,6 +86,19 @@ function validOffset(value, total) {
   return Number.isSafeInteger(value) && value >= 0 && value <= total;
 }
 
+function validAlignmentHold(state) {
+  if (state.status !== 'failed' || state.needs_review !== true || state.raw_deleted !== false
+      || !UUID.test(state.lecture_id || '') || !Array.isArray(state.transcription_issues)
+      || state.transcription_issues.length !== 1) return false;
+  const issue=state.transcription_issues[0];
+  return issue?.code === 'alignment_unavailable' && issue.kind === 'chunk'
+    && UUID.test(issue.chunk_id || '') && typeof issue.final_chunk === 'boolean'
+    && Number.isFinite(issue.start_seconds) && issue.start_seconds >= 0 && issue.start_seconds <= 86400
+    && typeof issue.partial_text === 'string' && issue.partial_text.length <= 16384
+    && Array.from(issue.partial_text).length <= 8192
+    && new TextEncoder().encode(issue.partial_text).byteLength <= 32768;
+}
+
 function stateError(state) {
   const message = typeof state?.error === 'string' && state.error.trim()
     ? state.error.trim()
@@ -451,7 +464,12 @@ export class RecordingFileUploader {
     }
     if (!STATUSES.has(state.status)) throw new Error('서버의 파일 변환 상태를 확인할 수 없습니다.');
     if (typeof state.raw_deleted !== 'boolean') throw new Error('서버의 임시 원본 삭제 상태를 확인할 수 없습니다.');
-    const discardedLecture = state.status === 'failed' || state.status === 'cancelled';
+    const alignmentHeld = validAlignmentHold(state);
+    if (state.needs_review !== undefined && typeof state.needs_review !== 'boolean'
+        || state.needs_review === true && !alignmentHeld) {
+      throw new Error('서버의 변환 보류 상태를 안전하게 확인하지 못했습니다.');
+    }
+    const discardedLecture = (state.status === 'failed' && !alignmentHeld) || state.status === 'cancelled';
     if ((discardedLecture ? state.lecture_id !== null : !UUID.test(state.lecture_id || ''))
         || state.file_fingerprint !== this.metadata.file_fingerprint) {
       throw new Error('서버가 다른 수업 또는 녹음 파일 정보를 반환했습니다.');

@@ -8,13 +8,92 @@ import unittest
 import uuid
 from pathlib import Path
 
+from fastapi import HTTPException
 from server.db import Database
-from server import platform_files
+from server import platform_files, transcription_issues
 
 TEST_ACCOUNTS = ("user-alpha", "user-beta")
 
 
 class DatabaseTests(unittest.TestCase):
+    def test_v26_alignment_migration_preserves_all_existing_columns_and_defaults(self):
+        with tempfile.TemporaryDirectory(prefix="stt-test-v27-migration-") as temporary:
+            database = Database(Path(temporary) / "data" / "classroom.sqlite3", TEST_ACCOUNTS)
+            database.initialize()
+            identifiers = [str(uuid.uuid4()) for _ in TEST_ACCOUNTS]
+            with database.connect() as connection:
+                connection.execute("UPDATE users SET password_hash='synthetic-preserved-hash',"
+                                   "setup_hash='synthetic-preserved-setup',setup_expires=9999999999")
+                connection.execute("INSERT INTO sessions VALUES('synthetic-preserved-session',?,9999999999,1)",
+                                   (TEST_ACCOUNTS[0],))
+                for index, (lecture_id, username) in enumerate(zip(identifiers, TEST_ACCOUNTS)):
+                    connection.execute("INSERT INTO lectures(id,username,title,language,created_at) "
+                                       "VALUES(?,?,'synthetic preserved lecture','ko','old-time')",
+                                       (lecture_id, username))
+                    connection.execute("INSERT INTO chunks(lecture_id,chunk_id,payload_hash,start_seconds,"
+                                       "overlap_seconds,final_chunk,status,processing_seconds,qwen_boundary_json) "
+                                       "VALUES(?,?,?,5,3,0,'done',0.5,'{}')",
+                                       (lecture_id, str(uuid.uuid4()), 'a' * 64))
+                    connection.execute("INSERT INTO imports(id,username,lecture_id,title,language,filename,"
+                                       "file_fingerprint,total_bytes,uploaded_bytes,status,processed_seconds,"
+                                       "duration_seconds,error,created_at,updated_at) "
+                                       "VALUES(?,?,?,'synthetic import','ko','synthetic.wav',?,1000,500,?,"
+                                       "8,16,'synthetic preserved error','old-time','old-time')",
+                                       (str(uuid.uuid4()), username, lecture_id, 'b' * 64,
+                                        'failed' if index == 0 else 'uploading'))
+                connection.execute("DROP TABLE transcription_issues")
+                for column in ('alignment_held', 'alignment_retry_pending'):
+                    connection.execute(f'ALTER TABLE imports DROP COLUMN {column}')
+                connection.execute("PRAGMA user_version=26")
+                tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+                before = {table: [dict(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')]
+                          for table in tables}
+            database.initialize()
+            database.initialize()
+            with database.connect() as connection:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
+                for table, rows in before.items():
+                    after = [dict(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')]
+                    self.assertEqual(len(after), len(rows), table)
+                    self.assertEqual([{key: current[key] for key in old} for old, current in zip(rows, after)],
+                                     rows, table)
+                self.assertEqual([tuple(row) for row in connection.execute(
+                    "SELECT alignment_held,alignment_retry_pending FROM imports ORDER BY id")], [(0, 0), (0, 0)])
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM transcription_issues").fetchone()[0], 0)
+                self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_alignment_issue_owner_unique_and_cascade_boundaries(self):
+        with tempfile.TemporaryDirectory(prefix="stt-test-alignment-owner-") as temporary:
+            database = Database(Path(temporary) / "data" / "classroom.sqlite3", TEST_ACCOUNTS)
+            database.initialize()
+            first, other, chunk_id = (str(uuid.uuid4()) for _ in range(3))
+            with database.connect() as connection:
+                for lecture_id, username in ((first, TEST_ACCOUNTS[0]), (other, TEST_ACCOUNTS[1])):
+                    connection.execute("INSERT INTO lectures(id,username,title,created_at) "
+                                       "VALUES(?,?,'synthetic','now')", (lecture_id, username))
+                    transcription_issues.save(connection, {'id': lecture_id, 'username': username},
+                        chunk_id, 'a' * 64, 0, 0, 8, False, 'synthetic provisional', 'now')
+                self.assertIsNotNone(transcription_issues.find(connection, first, TEST_ACCOUNTS[0]))
+                self.assertEqual(transcription_issues.public_issues(connection, first, TEST_ACCOUNTS[1]), [])
+                with self.assertRaises(HTTPException) as forbidden:
+                    transcription_issues.save(connection, {'id': first, 'username': TEST_ACCOUNTS[1]},
+                        chunk_id, 'a' * 64, 0, 0, 8, False, 'other synthetic provisional', 'now')
+                self.assertEqual(forbidden.exception.status_code, 404)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute("INSERT INTO transcription_issues SELECT * FROM transcription_issues WHERE lecture_id=?", (first,))
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute("UPDATE transcription_issues SET lecture_id=? WHERE lecture_id=?", (str(uuid.uuid4()), first))
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute("UPDATE transcription_issues SET partial_text='' WHERE lecture_id=?", (first,))
+                connection.execute("UPDATE lectures SET trashed_at='now' WHERE id=?", (first,))
+                self.assertEqual(transcription_issues.public_issues(connection, first, TEST_ACCOUNTS[0]), [])
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM transcription_issues").fetchone()[0], 2)
+                connection.execute("DELETE FROM lectures WHERE id=?", (first,))
+                self.assertIsNotNone(transcription_issues.find(connection, other, TEST_ACCOUNTS[1]))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM transcription_issues").fetchone()[0], 1)
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+
     def test_v20_continuations_migration_preserves_every_existing_row(self):
         with tempfile.TemporaryDirectory(prefix="stt-test-v21-migration-") as temporary:
             database = Database(Path(temporary) / "data" / "classroom.sqlite3", TEST_ACCOUNTS)
@@ -34,7 +113,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             database.initialize()
             with database.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual({table: [tuple(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')]
                                   for table in tables}, before)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM lecture_continuations").fetchone()[0], 0)
@@ -84,7 +163,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             database.initialize()
             with database.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual({table: [tuple(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')]
                                   for table in tables}, before)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM lecture_study_notes").fetchone()[0], 0)
@@ -148,7 +227,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             database.initialize()
             with database.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0],26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0],27)
                 self.assertEqual({table:[tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")]
                                   for table in before},before)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM account_password_resets").fetchone()[0],0)
@@ -178,7 +257,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             database.initialize()
             with database.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual({table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")]
                                   for table in before}, before)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM lecture_questions").fetchone()[0], 0)
@@ -214,7 +293,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             database.initialize()
             with database.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual({table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")]
                                   for table in before}, before)
                 for table in tables:
@@ -247,7 +326,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             database.initialize()
             with database.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0],26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0],27)
                 after = [dict(row) for row in connection.execute("SELECT * FROM lectures ORDER BY id")]
                 self.assertTrue(all(row.pop("trashed_at") is None for row in after))
                 self.assertEqual(after,before)
@@ -269,7 +348,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             database.initialize()
             with database.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual(tuple(connection.execute("SELECT * FROM lectures").fetchone()), before)
                 self.assertEqual([tuple(row) for row in connection.execute("SELECT * FROM users ORDER BY username")], users_before)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM lecture_metadata").fetchone()[0], 0)
@@ -300,7 +379,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             database.initialize()
             with database.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual(tuple(connection.execute("SELECT * FROM lectures").fetchone()), before)
                 self.assertEqual(connection.execute("SELECT last_verified_upload_at FROM drive_archive_statistics").fetchone()[0],
                                  "2026-09-06T00:00:00Z")
@@ -338,7 +417,7 @@ class DatabaseTests(unittest.TestCase):
                 after = dict(connection.execute("SELECT * FROM recording_archives").fetchone())
                 self.assertEqual({key: after[key] for key in before}, before)
                 self.assertEqual(tuple(after[key] for key in ("queued_at", "queued_bytes", "verified_at")), (None,) * 3)
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual(tuple(connection.execute("SELECT * FROM drive_archive_statistics").fetchone()), (1, None))
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute("UPDATE recording_archives SET queued_bytes=43")
@@ -358,7 +437,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             with database.connect() as connection:
                 self.assertEqual(tuple(connection.execute("SELECT * FROM lectures WHERE id=?", (lecture_id,)).fetchone()), before)
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 connection.execute(
                     "INSERT INTO lecture_translations(lecture_id,job_id,raw_revision,status,model,created_at,updated_at) "
                     "VALUES (?,?,'revision','queued','test-model','now','now')", (lecture_id, str(uuid.uuid4())),
@@ -383,7 +462,7 @@ class DatabaseTests(unittest.TestCase):
             database.initialize()
             with database.connect() as connection:
                 self.assertEqual(tuple(connection.execute("SELECT * FROM lectures WHERE id=?", (lecture_id,)).fetchone()), before)
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 connection.execute(
                     "INSERT INTO lecture_summaries(lecture_id,job_id,raw_revision,status,model,created_at,updated_at) "
                     "VALUES (?,?,'revision','queued','test-model','now','now')", (lecture_id, str(uuid.uuid4())),
@@ -415,7 +494,7 @@ class DatabaseTests(unittest.TestCase):
                     "WHERE lecture_id=? AND chunk_id=?", (lecture_id, chunk_id),
                 ).fetchone()
                 self.assertEqual(tuple(row), ("done", "test-payload", None))
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 26)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 27)
                 self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute("UPDATE chunks SET qwen_boundary_json=?", ("x" * 65537,))
@@ -545,7 +624,7 @@ class DatabaseTests(unittest.TestCase):
                 ).fetchone()
                 schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(tuple(state), (0, 0))
-            self.assertEqual(schema_version, 26)
+            self.assertEqual(schema_version, 27)
 
     def test_recording_archive_schema_keeps_remote_state_private_and_owned(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -686,7 +765,7 @@ class DatabaseTests(unittest.TestCase):
                     "AND name = 'drive_archive_user_folders'"
                 ).fetchone()
             self.assertEqual(tuple(row), ("ready", "opaqueDriveFile_1", 0, 0))
-            self.assertEqual(version, 26)
+            self.assertEqual(version, 27)
             self.assertIsNotNone(folders_table)
 
     def test_accounts_are_data_not_hardcoded_in_the_users_schema(self):
