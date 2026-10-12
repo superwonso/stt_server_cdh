@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - web/**
+      - study/**
+      - seed/**
       - tests/*.test.mjs
       - tests/test_publish_api_url.py
       - tests/test_runtime_config.py
@@ -35,6 +37,25 @@ jobs:
           persist-credentials: false
       - name: Test microphone queue and static privacy boundaries
         run: node --test tests/*.test.mjs
+      - name: Set up Node for the static study app
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+          run_install: false
+      - name: Validate and build the study app
+        working-directory: study
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+          NEXT_PUBLIC_BASE_PATH: /stt_server_cdh/study
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
+          pnpm run lint
+          pnpm run build
       - name: Test and stage public runtime configuration
         env:
           CLASSROOM_API_CONFIG: ${{ vars.CLASSROOM_API_CONFIG }}
@@ -42,6 +63,8 @@ jobs:
           python3 -m unittest tests/test_runtime_config.py tests/test_publish_api_url.py -v
           mkdir pages-artifact
           cp -a web/. pages-artifact/
+          mkdir -p pages-artifact/study
+          cp -a study/out/. pages-artifact/study/
           python3 scripts/runtime_config.py render pages-artifact/config.json
       - name: Configure Pages
         uses: actions/configure-pages@v5
