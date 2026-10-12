@@ -94,7 +94,7 @@ pnpm run build
 pnpm run test:e2e
 ```
 
-Windows E2E는 설치된 Microsoft Edge를 사용합니다. Linux CI에서는 `pnpm exec playwright install --with-deps chromium` 후 실행합니다. `pnpm run serve` 실행 중 `node scripts/audit.mjs`로 모바일 Lighthouse와 초기 전송 크기를 검사합니다.
+Windows E2E는 기본으로 설치된 Microsoft Edge를 사용합니다. `STUDY_BROWSER_EXECUTABLE`로 별도 시험 브라우저의 실행 파일을 지정할 수 있습니다. Linux CI에서는 `pnpm exec playwright install --with-deps chromium` 후 실행합니다. `pnpm run serve` 실행 중 `node scripts/audit.mjs`로 모바일 Lighthouse와 초기 전송 크기를 검사합니다.
 
 Pages 배포 후에는 `node scripts/check-public-assets.mjs`로 실제 공개된 자산의 학습 흐름을 검사합니다. 브라우저 안에서만 가상 부모·계정 범위를 제공하며 운영 계정·DB·유료 API를 사용하지 않습니다. 실제 운영 인증의 종단 검사를 대신하는 것은 아닙니다.
 

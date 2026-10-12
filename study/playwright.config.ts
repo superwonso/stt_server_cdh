@@ -7,8 +7,9 @@ export default defineConfig({
     baseURL: process.env.STUDY_TEST_URL || 'http://127.0.0.1:3218',
     trace: 'retain-on-failure',
     ...devices['Desktop Chrome'],
-    launchOptions:
-      process.platform === 'win32'
+    launchOptions: process.env.STUDY_BROWSER_EXECUTABLE
+      ? { executablePath: process.env.STUDY_BROWSER_EXECUTABLE }
+      : process.platform === 'win32'
         ? { executablePath: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' }
         : {},
   },

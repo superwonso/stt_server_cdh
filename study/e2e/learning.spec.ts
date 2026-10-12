@@ -100,21 +100,25 @@ test('mobile focus, dark theme, keyboard, two-stage clear and account reset', as
   await expect(app.getByRole('dialog')).toBeVisible();
   await app.getByRole('button', { name: '다음 단계', exact: true }).click();
   await app.getByRole('button', { name: '취소', exact: true }).click();
-  expect(
-    await page.evaluate(
-      (s) => Object.keys(JSON.parse(localStorage.getItem('hnk_v1')!).accounts[s].levels).length,
-      scope,
-    ),
-  ).toBe(1);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (s) => Object.keys(JSON.parse(localStorage.getItem('hnk_v1')!).accounts[s].levels).length,
+        scope,
+      ),
+    )
+    .toBe(1);
   await app.getByRole('button', { name: '기록 지우기', exact: true }).click();
   await app.getByRole('button', { name: '다음 단계', exact: true }).click();
   await app.getByRole('button', { name: '학습 기록 지우기', exact: true }).click();
-  expect(
-    await page.evaluate(
-      (s) => Object.keys(JSON.parse(localStorage.getItem('hnk_v1')!).accounts[s].levels).length,
-      scope,
-    ),
-  ).toBe(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (s) => Object.keys(JSON.parse(localStorage.getItem('hnk_v1')!).accounts[s].levels).length,
+        scope,
+      ),
+    )
+    .toBe(0);
   const overflow = await app.locator('body').evaluate((el) => el.scrollWidth > innerWidth);
   expect(overflow).toBe(false);
   await page.evaluate(() =>
