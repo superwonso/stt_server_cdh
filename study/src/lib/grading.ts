@@ -1,4 +1,5 @@
 import type { GradeResult, Question, QuestionType } from './types';
+import { getStructuredAliases } from './answer';
 
 /** Only comparison text is normalized. The question and answer remain exact. */
 export function normalizeAnswer(value: string): string {
@@ -7,6 +8,9 @@ export function normalizeAnswer(value: string): string {
     .toLocaleLowerCase('ko-KR')
     .replace(/[\s\p{P}\p{S}]+/gu, '');
 }
+
+/** Public name used by answer display/deduplication and import documentation. */
+export const clean = normalizeAnswer;
 
 /** Split lists without splitting a comma inside a parenthetical alias. */
 export function splitAnswers(value: string): string[] {
@@ -74,7 +78,7 @@ export function inferQuestionType(answer: string): QuestionType {
 }
 
 export function gradeAnswer(
-  question: Pick<Question, 'answer' | 'type'>,
+  question: Pick<Question, 'answer' | 'type'> & Partial<Question>,
   input: string,
 ): GradeResult {
   const normalizedInput = normalizeAnswer(input);
@@ -107,8 +111,21 @@ export function gradeAnswer(
       'sequence',
     );
   }
+  // Full-answer aliases include country variants and separator-free composite
+  // answers. getStructuredAliases never promotes one required slash component.
+  const variants = getStructuredAliases(question);
+  if (normalizedInput === normalizeAnswer(question.answer)) return result(true, 'exact');
+  if (variants.some((value) => normalizeAnswer(value) === normalizedInput))
+    return result(true, 'alias');
   if (question.type === 'multi') {
     const expected = splitAnswers(question.answer).map(answerAliases);
+    // Manually supplied full aliases can reorder answers. Do not merge their
+    // positions into component alias sets (A/B + B/A must not accept A/A).
+    for (const variant of getStructuredAliases({ ...question, aliases: [] })) {
+      const parts = splitAnswers(variant);
+      if (parts.length === expected.length)
+        parts.forEach((part, index) => expected[index].push(...answerAliases(part)));
+    }
     const actual = splitAnswers(input).map(normalizeAnswer);
     if (expected.length !== actual.length || actual.some((value) => !value))
       return result(false, 'multiple');
@@ -132,7 +149,6 @@ export function gradeAnswer(
       'multiple',
     );
   }
-  if (normalizedInput === normalizeAnswer(question.answer)) return result(true, 'exact');
   return result(
     answerAliases(question.answer).includes(normalizedInput),
     answerAliases(question.answer).includes(normalizedInput) ? 'alias' : 'mismatch',

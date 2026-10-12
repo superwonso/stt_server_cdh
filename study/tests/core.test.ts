@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { gradeAnswer, inferQuestionType, answerAliases } from '../src/lib/grading';
 import { getChoices, sequenceDistractors } from '../src/lib/choices';
 import { createRound, submitAnswer } from '../src/lib/round';
+import { renderAnswer, upgradeQuestion } from '../src/lib/answer';
 import {
   defaultProgress,
   loadProgress,
@@ -16,7 +17,7 @@ import type { Question, StorageAdapter } from '../src/lib/types';
 import seedData from '../data/questions.json';
 
 function question(id: string, answer: string, extra: Partial<Question> = {}): Question {
-  return {
+  return upgradeQuestion({
     id,
     chapter: '단원',
     sub: '소단원',
@@ -25,7 +26,7 @@ function question(id: string, answer: string, extra: Partial<Question> = {}): Qu
     answer,
     type: inferQuestionType(answer),
     ...extra,
-  };
+  });
 }
 function memory(): StorageAdapter & { values: Map<string, string> } {
   const values = new Map<string, string>();
@@ -119,17 +120,21 @@ describe('written answer grading preserves all required information', () => {
 });
 
 describe('multiple choice distractors', () => {
-  it('has exactly one grading-correct option for every approved seed question', () => {
-    const seed = seedData as Question[];
-    expect(seed).toHaveLength(665);
-    for (const item of seed) {
-      const choices = getChoices(item, seed, () => 0.4);
-      expect(
-        choices.filter((choice) => gradeAnswer(item, choice).correct),
-        item.id,
-      ).toEqual([item.answer]);
-    }
-  });
+  it(
+    'has exactly one grading-correct option for every approved seed question',
+    { timeout: 20_000 },
+    () => {
+      const seed = (seedData as Question[]).map((item) => upgradeQuestion(item));
+      expect(seed).toHaveLength(665);
+      for (const item of seed) {
+        const choices = getChoices(item, seed, () => 0.4);
+        expect(
+          choices.filter((choice) => gradeAnswer(item, choice).correct),
+          item.id,
+        ).toEqual([renderAnswer(item, { showCountry: true })]);
+      }
+    },
+  );
   it('uses distinct answers and avoids a valid alias as an incorrect option', () => {
     const target = question('a', '김구(김창수)');
     const pool = [

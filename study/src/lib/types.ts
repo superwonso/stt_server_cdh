@@ -1,4 +1,9 @@
 export type QuestionType = 'short' | 'multi' | 'sequence';
+export type Country =
+  '고구려' | '백제' | '신라' | '통일신라' | '발해' | '고려' | '조선' | '대한제국';
+export type AnswerPart =
+  | { kind: 'text'; value: string }
+  | { kind: 'ruler'; name: string; country: Country | null; countryAmbiguous?: boolean };
 export interface Question {
   id: string;
   chapter: string;
@@ -6,6 +11,9 @@ export interface Question {
   number: number;
   question: string;
   answer: string;
+  answerParts: AnswerPart[];
+  aliases: string[];
+  dataVersion: 2;
   type: QuestionType;
 }
 export type Level = 0 | 1 | 2;
@@ -28,6 +36,8 @@ export interface Progress extends DeckProgress {
   decks?: StudyDeck[];
   activeDeckId?: string;
   theme?: 'system' | 'light' | 'dark';
+  showCountry?: boolean;
+  dataVersion?: number;
   deckProgress?: Record<string, DeckProgress>;
   /** A read failure, never persisted as study data. */
   loadError?: StorageError;

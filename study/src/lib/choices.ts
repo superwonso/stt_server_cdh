@@ -1,5 +1,6 @@
 import type { Question } from './types';
 import { gradeAnswer, normalizeAnswer, sequenceTokens } from './grading';
+import { renderAnswer } from './answer';
 
 export function shuffled<T>(input: readonly T[], rng: () => number = Math.random): T[] {
   const result = [...input];
@@ -56,9 +57,11 @@ export function getChoices(
   question: Question,
   allQuestions: readonly Question[],
   rng: () => number = Math.random,
+  options: { showCountry: boolean } = { showCountry: true },
 ): string[] {
   const distractors: string[] = [];
-  const seen = new Set([normalizeAnswer(question.answer)]);
+  const correct = renderAnswer(question, options);
+  const seen = new Set([normalizeAnswer(correct)]);
   if (question.type === 'sequence')
     distractors.push(...sequenceDistractors(question.answer, 3, rng));
   else {
@@ -69,18 +72,21 @@ export function getChoices(
     ];
     for (const group of groups) {
       for (const item of shuffled(group, rng)) {
-        const normalized = normalizeAnswer(item.answer);
+        const display = renderAnswer(item, options);
+        const normalized = normalizeAnswer(display);
         if (
           item.id === question.id ||
           item.type === 'sequence' ||
           !normalized ||
           seen.has(normalized) ||
           gradeAnswer(question, item.answer).correct ||
-          gradeAnswer(item, question.answer).correct
+          gradeAnswer(question, display).correct ||
+          gradeAnswer(item, question.answer).correct ||
+          gradeAnswer(item, correct).correct
         )
           continue;
         seen.add(normalized);
-        distractors.push(item.answer);
+        distractors.push(display);
         if (distractors.length === 3) break;
       }
       if (distractors.length === 3) break;
@@ -88,5 +94,5 @@ export function getChoices(
   }
   // Small custom decks can have fewer than four distinct answers. Never invent
   // a fake name or duplicate option merely to fill an arbitrary slot count.
-  return shuffled([question.answer, ...distractors], rng);
+  return shuffled([correct, ...distractors], rng);
 }

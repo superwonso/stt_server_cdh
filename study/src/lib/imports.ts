@@ -1,4 +1,6 @@
 import { inferQuestionType } from './grading';
+import { upgradeQuestion } from './answer';
+import type { AnswerPart } from './types';
 
 export type QuestionKind = 'short' | 'multi' | 'sequence';
 
@@ -9,6 +11,9 @@ export interface DraftQuestion {
   question: string;
   answer: string;
   type: QuestionKind;
+  answerParts: AnswerPart[];
+  aliases: string[];
+  dataVersion: 2;
   source_excerpt?: string;
   source_page?: number | null;
 }
@@ -31,6 +36,9 @@ export interface ColumnMapping {
   answer: number;
   sub?: number;
   number?: number;
+  answerParts?: number;
+  aliases?: number;
+  dataVersion?: number;
 }
 
 export interface ImportTable {
@@ -62,6 +70,58 @@ function cleanCell(value: unknown): string {
     );
   }
   return result;
+}
+
+function structuredMetadata(source: Record<string, unknown>, context: string) {
+  if (source.dataVersion !== undefined && source.dataVersion !== 1 && source.dataVersion !== 2)
+    throw new Error(
+      `${context}의 데이터 버전을 확인해 주세요. 현재는 버전 1·2를 가져올 수 있어요.`,
+    );
+  if (
+    source.aliases !== undefined &&
+    (!Array.isArray(source.aliases) ||
+      source.aliases.length > 128 ||
+      !source.aliases.every((alias) => typeof alias === 'string' && alias.length <= 4000))
+  )
+    throw new Error(`${context}의 허용 별칭은 4,000자 이하 글자 최대 128개의 배열이어야 해요.`);
+  if (
+    source.answerParts !== undefined &&
+    (!Array.isArray(source.answerParts) ||
+      source.answerParts.length > 512 ||
+      !source.answerParts.every(
+        (part) =>
+          part &&
+          typeof part === 'object' &&
+          !Array.isArray(part) &&
+          ((part.kind === 'text' && typeof part.value === 'string' && part.value.length <= 4000) ||
+            (part.kind === 'ruler' &&
+              typeof part.name === 'string' &&
+              part.name.length <= 4000 &&
+              (part.country === null || typeof part.country === 'string'))),
+      ))
+  )
+    throw new Error(`${context}의 정답 구조 형식을 확인해 주세요.`);
+  return {
+    ...(source.answerParts !== undefined ? { answerParts: source.answerParts } : {}),
+    ...(source.aliases !== undefined ? { aliases: source.aliases } : {}),
+    ...(source.dataVersion !== undefined ? { dataVersion: source.dataVersion } : {}),
+  };
+}
+
+function tableMetadata(row: string[], mapping: ColumnMapping, context: string) {
+  const result: Record<string, unknown> = {};
+  for (const field of ['answerParts', 'aliases', 'dataVersion'] as const) {
+    const column = mapping[field];
+    if (column === undefined || column < 0) continue;
+    const cell = cleanCell(row[column]);
+    if (!cell) continue;
+    try {
+      result[field] = JSON.parse(cell);
+    } catch {
+      throw new Error(`${context}의 ${field} 열 JSON 형식을 확인해 주세요.`);
+    }
+  }
+  return structuredMetadata(result, context);
 }
 
 export function questionType(answer: string): QuestionKind {
@@ -170,6 +230,9 @@ const aliases: Record<keyof ColumnMapping, string[]> = {
   number: ['번호', '문항번호', 'number', 'no'],
   question: ['문제', '질문', '문항', '앞면', 'question', 'front', 'prompt'],
   answer: ['답', '정답', '답변', '뒷면', 'answer', 'back', 'response'],
+  answerParts: ['answerparts', '정답구조'],
+  aliases: ['aliases', '허용별칭'],
+  dataVersion: ['dataversion', '데이터버전'],
 };
 
 export function detectColumns(headers: string[]): ColumnMapping {
@@ -182,6 +245,9 @@ export function detectColumns(headers: string[]): ColumnMapping {
     answer: find('answer'),
     sub: find('sub'),
     number: find('number'),
+    answerParts: find('answerParts'),
+    aliases: find('aliases'),
+    dataVersion: find('dataVersion'),
   };
 }
 
@@ -244,7 +310,17 @@ export function tableToQuestions(
     used.add(key);
     const question = rawQuestion.replace(/^\s*\(\d+\)\s*/, '').trim();
     if (!question) throw new Error(`${index + 1}행에는 번호만 있고 문제가 없어요.`);
-    result.push({ chapter, sub, number, question, answer, type: questionType(answer) });
+    result.push(
+      upgradeQuestion({
+        chapter,
+        sub,
+        number,
+        question,
+        answer,
+        type: questionType(answer),
+        ...tableMetadata(row, mapping, `${index + 1}행`),
+      }),
+    );
     if (result.length > IMPORT_LIMITS.questions)
       throw new Error(
         `한 번에 ${IMPORT_LIMITS.questions}문제까지 가져올 수 있어요. 파일을 나눠 주세요.`,
@@ -314,12 +390,16 @@ export function parseJsonQuestions(text: string): DraftQuestion[] {
   const rows = raw.map((item, index) => {
     if (!item || typeof item !== 'object' || Array.isArray(item))
       throw new Error(`${index + 1}번째 문제의 형식을 확인해 주세요.`);
+    const question = cleanCell(item.question ?? item.문제);
+    const answer = cleanCell(item.answer ?? item.답);
+    if (!question || !answer)
+      throw new Error(`${index + 1}번째 문제의 ${question ? '정답' : '문제'}가 비어 있어요.`);
     return [
       cleanCell(item.chapter ?? item.파트 ?? '가져온 문제'),
       cleanCell(item.sub),
       cleanCell(item.number),
-      cleanCell(item.question ?? item.문제),
-      cleanCell(item.answer ?? item.답),
+      question,
+      answer,
     ];
   });
   const questions = tableToQuestions(
@@ -329,10 +409,16 @@ export function parseJsonQuestions(text: string): DraftQuestion[] {
   );
   return questions.map((question, index) => {
     const source = raw[index];
+    const enriched = upgradeQuestion({
+      ...question,
+      // Retain explicit country context until the canonicalizer has examined it.
+      answer: cleanCell(source.answer ?? source.답),
+      ...structuredMetadata(source, `${index + 1}번째 문제`),
+    });
     if (source.source_excerpt !== undefined) {
       if (typeof source.source_excerpt !== 'string' || source.source_excerpt.length > 400)
         throw new Error(`${index + 1}번째 문제의 원문 근거 형식을 확인해 주세요.`);
-      question.source_excerpt = source.source_excerpt;
+      enriched.source_excerpt = source.source_excerpt;
     }
     if (source.source_page !== undefined) {
       if (
@@ -340,9 +426,9 @@ export function parseJsonQuestions(text: string): DraftQuestion[] {
         (!Number.isSafeInteger(source.source_page) || source.source_page < 1)
       )
         throw new Error(`${index + 1}번째 문제의 원문 쪽 번호를 확인해 주세요.`);
-      question.source_page = source.source_page;
+      enriched.source_page = source.source_page;
     }
-    return question;
+    return enriched;
   });
 }
 

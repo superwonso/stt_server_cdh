@@ -8,13 +8,16 @@ import type {
   StorageResult,
   StudyDeck,
 } from './types';
+import { upgradeQuestion } from './answer';
 
 export const STORAGE_KEY = 'hnk_v1';
 export const MAX_DECKS = 20;
 export const MAX_DECK_QUESTIONS = 5000;
 export const MAX_STORAGE_CHARACTERS = 2_000_000;
 const RESERVED = new Set(['__proto__', 'prototype', 'constructor']);
-type AccountStore = { version: 1; accounts: Record<string, Progress> };
+// Read the original envelope, but write v2 so an already-open v1 client cannot
+// silently strip structured answers or the new display preference on save.
+type AccountStore = { version: 2; accounts: Record<string, Progress> };
 // Each browser context remembers the exact account state it last read/wrote.
 // Comparing only this account allows unrelated accounts to save independently.
 const baselines = new WeakMap<StorageAdapter, Map<string, string | null>>();
@@ -49,10 +52,21 @@ export function defaultProgress(): Progress {
     activeDeckId: 'seed',
     theme: 'system',
     deckProgress: {},
+    showCountry: true,
+    dataVersion: 2,
   };
 }
 
-export function validQuestion(value: unknown): value is Question {
+type StoredQuestion = Pick<
+  Question,
+  'id' | 'chapter' | 'sub' | 'number' | 'question' | 'answer' | 'type'
+> & {
+  answerParts?: unknown;
+  aliases?: unknown;
+  dataVersion?: unknown;
+};
+
+export function validQuestion(value: unknown): value is StoredQuestion {
   return (
     record(value) &&
     key(value.id) &&
@@ -94,7 +108,12 @@ function deckState(value: unknown): DeckProgress | null {
 export function sanitizeProgress(value: unknown): Progress | null {
   const common = deckState(value);
   if (!record(value) || !common || typeof value.initialized !== 'boolean') return null;
-  const result: Progress = { ...common, initialized: value.initialized };
+  const result: Progress = {
+    ...common,
+    initialized: value.initialized,
+    showCountry: typeof value.showCountry === 'boolean' ? value.showCountry : true,
+    dataVersion: 2,
+  };
   if (value.theme !== undefined) {
     if (!['system', 'light', 'dark'].includes(String(value.theme))) return null;
     result.theme = value.theme as Progress['theme'];
@@ -129,15 +148,20 @@ export function sanitizeProgress(value: unknown): Progress | null {
         id: deck.id,
         title: deck.title,
         createdAt: deck.createdAt,
-        questions: deck.questions.map((question) => ({
-          id: question.id,
-          chapter: question.chapter,
-          sub: question.sub,
-          number: question.number,
-          question: question.question,
-          answer: question.answer,
-          type: question.type,
-        })),
+        questions: deck.questions.map((question) =>
+          upgradeQuestion({
+            id: question.id,
+            chapter: question.chapter,
+            sub: question.sub,
+            number: question.number,
+            question: question.question,
+            answer: question.answer,
+            type: question.type,
+            answerParts: question.answerParts,
+            aliases: question.aliases,
+            dataVersion: question.dataVersion,
+          }),
+        ),
       });
     }
     result.decks = decks;
@@ -163,13 +187,13 @@ function readStore(adapter: StorageAdapter): { store?: AccountStore; error?: Sto
   } catch {
     return { error: 'unavailable' };
   }
-  if (raw === null) return { store: { version: 1, accounts: {} } };
+  if (raw === null) return { store: { version: 2, accounts: {} } };
   if (raw.length > MAX_STORAGE_CHARACTERS) return { error: 'corrupt' };
   try {
     const value: unknown = JSON.parse(raw);
     if (
       !record(value) ||
-      value.version !== 1 ||
+      ![1, 2].includes(value.version as number) ||
       !record(value.accounts) ||
       Object.keys(value.accounts).length > 100
     )
@@ -181,7 +205,7 @@ function readStore(adapter: StorageAdapter): { store?: AccountStore; error?: Sto
       if (!clean) return { error: 'corrupt' };
       accounts[scope] = clean;
     }
-    return { store: { version: 1, accounts } };
+    return { store: { version: 2, accounts } };
   } catch {
     return { error: 'corrupt' };
   }

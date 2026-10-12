@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { renderAnswer } from '../src/lib/answer';
+import { gradeAnswer } from '../src/lib/grading';
 import {
   decodeTextBytes,
   detectColumns,
@@ -48,6 +50,9 @@ describe('question table imports', () => {
       answer: 2,
       sub: 3,
       number: 4,
+      answerParts: -1,
+      aliases: -1,
+      dataVersion: -1,
     });
     expect(detectColumns(['단원명', '질문', '정답']).answer).toBe(2);
   });
@@ -62,7 +67,7 @@ describe('question table imports', () => {
     const header = detectHeaderRow(rows);
     expect(header).toBe(2);
     const questions = tableToQuestions(table(rows), mapping, header);
-    expect(questions).toEqual([
+    expect(questions).toMatchObject([
       {
         chapter: '삼국',
         sub: '고구려',
@@ -202,6 +207,151 @@ describe('question table imports', () => {
 });
 
 describe('CSV and JSON inputs', () => {
+  it('keeps the original country-parenthesis pair through JSON and Excel round trips in another country chapter', async () => {
+    const original = {
+      chapter: 'Ⅳ-1 조선',
+      sub: '지방 행정',
+      number: 17,
+      question: '향리 제도를 정비한 국가와 왕은?',
+      answer: '고려(성종)',
+      type: 'short',
+    };
+    const once = parseJsonQuestions(JSON.stringify([original]));
+    const afterJson = parseJsonQuestions(JSON.stringify({ version: 2, questions: once }));
+    expect(afterJson).toEqual(once);
+    expect(afterJson[0].answer).toBe(original.answer);
+    expect(afterJson[0].answerParts).toEqual([
+      { kind: 'text', value: '고려(' },
+      { kind: 'ruler', name: '성종', country: '고려' },
+      { kind: 'text', value: ')' },
+    ]);
+    const xlsx = await import('xlsx');
+    const book = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(
+      book,
+      xlsx.utils.aoa_to_sheet([
+        ['파트', '소제목', '번호', '문제', '답', 'answerParts', 'aliases', 'dataVersion'],
+        [
+          original.chapter,
+          original.sub,
+          original.number,
+          original.question,
+          original.answer,
+          JSON.stringify(afterJson[0].answerParts),
+          JSON.stringify(afterJson[0].aliases),
+          2,
+        ],
+      ]),
+      '문제-답',
+    );
+    const bytes = xlsx.write(book, { type: 'array', bookType: 'xlsx' });
+    const [sheet] = await readWorkbook(new File([bytes], '국가와왕.xlsx'));
+    const afterExcel = tableToQuestions(sheet, detectColumns(sheet.rows[0]));
+    expect(afterExcel).toEqual(afterJson);
+    const restored = afterExcel[0];
+    expect(renderAnswer(restored, { showCountry: true })).toBe(original.answer);
+    expect(renderAnswer(restored, { showCountry: false })).toBe(original.answer);
+    for (const answer of ['고려(성종)', '고려/성종', '성종/고려', '고려 성종', '성종 고려']) {
+      expect(gradeAnswer(restored, answer).correct, answer).toBe(true);
+    }
+    expect(gradeAnswer(restored, '조선 성종').correct).toBe(false);
+  });
+
+  it('preserves structured metadata and manual full-answer aliases through JSON round trips', () => {
+    const original = {
+      chapter: '조선',
+      sub: '왕',
+      number: 1,
+      question: '왕은?',
+      answer: '성종',
+      type: 'short',
+      dataVersion: 2,
+      answerParts: [{ kind: 'ruler', name: '성종', country: '조선' }],
+      aliases: ['성종대왕'],
+    };
+    const once = parseJsonQuestions(JSON.stringify({ version: 2, questions: [original] }));
+    expect(once[0]).toMatchObject({
+      answer: '성종',
+      dataVersion: 2,
+      answerParts: [{ kind: 'ruler', name: '성종', country: '조선' }],
+    });
+    expect(once[0].aliases).toContain('성종대왕');
+    expect(parseJsonQuestions(JSON.stringify({ version: 2, questions: once }))).toEqual(once);
+  });
+  it('does not lose explicit country context when importing legacy JSON without metadata', () => {
+    const result = parseJsonQuestions(JSON.stringify([{ question: '왕은?', answer: '조선 성종' }]));
+    expect(result[0]).toMatchObject({
+      answer: '성종',
+      type: 'short',
+      dataVersion: 2,
+      answerParts: [{ kind: 'ruler', name: '성종', country: '조선' }],
+    });
+  });
+  it('regenerates mismatching parts and never turns a non-ruler into a country-prefixed ruler', () => {
+    const data = [
+      {
+        question: '왕은?',
+        answer: '세종',
+        answerParts: [{ kind: 'ruler', name: '정조', country: '조선' }],
+      },
+      {
+        question: '제도는?',
+        answer: '대동법',
+        answerParts: [{ kind: 'ruler', name: '대동법', country: '조선' }],
+      },
+    ];
+    const result = parseJsonQuestions(JSON.stringify(data));
+    expect(result[0].answerParts).toEqual([{ kind: 'ruler', name: '세종', country: '조선' }]);
+    expect(result[1].answerParts).toEqual([{ kind: 'text', value: '대동법' }]);
+  });
+  it('rejects malformed metadata shapes and removes partial multi-answer aliases', () => {
+    const item = { question: '제도와 왕은?', answer: '대동법/광해군' };
+    const result = parseJsonQuestions(JSON.stringify([{ ...item, aliases: ['광해군', '대동법'] }]));
+    expect(result[0].aliases).not.toContain('광해군');
+    expect(result[0].aliases).not.toContain('대동법');
+    expect(() =>
+      parseJsonQuestions(JSON.stringify([{ ...item, aliases: { __proto__: '값' } }])),
+    ).toThrow('별칭');
+    expect(() =>
+      parseJsonQuestions(JSON.stringify([{ ...item, aliases: ['가'.repeat(4001)] }])),
+    ).toThrow('별칭');
+    expect(() =>
+      parseJsonQuestions(JSON.stringify([{ ...item, answerParts: [{ kind: 'text', value: {} }] }])),
+    ).toThrow('정답 구조');
+    expect(() => parseJsonQuestions(JSON.stringify([{ ...item, dataVersion: 99 }]))).toThrow(
+      '버전',
+    );
+  });
+  it('round trips optional structured Excel columns while keeping the answer cell pure', async () => {
+    const xlsx = await import('xlsx');
+    const book = xlsx.utils.book_new();
+    const parts = [{ kind: 'ruler', name: '성종', country: '조선' }];
+    const aliases = ['성종대왕'];
+    xlsx.utils.book_append_sheet(
+      book,
+      xlsx.utils.aoa_to_sheet([
+        ['파트', '소제목', '번호', '문제', '답', 'answerParts', 'aliases', 'dataVersion'],
+        ['조선', '왕', 1, '왕은?', '성종', JSON.stringify(parts), JSON.stringify(aliases), 2],
+      ]),
+      '문제-답',
+    );
+    const bytes = xlsx.write(book, { type: 'array', bookType: 'xlsx' });
+    const [sheet] = await readWorkbook(new File([bytes], '구조화문제.xlsx'));
+    const result = tableToQuestions(sheet, detectColumns(sheet.rows[0]));
+    expect(result[0].answer).toBe('성종');
+    expect(result[0].answerParts).toEqual(parts);
+    expect(result[0].aliases).toContain('성종대왕');
+    expect(result[0].dataVersion).toBe(2);
+    expect(() =>
+      tableToQuestions(
+        table([
+          ['문제', '답', 'aliases'],
+          ['왕은?', '성종', '잘못된 JSON'],
+        ]),
+        { chapter: -1, question: 0, answer: 1, aliases: 2 },
+      ),
+    ).toThrow('JSON');
+  });
   it('decodes UTF-8, UTF-16 and Korean Windows text without replacement characters', () => {
     expect(decodeTextBytes(new TextEncoder().encode('문제,답').buffer).text).toBe('문제,답');
     expect(decodeTextBytes(Uint8Array.from([0xff, 0xfe, 0x38, 0xbb]).buffer).text).toBe('문');
@@ -225,6 +375,14 @@ describe('CSV and JSON inputs', () => {
     expect(() => parseJsonQuestions('[]')).toThrow('찾지 못');
     expect(() => parseJsonQuestions('{oops}')).toThrow('JSON 문법');
     expect(() => parseJsonQuestions('[{"question":{},"answer":"답"}]')).toThrow('글자나 숫자');
+    expect(() =>
+      parseJsonQuestions(
+        JSON.stringify([
+          { chapter: '', sub: '', number: '', question: '', answer: '' },
+          { question: '왕은?', answer: '세종' },
+        ]),
+      ),
+    ).toThrow('1번째 문제');
   });
   it('preserves bounded source evidence for human review and rejects malformed evidence', () => {
     const question = {
