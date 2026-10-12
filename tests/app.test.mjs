@@ -28,6 +28,7 @@ import * as TestUnifiedNoteView from '../web/unified-note-view.js';
 const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
   .replace("import { createTimetableCatalog, fillTimetableSelect } from './timetable-subjects.js';", 'const {createTimetableCatalog,fillTimetableSelect}=TestTimetableSubjects;')
   .replace("import { createReminder } from './reminder.js';", 'const createReminder = () => ({reset(){},open(){},hide(){}});')
+  .replace("import { createStudyWorkspace } from './study-bridge.js';", 'const createStudyWorkspace = () => ({reset(){},open(){},hide(){}});')
   .replace("import { renderUnifiedStudyNote } from './unified-note-view.js';", 'const {renderUnifiedStudyNote} = TestUnifiedNoteView;')
   .replace("import { createMaterialPanel } from './study-materials.js';", 'const createMaterialPanel = () => ({reset(){},setScope(){}});')
   .replace("import { createCourseWorkspace } from './course-workspace.js';", 'const createCourseWorkspace = () => ({reset(){},open(){}});')
@@ -9305,17 +9306,25 @@ test('service tabs preserve live recording, current lesson and pending transfer 
   assert.equal(app.element('service-recording').hidden,false);
   assert.equal(app.element('reminder-logout').disabled,true);
   assert.equal(app.run('JSON.stringify([current,captureSession,pending])'),before);
+  app.run("selectService('study')");
+  assert.equal(app.element('study-panel').hidden,false);
+  assert.equal(app.element('reminder-panel').hidden,true);
+  assert.equal(app.element('service-study')['aria-selected'],'true');
+  assert.equal(app.run('recording'),true);
+  assert.equal(app.run('JSON.stringify([current,captureSession,pending])'),before);
   app.run("selectService('yeobaek')");
   assert.equal(app.element('main-content').hidden,false);
   assert.equal(app.run('JSON.stringify([current,captureSession,pending])'),before);
 });
 test('service tabs require login and reset reminder private state at login boundary',()=>{
   const app=reviewApp(()=>response({}));openReviewFixture(app);
-  app.run("globalThis.reminderResets=0;reminderWorkspace={reset(){reminderResets++},open(){},hide(){}}; selectService('reminder');");
+  app.run("globalThis.reminderResets=0;globalThis.studyResets=0;reminderWorkspace={reset(){reminderResets++},open(){},hide(){}};studyWorkspace={reset(){studyResets++},open(){},hide(){}}; selectService('study');");
   app.run('showLogin()');
   assert.equal(app.run('reminderResets'),1);
+  assert.equal(app.run('studyResets'),1);
   assert.equal(app.element('service-tabs').hidden,true);
   assert.equal(app.element('reminder-panel').hidden,true);
+  assert.equal(app.element('study-panel').hidden,true);
   app.run("selectService('reminder')");
   assert.equal(app.run('activeService'),'yeobaek');
 });
@@ -9323,8 +9332,10 @@ test('service tabs allow keyboard navigation without changing audio state',()=>{
   const app=reviewApp(()=>response({}));openReviewFixture(app);
   let prevented=false;
   app.element('service-tabs').onkeydown({key:'End',preventDefault(){prevented=true;}});
-  assert.ok(prevented);assert.equal(app.run('activeService'),'reminder');
-  assert.equal(app.element('service-reminder').focused,true);
+  assert.ok(prevented);assert.equal(app.run('activeService'),'study');
+  assert.equal(app.element('service-study').focused,true);
+  app.element('service-tabs').onkeydown({key:'ArrowLeft',preventDefault(){}});
+  assert.equal(app.run('activeService'),'reminder');
   app.element('service-tabs').onkeydown({key:'Home',preventDefault(){}});
   assert.equal(app.run('activeService'),'yeobaek');
 });

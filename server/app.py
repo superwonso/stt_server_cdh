@@ -63,6 +63,7 @@ from .translator import MindlogicTranslator
 from .translation_service import TranslationService
 from .study_notes import MindlogicStudyNotes
 from .study_note_service import StudyNoteService
+from .study_import import StudyImportService
 from .material_service import MaterialService
 from .course_review import CourseReviewService, install_courses, course_session_for, active_lecture_review
 from .security import PASSWORD_HASHER, RateLimiter, digest, new_secret, password_matches
@@ -377,6 +378,7 @@ def create_app(
     question_answerer=None,
     study_note_maker=None,
     course_review_maker=None,
+    study_generator=None,
     drive_storage=None,
     tunnel_status=None,
     tunnel_restart=None,
@@ -404,6 +406,8 @@ def create_app(
     correction_engine = postprocessor or MindlogicPostprocessor(settings)
     limiter = RateLimiter()
     timetable_recognizer = TimetableRecognizer(settings, database)
+    study_import_service = StudyImportService(settings, limiter, generator=study_generator,
+                                             capacity=timetable_recognizer.capacity)
     summary_service = SummaryService(settings, database, summarizer or MindlogicSummarizer(settings), limiter)
     translation_service = TranslationService(settings, database, translator or MindlogicTranslator(settings), limiter)
     question_service = QuestionService(settings, database, question_answerer or QuestionAnswerer(settings), limiter)
@@ -558,6 +562,7 @@ def create_app(
     app.state.translation_service = translation_service
     app.state.question_service = question_service
     app.state.study_note_service = study_note_service
+    app.state.study_import_service = study_import_service
     app.state.material_service = material_service
     app.state.course_review_service = course_review_service
     app.state.recording_store = recording_store
@@ -4083,6 +4088,7 @@ def create_app(
     install_courses(app, database, identity=data_identity, limiter=limiter)
     install_review(app, database, identity=data_identity, recognition=timetable_recognizer.capabilities)
     timetable_recognizer.install(app, identity=data_identity)
+    study_import_service.install(app, identity=data_identity)
     material_service.install(app, identity=data_identity)
     course_review_service.install(app, identity=data_identity, raw_segments=raw_segments,
                                   transcript_revision=transcript_revision)

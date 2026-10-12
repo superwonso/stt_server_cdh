@@ -21,7 +21,7 @@
     </nav>
   </header>
   <main class="policy-document" id="content">
-    <p class="policy-meta">시행일 · 2026년 9월 30일 / 버전 1.1</p>
+    <p class="policy-meta">시행일 · 2026년 10월 12일 / 버전 1.2</p>
     <h1>개인정보처리방침</h1>
     <p>차동현(이하 “운영자”)은 수업 기록 서비스 <strong>여백</strong>과 그 안의 <strong>리마인더</strong>를 운영합니다. 이 방침은 여백 웹사이트와 연결된 서버에서 개인정보를 어떻게 처리하는지 설명합니다. 정책 문서는 로그인 없이 읽을 수 있습니다.</p>
     <div class="policy-note">
@@ -51,6 +51,8 @@
         <dd>수업명·과목·날짜, 녹음 및 업로드한 파일, 전사문과 시간 정보, 메모, 자료에서 추출한 텍스트, 번역·정리본, 질문·답변과 처리 상태를 저장합니다. 수업 기록, 파일 변환, 검색, 내려받기 및 요청한 학습 기능 제공에 사용합니다.</dd>
         <dt>리마인더</dt>
         <dd>시간표, 과목, 학습 항목, 시험·복습 일정, 루틴, 완료 기록과 설정을 계정별로 저장합니다. 시간표 자동 인식을 요청하면 제출한 글 또는 이미지를 처리합니다. 인식 입력은 여백 서버에서 파일로 보관하지 않으며, 사용자가 확인해 등록한 시간표는 저장합니다.</dd>
+        <dt>암기 학습</dt>
+        <dd>암기 학습의 개인 문제집, 선택 단원, 학습 단계와 화면 설정은 로그인 계정별로 구분하여 현재 브라우저에 저장합니다. 파일 가져오기와 문제집 내보내기는 기기에서 처리하며 원본 파일을 서버로 업로드하지 않습니다. AI 문제 만들기에 따로 동의하여 실행하면 검토 화면의 텍스트와 요청한 문제 수를 운영 서버와 NOVA의 GPT-6 Luna 연결로 보냅니다. 학습 진도는 보내지 않습니다. 중복 호출 방지를 위한 요청 식별자·입력 해시·소유 계정·생성 결과는 운영 서버 메모리에 최대 512건까지 남고 서버 재시작 시 사라집니다. 원문과 결과를 이 기능의 서버 파일이나 데이터베이스에 저장하지 않습니다.</dd>
         <dt>운영·보안 및 문의</dt>
         <dd>접속·요청 시각, 오류 및 처리 상태, 기능 사용량, 보안 조치 기록을 서비스 유지와 장애 대응에 사용합니다. 관리자는 계정별 현재 작업 종류와 최근 기능 이용 시각을 확인할 수 있습니다. 최근 활동에는 녹음·파일 변환·AI 정리 요청·리마인더 사용 등 정해진 작업 종류와 계정·시각만 기록하며, 수업 내용·파일명·검색어·입력 문장·키 입력 내용은 포함하지 않습니다. 문의하면 회신용 이메일과 문의 내용을 처리합니다. 웹 호스팅·연결 업체는 IP 주소 등 접속 정보를 자체 서비스 제공·보안 목적으로 처리할 수 있습니다.</dd>
       </dl>
@@ -69,7 +71,7 @@
             <tr role="row"><th id="provider-cloudflare" role="rowheader" scope="row">Cloudflare</th><td role="cell" headers="provider-cloudflare provider-purpose" data-label="목적·시점">브라우저와 운영 서버의 통신 연결·보안</td><td role="cell" headers="provider-cloudflare provider-data" data-label="처리하는 정보">접속 정보와 서버로 전송하는 로그인·음성·수업 요청 및 응답. 통신을 중계하므로 모든 내용이 브라우저 안에서만 처리되는 서비스는 아닙니다.</td></tr>
             <tr role="row"><th id="provider-google" role="rowheader" scope="row">Google Drive</th><td role="cell" headers="provider-google provider-purpose" data-label="목적·시점">Drive 연동 시 완료된 녹음 보관·다운로드·삭제</td><td role="cell" headers="provider-google provider-data" data-label="처리하는 정보">녹음 WAV, 이용자 아이디를 사용한 보관 폴더명, 파일 식별자·크기·검증 정보, 연결한 Google 계정의 식별 정보와 접근 권한. 자세한 내용은 3항을 참고하세요.</td></tr>
             <tr role="row"><th id="provider-clova" role="rowheader" scope="row">NAVER Cloud · CLOVA Speech</th><td role="cell" headers="provider-clova provider-purpose" data-label="목적·시점">CLOVA를 선택한 수업의 실시간 음성 인식</td><td role="cell" headers="provider-clova provider-data" data-label="처리하는 정보">음성 및 인식 처리에 필요한 정보. 인식 결과는 운영자의 NAVER Cloud Object Storage에도 저장될 수 있으며, 여백의 수업 삭제만으로 그 사본이 삭제되지는 않습니다.</td></tr>
-            <tr role="row"><th id="provider-nova" role="rowheader" scope="row">마인드로직 · NOVA와 연결된 AI 모델 제공업체</th><td role="cell" headers="provider-nova provider-purpose" data-label="목적·시점">AI 후보정·요약·번역·정리·질문·복습 또는 시간표 인식을 요청할 때</td><td role="cell" headers="provider-nova provider-data" data-label="처리하는 정보">해당 작업에 필요한 전사·자료 텍스트와 자료명, 질문·참조 내용, 시간표 글 또는 이미지. 현재 서비스는 GPT-6 Luna를 요청하며 마인드로직의 연결 서비스를 이용합니다. 일부 정보 가림은 완전한 익명화를 뜻하지 않으며, 시간표 인식에는 제출한 글·이미지를 그대로 보냅니다.</td></tr>
+            <tr role="row"><th id="provider-nova" role="rowheader" scope="row">마인드로직 · NOVA와 연결된 AI 모델 제공업체</th><td role="cell" headers="provider-nova provider-purpose" data-label="목적·시점">AI 후보정·요약·번역·정리·질문·복습·시간표 인식·암기 문제 생성을 요청할 때</td><td role="cell" headers="provider-nova provider-data" data-label="처리하는 정보">해당 작업에 필요한 전사·자료 텍스트와 자료명, 질문·참조 내용, 시간표 글 또는 이미지, 문제 생성에 동의한 자료 텍스트. 현재 서비스는 GPT-6 Luna를 요청하며 마인드로직의 연결 서비스를 이용합니다. 일부 정보 가림은 완전한 익명화를 뜻하지 않으며, 시간표 인식에는 제출한 글·이미지를 그대로 보냅니다.</td></tr>
           </tbody>
         </table>
       </div>
@@ -114,6 +116,7 @@
       <p>여백은 자체 광고·방문자 분석 도구를 사용하지 않습니다. 로그인 복원을 위해 현재 탭의 저장소에 아이디·서버 주소·만료 시각·로그인 토큰을 보관하며, 유효기간은 서버 세션과 최대 24시간 중 짧은 쪽을 적용합니다. 로그아웃 시 로그인 기록을 정리합니다. 브라우저의 탭 복원 기능이 저장 상태를 복구할 수 있으므로 공용 기기에서는 직접 로그아웃해 주세요.</p>
       <p>서버 주소·화면 설정 등은 브라우저의 로컬 저장소에, 미전송·보류 음성과 복구 상태는 기기의 데이터베이스에 남을 수 있습니다. <strong>로그아웃하거나 서버 수업을 삭제해도 기기의 보류 음성이 자동으로 모두 지워지는 것은 아닙니다.</strong> 필요한 파일을 먼저 내려받은 후 앱의 기기 보관 관리 또는 브라우저의 사이트 데이터 삭제 기능을 사용하세요. 사이트 데이터를 지우면 아직 전송하지 못한 음성을 복구할 수 없을 수 있습니다.</p>
       <p>마이크·화면 오디오 권한은 브라우저 설정에서 거절하거나 철회할 수 있습니다. 거절하면 해당 녹음 기능을 사용할 수 없지만, 이미 저장된 기록 조회와 직접 입력 등 가능한 기능은 이용할 수 있습니다.</p>
+      <p>암기 학습의 <strong>기록 지우기</strong>는 현재 문제집의 학습 단계를 초기화합니다. 문제집과 다른 기기의 기록까지 삭제하는 동작은 아닙니다. 로그아웃해도 이 기기의 학습 기록은 남습니다. 공용 기기에서는 개인 문제집을 남기지 않도록 관리하고, 브라우저 사이트 데이터를 삭제하기 전에는 아직 보내지 못한 음성 등 필요한 자료를 먼저 보관해 주세요. AI 전송에 동의하지 않아도 문제·답 파일을 직접 가져와 학습할 수 있습니다.</p>
     </section>
 
     <section aria-labelledby="rights">
@@ -137,6 +140,7 @@
       <h2 id="changes">9. 방침 변경</h2>
       <p>처리 목적·항목·외부 전달·보관 방식 등이 바뀌면 이 페이지에 변경 내용과 시행일을 알립니다. 기존 범위를 넘어서는 이용에 동의가 필요한 경우에는 새로운 처리를 시작하기 전에 필요한 안내와 동의를 진행합니다.</p>
       <p class="policy-meta">2026년 9월 29일: 최초 공개.</p>
+      <p class="policy-meta">2026년 10월 12일: 암기 학습의 기기 저장과 선택적 AI 문제 만들기 처리 범위를 추가했습니다.</p>
     </section>
   </main>
   <footer class="policy-footer"><a href="./">여백으로 돌아가기</a> · <a href="./terms.html">서비스 이용약관</a></footer>

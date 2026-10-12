@@ -1,5 +1,6 @@
 import { createTimetableCatalog, fillTimetableSelect } from './timetable-subjects.js';
 import { createReminder } from './reminder.js';
+import { createStudyWorkspace } from './study-bridge.js';
 import { renderUnifiedStudyNote } from './unified-note-view.js';
 import { createMaterialPanel } from './study-materials.js';
 import { createCourseWorkspace } from './course-workspace.js';
@@ -3976,6 +3977,7 @@ function trackPresenceRequest(path,method,anonymous) {
   if (anonymous || presenceTimer === null || !token || !['POST','PUT'].includes(method)) return () => {};
   let activity = '';
   if (/^\/courses\/[^/]+\/reviews$/.test(path)) activity = 'course_review';
+  else if (path === '/study/generate') activity = 'questioning';
   else if (/^\/study-materials(?:$|\/[^/]+\/(?:content|convert)$)/.test(path)) activity = 'materials';
   else {
     const match = /^\/lectures\/[^/]+\/(summary|translation|questions|study-note)$/.exec(path);
@@ -5054,7 +5056,7 @@ $('study-note-download').onclick = event => {
 
 // Service navigation changes presentation only: microphone, transfer queues,
 // selected lecture and their recovery state remain owned by the existing app.
-let reminderWorkspace = null, activeService = 'yeobaek';
+let reminderWorkspace = null, studyWorkspace = null, activeService = 'yeobaek';
 const timetableCatalog = createTimetableCatalog({api,scopeKey:learningScopeKey,onChange:renderTimetableSuggestions});
 function updateTimetablePickerAvailability() {
   const empty = !timetableCatalog.snapshot().subjects.length;
@@ -5088,48 +5090,59 @@ for (const id of ['lecture-timetable-refresh','metadata-timetable-refresh']) $(i
 };
 
 function resetReminderWorkspace() {
-  reminderWorkspace?.reset(); timetableCatalog.reset(); activeService = 'yeobaek';
+  reminderWorkspace?.reset(); studyWorkspace?.reset(); timetableCatalog.reset(); activeService = 'yeobaek';
   $('service-tabs').hidden = true; $('reminder-logout').hidden = true;
-  $('reminder-panel').hidden = true; $('main-content').hidden = false;
+  $('reminder-panel').hidden = true; $('study-panel').hidden = true; $('main-content').hidden = false;
   document.querySelector('.sidebar').hidden = false;
   $('workspace').classList.toggle('show-reminder',false);
+  $('workspace').classList.toggle('show-study',false);
 }
 function updateServiceTabs() {
   const signedIn = !!user && !!token && !$('workspace').hidden;
   $('service-tabs').hidden = !signedIn;
-  $('reminder-logout').hidden = !signedIn || activeService !== 'reminder';
+  $('reminder-logout').hidden = !signedIn || activeService === 'yeobaek';
   $('reminder-logout').disabled = isBusy() || pending.length > 0
     || [...liveSessions.values()].some(session => session.owner === user && hasVolatilePendingAudio(session));
   $('service-recording').hidden = !recording && !paused;
   $('service-recording').textContent = paused ? ' · 일시정지' : ' · 녹음 중';
-  for (const name of ['yeobaek','reminder']) {
+  for (const name of ['yeobaek','reminder','study']) {
     $('service-'+name).setAttribute('aria-selected', String(name === activeService));
     $('service-'+name).tabIndex = name === activeService ? 0 : -1;
   }
 }
 function selectService(name) {
-  if (!user || !token || $('workspace').hidden || !['yeobaek','reminder'].includes(name)) return;
+  if (!user || !token || $('workspace').hidden || !['yeobaek','reminder','study'].includes(name)) return;
   activeService = name;
-  const showingReminder = name === 'reminder';
-  $('main-content').hidden = showingReminder;
-  document.querySelector('.sidebar').hidden = showingReminder;
+  const showingReminder = name === 'reminder', showingStudy = name === 'study';
+  $('main-content').hidden = name !== 'yeobaek';
+  document.querySelector('.sidebar').hidden = name !== 'yeobaek';
   $('reminder-panel').hidden = !showingReminder;
+  $('study-panel').hidden = !showingStudy;
   $('workspace').classList.toggle('show-reminder', showingReminder);
+  $('workspace').classList.toggle('show-study', showingStudy);
   updateServiceTabs();
   if (showingReminder) {
     if (!reminderWorkspace) reminderWorkspace = createReminder({container:$('reminder-panel'),api,scopeKey:learningScopeKey});
     void reminderWorkspace.open();
-  } else { reminderWorkspace?.hide(); void timetableCatalog.load({force:true}); }
+  } else reminderWorkspace?.hide();
+  if (showingStudy) {
+    if (!studyWorkspace) studyWorkspace = createStudyWorkspace({container:$('study-panel'),api,scopeKey:learningScopeKey,
+      getOwner:()=>user,onInteraction:()=>notePresenceInteraction()});
+    void studyWorkspace.open();
+  } else studyWorkspace?.hide();
+  if (name === 'yeobaek') void timetableCatalog.load({force:true});
   notePresenceStateChange();
 }
 $('service-yeobaek').onclick = () => selectService('yeobaek');
 $('service-reminder').onclick = () => selectService('reminder');
+$('service-study').onclick = () => selectService('study');
 $('reminder-logout').onclick = () => $('logout').click();
 $('service-tabs').onkeydown = event => {
   if (!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
   event.preventDefault();
-  const name = event.key === 'Home' ? 'yeobaek' : event.key === 'End' ? 'reminder'
-    : activeService === 'yeobaek' ? 'reminder' : 'yeobaek';
+  const names = ['yeobaek','reminder','study'];
+  const name = event.key === 'Home' ? names[0] : event.key === 'End' ? names.at(-1)
+    : names[(names.indexOf(activeService) + (event.key === 'ArrowRight' ? 1 : names.length - 1)) % names.length];
   selectService(name); $('service-'+name).focus();
 };
 

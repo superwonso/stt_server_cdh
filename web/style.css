@@ -3009,12 +3009,15 @@ button {
 .site-header:has(.service-tabs:not([hidden])) .connection-button { grid-column:4; grid-row:1; justify-self:end; }
 }
 .service-tabs { display:flex; gap:4px; margin-inline:auto; padding:4px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
-.service-tabs button { min-height:40px; padding:8px 20px; border:0; border-radius:10px; background:transparent; color:var(--muted); font-weight:700; white-space:nowrap; }
+.service-tabs button { min-height:44px; padding:8px 16px; border:0; border-radius:10px; background:transparent; color:var(--muted); font-weight:700; white-space:nowrap; }
 .service-tabs button[aria-selected="true"] { color:var(--surface); background:var(--forest-700); }
 .service-tabs button:focus-visible { outline:3px solid var(--forest-600); outline-offset:3px; }
 #service-recording { font-size:11px; }
-.workspace.show-reminder { display:block; }
-@media screen and (max-width:900px) {
+.workspace.show-reminder, .workspace.show-study { display:block; }
+.study-panel { width:100%; min-width:0; }
+.study-frame { display:block; width:100%; min-height:600px; border:0; background:var(--surface-muted); }
+.study-loading { margin:0; padding:24px; color:var(--muted); text-align:center; }
+@media screen and (max-width:1100px) {
   .site-header:has(.service-tabs:not([hidden])) {
     grid-template-columns:auto minmax(64px,1fr) auto;
     grid-template-rows:var(--header-height) auto;
@@ -3026,7 +3029,7 @@ button {
   .site-header:has(.service-tabs:not([hidden])) #reminder-logout { grid-column:2; justify-self:end; margin:0; font-size:12px; }
   .site-header:has(.service-tabs:not([hidden])) .connection-button { grid-column:3; max-width:min(150px,38vw); }
   .service-tabs { justify-content:center; }
-  .service-tabs button { flex:1; }
+  .service-tabs button { flex:1; padding-inline:10px; }
 }
 
 /* Explicit timetable suggestions fill text fields without changing a lecture group. */
@@ -3034,7 +3037,7 @@ button {
 .timetable-pick-row select { flex:1; width:0; min-width:0; max-width:100%; font-size:12px; min-height:40px; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--surface); color:var(--ink); }
 .timetable-pick-row button { flex-shrink:0; font-size:12px; min-height:40px; }
 .timetable-pick-help { display:block; color:var(--muted); font-size:11px; line-height:1.5; overflow-wrap:anywhere; }
-.workspace.show-reminder { grid-template-columns:minmax(0,1fr); }
+.workspace.show-reminder, .workspace.show-study { grid-template-columns:minmax(0,1fr); }
 
 .course-timetable-field { grid-column:1/-1; display:grid; gap:6px; }
 
