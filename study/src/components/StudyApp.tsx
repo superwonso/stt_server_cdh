@@ -11,6 +11,7 @@ import type {
 import { defaultProgress, loadProgress, saveProgressLocked, validQuestion } from '@/lib/storage';
 import { gradeAnswer } from '@/lib/grading';
 import { getChoices } from '@/lib/choices';
+import { renderAnswer, upgradeQuestion } from '@/lib/answer';
 import { createRound, submitAnswer } from '@/lib/round';
 import { useStudyBridge } from '@/lib/bridge';
 import type { DraftQuestion, GenerateRequest, GenerateResult } from '@/lib/imports';
@@ -136,11 +137,12 @@ function Workspace({
         )
           throw new Error(seedError);
         if (controller.signal.aborted) throw new Error(seedError);
+        const questions = data.map((question) => upgradeQuestion(question));
         if (mounted.current) {
-          seedCache.current = data;
-          setSeed(data);
+          seedCache.current = questions;
+          setSeed(questions);
         }
-        return data as Question[];
+        return questions;
       } catch (error) {
         if (mounted.current && !controller.signal.aborted) setSeedFailed(true);
         throw error;
@@ -275,6 +277,7 @@ function Workspace({
     };
   }, [loaded, pendingSeedProgress, ensureSeed]);
   const title = deck?.title || '한능검 · 공부내용 확인';
+  const showCountry = progress.showCountry ?? true;
   const commit = useCallback(
     async (next: Progress) => {
       if (!mounted.current) return false;
@@ -307,11 +310,11 @@ function Workspace({
   const generatedChoices = useMemo(() => {
     if (!activeQuestion) return [];
     try {
-      return getChoices(activeQuestion, questions);
+      return getChoices(activeQuestion, questions, Math.random, { showCountry });
     } catch {
       return [];
     }
-  }, [activeQuestion, questions]);
+  }, [activeQuestion, questions, showCountry]);
   const choices = feedback?.choices || generatedChoices;
   const isWritten =
     feedback?.written ??
@@ -448,7 +451,7 @@ function Workspace({
         const q = all.find((item) => item.id === id);
         if (q && (next.levels[id] || 0) === 0) {
           try {
-            if (getChoices(q, all).length < 2) next.levels[id] = 1;
+            if (getChoices(q, all, Math.random, { showCountry }).length < 2) next.levels[id] = 1;
           } catch {
             next.levels[id] = 1;
           }
@@ -579,7 +582,7 @@ function Workspace({
       if (!currentAction(version)) return;
       if (format === 'json') await exporter.downloadStudyJson(all, title);
       if (format === 'excel') await exporter.downloadStudyExcel(all, title);
-      if (format === 'pdf') await exporter.downloadStudySheet(all, title);
+      if (format === 'pdf') await exporter.downloadStudySheet(all, title, { showCountry });
       if (currentAction(version)) setNotice('다운로드 파일을 확인해 주세요.');
     } catch (caught) {
       if (currentAction(version))
@@ -844,6 +847,15 @@ function Workspace({
                   {pendingSeedProgress ? '진도 확인 중' : `${remaining}문제 더 익히기`}
                 </span>
               </div>
+              <label className="study-check study-section">
+                <input
+                  type="checkbox"
+                  disabled={actionPending}
+                  checked={showCountry}
+                  onChange={(e) => commit({ ...progress, showCountry: e.target.checked })}
+                />
+                왕 이름 앞에 나라 표시
+              </label>
               <div className="study-launch">
                 <button
                   className="study-btn study-btn-primary"
@@ -998,7 +1010,7 @@ function Workspace({
                     <p>
                       {feedback.correct
                         ? '잘 기억했어요. 다음 문제로 넘어갑니다.'
-                        : `정답: ${feedback.question.answer}`}
+                        : `정답: ${renderAnswer(feedback.question, { showCountry })}`}
                     </p>
                     <div className="study-controls">
                       {!feedback.correct && feedback.written && round.lastAnswer?.written && (
@@ -1077,7 +1089,7 @@ function Workspace({
                       return q ? (
                         <li key={id}>
                           <strong>{q.question}</strong>
-                          <p className="study-muted">정답: {q.answer}</p>
+                          <p className="study-muted">정답: {renderAnswer(q, { showCountry })}</p>
                         </li>
                       ) : null;
                     })}
@@ -1115,7 +1127,9 @@ function Workspace({
               >
                 <span className="study-badge">{flipped ? '정답' : '문제'}</span>
                 <span className="study-question">
-                  {flipped ? flash[flashIndex].answer : flash[flashIndex].question}
+                  {flipped
+                    ? renderAnswer(flash[flashIndex], { showCountry })
+                    : flash[flashIndex].question}
                 </span>
                 <span className="study-muted study-small">눌러서 뒤집기 · Space</span>
               </button>

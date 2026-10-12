@@ -1,4 +1,5 @@
 import type { DraftQuestion } from './imports';
+import { renderAnswer } from './answer';
 
 function filename(title: string): string {
   return (
@@ -24,7 +25,7 @@ function download(data: BlobPart, type: string, name: string): void {
 
 export function downloadStudyJson(questions: DraftQuestion[], title: string): void {
   download(
-    JSON.stringify({ version: 1, title, questions }, null, 2),
+    JSON.stringify({ version: 2, title, questions }, null, 2),
     'application/json;charset=utf-8',
     `${filename(title)}.json`,
   );
@@ -33,8 +34,17 @@ export function downloadStudyJson(questions: DraftQuestion[], title: string): vo
 export async function downloadStudyExcel(questions: DraftQuestion[], title: string): Promise<void> {
   const xlsx = await import('xlsx');
   const rows = [
-    ['파트', '소제목', '번호', '문제', '답'],
-    ...questions.map((item) => [item.chapter, item.sub, item.number, item.question, item.answer]),
+    ['파트', '소제목', '번호', '문제', '답', 'answerParts', 'aliases', 'dataVersion'],
+    ...questions.map((item) => [
+      item.chapter,
+      item.sub,
+      item.number,
+      item.question,
+      item.answer,
+      JSON.stringify(item.answerParts),
+      JSON.stringify(item.aliases),
+      item.dataVersion,
+    ]),
   ];
   const sheet = xlsx.utils.aoa_to_sheet(rows);
   // XLSX stores strings with an explicit cell type. Keep formula-like answers as
@@ -50,7 +60,16 @@ export async function downloadStudyExcel(questions: DraftQuestion[], title: stri
       delete cell.f;
     }
   }
-  sheet['!cols'] = [{ wch: 24 }, { wch: 30 }, { wch: 8 }, { wch: 80 }, { wch: 45 }];
+  sheet['!cols'] = [
+    { wch: 24 },
+    { wch: 30 },
+    { wch: 8 },
+    { wch: 80 },
+    { wch: 45 },
+    { wch: 55 },
+    { wch: 40 },
+    { wch: 12 },
+  ];
   const workbook = xlsx.utils.book_new();
   xlsx.utils.book_append_sheet(workbook, sheet, '문제-답');
   const bytes = xlsx.write(workbook, { type: 'array', bookType: 'xlsx', compression: true });
@@ -63,6 +82,7 @@ export async function downloadStudyExcel(questions: DraftQuestion[], title: stri
 
 export interface StudyPdfOptions {
   fontUrl?: string;
+  showCountry?: boolean;
 }
 
 /** Produces a local, printable question booklet with a separate answer section. */
@@ -72,6 +92,9 @@ export async function downloadStudySheet(
   options: StudyPdfOptions = {},
 ): Promise<void> {
   if (!questions.length) throw new Error('PDF로 만들 문제가 없어요.');
+  const displayAnswers = questions.map((question) =>
+    renderAnswer(question, { showCountry: options.showCountry ?? true }),
+  );
   const [{ PDFDocument, rgb }, fontkit] = await Promise.all([
     import('pdf-lib'),
     import('@pdf-lib/fontkit'),
@@ -93,7 +116,12 @@ export async function downloadStudySheet(
   const supported = new Set(font.getCharacterSet());
   const allText = [
     title,
-    ...questions.flatMap((item) => [item.chapter, item.sub, item.question, item.answer]),
+    ...questions.flatMap((item, index) => [
+      item.chapter,
+      item.sub,
+      item.question,
+      displayAnswers[index],
+    ]),
   ].join('\n');
   for (const character of allText) {
     if (!/[\s\u0000-\u001f]/.test(character) && !supported.has(character.codePointAt(0)!)) {
@@ -186,9 +214,9 @@ export async function downloadStudySheet(
   y -= 16;
   write('가져온 원문과 직접 확인한 정답을 바탕으로 복습하세요.', 9, muted);
   y -= 14;
-  questions.forEach((item, index) => {
-    ensure(Math.min(100, lines(`${index + 1}. ${item.answer}`, 10.5).length * 17 + 14));
-    write(`${index + 1}. ${item.answer}`);
+  displayAnswers.forEach((answer, index) => {
+    ensure(Math.min(100, lines(`${index + 1}. ${answer}`, 10.5).length * 17 + 14));
+    write(`${index + 1}. ${answer}`);
     y -= 10;
   });
   pages.forEach((page, index) => {

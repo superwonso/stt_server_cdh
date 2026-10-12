@@ -24,6 +24,7 @@ const result = spawnSync(
     path.join(directory, 'node_modules/@playwright/test/cli.js'),
     'test',
     'e2e/learning.spec.ts',
+    'e2e/structured-answer.spec.ts',
     '--reporter=list,json',
     '--output=test-results/public-assets',
     ...args,
