@@ -25,6 +25,7 @@ const result = spawnSync(
     'test',
     'e2e/learning.spec.ts',
     'e2e/structured-answer.spec.ts',
+    'e2e/keyboard.spec.ts',
     '--reporter=list,json',
     '--output=test-results/public-assets',
     ...args,

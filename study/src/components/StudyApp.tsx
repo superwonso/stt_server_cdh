@@ -112,6 +112,7 @@ function Workspace({
   const dialog = useRef<HTMLDialogElement>(null);
   const answerInput = useRef<HTMLInputElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const heldShortcuts = useRef(new Set<string>());
   const cancelAction = useCallback(() => {
     actionVersion.current++;
     actionBusy.current = false;
@@ -221,6 +222,21 @@ function Workspace({
     activeRef.current = active;
     if (!active) cancelAction();
   }, [active, cancelAction]);
+  useEffect(() => {
+    const held = heldShortcuts.current;
+    const release = (event: KeyboardEvent) => held.delete(event.code || event.key);
+    const clear = () => held.clear();
+    clear();
+    window.addEventListener('keyup', release);
+    window.addEventListener('blur', clear);
+    document.addEventListener('visibilitychange', clear);
+    return () => {
+      clear();
+      window.removeEventListener('keyup', release);
+      window.removeEventListener('blur', clear);
+      document.removeEventListener('visibilitychange', clear);
+    };
+  }, [active]);
   useEffect(() => {
     const theme = progress.theme || 'system';
     if (theme === 'system') delete document.documentElement.dataset.theme;
@@ -372,99 +388,138 @@ function Workspace({
     },
     [flash, flashIndex],
   );
-  useEffect(() => {
-    const keyboard = (event: KeyboardEvent) => {
-      if (
-        !active ||
-        event.isComposing ||
-        event.keyCode === 229 ||
-        event.repeat ||
-        dialog.current?.open
-      )
-        return;
-      const target = event.target as HTMLElement;
-      if (view === 'learn') {
-        if (event.key === 'Enter' && feedback) {
-          event.preventDefault();
-          finishFeedback();
-          return;
-        }
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
-        if (
-          !feedback &&
-          !isWritten &&
-          /^[1-4]$/.test(event.key) &&
-          choices[Number(event.key) - 1]
-        ) {
-          event.preventDefault();
-          answer(choices[Number(event.key) - 1]);
-        }
-      }
-      if (view === 'flash' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) {
-        if (event.key === ' ') {
-          event.preventDefault();
-          setFlipped((v) => !v);
-        }
-        if (event.key === 'ArrowLeft') {
-          event.preventDefault();
-          flashAnswer(false);
-        }
-        if (event.key === 'ArrowRight') {
-          event.preventDefault();
-          flashAnswer(true);
-        }
-      }
-    };
-    window.addEventListener('keydown', keyboard);
-    return () => window.removeEventListener('keydown', keyboard);
-  }, [active, view, feedback, finishFeedback, isWritten, answer, choices, flashAnswer]);
-  const beginAction = () => {
+  const beginAction = useCallback(() => {
     if (actionBusy.current || !activeRef.current || !mounted.current) return null;
     actionBusy.current = true;
     setActionPending(true);
     return ++actionVersion.current;
-  };
-  const currentAction = (version: number) =>
-    mounted.current && activeRef.current && actionVersion.current === version;
-  const finishAction = (version: number) => {
+  }, []);
+  const currentAction = useCallback(
+    (version: number) => mounted.current && activeRef.current && actionVersion.current === version,
+    [],
+  );
+  const finishAction = useCallback((version: number) => {
     if (actionVersion.current !== version) return;
     actionBusy.current = false;
     if (mounted.current) {
       setActionPending(false);
       setExporting(false);
     }
-  };
-  const startLearn = async (newSession = true) => {
-    if (!selectedCount) return;
-    const version = beginAction();
-    if (version === null) return;
-    try {
-      const all = deck?.questions || (await ensureSeed());
-      if (!currentAction(version)) return;
-      const chosen = all.filter((q) => progress.selectedChapters.includes(q.chapter));
-      if (!chosen.length) return;
-      if (newSession) setStats(emptyStats);
-      setFeedback(null);
-      setWritten('');
-      const next = createRound(chosen, progress.levels, { size: 7, shuffle: progress.shuffle });
-      for (const id of next.initialIds) {
-        const q = all.find((item) => item.id === id);
-        if (q && (next.levels[id] || 0) === 0) {
-          try {
-            if (getChoices(q, all, Math.random, { showCountry }).length < 2) next.levels[id] = 1;
-          } catch {
-            next.levels[id] = 1;
+  }, []);
+  const startLearn = useCallback(
+    async (newSession = true) => {
+      if (!selectedCount) return;
+      const version = beginAction();
+      if (version === null) return;
+      try {
+        const all = deck?.questions || (await ensureSeed());
+        if (!currentAction(version)) return;
+        const chosen = all.filter((q) => progress.selectedChapters.includes(q.chapter));
+        if (!chosen.length) return;
+        if (newSession) setStats(emptyStats);
+        setFeedback(null);
+        setWritten('');
+        const next = createRound(chosen, progress.levels, { size: 7, shuffle: progress.shuffle });
+        for (const id of next.initialIds) {
+          const q = all.find((item) => item.id === id);
+          if (q && (next.levels[id] || 0) === 0) {
+            try {
+              if (getChoices(q, all, Math.random, { showCountry }).length < 2) next.levels[id] = 1;
+            } catch {
+              next.levels[id] = 1;
+            }
           }
         }
+        setRound(next);
+        setView(next.queue.length ? 'learn' : 'result');
+      } catch {
+        if (currentAction(version)) setError(seedError);
+      } finally {
+        finishAction(version);
       }
-      setRound(next);
-      setView(next.queue.length ? 'learn' : 'result');
-    } catch {
-      if (currentAction(version)) setError(seedError);
-    } finally {
-      finishAction(version);
-    }
-  };
+    },
+    [
+      selectedCount,
+      beginAction,
+      deck,
+      ensureSeed,
+      currentAction,
+      progress.selectedChapters,
+      progress.levels,
+      progress.shuffle,
+      showCountry,
+      finishAction,
+    ],
+  );
+  useEffect(() => {
+    const keyboard = (event: KeyboardEvent) => {
+      if (
+        !active ||
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.keyCode === 229 ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.metaKey ||
+        event.shiftKey ||
+        dialog.current?.open
+      )
+        return;
+      const code = event.code || event.key;
+      if (heldShortcuts.current.has(code)) {
+        event.preventDefault();
+        return;
+      }
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable ||
+          (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) &&
+            !(target instanceof HTMLInputElement && target.disabled)))
+      )
+        return;
+      if (event.repeat) return;
+      const numberKey = /^[1-4]$/.test(event.key);
+      const takeKey = () => {
+        event.preventDefault();
+        heldShortcuts.current.add(code);
+      };
+      if (view === 'learn') {
+        // Consume a continuation separately: it must never answer the next question.
+        if (feedback && (numberKey || event.key === 'Enter')) {
+          takeKey();
+          finishFeedback();
+          return;
+        }
+        if (!feedback && !isWritten && numberKey && choices[Number(event.key) - 1]) {
+          takeKey();
+          answer(choices[Number(event.key) - 1]);
+        }
+        return;
+      }
+      if (view === 'round' && (numberKey || event.key === 'Enter')) {
+        takeKey();
+        void startLearn(false);
+        return;
+      }
+      if (view === 'flash') {
+        if (event.key === ' ') {
+          takeKey();
+          setFlipped((v) => !v);
+        }
+        if (event.key === 'ArrowLeft') {
+          takeKey();
+          flashAnswer(false);
+        }
+        if (event.key === 'ArrowRight') {
+          takeKey();
+          flashAnswer(true);
+        }
+      }
+    };
+    window.addEventListener('keydown', keyboard);
+    return () => window.removeEventListener('keydown', keyboard);
+  }, [active, view, feedback, finishFeedback, isWritten, answer, choices, flashAnswer, startLearn]);
   const startFlash = async (list?: Question[]) => {
     const version = beginAction();
     if (version === null) return;
@@ -1035,7 +1090,8 @@ function Workspace({
                 )}
               </div>
               <p className="study-footer-note">
-                {isWritten ? 'Enter 정답 확인' : '숫자 1–4 보기 선택'} · Enter 계속하기
+                {isWritten ? 'Enter 정답 확인' : '숫자 1–4 보기 선택'} · 결과를 본 뒤 숫자 1–4 또는
+                Enter로 계속하기
                 <br />
                 중간에 나가도 지금까지 익힌 단계는 저장돼요.
               </p>
@@ -1078,6 +1134,9 @@ function Workspace({
                   </button>
                 )}
               </div>
+              {view === 'round' && (
+                <p className="study-footer-note">숫자 1–4 또는 Enter로 다음 라운드</p>
+              )}
               {stats.wrongIds.length > 0 && (
                 <details className="study-section text-left">
                   <summary className="study-btn">
