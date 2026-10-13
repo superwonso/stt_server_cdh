@@ -986,7 +986,7 @@ function Workspace({
                   </span>
                 </div>
                 {activeQuestion.sub && (
-                  <p className="study-muted study-small study-section">{activeQuestion.sub}</p>
+                  <p className="study-question-context">{activeQuestion.sub}</p>
                 )}
                 <h1 ref={heading} tabIndex={-1} className="study-question" data-testid="question">
                   {activeQuestion.question}

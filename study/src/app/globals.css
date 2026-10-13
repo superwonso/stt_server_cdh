@@ -356,6 +356,16 @@ textarea.study-input {
   margin: 26px 0 30px;
   font-weight: 600;
 }
+.study-question-context {
+  margin: 24px 0 0;
+  color: var(--ink);
+  font-size: clamp(1.2rem, 2.3vw, 1.47rem);
+  font-weight: 500;
+  line-height: 1.6;
+  white-space: pre-line;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
 .study-badge {
   display: inline-flex;
   align-items: center;
