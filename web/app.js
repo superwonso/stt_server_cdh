@@ -111,8 +111,9 @@ const loadedLectureOwners = new WeakMap();
 let textExportIdentity = '', continuationCapability = '', partialRecordingCapability = '';
 let recordingUploadCapability = '', audioSending = false, audioRetryTimer = null, audioRetryAttempt = 0;
 let audioUploadError = '', audioUploadErrorScope = '';
-// Korean, English, and automatic detection default to Qwen. Explicit choices belong to that
-// language in this account session, never shared storage or an active lecture.
+// Korean defaults to configured CLOVA; English and automatic detection default to Qwen.
+// Explicit choices belong to that language in this account session, never shared storage
+// or an active lecture.
 let micProviderPreferences = {};
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30000;
@@ -5288,7 +5289,7 @@ function preferredMicrophoneProvider() {
   const preference = micProviderPreferences[language];
   if (preference === 'qwen') return 'qwen';
   if (preference === 'clova' && transcriptionProviders.clova.configured) return 'clova';
-  return 'qwen';
+  return language === 'ko' && transcriptionProviders.clova.configured ? 'clova' : 'qwen';
 }
 function applyNewLectureProvider() {
   // Historical and in-progress lectures display their immutable persisted
