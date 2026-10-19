@@ -5,6 +5,7 @@ import { renderUnifiedStudyNote } from './unified-note-view.js';
 import { createMaterialPanel } from './study-materials.js';
 import { createCourseWorkspace } from './course-workspace.js';
 import { MicrophoneCapture } from './audio.js';
+import { RecordingDeadline, validRecordingControl, recordingStopMessage } from './recording-control.js';
 import { validateRecordingSelection, isFileDrag, recordingFileFromDrop } from './recording-file-selection.js';
 import { buildRecoverableLocalAudioExports, mergeLocalAudioExportParts, validateLocalWav } from './local-audio-export.js';
 import { renderDriveStatus } from './admin-storage.js';
@@ -47,6 +48,8 @@ let draft = null, captureSession = null, pausePromise = null, resumePromise = nu
 let elapsedActiveMs = 0, elapsedStartedAt = 0;
 let noticeTimer, statusTimer, statusSequence = 0, retryTimer = null, retryAttempt = 0, retryMessage = '';
 let captureWarning = '';
+let asrController = null, asrCaptureId = null, asrRun = 0, recordingControlTimer = null;
+let transcriptionStopPromise = null;
 let inputUnavailable = false, inputReconnectNeeded = false, inputUnavailableMessage = '';
 let liveQueue = null, liveQueueReady = null, liveQueueAvailable = false;
 let liveQueueRecoveryPromise = null;
@@ -222,6 +225,7 @@ function recordingAudioComplete(lecture) {
   return lecture?.recording_audio_finalized === true || lecture?.recording_finalized === true;
 }
 function canFinalizeStoppedRecording() {
+  if(liveSessions.get(current?.id)?.transcriptionStopped)return false;
   return !!(user && token && current && !current.recording_finalized
     && (current.recording_available || localPcmSnapshots.has(current.id))
     && !isBusy() && !importIsActive() && !importStarting && !importCancelling);
@@ -564,6 +568,7 @@ async function finishRemovedPendingChunk(chunk) {
     volatilePendingWarning = '';
   }
   if (chunk?.final && !pending.some(item => item.captureId === chunk.captureId)) {
+    if(session && !session.transcriptionStopped) { session.deadline?.stop(); void syncRecordingControl(session,'finish').catch(() => {}); }
     cancelStorageRetry(session);
     if (session?.durable && liveQueueAvailable) {
       try {
@@ -623,6 +628,7 @@ function storedSessionInput(session) {
   return {id:session.id,owner:session.owner,title:session.title,language:session.language,
     source:session.source,asrProvider:session.asrProvider,createdAt:session.createdAt,
     ...(session.uploadHeld ? {uploadHeld:true} : {}),
+    ...(session.transcriptionStopped ? {transcriptionStopped:true,transcriptionStopReason:session.stopReason || 'manual'} : {}),
     ...(session.continuationOf ? {continuationOf:session.continuationOf} : {})};
 }
 
@@ -875,6 +881,9 @@ function runtimeSessionFromStored(stored) {
     asrProvider:stored.asrProvider,
     continuationOf:stored.continuationOf || null,
     uploadHeld:stored.uploadHeld === true,
+    transcriptionStopped:stored.transcriptionStopped === true,
+    stopReason:stored.transcriptionStopReason || 'manual',
+    heldError:stored.transcriptionStopped ? recordingStopMessage(stored.transcriptionStopReason) : '',
     heldDurable:stored.uploadHeld === true,
     recoveryClosedAt:stored.recoveryClosedAt || null,
     continuationVerified:!!stored.continuationOf && !!lecture,
@@ -931,6 +940,8 @@ async function performDurableLiveAudioRecovery(owner) {
       // Never let a stale ordinary create/recovery undo an in-memory hold that
       // has not yet been made durable; only the explicit restore action may.
       session.uploadHeld = session.uploadHeld === true || stored.uploadHeld === true;
+      session.transcriptionStopped ||= stored.transcriptionStopped === true;
+      if(stored.transcriptionStopped){session.stopReason=stored.transcriptionStopReason || 'manual';session.heldError=recordingStopMessage(session.stopReason);}
       if (stored.uploadHeld === true) session.heldDurable = true;
       session.recoveryClosedAt = stored.recoveryClosedAt || null;
       const candidate = lectures.find(item => item.id === stored.id) || null;
@@ -1016,7 +1027,9 @@ async function performDurableLiveAudioRecovery(owner) {
   for (const [id,session] of byId) {
     const sessionChunks = pending.filter(chunk => chunk.captureId === id);
     const snapshot = localPcmSnapshots.get(id);
+    if (session.transcriptionStopped) { watchRecordingControl(session); if(!session.lecture)void ensureLectureAssigned(session); }
     if (session.uploadHeld) continue;
+    watchRecordingControl(session);
     const stillCapturedHere = session === captureSession && !!capture
       && (recording || paused || starting || pausing || resuming || inputUnavailable);
     const recoveredActiveSession = session.recovered && !stillCapturedHere
@@ -1219,7 +1232,8 @@ async function api(path, options = {}, timeout = 15000, baseUrl = '') {
         clearActiveAuthExpiry(); token = ''; showLogin(false);
       }
       const error = new Error(message); error.status = response.status;
-      error.code = typeof data?.error_code === 'string' ? data.error_code : typeof data?.code === 'string' ? data.code : '';
+      if (data?.detail?.code === 'recording_stopped') { error.code = 'recording_stopped'; error.recordingControl = data.detail.recording_control; }
+      error.code ||= typeof data?.error_code === 'string' ? data.error_code : typeof data?.code === 'string' ? data.code : '';
       if (response.status === 422 && error.code === 'alignment_unavailable' && data?.retryable === false) {
         error.alignmentUnavailable = true;
         error.partialText = validAlignmentPartialText(data.partial_text) ? data.partial_text : '';
@@ -1840,6 +1854,11 @@ async function enterAuthenticatedWorkspace(response, authServer, {notAfter = Inf
       scrubAccountWorkspace();
     } else {
       rebindScheduledCorrectionsToLogin();
+      // A new trusted tunnel requires the same owner's fresh login before
+      // recording controls may bind to it. Never carry old request responses.
+      for(const session of liveSessions.values())if(session.owner===user && session.controlServer!==authServer){
+        session.controlServer=authServer;session.controlRegistered=false;session.controlState=null;session.stopAcknowledged=false;
+      }
     }
     $('password').value = ''; $('password-confirm').value = ''; $('setup-code').value = '';
     try {
@@ -2226,6 +2245,7 @@ async function recoverFileImport() {
   void runFileImport(recovered, generation);
   await refreshImportLecture(active, true, generation);
 }
+function rawAudioHeld(session) { return !session || !!session.recoveryClosedAt || (session.uploadHeld === true && session.transcriptionStopped !== true); }
 function isHeldCapture(id) { return liveSessions.get(id)?.uploadHeld === true; }
 function nextPendingChunk() { return pending.find(chunk => !isHeldCapture(chunk.captureId)) || null; }
 function activePendingCount() { return pending.reduce((count,chunk)=>count+(isHeldCapture(chunk.captureId)?0:1),0); }
@@ -2239,7 +2259,8 @@ function ownerScheduledCorrectionPending(inFlightOnly = false) {
     scheduled.owner === user && (scheduled.status === 'starting'
       || (!inFlightOnly && scheduled.status === 'scheduled')));
 }
-function isBusy() { return authenticating || loggingOut || holdingAudio || recording || paused || starting || pausing || resuming || stopping || !!draft || activePendingCount() > 0 || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture || ownerScheduledCorrectionPending(true); }
+function unsafeStoppedAudio() { return [...liveSessions.values()].some(session=>session.owner===user&&session.transcriptionStopped&&(!session.heldDurable||hasVolatilePendingAudio(session))); }
+function isBusy() { return unsafeStoppedAudio() || authenticating || loggingOut || holdingAudio || recording || paused || starting || pausing || resuming || stopping || !!draft || activePendingCount() > 0 || sending || importTransportBusy() || recordingDownloadPending || recordingFinalizePending || deletingLecture || ownerScheduledCorrectionPending(true); }
 function hasOwnerLockedWork() {
   return holdingAudio || recording || paused || starting || pausing || resuming || stopping || !!capture
     || !!draft || pending.length > 0 || sending || recordingFinalizePending || ownerScheduledCorrectionPending();
@@ -5418,7 +5439,8 @@ function renderHeldAudio() {
     finish.disabled=!!heldRecoveryBlockReason(session.id);
     finish.onclick=()=>{if(sameAccount()&&!heldRecoveryBlockReason(session.id))void prepareLocalAudioExport({captureId:session.id,checkConversion:true});};
     const restore=document.createElement('button');restore.type='button';restore.textContent='선택한 수업 전송 복구';restore.dataset.action='restore-held';
-    restore.disabled=!!heldRestoreBlockReason();restore.onclick=()=>{if(sameAccount())void restoreHeldAudio(session.id);};
+    restore.disabled=!!heldRestoreBlockReason() || !!session.transcriptionStopped;
+    if(session.transcriptionStopped)restore.textContent='중단됨 · 파일 변환으로 처리';restore.onclick=()=>{if(sameAccount())void restoreHeldAudio(session.id);};
     if(isClosed){
       const reopen=document.createElement('button');reopen.type='button';reopen.textContent='보류 목록으로 되돌리기';reopen.dataset.action='reopen-held';
       reopen.disabled=!!heldRecoveryBlockReason(session.id);reopen.onclick=()=>{if(sameAccount())void reopenHeldAudio(session.id);};
@@ -6022,9 +6044,15 @@ function updateControls() {
   $('asr-provider-clova').disabled = !transcriptionProviders.clova.configured || $('language').value === 'auto';
   $('asr-provider').disabled = busy || !!current || system;
   updateProviderGuidance();
-  $('record-button').disabled = authenticating || loggingOut || holdingAudio || captureTransition || activeImport || importStarting || recordingFinalizePending || (!liveSession && (!!draft || activePendingCount() > 0 || sending));
+  $('record-button').disabled = authenticating || loggingOut || holdingAudio || captureTransition || activeImport || importStarting || recordingFinalizePending || (!liveSession && (!!draft || activePendingCount() > 0 || sending || unsafeStoppedAudio()));
   $('record-button').classList.toggle('stop', liveSession);
   $('record-button').textContent = stopping ? '마지막 음성 정리 중…' : liveSession ? '■ 받아쓰기 종료' : starting ? (system ? '공유 화면 준비 중…' : '마이크 준비 중…') : activeImport || importStarting ? '파일 변환이 끝난 뒤 시작' : current ? '＋ 새 수업 시작' : system ? '● 화면 소리 받아쓰기' : '● 받아쓰기 시작';
+  $('recording-stop').hidden = !(capture || starting || recording || paused || activePendingCount() || sending || draft);
+  $('recording-stop').disabled = !!transcriptionStopPromise;
+  const stoppedShown=liveSessions.get(current?.id);
+  $('recording-control-note').textContent = stoppedShown?.transcriptionStopped ? recordingStopMessage(stoppedShown.stopReason)
+    : (liveSession || activePendingCount() || sending) ? '새 전사 결과가 3분 동안 없으면 자동 중단됩니다. 받아쓰기 종료는 남은 전사를 기다리고, 녹음·전사 중단은 미처리 음성을 보관합니다.' : '';
+  $('recording-control-note').hidden = !$('recording-control-note').textContent;
   $('pause-button').disabled = authenticating || loggingOut || holdingAudio || pausing || resuming || stopping
     || (!recording && !paused && !inputUnavailable);
   $('pause-button').classList.toggle('resume', paused || inputBlocked);
@@ -6066,7 +6094,7 @@ function updateControls() {
   $('processing-text').textContent = inputBlocked
     ? '새 음성을 받지 못하고 있습니다. 입력 복구 버튼으로 마이크를 확인해 주세요. 이미 받은 음성은 내려받을 수 있습니다.'
     : sendError ? '서버 전송이 보류됐습니다. 마이크 수신 상태는 위 안내를 확인하고, 기기에 남은 음성은 내려받을 수 있습니다.'
-      : retryMessage || (pausing ? '일시정지 지점까지 빠짐없이 정리하고 있어요…' : resuming ? '오디오 입력을 다시 연결하고 있어요…' : sending ? '음성을 글로 바꾸고 있어요. 녹음은 기다리지 않고 계속됩니다…' : '다음 문장을 듣고 있어요…');
+      : retryMessage || (pausing ? '일시정지 지점까지 빠짐없이 정리하고 있어요…' : resuming ? '오디오 입력을 다시 연결하고 있어요…' : sending ? (recording ? '음성을 글로 바꾸고 있어요. 녹음은 기다리지 않고 계속됩니다…' : '녹음은 종료됐어요. 남은 음성을 글로 바꾸고 있어요…') : '다음 문장을 듣고 있어요…');
   const recoveryWarning = recoveryFinalizationRequired.size
     ? `비정상적으로 닫힌 수업이 ${recoveryFinalizationRequired.size}개 있어요. 다른 탭에서 아직 녹음 중인지 먼저 확인하고, 중단된 수업이라면 해당 수업을 열어 “녹음 WAV 마무리”를 눌러 마지막 문장을 확정해 주세요.`
     : '';
@@ -6547,6 +6575,7 @@ async function startRecording({continuation = null} = {}) {
   const coordinationRequest = liveCoordination.acquireLiveCapture(session.owner);
   liveSessions.set(session.id,session);
   session.storeReady = prepareStoredLiveSession(session);
+  watchRecordingControl(session);
   draft = session; captureSession = session;
   const queue = chunk => {
     if (session.discardAudio) return;
@@ -6623,6 +6652,8 @@ function pauseRecording() {
       await operation;
       if (capture !== microphone || stopping) return;
       recording = false; paused = true;
+      captureSession?.deadline?.pause();
+      void syncRecordingControl(captureSession,'pause').catch(() => {});
       alignElapsedToCapture();
       void persistLiveSessionState(captureSession,'paused');
       renderHistory();
@@ -6682,6 +6713,7 @@ function resumeRecording() {
       inputUnavailableMessage = inputUnavailable ? '오디오 연결 후 실제 입력이 들어오는지 확인하고 있습니다.' : '';
       paused = microphone.paused;
       recording = microphone.recording;
+      if(!paused){captureSession?.deadline?.resume();void syncRecordingControl(captureSession,'resume').catch(()=>{});}
       void persistLiveSessionState(captureSession,paused ? 'paused' : inputUnavailable ? 'input-unavailable' : 'recording');
       if (recording) startElapsedClock();
       renderHistory();
@@ -6726,7 +6758,7 @@ function enqueueChunk(session, chunk) {
   if (item.lectureReady) void drain();
 }
 async function assignLecture(session) {
-  if (!session || session.owner !== user || !token || session.uploadHeld) throw connectionChangedBeforeRequestError();
+  if (!session || session.owner !== user || !token || (session.uploadHeld && !session.transcriptionStopped)) throw connectionChangedBeforeRequestError();
   if (session.lecture) return;
   if (session.creating) return session.creating;
   session.creating = (async () => {
@@ -6734,7 +6766,7 @@ async function assignLecture(session) {
     const assignmentToken = token;
     const assignmentServer = apiUrl;
     const assignmentGeneration = requestGeneration;
-    const assignmentIsCurrent = () => !session.uploadHeld && session.owner === assignmentOwner && user === assignmentOwner
+    const assignmentIsCurrent = () => (!session.uploadHeld || session.transcriptionStopped) && session.owner === assignmentOwner && user === assignmentOwner
       && token === assignmentToken && apiUrl === assignmentServer && requestGeneration === assignmentGeneration;
     if (session.continuationOf && continuationCapability !== JSON.stringify([user,token,apiUrl])) {
       await updateStatus();
@@ -6791,7 +6823,7 @@ async function assignLecture(session) {
       const parent = lectures.find(item => item.id === session.continuationOf);
       if (parent) parent.continuations = [...new Set([...(parent.continuations || []),lecture.id])];
     }
-    if (captureSession === session || !current) {
+    if (!session.transcriptionStopped && (captureSession === session || !current)) {
       current = {...lecture,segments:lecture.segments || []};
       lectureDateFilter = '';
     }
@@ -6804,7 +6836,7 @@ function scheduleLectureAssignmentRetry(session, error) {
   if (!session || session.lecture || session.assignmentTimer !== null) return;
   session.assignmentAttempt = Math.max(0,Number(session.assignmentAttempt) || 0) + 1;
   const delay = Math.min(RETRY_MAX_MS,RETRY_BASE_MS * (2 ** Math.min(session.assignmentAttempt - 1,10)));
-  retryMessage = `${errorText(error)} 녹음은 이 기기에 보관하며 ${Math.ceil(delay / 1000)}초 후 수업 연결을 다시 확인할게요.`;
+  if(!session.transcriptionStopped)retryMessage = `${errorText(error)} 녹음은 이 기기에 보관하며 ${Math.ceil(delay / 1000)}초 후 수업 연결을 다시 확인할게요.`;
   if (shouldRecoverPublishedServer(error)) void recoverPublishedServerAfterTransportFailure();
   session.assignmentTimer = setTimeout(() => {
     session.assignmentTimer = null;
@@ -6814,20 +6846,23 @@ function scheduleLectureAssignmentRetry(session, error) {
 }
 
 async function ensureLectureAssigned(session) {
-  if (!session || session.uploadHeld || session.lecture || session.creating || !token || session.owner !== user) return;
+  if (!session || (session.uploadHeld && !session.transcriptionStopped) || session.lecture || session.creating || !token || session.owner !== user) return;
   const owner=user,sessionToken=token,server=apiUrl,generation=requestGeneration;
-  const isCurrent=()=>!session.uploadHeld && owner===user && sessionToken===token && server===apiUrl && generation===requestGeneration;
+  const isCurrent=()=>(!session.uploadHeld || session.transcriptionStopped) && owner===user && sessionToken===token && server===apiUrl && generation===requestGeneration;
   try {
     await assignLecture(session);
     if (!isCurrent()) return;
-    if (!sendError) retryMessage = '';
+    await syncRecordingControl(session,session.transcriptionStopped ? 'stop' : 'start');
+    if (!isCurrent()) return;
+    if (!session.transcriptionStopped && !sendError) retryMessage = '';
     void drainRecordingAudio();
     void drain();
   } catch (error) {
     if (!isCurrent()) return;
     if (retryableUpload(error) || !token) scheduleLectureAssignmentRetry(session,error);
     else {
-      if (!sendError) sendError = manualUploadError(error);
+      if(session.transcriptionStopped)session.heldError=recordingStopMessage(session.stopReason)+' 서버 연결은 다시 확인 중입니다.';
+      else if (!sendError) sendError = manualUploadError(error);
       else notice(errorText(error));
       // These queued chunks have not reached an ASR provider. Leave their
       // durable state queued so one explicit retry can resume the whole ordered
@@ -6838,6 +6873,124 @@ async function ensureLectureAssigned(session) {
     updateControls();
   }
 }
+function recordingControlScope(session) {
+  return !!session && session.owner === user && !!token && (!session.controlServer || session.controlServer === apiUrl);
+}
+function watchRecordingControl(session) {
+  session.controlServer ||= apiUrl;
+  session.deadline ||= new RecordingDeadline();
+  if (session.transcriptionStopped) session.deadline.stop();
+  if (recordingControlTimer === null) recordingControlTimer = setInterval(() => { void pollRecordingControls(); },5000);
+}
+async function syncRecordingControl(session, action = '') {
+  if (!recordingControlScope(session) || !session.lecture) return null;
+  if (['pause','resume'].includes(action)) session.controlDesired=action==='pause'?'paused':'active';
+  if (action === 'start' && session.transcriptionStopped) action = 'stop';
+  const owner=user,sessionToken=token,server=apiUrl;
+  const isCurrent=()=>session.owner===owner && user===owner && token===sessionToken && apiUrl===server;
+  const previous=session.controlChain || Promise.resolve();
+  const operation=previous.catch(()=>{}).then(async()=>{
+    if(!isCurrent())return null;
+    let command=action;
+    if(session.transcriptionStopped && command && command!=='stop')command='stop';
+    if(command==='start'&&session.controlRegistered)return session.controlState;
+    const options=command ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:command,capture_id:session.id,...(command==='stop'?{reason:session.stopReason || 'manual'}:{})})} : {};
+    let value;
+    try{value=await api('/lectures/'+session.id+'/recording-control',options,10000);}
+    catch(error){
+      if(error?.code!=='recording_stopped')throw error;
+      value=error.recordingControl;
+    }
+    if(!isCurrent())return null;
+    if(!validRecordingControl(value,session.id))throw new Error('녹음 중단 상태를 확인하지 못했습니다. 원본은 보관합니다.');
+    if(value.revision<(session.controlState?.revision || 0))return session.controlState;
+    session.controlState=value;
+    session.controlRegistered=value.state!=='unregistered';
+    if(value.state==='stopped'){
+      session.stopAcknowledged=true;
+      void stopTranscription(session,value.reason || 'manual',{remote:true});
+    }else if(value.state==='finished'){session.deadline?.stop();session.controlDesired='';}
+    else if(typeof value.last_text_at==='number' && value.last_text_at>(session.lastServerTextAt || 0)){
+      session.lastServerTextAt=value.last_text_at;
+      session.deadline?.progress();
+    }
+    return value;
+  });
+  session.controlChain=operation;
+  return operation;
+}
+async function pollRecordingControls() {
+  // Every local deadline runs before any network await, including expired auth.
+  for(const session of liveSessions.values())if(!session.uploadHeld && (session.owner===user || session===captureSession) && session.deadline?.expired())void stopTranscription(session,'no_text_timeout');
+  for(const session of liveSessions.values()){
+    if(!recordingControlScope(session))continue;
+    // A prior explicit all-upload hold remains all-upload held. A later
+    // server timeout must not silently reopen its original-audio lane.
+    if(session.uploadHeld && !session.transcriptionStopped)continue;
+    if(session.controlPolling)continue;
+    if(session.transcriptionStopped && session.stopAcknowledged && session.heldDurable)continue;
+    if(!session.deadline && !session.transcriptionStopped)continue;
+    session.controlPolling=true;
+    try{
+      if(session.transcriptionStopped && !session.heldDurable)await persistTranscriptionStop(session);
+      if(!session.lecture){void ensureLectureAssigned(session);continue;}
+      await syncRecordingControl(session,session.transcriptionStopped?'stop':!session.controlRegistered?'start':session.controlState?.state!=='finished'&&session.controlDesired&&session.controlDesired!==session.controlState?.state?(session.controlDesired==='paused'?'pause':'resume'):'');
+    }catch{/* Local deadline remains active while offline; never resume a stopped capture. */}
+    finally{session.controlPolling=false;}
+  }
+}
+async function persistTranscriptionStop(session) {
+  await session.storeReady?.catch(()=>{});
+  await session.persistChain?.catch(()=>{});
+  const queue=await openLiveQueue();
+  if(!queue)throw new Error('중단한 음성의 기기 저장을 확인하지 못했어요. 이 탭을 닫지 말고 원본을 내려받아 주세요.');
+  await queue.setSessionUploadHeld(session.owner,session.id,true,{transcriptionStopped:true,reason:session.stopReason || 'manual'});
+  session.heldDurable=true;
+  if(hasVolatilePendingAudio(session))throw new Error('음성이 이 탭 메모리에 남아 있어요. 원본 저장 전에는 이 탭을 닫지 마세요.');
+  await releaseStoppedSessionCaptureLeaseWhenSafe(session);
+}
+function stopTranscription(session, reason='manual', {remote=false}={}) {
+  if(!session || (session.owner!==user && session!==captureSession))return Promise.resolve(false);
+  if(session.transcriptionStopPromise)return session.transcriptionStopPromise;
+  if(session.transcriptionStopped && session.heldDurable && !hasVolatilePendingAudio(session)){if(remote)session.stopAcknowledged=true;return Promise.resolve(true);}
+  const controlsActiveWork=asrCaptureId===session.id || captureSession===session || nextPendingChunk()?.captureId===session.id || draft===session;
+  session.transcriptionStopped=true;session.uploadHeld=true;session.cancelled=true;
+  session.stopReason=reason==='no_text_timeout'?'no_text_timeout':'manual';
+  session.deadline?.stop();session.heldError=recordingStopMessage(session.stopReason);
+  if(remote)session.stopAcknowledged=true;
+  if(session.assignmentTimer!==null)clearTimeout(session.assignmentTimer);session.assignmentTimer=null;
+  for(const item of pending)if(item.captureId===session.id)manualRetryApprovedIds.delete(item.id);
+  // Invalidate the old run before aborting. Its late finally/response may not
+  // clear a new run's busy state or apply old text to the new lecture.
+  if(asrCaptureId===session.id){++asrRun;asrController?.abort();asrController=null;asrCaptureId=null;sending=false;}
+  if(controlsActiveWork){clearUploadRetry();sendError='';retryMessage='';}
+  const owner=user,server=apiUrl;
+  const owns=()=>owner===user&&server===apiUrl;
+  let operation;
+  operation=(async()=>{
+    if(captureSession===session)await stopRecording();
+    if(!owns())return false;
+    if(draft===session)draft=null;
+    if(!remote)void syncRecordingControl(session,'stop').catch(()=>{});
+    try{await persistTranscriptionStop(session);}
+    catch(error){if(owns())notice(errorText(error));return false;}
+    if(!owns())return false;
+    if(captureSession===session)captureSession=null;
+    notice(session.heldError);
+    void drainRecordingAudio();
+    return true;
+  })().finally(()=>{
+    if(session.transcriptionStopPromise===operation)session.transcriptionStopPromise=null;
+    if(transcriptionStopPromise===operation)transcriptionStopPromise=null;
+    if(owns()){renderHistory();updateControls();}
+  });
+  session.transcriptionStopPromise=operation;transcriptionStopPromise=operation;updateControls();return operation;
+}
+$('recording-stop').onclick=()=>{
+  const session=captureSession || liveSessions.get(nextPendingChunk()?.captureId) || draft;
+  if(session)void stopTranscription(session);
+};
+
 function stopRecording(message) {
   if (stopPromise) return stopPromise;
   if (!recording && !paused && !starting && !pausing && !resuming && !capture) return Promise.resolve();
@@ -6852,6 +7005,10 @@ function stopRecording(message) {
     finally {
       await session?.persistChain?.catch(error => setLiveQueueWarning(error));
       await persistLiveSessionState(session,'stopped');
+      if(session && !session.transcriptionStopped){
+        if(!pending.some(item=>item.captureId===session.id)){session.deadline?.stop();void syncRecordingControl(session,'finish').catch(()=>{});}
+        else if(session.deadline?.paused){session.deadline.resume();void syncRecordingControl(session,'resume').catch(()=>{});}
+      }
       if (capture === microphone) capture = null;
       const released = await releaseStoppedSessionCaptureLeaseWhenSafe(session);
       if (!released) {
@@ -7011,7 +7168,7 @@ function nextRecordingAudioChunk() {
   const scope = recordingAudioScope();
   const blocked = new Set(pending.filter(chunk => chunk.audioBlockedScope === scope).map(chunk => chunk.captureId));
   return pending.find(chunk => chunk.owner === user && !chunk.locallySkipped && !audioChunkStored(chunk)
-    && !blocked.has(chunk.captureId) && !isHeldCapture(chunk.captureId)
+    && !blocked.has(chunk.captureId) && !rawAudioHeld(liveSessions.get(chunk.captureId))
     && !!liveSessions.get(chunk.captureId)?.lecture && chunk.lectureReady) || null;
 }
 function resetRecordingAudioRetry() {
@@ -7083,7 +7240,7 @@ async function drainRecordingAudio() {
         const session = liveSessions.get(chunk.captureId);
         const matches = () => stillCurrent() && !holdingAudio && pending.includes(chunk)
           && !chunk.locallySkipped && liveSessions.get(chunk.captureId) === session
-          && session?.owner === owner && !session.uploadHeld
+          && session?.owner === owner && !rawAudioHeld(session)
           && !!lectureForStoredProvider(session,session.lecture);
         await chunk.persistPromise;
         if (!matches()) break;
@@ -7093,7 +7250,9 @@ async function drainRecordingAudio() {
           const storedSession = await liveQueue.getSession(owner,chunk.captureId);
           if (!matches()) break;
           if (storedSession?.uploadHeld === true) {
-            session.uploadHeld = true; session.heldDurable = true; continue;
+            session.uploadHeld = true; session.heldDurable = true;
+            session.transcriptionStopped ||= storedSession.transcriptionStopped === true;
+            if (rawAudioHeld(session)) continue;
           }
           const storedChunk = await liveQueue.getChunk(owner,chunk.id);
           if (!matches()) break;
@@ -7203,7 +7362,7 @@ function validateChunkResponse(response) {
 }
 function chunkResponseScopeIsCurrent(chunk, session, scope) {
   return scope?.owner === user && scope.sessionToken === token && scope.server === apiUrl
-    && liveSessions.get(chunk.captureId) === session && session.owner === scope.owner
+    && liveSessions.get(chunk.captureId) === session && session.owner === scope.owner && !session.transcriptionStopped
     && session.asrProvider === chunk.asrProvider && !!lectureForStoredProvider(session,session.lecture)
     && (current?.id !== chunk.lectureId || !!lectureForStoredProvider(session,current));
 }
@@ -7219,7 +7378,7 @@ async function queryClovaChunkResult(chunk, blob, session, scope) {
   const timeout = Math.min(15000,chunk.resultPollDeadline - Date.now());
   if (timeout <= 0) throw new Error('서버의 음성 처리 결과 확인 시간이 지났어요.');
   const result = await api(`/lectures/${encodeURIComponent(chunk.lectureId)}/chunks/${encodeURIComponent(chunk.id)}/result`,{
-    uploaderAlreadyLocked:true,
+    uploaderAlreadyLocked:true,signal:asrController?.signal,
     headers:{'X-Chunk-Payload-SHA256':chunk.resultPayloadHash,
       'X-Start-Seconds':String(chunk.startSeconds),'X-Overlap-Seconds':String(chunk.overlapSeconds ?? 0),
       'X-Final-Chunk':chunk.final ? 'true' : 'false'},
@@ -7273,13 +7432,21 @@ async function drain() {
   const drainToken=token,drainServer=apiUrl;
   const drainScopeIsCurrent=()=>user===drainOwner&&token===drainToken&&apiUrl===drainServer;
   let processingChunk=null;
+  const run=++asrRun,controller=new AbortController();asrController=controller;asrCaptureId=nextPendingChunk()?.captureId;
+  const runIsCurrent=()=>run===asrRun&&!controller.signal.aborted&&drainScopeIsCurrent();
   sending = true; updateControls();
   try {
     if (!hasRequestableServer()) await ensureTrustedApiRequest();
-    if (!drainScopeIsCurrent()) return;
+    if (!runIsCurrent()) return;
+    const firstSession=liveSessions.get(nextPendingChunk()?.captureId);
+    if(firstSession){
+      if(!recordingControlScope(firstSession))throw new Error('녹음의 서버 연결이 바뀌어 자동 전송을 보류했어요. 원본을 보관하고 연결을 확인해 주세요.');
+      await syncRecordingControl(firstSession,'start');
+    }
+    if(!runIsCurrent())return;
     const coordinated = await liveCoordination.runUploader(drainOwner,async () => {
-    while (nextPendingChunk() && token && drainScopeIsCurrent() && !holdingAudio) {
-      const chunk = nextPendingChunk();processingChunk=chunk;
+    while (nextPendingChunk() && token && runIsCurrent() && !holdingAudio) {
+      const chunk = nextPendingChunk();processingChunk=chunk;asrCaptureId=chunk.captureId;
       let qwenRetryForThisRequest = false;
       if (recordingAudioUploadEnabled() && !audioChunkStored(chunk)) {
         void drainRecordingAudio(); break;
@@ -7301,7 +7468,7 @@ async function drain() {
       const freshSession=await liveQueue.getSession(drainOwner,chunk.captureId);
       if (!token || !drainScopeIsCurrent() || nextPendingChunk()!==chunk) break;
       if (freshSession?.uploadHeld===true) {
-        session.uploadHeld=true;session.heldDurable=true;manualRetryApprovedIds.delete(chunk.id);
+        session.uploadHeld=true;session.heldDurable=true;session.transcriptionStopped ||= freshSession.transcriptionStopped === true;manualRetryApprovedIds.delete(chunk.id);
         continue;
       }
       if (!freshSession) {
@@ -7363,6 +7530,7 @@ async function drain() {
       session.providerMismatch = false;
       session.lecture = known;
       chunk.lectureReady = true;
+      if (!session.controlRegistered || !runIsCurrent() || session.transcriptionStopped || nextPendingChunk() !== chunk) break;
       const responseScope = {owner:drainOwner,sessionToken:drainToken,server:drainServer};
       let blob;
       try {
@@ -7381,6 +7549,9 @@ async function drain() {
         if (user === drainOwner) sendError = '로그인 또는 수업 연결이 바뀌어 보관된 음성을 보내지 않았어요.';
         break;
       }
+      session.deadline ||= new RecordingDeadline();
+      session.deadline.requestStarted(chunk.id);
+      if(session.deadline.expired()){void stopTranscription(session,'no_text_timeout');break;}
       let response;
       if (chunk.asrProvider === 'clova' && chunk.recoveryOnly) {
         try {
@@ -7399,6 +7570,7 @@ async function drain() {
               : '서버에서 이 음성의 확정된 처리 결과를 찾지 못했어요.');
           }
         } catch (error) {
+          if (!runIsCurrent() || session.transcriptionStopped) break;
           chunk.recoveryOnly = false;
           await markPendingBlocked(chunk,error);
           if (user === drainOwner) sendError = clovaManualUploadError(error);
@@ -7415,8 +7587,10 @@ async function drain() {
           if (user === drainOwner) sendError = '로그인 또는 수업 연결이 바뀌어 보관된 음성을 보내지 않았어요.';
           break;
         }
-        response = await api(`/lectures/${chunk.lectureId}/chunks`,{method:'POST',body:blob,uploaderAlreadyLocked:true,headers:{'Content-Type':'audio/wav','X-Chunk-Id':chunk.id,'X-Start-Seconds':String(chunk.startSeconds),'X-Overlap-Seconds':String(chunk.overlapSeconds ?? 0),'X-Final-Chunk':chunk.final ? 'true' : 'false',...(qwenRetryForThisRequest ? {'X-Qwen-Retry':'1'} : {})}},UPLOAD_TIMEOUT_MS);
+        response = await api(`/lectures/${chunk.lectureId}/chunks`,{method:'POST',body:blob,uploaderAlreadyLocked:true,signal:controller.signal,headers:{'X-Recording-Capture-ID':session.id,'Content-Type':'audio/wav','X-Chunk-Id':chunk.id,'X-Start-Seconds':String(chunk.startSeconds),'X-Overlap-Seconds':String(chunk.overlapSeconds ?? 0),'X-Final-Chunk':chunk.final ? 'true' : 'false',...(qwenRetryForThisRequest ? {'X-Qwen-Retry':'1'} : {})}},UPLOAD_TIMEOUT_MS);
       } catch (error) {
+        if (!runIsCurrent() || session.transcriptionStopped) break;
+        if (error?.code === 'recording_stopped') { void stopTranscription(session,error.recordingControl?.reason || 'manual',{remote:true}); break; }
         if (chunk.asrProvider === 'clova'
             && (error?.connectionChanged === true || error?.connectionLeaseExpired === true)) {
           // api() creates these errors before fetch. The provider cannot have
@@ -7474,14 +7648,18 @@ async function drain() {
         break;
       }
       }
+      if (run!==asrRun || controller.signal.aborted || session.transcriptionStopped) break;
       if (!chunkResponseScopeIsCurrent(chunk,session,responseScope)) {
         await markPendingBlocked(chunk,{code:'stale_chunk_response'});
         if (user === drainOwner) sendError = '로그인 또는 수업 연결이 바뀌어 이전 음성 응답을 적용하지 않았어요. 보관된 음성 상태를 확인해 주세요.';
         break;
       }
       validateChunkResponse(response);
+      session.deadline?.requestConfirmed(chunk.id);
       setAlignmentIssue(chunk.lectureId,null,chunk.id);
       chunk.serverConfirmed = true;
+      const knownTextIds=new Set((session.lecture?.segments || []).map(row=>row.id));
+      if (response.segments?.some(row=>!knownTextIds.has(row.id)&&typeof row.text==='string'&&row.text.trim())) session.deadline?.progress();
       applyRecordingFlags(chunk.lectureId,response);
       // The server has already committed this text. Slow local storage cleanup
       // must not delay display or replace the selected transcript with a draft.
@@ -7494,9 +7672,11 @@ async function drain() {
       retryAttempt = 0; retryMessage = '';
       updateControls();
     }
-    });
+    },{signal:controller.signal,waitMs:15000});
     noteCoordinationSupport(coordinated.supported);
   } catch (error) {
+    if (!runIsCurrent() || processingChunk && liveSessions.get(processingChunk.captureId)?.transcriptionStopped) return;
+    if (error?.code === 'recording_stopped' && processingChunk) { void stopTranscription(liveSessions.get(processingChunk.captureId),error.recordingControl?.reason || 'manual',{remote:true}); return; }
     if (error?.coordinationRetrySafe) {
       scheduleUploadRetry(error);
     } else {
@@ -7504,7 +7684,8 @@ async function drain() {
       await markPendingBlocked(processingChunk,error);
     }
   } finally {
-    sending = false; updateControls();
+    if (run!==asrRun) return;
+    sending = false; if(asrController===controller){asrController=null;asrCaptureId=null;}updateControls();
     // Pick up a final microphone tail that may have arrived while an upload awaited.
     if (drainScopeIsCurrent() && nextPendingChunk()?.owner === user && token && !sendError && retryTimer === null && !holdingAudio
         && (!recordingAudioUploadEnabled() || audioChunkStored(nextPendingChunk()))) void drain();
@@ -7623,7 +7804,7 @@ async function requestRecordingFinalization(lectureId, operationIsCurrent, {manu
   let retriedLostResponse = false;
   let contentionRetries = 0;
   while (operationIsCurrent()) {
-    const headers = manualAlignmentRetry ? {'X-Qwen-Retry':'1'} : {};
+    const headers = {...(manualAlignmentRetry ? {'X-Qwen-Retry':'1'} : {}),...(liveSessions.get(lectureId)?.controlRegistered ? {'X-Recording-Capture-ID':lectureId} : {})};
     manualAlignmentRetry = false; // A lost response may be reconciled, never grant a second inference.
     try {
       return await api(path, {method:'POST',uploaderAlreadyLocked:true,headers},UPLOAD_TIMEOUT_MS);

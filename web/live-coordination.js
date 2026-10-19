@@ -85,7 +85,45 @@ function frozenResult(value) {
   return Object.freeze(value);
 }
 
-async function runLocalExclusive(tails, key, work) {
+function acquisitionGate({ signal, waitMs = 15000 } = {}) {
+  if (!Number.isInteger(waitMs) || waitMs < 1 || waitMs > 60000
+      || (signal !== undefined && (typeof signal?.aborted !== 'boolean'
+        || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function'))) {
+    throw new LiveCoordinationValidationError('전송 잠금 대기 설정이 올바르지 않습니다.');
+  }
+  const controller = new AbortController();
+  let rejectWait, timer, failure, acquired = false;
+  const interrupted = new Promise((resolve, reject) => { rejectWait = reject; });
+  // The caller may already be cancelled before a browser request is made.
+  interrupted.catch(() => undefined);
+  const stopWaiting = (timeout = false) => {
+    if (acquired || failure) return;
+    failure = new LiveCoordinationError(
+      timeout ? '다른 탭의 전송을 기다리는 시간이 지났습니다. 음성은 보관되어 있습니다.' : '전송 잠금 대기를 중단했습니다. 음성은 보관되어 있습니다.',
+      { code: timeout ? 'uploader_lock_timeout' : 'uploader_lock_aborted', retrySafe: true },
+    );
+    controller.abort();
+    rejectWait(failure);
+  };
+  const aborted = () => stopWaiting();
+  signal?.addEventListener('abort', aborted, {once: true});
+  if (signal?.aborted) stopWaiting();
+  else timer = setTimeout(() => stopWaiting(true), waitMs);
+  const dispose = () => { clearTimeout(timer); signal?.removeEventListener('abort', aborted); };
+  return {
+    signal: controller.signal,
+    wait: promise => Promise.race([promise, interrupted]),
+    enter() {
+      if (failure) throw failure;
+      acquired = true;
+      dispose();
+    },
+    get failure() { return failure; },
+    dispose,
+  };
+}
+
+async function runLocalExclusive(tails, key, work, gate = null) {
   const previous = tails.get(key) || Promise.resolve();
   let releaseTurn;
   const turn = new Promise((resolve) => {
@@ -94,12 +132,17 @@ async function runLocalExclusive(tails, key, work) {
   const tail = previous.catch(() => undefined).then(() => turn);
   tails.set(key, tail);
 
-  await previous.catch(() => undefined);
   try {
+    const ready = previous.catch(() => undefined);
+    await (gate ? gate.wait(ready) : ready);
+    gate?.enter();
     return await work();
   } finally {
+    gate?.dispose();
     releaseTurn();
-    if (tails.get(key) === tail) tails.delete(key);
+    // A cancelled queued waiter must not let its successor overtake the still
+    // active predecessor in environments without Web Locks.
+    tail.then(() => { if (tails.get(key) === tail) tails.delete(key); });
   }
 }
 
@@ -192,8 +235,8 @@ export class LiveCoordination {
   }
 
   /** Runs one owner's ASR uploader work serially across same-origin tabs. */
-  async runUploader(owner, work) {
-    return this.#runUploaderLane(owner, work, 'uploader', localUploaderTails);
+  async runUploader(owner, work, options = {}) {
+    return this.#runUploaderLane(owner, work, 'uploader', localUploaderTails, options);
   }
 
   /**
@@ -267,18 +310,27 @@ export class LiveCoordination {
     }
   }
 
-  async #runUploaderLane(owner, work, lane, localTails) {
+  async #runUploaderLane(owner, work, lane, localTails, options) {
     const clean = cleanOwner(owner);
     const operation = cleanWork(work, '업로드');
     const ownerKey = await ownerFingerprint(clean);
-    if (!this.supported) return this.#runLocalUploader(ownerKey, operation, localTails);
+    const gate = lane === 'uploader' ? acquisitionGate(options) : null;
+    if (!this.supported) {
+      try {
+        const value = await runLocalExclusive(localTails, ownerKey, operation, gate);
+        return frozenResult({supported: false, value});
+      } finally { gate?.dispose(); }
+    }
 
     const manager = browserLockManager();
     const name = lockName(lane, ownerKey);
     let callbackEntered = false;
     let outcome;
     try {
-      await manager.request(name, { mode: 'exclusive' }, async (lock) => {
+      const requested = manager.request(name, { mode: 'exclusive', ...(gate ? {signal: gate.signal} : {}) }, async (lock) => {
+        // Also protect against older/incomplete lock implementations that
+        // invoke a queued callback despite its aborted acquisition signal.
+        gate?.enter();
         callbackEntered = true;
         if (!lock) {
           outcome = { coordinationError: new LiveCoordinationError(
@@ -293,7 +345,9 @@ export class LiveCoordination {
           outcome = { operationError: error };
         }
       });
+      await (gate ? gate.wait(requested) : requested);
     } catch (error) {
+      if (!callbackEntered && gate?.failure) throw gate.failure;
       if (callbackEntered) {
         if (outcome && Object.hasOwn(outcome, 'operationError')) throw outcome.operationError;
         throw outcome?.coordinationError || new LiveCoordinationError(
@@ -305,7 +359,7 @@ export class LiveCoordination {
         '브라우저의 탭 간 업로드 잠금을 얻지 못했습니다. 잠시 후 다시 시도합니다.',
         { code: 'uploader_lock_failed', cause: error, retrySafe: true },
       );
-    }
+    } finally { gate?.dispose(); }
 
     if (outcome && Object.hasOwn(outcome, 'operationError')) throw outcome.operationError;
     if (outcome?.coordinationError) throw outcome.coordinationError;

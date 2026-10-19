@@ -1159,3 +1159,17 @@ test('malformed closure markers fail closed and ordinary creates or updates cann
   delete data.sessions.get(CAPTURE_ID).uploadHeld;
   await assert.rejects(queue.getSession(OWNER,CAPTURE_ID),LiveQueueCorruptError);
 });
+
+
+test('terminal transcription stop preserves uncertain PCM and survives reopening but cannot resume ASR',async()=>{
+  const {queue,data}=await heldQueueFixture();
+  const before=await audioRowsWithBytes(data);
+  const stopped=await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true,{transcriptionStopped:true});
+  assert.equal(stopped.transcriptionStopped,true);assert.equal(stopped.uploadHeld,true);
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+  assert.equal((await queue.recoverOwner(OWNER)).sessions[0].transcriptionStopped,true);
+  assert.equal((await queue.readExportSnapshot(OWNER)).sessions[0].transcriptionStopped,true);
+  await assert.rejects(queue.setSessionUploadHeld(OWNER,CAPTURE_ID,false),LiveQueueConflictError);
+  assert.equal((await queue.setSessionUploadHeld(OWNER,CAPTURE_ID,true)).transcriptionStopped,true);
+  assert.deepEqual(await audioRowsWithBytes(data),before);
+});

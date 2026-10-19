@@ -266,7 +266,7 @@ async function sameBlobBytes(left, right) {
 }
 
 function normalizeSessionInput(value, now) {
-  onlyKeys(value, new Set(['id', 'owner', 'title', 'language', 'source', 'asrProvider', 'createdAt', 'continuationOf', 'uploadHeld']), '녹음 세션');
+  onlyKeys(value, new Set(['id', 'owner', 'title', 'language', 'source', 'asrProvider', 'createdAt', 'continuationOf', 'uploadHeld', 'transcriptionStopped', 'transcriptionStopReason']), '녹음 세션');
   const createdAt = value.createdAt === undefined ? now : value.createdAt;
   const session = {
     id: cleanUuid(value.id, '녹음 세션 ID'),
@@ -288,6 +288,14 @@ function normalizeSessionInput(value, now) {
       throw new LiveQueueValidationError('새 녹음의 전송 보류 표시는 true만 사용할 수 있습니다.');
     }
     session.uploadHeld = true;
+  }
+  if (Object.hasOwn(value, 'transcriptionStopped')) {
+    if (value.transcriptionStopped !== true || value.uploadHeld !== true) throw new LiveQueueValidationError('전사 중단 표시는 보류 상태에서만 사용할 수 있습니다.');
+    session.transcriptionStopped = true;
+  }
+  if (Object.hasOwn(value,'transcriptionStopReason')) {
+    if (!session.transcriptionStopped || !['manual','no_text_timeout'].includes(value.transcriptionStopReason)) throw new LiveQueueValidationError('전사 중단 사유가 올바르지 않습니다.');
+    session.transcriptionStopReason=value.transcriptionStopReason;
   }
   return session;
 }
@@ -311,6 +319,8 @@ function validateSessionRecord(value) {
   ]);
   if (ownObject(value) && Object.hasOwn(value, 'continuationOf')) expected.add('continuationOf');
   if (ownObject(value) && Object.hasOwn(value, 'uploadHeld')) expected.add('uploadHeld');
+  if (ownObject(value) && Object.hasOwn(value, 'transcriptionStopped')) expected.add('transcriptionStopped');
+  if (ownObject(value) && Object.hasOwn(value, 'transcriptionStopReason')) expected.add('transcriptionStopReason');
   if (ownObject(value) && Object.hasOwn(value, 'recoveryClosedAt')) expected.add('recoveryClosedAt');
   onlyKeys(value, expected, '저장된 녹음 세션');
   if (Object.keys(value).length !== expected.size) {
@@ -335,6 +345,10 @@ function validateSessionRecord(value) {
   if (Object.hasOwn(value, 'uploadHeld') && value.uploadHeld !== true) {
     throw new LiveQueueValidationError('저장된 녹음의 전송 보류 표시가 올바르지 않습니다.');
   }
+  if (Object.hasOwn(value, 'transcriptionStopped') && (value.transcriptionStopped !== true || value.uploadHeld !== true)) {
+    throw new LiveQueueValidationError('저장된 전사 중단 표시가 올바르지 않습니다.');
+  }
+  if (Object.hasOwn(value,'transcriptionStopReason') && (value.transcriptionStopped !== true || !['manual','no_text_timeout'].includes(value.transcriptionStopReason))) throw new LiveQueueValidationError('저장된 전사 중단 사유가 올바르지 않습니다.');
   if (Object.hasOwn(value, 'recoveryClosedAt')) {
     finiteInteger(value.recoveryClosedAt, '보관 상태 종료 시각', { min: 1, max: MAX_TIMESTAMP });
     if (value.uploadHeld !== true) throw new LiveQueueValidationError('종료한 보관 음성은 전송 보류 상태여야 합니다.');
@@ -361,6 +375,8 @@ function sessionCopy(value) {
     capturedSamples: value.capturedSamples,
     ...(value.continuationOf != null ? {continuationOf: value.continuationOf} : {}),
     ...(value.uploadHeld === true ? {uploadHeld: true} : {}),
+    ...(value.transcriptionStopped === true ? {transcriptionStopped:true} : {}),
+    ...(value.transcriptionStopReason ? {transcriptionStopReason:value.transcriptionStopReason} : {}),
     ...(value.recoveryClosedAt !== undefined ? {recoveryClosedAt:value.recoveryClosedAt} : {}),
   };
 }
@@ -997,10 +1013,10 @@ export class DurableLiveQueue {
    * closed even if a stopped legacy tab has cached session metadata. The
    * uploader lock excludes a tab that already read its WAV for an HTTP call.
    */
-  async setSessionUploadHeld(ownerValue, captureIdValue, held) {
+  async setSessionUploadHeld(ownerValue, captureIdValue, held, {transcriptionStopped = false, reason = 'manual'} = {}) {
     const owner = cleanOwner(ownerValue);
     const captureId = cleanUuid(captureIdValue, '녹음 세션 ID');
-    if (typeof held !== 'boolean') {
+    if (typeof held !== 'boolean' || typeof transcriptionStopped !== 'boolean' || (transcriptionStopped && (!held || !['manual','no_text_timeout'].includes(reason)))) {
       throw new LiveQueueValidationError('녹음의 전송 보류 여부가 올바르지 않습니다.');
     }
     const now = this._clock();
@@ -1012,6 +1028,7 @@ export class DurableLiveQueue {
       if (held && session.state === 'completed') {
         throw new LiveQueueConflictError('완료된 녹음 세션의 전송을 보류할 수 없습니다.');
       }
+      if (!held && session.transcriptionStopped === true) throw new LiveQueueConflictError('중단한 전사는 다시 전송할 수 없습니다. 원본을 파일 변환으로 보내거나 새 수업을 시작해 주세요.');
       if (!held && session.recoveryClosedAt !== undefined) {
         throw new LiveQueueConflictError('종료한 보관 상태를 다시 연 뒤 전송 복구를 선택해 주세요.');
       }
@@ -1037,7 +1054,8 @@ export class DurableLiveQueue {
           } catch (error) { reject(error); }
         };
       });
-      if ((session.uploadHeld === true) === held) return sessionCopy(session);
+      if ((session.uploadHeld === true) === held && (!transcriptionStopped || session.transcriptionStopped)) return sessionCopy(session);
+      if (transcriptionStopped) { session.transcriptionStopped = true; session.transcriptionStopReason=reason; }
       if (held) session.uploadHeld = true;
       else delete session.uploadHeld;
       session.updatedAt = now;

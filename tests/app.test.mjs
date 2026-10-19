@@ -19,6 +19,7 @@ import * as TestLectureQuestions from '../web/lecture-questions.js';
 import * as TestStudyNotes from '../web/study-notes.js';
 import * as TestLlmResults from '../web/llm-results.js';
 import * as TestLiveQueue from '../web/live-queue.js';
+import * as TestRecordingControl from '../web/recording-control.js';
 import { groupTranscriptSentences } from '../web/transcript-sentences.js';
 import { TranscriptFollow } from '../web/transcript-follow.js';
 import { AUTH_SESSION_STORAGE_KEY, TabAuthSessionStore } from '../web/auth-session.js';
@@ -32,6 +33,7 @@ const source = (await readFile(new URL('../web/app.js', import.meta.url), 'utf8'
   .replace("import { renderUnifiedStudyNote } from './unified-note-view.js';", 'const {renderUnifiedStudyNote} = TestUnifiedNoteView;')
   .replace("import { createMaterialPanel } from './study-materials.js';", 'const createMaterialPanel = () => ({reset(){},setScope(){}});')
   .replace("import { createCourseWorkspace } from './course-workspace.js';", 'const createCourseWorkspace = () => ({reset(){},open(){}});')
+  .replace("import { RecordingDeadline, validRecordingControl, recordingStopMessage } from './recording-control.js';", 'const {RecordingDeadline,validRecordingControl,recordingStopMessage}=TestRecordingControl;')
   .replace("import { MicrophoneCapture } from './audio.js';", 'const MicrophoneCapture = TestCapture;')
   .replace("import { validateRecordingSelection, isFileDrag, recordingFileFromDrop } from './recording-file-selection.js';", 'const { validateRecordingSelection, isFileDrag, recordingFileFromDrop } = TestRecordingFileSelection;')
   .replace("import { buildRecoverableLocalAudioExports, validateLocalWav } from './local-audio-export.js';", 'const { buildRecoverableLocalAudioExports, validateLocalWav } = TestLocalAudioExport;')
@@ -294,13 +296,15 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
     TestRecordingReview:{readRecordingClip,RecordingClipPlayer,filterTranscript},
     TestLectureLibrary, TestTimetableSubjects,
     TestManualNotes,
-    TestLectureQuestions, TestStudyNotes,TestUnifiedNoteView, TestLlmResults, TestLiveQueue,
+    TestLectureQuestions, TestStudyNotes,TestUnifiedNoteView, TestLlmResults, TestLiveQueue, TestRecordingControl,
     TestGroupTranscriptSentences:groupTranscriptSentences, TestTranscriptFollow:TranscriptFollow,
     TestLocalAudioExport, TestHeldImportRecovery:recoveryHelpers, TestRecordingFileSelection, TestEncodeWav:encodeWav,
     setTimeout:(callback,delay = 0) => { const value = ++id; timeouts.set(value,{callback,delay}); return value; },
     clearTimeout:value => timeouts.delete(value),
     setInterval:(callback,delay = 0) => { const value = ++id; intervals.set(value,{callback,delay}); return value; },clearInterval:value => intervals.delete(value),
-    fetch:(url,options) => !translationApi && url.endsWith('/translation')
+    fetch:(url,options) => url.endsWith('/recording-control')
+      ? Promise.resolve(response({state:options?.body ? ({stop:'stopped',finish:'finished',pause:'paused'}[JSON.parse(options.body).action] || 'active') : 'active',capture_id:url.split('/').at(-2),revision:1,reason:options?.body ? JSON.parse(options.body).reason : null,last_text_at:null}))
+      : !translationApi && url.endsWith('/translation')
       ? Promise.resolve(response({configured:false,model:'solar-pro4',translation:null})) : fetch(url,options),
     TestCapture:class {
       constructor(callbacks) {
@@ -368,9 +372,11 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
         if (stored && stored.owner !== owner) throw new Error('session ownership mismatch');
         return stored ? {...stored} : null;
       }
-      async setSessionUploadHeld(owner,id,held) {
+      async setSessionUploadHeld(owner,id,held,{transcriptionStopped=false,reason='manual'}={}) {
         requireOwner(owner);requireUuid(id,'captureId');assert.equal(typeof held,'boolean');
         const stored=this.sessions.get(id);if(!stored || stored.owner!==owner)throw new Error('session ownership mismatch');
+        if(!held&&stored.transcriptionStopped)throw new Error('terminal stop');
+        if(transcriptionStopped){stored.transcriptionStopped=true;stored.transcriptionStopReason=reason;}
         if(held)stored.uploadHeld=true;else delete stored.uploadHeld;
         for(const chunk of this.chunks.values())if(chunk.owner===owner&&chunk.captureId===id){
           if(held)chunk.uploadHeld=true;else delete chunk.uploadHeld;
@@ -1487,7 +1493,7 @@ test('temporary input loss during lecture creation keeps capture open until an e
   assert.equal(app.run('inputUnavailable'), true);
   assert.equal(app.microphone().stopCalls, undefined);
   assert.equal(uploads.length, 0);
-  assert.equal(app.intervals.size, 0, 'elapsed time pauses while no input is arriving');
+  assert.equal(app.run('timer'), null, 'elapsed time pauses while no input is arriving');
 
   creation.resolve(response({id:lectureId,title:'수업',created_at:new Date().toISOString(),segments:[]}));
   await tick(); await tick();
@@ -1495,7 +1501,7 @@ test('temporary input loss during lecture creation keeps capture open until an e
   await tick();
   assert.equal(app.run('inputUnavailable'), false);
   assert.equal(app.run('recording'), true);
-  assert.equal(app.intervals.size, 1);
+  assert.notEqual(app.run('timer'), null);
 
   await app.run('stopRecording()');
   await tick(); await tick();
@@ -8979,6 +8985,7 @@ test('held recovery restarts yielded schedulers for another normal lesson withou
     const originalAudioScheduler=drainRecordingAudio;
     drainRecordingAudio=(...args)=>{__heldRawSchedulerCalls++;return originalAudioScheduler(...args);};
     fetch=async(url,options)=>{
+      if(url.endsWith('/recording-control'))return {status:200,ok:true,headers:new Headers(),json:async()=>({state:'active',capture_id:url.split('/').at(-2),revision:1})};
       __heldConcurrencyRequests.push({url,method:options.method,id:options.headers.get('X-Chunk-Id')});
       if(url!==apiUrl+'/lectures/'+${JSON.stringify(nextId)}+'/chunks'||options.method!=='POST')throw new Error('only the separate normal lesson may be uploaded');
       return {status:200,ok:true,headers:new Headers(),json:async()=>({
@@ -9373,4 +9380,71 @@ test('logout clears timetable choices and a late old account list cannot repaint
   gate.resolve(response({timetable:{classes:[{subject:'OLD PRIVATE'}]}}));await loading;
   for(const id of ['lecture-timetable','metadata-timetable','course-options'])assert.equal(app.element(id).children.some(x=>x.value==='OLD PRIVATE'),false);
   assert.equal(app.element('lecture-timetable').disabled,true);assert.equal(app.element('metadata-timetable').disabled,true);
+});
+
+
+test('explicit transcription stop preserves final PCM and uncertain CLOVA rows while raw uploads continue and new lessons open',async()=>{
+  const late=deferred();const {app,start,rawPosts,asrPosts}=originalAudioApp({transcribe:()=>late.promise});
+  await start();app.microphone().callbacks.onChunk(chunk(0));
+  await until(()=>asrPosts.length===1,'synthetic ASR entered');
+  const oldId=app.run('captureSession.id'),oldToken=app.run('asrController');
+  app.microphone().tail=chunk(5,3.2,3,true);
+  assert.equal(app.element('recording-stop').hidden,false);assert.equal(app.element('recording-stop').disabled,false);
+  await app.run('stopTranscription(captureSession)');
+  await until(()=>rawPosts.length===2&&app.run('pending.every(item=>audioChunkStored(item))'),'stopped original audio keeps uploading');
+  assert.equal(oldToken.signal.aborted,true);assert.equal(app.microphone().stopCalls,1);
+  assert.equal(app.run('capture'),null);assert.equal(app.run('pending.length'),2);
+  assert.equal(app.run('pending[1].final'),true);assert.equal(app.run('pending[0].inflight'),true);
+  assert.equal(app.run('liveQueue.sessions.get('+JSON.stringify(oldId)+').transcriptionStopped'),true);
+  assert.equal(app.run('activePendingCount()'),0);assert.equal(app.element('record-button').disabled,false);
+  await app.run('retryPending()');assert.equal(asrPosts.length,1,'terminal stop cannot retransmit');
+  await app.run('prepareIndependentLesson()');assert.equal(app.run('current'),null);
+  await app.run('startRecording()');const nextId=app.run('captureSession.id');assert.notEqual(nextId,oldId);
+  late.resolve(response({segments:[{id:'late-old-text',start:0,end:1,text:'이전 중단 응답'}],recording_finalized:true,recording_available:true}));
+  await tick();await tick();
+  assert.equal(app.run('current.id'),nextId);assert.equal(app.run('current.segments.length'),0);
+  assert.equal(app.run('pending.length'),2,'late response cannot discard stopped PCM');
+  app.run("asrCaptureId=captureSession.id;asrController=new AbortController();sending=true;sendError='새 수업 오류';");
+  const nextController=app.run('asrController');
+  await app.run('stopTranscription(liveSessions.get('+JSON.stringify(oldId)+'),"manual",{remote:true})');
+  assert.equal(nextController.signal.aborted,false);assert.equal(app.run('sending'),true);assert.equal(app.run('sendError'),'새 수업 오류');
+});
+
+test('local no-text stop still releases microphone after auth expiry and does not use network or replay audio',async()=>{
+  const {app}=continuationApp();await app.run('startRecording()');await until(()=>app.run('!!current'));
+  app.run("token='';captureSession.deadline.since=Date.now()-180001;");
+  await app.run('pollRecordingControls()');await until(()=>app.run('!capture&&!transcriptionStopPromise'),'offline deadline stops microphone');
+  assert.equal(app.microphone().stopCalls,1);assert.equal(app.run('[...liveSessions.values()][0].transcriptionStopped'),true);
+  assert.equal(app.run('sending'),false);assert.equal(app.run('liveQueue.sessions.values().next().value.transcriptionStopped'),true);
+});
+
+test('paused recording preserves its no-text budget and normal end does not claim capture continues',async()=>{
+  const {app}=continuationApp();await app.run('startRecording()');await until(()=>app.run('!!current'));
+  app.run('captureSession.deadline.since=Date.now()-170000');await app.run('pauseRecording()');
+  app.run('captureSession.deadline.since=Date.now()-999999');await app.run('pollRecordingControls()');
+  assert.equal(app.run('paused'),true);assert.equal(app.microphone().stopCalls,undefined);
+  await app.run('resumeRecording()');assert.equal(app.run('captureSession.deadline.paused'),false);
+  assert.ok(app.run('captureSession.deadline.remaining<=10000'));
+  await app.run('stopRecording()');app.run('sending=true;updateControls()');
+  assert.match(app.element('processing-text').textContent,/녹음은 종료/);
+  assert.doesNotMatch(app.element('processing-text').textContent,/녹음은 기다리지 않고 계속/);
+});
+
+
+test('auth expiry during paused unconfirmed ASR still stops capture locally and keeps original audio',async()=>{
+  const late=deferred();const {app,start,asrPosts}=originalAudioApp({transcribe:()=>late.promise});
+  await start();app.microphone().callbacks.onChunk(chunk(0));await until(()=>asrPosts.length===1);
+  const oldId=app.run('captureSession.id');app.microphone().tail=chunk(5,3.2,3,true);
+  await app.run('pauseRecording()');assert.equal(app.run('captureSession.deadline.paused'),true);
+  const requestDeadline=app.run('captureSession.deadline.requests.values().next().value');
+  app.run('captureSession.deadline.requestStarted(pending[0].id,Date.now()+999999)');
+  assert.equal(app.run('captureSession.deadline.requests.values().next().value'),requestDeadline);
+  app.run("token='';for(const id of captureSession.deadline.requests.keys())captureSession.deadline.requests.set(id,Date.now()-1);");
+  await app.run('pollRecordingControls()');await until(()=>app.run('!capture&&!transcriptionStopPromise'),'paused unauthenticated request deadline');
+  assert.equal(app.microphone().stopCalls,1);assert.equal(app.run('pending.length'),2);assert.equal(app.run('pending[1].final'),true);
+  assert.equal(app.run('liveQueue.sessions.get('+JSON.stringify(oldId)+').transcriptionStopped'),true);
+  assert.equal(app.run('liveQueue.sessions.get('+JSON.stringify(oldId)+').transcriptionStopReason'),'no_text_timeout');
+  assert.equal(app.run('sending'),false);assert.equal(asrPosts.length,1);
+  late.resolve(response({detail:{code:'recording_stopped',recording_control:{state:'stopped',capture_id:oldId,revision:3,reason:'no_text_timeout'}}},409));
+  await tick();await tick();assert.equal(app.run('pending.length'),2);assert.equal(app.run('capture'),null);
 });

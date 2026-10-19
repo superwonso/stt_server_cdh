@@ -226,10 +226,12 @@
                 <strong id="record-state">시작할 준비가 됐어요</strong>
                 <time id="elapsed" aria-label="녹음 시간">00:00</time>
               </div>
+              <p id="recording-control-note" role="status" hidden></p>
               <p id="record-hint">약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.</p>
               <div class="level-track" aria-hidden="true"><span id="mic-level"></span></div>
             </div>
             <div class="record-actions" role="group" aria-label="받아쓰기 녹음 제어">
+              <button id="recording-stop" class="pause-button" type="button" aria-describedby="recording-control-note" title="녹음과 전사를 중단하고 미처리 음성은 원본으로 보관합니다." hidden>■ 녹음·전사 중단</button>
               <button id="pause-button" class="pause-button" type="button" aria-pressed="false" disabled>Ⅱ 일시정지</button>
               <button id="record-button" class="record-button" type="button">● 받아쓰기 시작</button>
             </div>

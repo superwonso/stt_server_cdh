@@ -432,3 +432,75 @@ test('tryAllUploaders manager failure after work is not declared safe to replay'
     error.code === 'uploader_lock_failed' && error.coordinationRetrySafe === false && error.cause === failure);
   assert.equal(calls, 1);
 });
+
+test('ASR lock wait is abortable and a late ignored-abort callback never uploads', {timeout: 2000}, async t => {
+  const manager = new LockManager(); environment(t, manager);
+  const coordination = new LiveCoordination(), firstGate = deferred(), controller = new AbortController();
+  const first = coordination.runUploader(OWNER, () => firstGate.promise);
+  await turns();
+  let calls = 0;
+  const waiting = coordination.runUploader(OWNER, () => { calls += 1; }, {signal: controller.signal});
+  const rejected = assert.rejects(waiting, error => error.code === 'uploader_lock_aborted' && error.coordinationRetrySafe);
+  await turns(); controller.abort(); await rejected;
+  firstGate.resolve(); await first; await turns();
+  assert.equal(calls, 0);
+  assert.equal((await coordination.runUploader(OWNER, () => 'next')).value, 'next');
+});
+
+test('ASR lock wait timeout prevents the queued upload and leaves original-audio lane usable', {timeout: 2000}, async t => {
+  const manager = new LockManager(); environment(t, manager);
+  const coordination = new LiveCoordination(), firstGate = deferred();
+  const first = coordination.runUploader(OWNER, () => firstGate.promise);
+  await turns();
+  let calls = 0;
+  await assert.rejects(coordination.runUploader(OWNER, () => { calls += 1; }, {waitMs: 10}),
+    error => error.code === 'uploader_lock_timeout' && error.coordinationRetrySafe);
+  assert.equal((await coordination.runAudioUploader(OWNER, () => 'original saved')).value, 'original saved');
+  firstGate.resolve(); await first; await turns(); assert.equal(calls, 0);
+});
+
+test('acquired ASR work is not abandoned by its acquisition timeout or later signal', {timeout: 2000}, async t => {
+  environment(t, new LockManager());
+  const coordination = new LiveCoordination(), gate = deferred(), controller = new AbortController();
+  let entered = false, settled = false;
+  const active = coordination.runUploader(OWNER, async () => { entered = true; await gate.promise; return 'saved'; },
+    {signal: controller.signal, waitMs: 10}).then(value => { settled = true; return value; });
+  await turns(); assert.equal(entered, true); controller.abort();
+  await new Promise(resolve => setTimeout(resolve, 25)); assert.equal(settled, false);
+  gate.resolve(); assert.equal((await active).value, 'saved');
+});
+
+test('cancelled fallback waiter cannot release or overtake the active predecessor', {timeout: 2000}, async t => {
+  environment(t, null);
+  const coordination = new LiveCoordination(), gate = deferred(), controller = new AbortController(), events = [];
+  const first = coordination.runUploader(OWNER, async () => { events.push('first'); await gate.promise; });
+  await turns();
+  const cancelled = coordination.runUploader(OWNER, () => events.push('cancelled'), {signal: controller.signal});
+  const rejection = assert.rejects(cancelled, error => error.code === 'uploader_lock_aborted');
+  controller.abort(); await rejection;
+  const next = coordination.runUploader(OWNER, () => events.push('next'));
+  await turns(); assert.deepEqual(events, ['first']);
+  gate.resolve(); await Promise.all([first, next]); assert.deepEqual(events, ['first', 'next']);
+});
+
+test('fallback ASR lock timeout is bounded without running the cancelled work', {timeout: 2000}, async t => {
+  environment(t, null);
+  const coordination = new LiveCoordination(), gate = deferred();
+  const first = coordination.runUploader(OWNER, () => gate.promise);
+  await turns(); let calls = 0;
+  await assert.rejects(coordination.runUploader(OWNER, () => { calls += 1; }, {waitMs: 10}),
+    error => error.code === 'uploader_lock_timeout' && error.coordinationRetrySafe);
+  gate.resolve(); await first; await turns(); assert.equal(calls, 0);
+});
+
+test('already-aborted or invalid acquisition options never invoke uploader work', async t => {
+  environment(t, new LockManager());
+  const coordination = new LiveCoordination(), controller = new AbortController(); controller.abort();
+  let calls = 0;
+  await assert.rejects(coordination.runUploader(OWNER, () => { calls += 1; }, {signal: controller.signal}),
+    error => error.code === 'uploader_lock_aborted');
+  for (const options of [{waitMs: 0}, {waitMs: Infinity}, {waitMs: 60001}, {waitMs: 1.2}, {signal: {}}]) {
+    await assert.rejects(coordination.runUploader(OWNER, () => { calls += 1; }, options), LiveCoordinationValidationError);
+  }
+  assert.equal(calls, 0);
+});
