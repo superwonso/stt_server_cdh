@@ -11,9 +11,11 @@ from pathlib import Path
 import httpx
 
 from .model_protocol import (
-    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_STATUS_BYTES, AlignmentUnavailableError, ModelUnavailableError,
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_STATUS_BYTES, AlignmentUnavailableError, ModelUnavailableError, ModelRequestCancelledError,
     ProtocolError, dump_json, load_json, make_request, read_alignment_failure, read_result, safe_status,
+    make_cancel_request, read_cancel_request, read_cancelled_result,
 )
+from .model_cancellation import check_cancelled
 
 
 def validate_socket_path(value) -> Path:
@@ -56,6 +58,7 @@ def _gpu(value):
 
 class RemoteTranscriber:
     supports_boundary_context = True
+    supports_cancellation = True
 
     def __init__(self, settings):
         self._path = getattr(settings, "local_model_socket", None)
@@ -69,6 +72,7 @@ class RemoteTranscriber:
         self._model = str(getattr(settings, "model", "unknown"))
         self._device = str(getattr(settings, "device", "unknown"))
         self._client = None
+        self._cancel_client = None
         self._client_lock, self._status_lock = threading.Lock(), threading.Lock()
         self._closed = False
         self._status_thread = None
@@ -79,33 +83,37 @@ class RemoteTranscriber:
         return {**safe_status({}, model=self._model, device=self._device, state="offline"),
                 "gpu": {"available": False}}
 
-    def _get_client(self):
+    def _get_client(self, *, control=False):
         path = validate_socket_path(self._path) if self._runtime is None else None
         with self._client_lock:
             if self._closed:
                 raise ModelUnavailableError()
-            if self._client is None:
+            attribute = "_cancel_client" if control else "_client"
+            client = getattr(self, attribute)
+            if client is None:
                 if self._runtime is not None:
-                    self._client = httpx.Client(
+                    client = httpx.Client(
                         transport=httpx.HTTPTransport(trust_env=False, retries=0,
                             limits=httpx.Limits(max_connections=2, max_keepalive_connections=0)),
                         timeout=httpx.Timeout(self._timeout, connect=1),
                         trust_env=False, follow_redirects=False,
                     )
-                    return self._client
-                self._client = httpx.Client(
-                    transport=httpx.HTTPTransport(uds=str(path), trust_env=False, retries=0,
-                                                  limits=httpx.Limits(max_connections=2, max_keepalive_connections=0)),
-                    base_url="http://local-model", timeout=httpx.Timeout(self._timeout, connect=1),
-                    trust_env=False, follow_redirects=False,
-                )
-            return self._client
+                else:
+                    client = httpx.Client(
+                        transport=httpx.HTTPTransport(uds=str(path), trust_env=False, retries=0,
+                                                      limits=httpx.Limits(max_connections=2, max_keepalive_connections=0)),
+                        base_url="http://local-model", timeout=httpx.Timeout(self._timeout, connect=1),
+                        trust_env=False, follow_redirects=False,
+                    )
+                setattr(self, attribute, client)
+            return client
 
-    def _request(self, method, path, *, body=None, maximum=MAX_RESPONSE_BYTES, status=False, request_id=None):
+    def _request(self, method, path, *, body=None, maximum=MAX_RESPONSE_BYTES, status=False, request_id=None, control=False):
         try:
-            deadline = time.monotonic() + (0.8 if status else self._timeout)
-            client = self._get_client()
-            timeout = httpx.Timeout(0.8) if status else httpx.Timeout(self._timeout, connect=1)
+            short = status or control
+            deadline = time.monotonic() + (0.8 if short else self._timeout)
+            client = self._get_client(control=True) if control else self._get_client()
+            timeout = httpx.Timeout(0.8) if short else httpx.Timeout(self._timeout, connect=1)
             headers = {"Content-Type": "application/json", "Accept-Encoding": "identity"}
             target = path
             if self._runtime is not None:
@@ -139,8 +147,14 @@ class RemoteTranscriber:
                         }:
                             code = failed["code"]
                     except ProtocolError:
-                        if response.status_code == 422:
+                        if response.status_code in {409, 422}:
                             raise
+                    if isinstance(failed, dict) and failed.get("code") == "transcription_cancelled":
+                        if (response.status_code != 409 or method != "POST" or path != "/transcribe"
+                                or request_id is None or status or control
+                                or response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"):
+                            raise ProtocolError()
+                        raise read_cancelled_result(failed, request_id) from None
                     if isinstance(failed, dict) and failed.get("code") == "alignment_unavailable":
                         if (response.status_code != 422 or method != "POST" or path != "/transcribe"
                                 or request_id is None or status
@@ -160,7 +174,7 @@ class RemoteTranscriber:
             raise ModelUnavailableError() from None
         except ModelUnavailableError:
             raise
-        except AlignmentUnavailableError as error:
+        except (AlignmentUnavailableError, ModelRequestCancelledError) as error:
             raise error from None
         except RuntimeError:
             # HTTPX client-close races are not application tracebacks.
@@ -206,9 +220,31 @@ class RemoteTranscriber:
         # Introspection never initializes ROCm in the API process.
         return dict(self.status()["gpu"])
 
+    def _cancel_request(self, request_id):
+        # Separate bounded control connections cannot queue behind inference
+        # or status. Retry only this idempotent UUID cancellation, never PCM.
+        body = dump_json(make_cancel_request(request_id), 512)
+        for _ in range(3):
+            try:
+                value = self._request("POST", f"/requests/{request_id}/cancel", body=body,
+                                      maximum=512, control=True)
+                if (not isinstance(value, dict) or set(value) != {"version", "request_id", "cancel_requested"}
+                        or value["cancel_requested"] is not True
+                        or read_cancel_request({key: value[key] for key in ("version", "request_id")}) != request_id):
+                    raise ProtocolError()
+                return True
+            except (ModelUnavailableError, ProtocolError):
+                pass
+        return False
+
     def transcribe(self, samples, language, overlap_seconds=0.0, final_chunk=True, *,
-                   start_seconds=0.0, boundary_context=None, boundary_output=None):
+                   start_seconds=0.0, boundary_context=None, boundary_output=None, cancel_event=None):
+        finished = threading.Event()
+        cancel_sent = threading.Event()
+        cancel_lock = threading.Lock()
+        watcher = None
         try:
+            check_cancelled(cancel_event)
             if boundary_output is not None and not isinstance(boundary_output, dict):
                 raise ProtocolError()
             request_id = str(uuid.uuid4())
@@ -217,7 +253,28 @@ class RemoteTranscriber:
                                    boundary_requested=boundary_context is not None or boundary_output is not None,
                                    request_id=request_id)
             body = dump_json(request, MAX_REQUEST_BYTES)
-            response = self._request("POST", "/transcribe", body=body, request_id=request_id)
+            def request_cancel():
+                with cancel_lock:
+                    if cancel_sent.is_set():
+                        return
+                    cancel_sent.set()
+                self._cancel_request(request_id)
+            if cancel_event is not None:
+                def watch_cancel():
+                    while not finished.wait(.05):
+                        if cancel_event.is_set():
+                            request_cancel()
+                            return
+                watcher = threading.Thread(target=watch_cancel, name="local-model-cancel", daemon=True)
+                watcher.start()
+            try:
+                response = self._request("POST", "/transcribe", body=body, request_id=request_id)
+            except ModelUnavailableError as error:
+                if error.code in {"model_timeout", "model_unavailable"}:
+                    request_cancel()
+                check_cancelled(cancel_event)
+                raise
+            check_cancelled(cancel_event)
             segments, output = read_result(response, request_id, len(samples))
             if (output is not None) != request["boundary_requested"]:
                 raise ProtocolError()
@@ -227,6 +284,10 @@ class RemoteTranscriber:
             return segments
         except ProtocolError:
             raise ModelUnavailableError("model_protocol_error") from None
+        finally:
+            finished.set()
+            if watcher is not None:
+                watcher.join(.1)
 
     def close(self):
         with self._client_lock:
@@ -234,5 +295,8 @@ class RemoteTranscriber:
             if self._client is not None:
                 self._client.close()
                 self._client = None
+            if self._cancel_client is not None:
+                self._cancel_client.close()
+                self._cancel_client = None
         self._cached_status = self._fallback_status()
         self._status_at = time.monotonic()

@@ -46,6 +46,44 @@ class ProtocolError(ValueError):
         super().__init__("Invalid local model protocol")
 
 
+class ModelRequestCancelledError(RuntimeError):
+    """One request was stopped; no transcript or boundary was committed."""
+    code = "transcription_cancelled"
+    retryable = False
+
+    def __init__(self):
+        super().__init__("이 음성의 처리를 중단했습니다.")
+
+    def __str__(self):
+        return "이 음성의 처리를 중단했습니다."
+
+    def __repr__(self):
+        return "ModelRequestCancelledError()"
+
+
+def make_cancel_request(request_id):
+    return {"version": PROTOCOL_VERSION, "request_id": _request_id(request_id)}
+
+
+def read_cancel_request(value):
+    if (not isinstance(value, dict) or set(value) != {"version", "request_id"}
+            or type(value["version"]) is not int or value["version"] != PROTOCOL_VERSION):
+        raise ProtocolError()
+    return _request_id(value["request_id"])
+
+
+def make_cancelled_result(request_id):
+    return {**make_cancel_request(request_id), "code": "transcription_cancelled", "retryable": False}
+
+
+def read_cancelled_result(value, request_id):
+    if (not isinstance(value, dict) or set(value) != {"version", "request_id", "code", "retryable"}
+            or value["code"] != "transcription_cancelled" or value["retryable"] is not False
+            or read_cancel_request({key: value[key] for key in ("version", "request_id")}) != _request_id(request_id)):
+        raise ProtocolError()
+    return ModelRequestCancelledError()
+
+
 def validate_partial_text(value: str) -> str:
     """Bound an exact provisional transcript; never truncate or make segments."""
     if (not isinstance(value, str) or not value or value != value.strip()

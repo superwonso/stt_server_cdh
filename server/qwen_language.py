@@ -119,11 +119,12 @@ class LanguageHeaderLogitsProcessor:
 
 class KoreanEnglishASRMixin:
     def _infer_asr_transformers(self, contexts, wavs, languages):
+        from .model_cancellation import RequestStoppingCriteria, check_cancelled
         # Adapted from qwen-asr 0.0.6 inference/qwen3_asr.py:
         # Copyright 2026 The Alibaba Qwen team. SPDX-License-Identifier: Apache-2.0
         # https://www.apache.org/licenses/LICENSE-2.0
-        # The only behavioral addition is a per-generate language-header mask.
-        # Keep the upstream processing, batching and decoding contract intact.
+        # Keep upstream processing/batching/decoding, with a request-local
+        # language-header mask and cooperative cancellation between tokens.
         if len(contexts) != len(wavs) or len(wavs) != len(languages):
             raise ValueError("qwen_language_batch_invalid")
         outs = []
@@ -140,13 +141,14 @@ class KoreanEnglishASRMixin:
             language is None for language in languages
         ) else None
         for offset in range(0, len(texts), batch_size):
+            check_cancelled()
             sub_text = texts[offset:offset + batch_size]
             sub_wavs = wavs[offset:offset + batch_size]
             sub_languages = languages[offset:offset + batch_size]
             inputs = self.processor(text=sub_text, audio=sub_wavs,
                                     return_tensors="pt", padding=True)
             inputs = inputs.to(self.model.device).to(self.model.dtype)
-            kwargs = {}
+            kwargs = {"stopping_criteria": [RequestStoppingCriteria()]}
             if any(language is None for language in sub_languages):
                 kwargs["logits_processor"] = [LanguageHeaderLogitsProcessor(
                     paths, prompt_length=inputs["input_ids"].shape[1],
@@ -155,6 +157,8 @@ class KoreanEnglishASRMixin:
                 )]
             text_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens,
                                            **kwargs)
+            # A stopped decode is never passed to parsing/alignment as success.
+            check_cancelled()
             decoded = self.processor.batch_decode(
                 text_ids.sequences[:, inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True, clean_up_tokenization_spaces=False,
@@ -166,8 +170,12 @@ class KoreanEnglishASRMixin:
 def load_korean_english_asr(*args, **kwargs):
     """Load the existing pinned model lazily with the auto-language adapter."""
     from qwen_asr import Qwen3ASRModel
+    from .model_cancellation import CancellableAligner
 
     class KoreanEnglishQwenASR(KoreanEnglishASRMixin, Qwen3ASRModel):
         pass
 
-    return KoreanEnglishQwenASR.from_pretrained(*args, **kwargs)
+    model = KoreanEnglishQwenASR.from_pretrained(*args, **kwargs)
+    if getattr(model, "forced_aligner", None) is not None:
+        model.forced_aligner = CancellableAligner(model.forced_aligner)
+    return model

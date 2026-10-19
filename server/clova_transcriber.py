@@ -413,6 +413,7 @@ class ClovaStreamingTranscriber:
         username: str,
         start_seconds: float,
         payload_hash: str,
+        cancel_event: threading.Event | None = None,
     ) -> list[dict]:
         if not isinstance(username, str) or not isinstance(lecture_id, str):
             raise ClovaTranscriptionError("invalid_input")
@@ -420,7 +421,7 @@ class ClovaStreamingTranscriber:
         # Register before waiting for this lecture's operation turn. A concurrent
         # lecture deletion can therefore invalidate both the active call and
         # already-queued calls before either sends CONFIG or private audio.
-        with self._track_operation(owner_key) as operation_token:
+        with self._track_operation(owner_key, cancel_event) as operation_token:
             return self._transcribe_tracked(
                 samples,
                 language,
@@ -690,9 +691,14 @@ class ClovaStreamingTranscriber:
             self._shutdown(session)
 
     @contextmanager
-    def _track_operation(self, owner_key: tuple[str, str]):
+    def _track_operation(self, owner_key: tuple[str, str], cancel_event=None):
         token = object()
         with self._state_lock:
+            # API sets this event before close_session takes the same lock.
+            # Calls registered earlier are invalidated by close_session;
+            # calls entering afterwards must not open a fresh paid stream.
+            if cancel_event is not None and cancel_event.is_set():
+                raise ClovaTranscriptionError("provider_unavailable", retryable=False)
             # Cancellation removes authorization tokens immediately, but its
             # queued calls still own their turns until they unwind. Count the
             # turns so repeated close/reopen cannot bypass the resource bound.

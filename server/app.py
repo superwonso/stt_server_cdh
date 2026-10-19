@@ -55,6 +55,7 @@ from .correction_result import completed_correction_result
 from .llm_result import RESULT_WARNING
 from .recording_snapshot import RecordingSnapshot, SnapshotStream
 from .recording_uploads import RecordingUploadStore, require_asr_receipt, stored_seconds
+from .recording_control import RecordingControl
 from .summarizer import MindlogicSummarizer
 from .summary_service import SummaryService
 from .question_service import QuestionService
@@ -71,7 +72,7 @@ from .settings import Settings
 from .platform_files import ensure_private_directory, open_file, validate_private_path
 from .transcriber import LocalTranscriber
 from .remote_transcriber import RemoteTranscriber
-from .model_protocol import AlignmentUnavailableError, ModelUnavailableError
+from .model_protocol import AlignmentUnavailableError, ModelUnavailableError, ModelRequestCancelledError
 from . import transcription_issues
 from .transcription_issues import AlignmentChunkError
 from .model_control import ModelControlError, create_model_control, sanitized_status as sanitized_model_control_status
@@ -188,6 +189,13 @@ class PresenceBody(BaseModel):
     activity: PresenceActivity
     tab_id: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")] | None = None
     idle_seconds: Annotated[StrictInt, Field(ge=0, le=86400)] | None = None
+
+
+class RecordingControlBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["start", "pause", "resume", "stop", "finish"]
+    capture_id: uuid.UUID
+    reason: Literal["manual", "no_text_timeout"] = "manual"
 
 
 class AdminAccessBody(BaseModel):
@@ -474,6 +482,7 @@ def create_app(
     correction_worker_thread: threading.Thread | None = None
     process_started_at = time.monotonic()
     activity_tracker = ActivityTracker(database, clock=lambda: time.time())
+    recording_control = RecordingControl(database, lambda owner, lecture: clova_engine.close_session(owner, lecture))
     account_ids = {username: secrets.token_urlsafe(24) for username in settings.accounts}
 
     @asynccontextmanager
@@ -497,6 +506,7 @@ def create_app(
             # Even a partially failed startup must stop workers already started.
             ensure_import_worker()
             ensure_correction_worker()
+            recording_control.start()
             summary_service.start()
             translation_service.start()
             question_service.start()
@@ -512,6 +522,7 @@ def create_app(
             # waits share one deadline inside stop.sh's process grace time.
             request_correction_worker_shutdown()
             request_import_worker_shutdown()
+            recording_control.request_shutdown()
             summary_service.request_shutdown()
             translation_service.request_shutdown()
             question_service.request_shutdown()
@@ -537,6 +548,7 @@ def create_app(
             )
             lease_renewer.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             model_control.stop(timeout=min(1.0, max(0.0, shutdown_deadline - time.monotonic())))
+            recording_control.stop(timeout=min(1.0, max(0.0, shutdown_deadline - time.monotonic())))
             if backup_scheduler is not None:
                 backup_scheduler.stop(timeout=min(5.0, max(0.0, shutdown_deadline - time.monotonic())))
             if hasattr(clova_engine, "close"):
@@ -554,6 +566,7 @@ def create_app(
     app.state.database = database
     app.state.model_control = model_control
     app.state.activity_tracker = activity_tracker
+    app.state.recording_control = recording_control
     app.state.timetable_recognizer = timetable_recognizer
     app.state.transcriber = engine
     app.state.clova_transcriber = clova_engine
@@ -606,6 +619,7 @@ def create_app(
             "X-Overlap-Seconds",
             "X-Final-Chunk",
             "X-Qwen-Retry",
+            "X-Recording-Capture-ID",
             "X-Lecture-Id",
             "X-Import-Id",
             "X-Upload-Offset",
@@ -1227,6 +1241,20 @@ def create_app(
         result["recording_audio_finalized"] = audio_finalized
         result["recording_stored_seconds"] = seconds
         return result
+
+    @app.get("/lectures/{lecture_id}/recording-control")
+    def get_recording_control(lecture_id: str, user: dict = Depends(data_identity)):
+        if not limiter.allow(("recording-control-read", user["username"]), 600, 60):
+            raise HTTPException(429, "잠시 후 녹음 상태를 다시 확인하세요.", headers={"Retry-After": "2"})
+        return JSONResponse(recording_control.status(lecture_id, user["username"]),
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/lectures/{lecture_id}/recording-control")
+    def update_recording_control(lecture_id: str, body: RecordingControlBody, user: dict = Depends(data_identity)):
+        if not limiter.allow(("recording-control-write", user["username"]), 120, 60):
+            raise HTTPException(429, "잠시 후 녹음 상태를 다시 확인하세요.", headers={"Retry-After": "2"})
+        return JSONResponse(recording_control.command(lecture_id, user["username"],
+                            str(body.capture_id), body.action, body.reason), headers={"Cache-Control": "no-store"})
 
     def lecture_result(lecture: dict, *, segments: list[dict] | None = None) -> dict:
         result = {
@@ -1866,11 +1894,13 @@ def create_app(
                 headers={"Retry-After": "2"},
             )
 
-    def transcribe_local_chunk(lecture, samples, overlap, final, start_seconds):
+    def transcribe_local_chunk(lecture, samples, overlap, final, start_seconds, cancel_event=None):
         # Context is private, owner-scoped and taken only from a committed
         # chunk. Retry/rollback/restart cannot advance an in-memory ASR tail.
+        cancel_args = ({"cancel_event": cancel_event}
+                       if getattr(engine, "supports_cancellation", False) else {})
         if not getattr(engine, "supports_boundary_context", False):
-            return engine.transcribe(samples, lecture["language"], overlap, final), None
+            return engine.transcribe(samples, lecture["language"], overlap, final, **cancel_args), None
         with database.connect() as connection:
             previous = connection.execute(
                 "SELECT c.qwen_boundary_json FROM chunks c "
@@ -1891,6 +1921,7 @@ def create_app(
         segments = engine.transcribe(
             samples, lecture["language"], overlap, final,
             start_seconds=start_seconds, boundary_context=context, boundary_output=output,
+            **cancel_args,
         )
         serialized = json.dumps(output, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         if len(serialized.encode("utf-8")) > 65536:
@@ -1900,7 +1931,13 @@ def create_app(
     @app.post("/lectures/{lecture_id}/recording-finalize")
     def finalize_received_recording(lecture_id: str,
                                    x_qwen_retry: Annotated[Literal["0", "1"], Header()] = "0",
+                                   x_recording_capture_id: Annotated[uuid.UUID | None, Header()] = None,
                                    user: dict = Depends(data_identity)):
+        capture_id = None if x_recording_capture_id is None else str(x_recording_capture_id)
+        with recording_control.request(lecture_id, user["username"], capture_id) as control_request:
+            return finalize_received_recording_impl(lecture_id, x_qwen_retry, user, control_request)
+
+    def finalize_received_recording_impl(lecture_id, x_qwen_retry, user, control_request):
         """Close an interrupted lesson and recover its withheld final ASR guard."""
 
         lecture = owned_lecture(lecture_id, user["username"])
@@ -1912,6 +1949,7 @@ def create_app(
             with recording_store.lock:
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
+                    recording_control.check(connection, lecture_id, control_request.capture_id, allow_finished=True)
                     current = connection.execute(
                         "SELECT recording_finalized, audio_finalized FROM lectures "
                         "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
@@ -1925,6 +1963,7 @@ def create_app(
                             "UPDATE lectures SET recording_finalized = 1 WHERE id = ?",
                             (lecture_id,),
                         )
+                    recording_control.mark_finished(connection, lecture_id)
             try:
                 clova_engine.close_session(user["username"], lecture_id)
             except Exception:
@@ -1936,6 +1975,7 @@ def create_app(
             }
         guard_chunk_id = final_guard_chunk_id()
         with database.connect() as connection:
+            recording_control.check(connection, lecture_id, control_request.capture_id, allow_finished=True)
             if lecture["recording_finalized"]:
                 segments = finalized_tail_segments(
                     connection,
@@ -1972,6 +2012,7 @@ def create_app(
             # crash is safe because startup already removes pending chunks.
             with database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                recording_control.check(connection, lecture_id, control_request.capture_id, allow_finished=True)
                 current = connection.execute(
                     "SELECT recording_finalized FROM lectures "
                     "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
@@ -2024,11 +2065,15 @@ def create_app(
                     )
                 acquired_capacity = True
                 started = time.perf_counter()
-                inference_lock.acquire()
+                while not inference_lock.acquire(timeout=0.25):
+                    if control_request.cancel_event.is_set():
+                        raise ModelRequestCancelledError()
                 try:
+                    if control_request.cancel_event.is_set():
+                        raise ModelRequestCancelledError()
                     raw_segments, boundary_json = transcribe_local_chunk(
                         lecture, samples, snapshot["duration_seconds"], True,
-                        snapshot["start_seconds"],
+                        snapshot["start_seconds"], control_request.cancel_event,
                     )
                 finally:
                     inference_lock.release()
@@ -2055,6 +2100,7 @@ def create_app(
                 expected_frames = None if snapshot is None else snapshot["total_frames"]
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
+                    recording_control.check(connection, lecture_id, control_request.capture_id, allow_finished=True)
                     current = connection.execute(
                         "SELECT recording_finalized, audio_finalized FROM lectures "
                         "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
@@ -2113,11 +2159,13 @@ def create_app(
                                     headers={"Retry-After": "2"},
                                 )
                             transcription_issues.clear(connection, lecture_id, guard_chunk_id)
+                            recording_control.text_committed(connection, lecture_id, segments)
                         connection.execute(
                             "UPDATE lectures SET recording_finalized = 1 "
                             "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
                             (lecture_id, user["username"]),
                         )
+                        recording_control.mark_finished(connection, lecture_id)
             queue_completed_recording(user["username"], lecture_id)
             return {
                 "segments": segments,
@@ -2137,14 +2185,19 @@ def create_app(
                                         headers={"Retry-After": "2"}) from None
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
+                    recording_control.check(connection, lecture_id, control_request.capture_id)
                     ensure_recording_can_finalize(connection, lecture_id, exclude_chunk_id=guard_chunk_id)
                     issue = transcription_issues.save(connection, lecture, guard_chunk_id, payload_hash,
                         snapshot["start_seconds"], snapshot["duration_seconds"], snapshot["duration_seconds"],
                         True, error.partial_text, now_text(), kind="finalize")
             raise AlignmentChunkError(issue) from None
+        except ModelRequestCancelledError:
+            recording_control.raise_cancelled(lecture_id, control_request.capture_id)
         except ModelUnavailableError as error:
+            recording_control.check_current(lecture_id, control_request.capture_id)
             raise local_model_retry_error(error) from None
         except Exception as error:
+            recording_control.check_current(lecture_id, control_request.capture_id)
             log.exception("Could not finalize the stored recording guard")
             raise HTTPException(
                 503,
@@ -2486,6 +2539,19 @@ def create_app(
         payload: bytes,
         interrupted=None,
         allow_alignment_retry=False,
+        recording_capture_id=None,
+    ):
+        if interrupted is not None:
+            # File-import cancellation is a separate lane with its own owner.
+            return process_chunk_impl(lecture, chunk_id, start_seconds, overlap_seconds, final_chunk,
+                                      payload, interrupted, allow_alignment_retry)
+        with recording_control.request(lecture["id"], lecture["username"], recording_capture_id) as request_control:
+            return process_chunk_impl(lecture, chunk_id, start_seconds, overlap_seconds, final_chunk,
+                                      payload, interrupted, allow_alignment_retry, request_control)
+
+    def process_chunk_impl(
+        lecture, chunk_id, start_seconds, overlap_seconds, final_chunk, payload,
+        interrupted=None, allow_alignment_retry=False, request_control=None,
     ):
         samples, duration, pcm = decode_wav(payload)
         if overlap_seconds > duration or (not final_chunk and overlap_seconds >= duration):
@@ -2520,6 +2586,8 @@ def create_app(
         try:
             with database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                if request_control is not None:
+                    recording_control.check(connection, lecture_id, request_control.capture_id, allow_finished=True)
                 replay = replay_result(
                     connection,
                     lecture_id,
@@ -2557,18 +2625,21 @@ def create_app(
             boundary_json = None
             provider = lecture.get("asr_provider", "qwen")
             if provider == "qwen":
-                if interrupted is None:
-                    inference_lock.acquire()
-                else:
-                    while not inference_lock.acquire(timeout=0.25):
-                        if interrupted():
-                            raise ImportInterrupted("import stopped while waiting for inference")
-                    if interrupted():
-                        inference_lock.release()
-                        raise ImportInterrupted("import stopped before inference")
+                while not inference_lock.acquire(timeout=0.25):
+                    if interrupted is not None and interrupted():
+                        raise ImportInterrupted("import stopped while waiting for inference")
+                    if request_control is not None and request_control.cancel_event.is_set():
+                        raise ModelRequestCancelledError()
                 try:
+                    if interrupted is not None and interrupted():
+                        raise ImportInterrupted("import stopped before inference")
+                    if request_control is not None:
+                        recording_control.check_current(lecture_id, request_control.capture_id)
+                        if request_control.cancel_event.is_set():
+                            raise ModelRequestCancelledError()
                     raw_segments, boundary_json = transcribe_local_chunk(
                         lecture, samples, overlap_seconds, final_chunk, start_seconds,
+                        None if request_control is None else request_control.cancel_event,
                     )
                 finally:
                     inference_lock.release()
@@ -2577,6 +2648,10 @@ def create_app(
                     # Imports are deliberately local-only. Reaching this branch
                     # indicates corrupted metadata rather than an opt-in cloud job.
                     raise RuntimeError("External provider is not allowed for imports")
+                if request_control is not None:
+                    recording_control.check_current(lecture_id, request_control.capture_id)
+                    if request_control.cancel_event.is_set():
+                        raise ModelRequestCancelledError()
                 raw_segments = clova_engine.transcribe(
                     samples,
                     lecture["language"],
@@ -2586,6 +2661,8 @@ def create_app(
                     username=lecture["username"],
                     start_seconds=start_seconds,
                     payload_hash=payload_hash,
+                    **({"cancel_event": request_control.cancel_event}
+                       if request_control is not None and isinstance(clova_engine, ClovaStreamingTranscriber) else {}),
                 )
             else:
                 raise RuntimeError("Unsupported persisted transcription provider")
@@ -2594,6 +2671,8 @@ def create_app(
             with recording_store.lock:
                 with database.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
+                    if request_control is not None:
+                        recording_control.check(connection, lecture_id, request_control.capture_id)
                     still_owned = connection.execute(
                         "SELECT id, recording_finalized, audio_finalized FROM lectures "
                         "WHERE id = ? AND username = ? AND deleting = 0 AND trashed_at IS NULL",
@@ -2640,6 +2719,8 @@ def create_app(
                         (processing_seconds, boundary_json, lecture_id, chunk_id),
                     )
                     transcription_issues.clear(connection, lecture_id, chunk_id)
+                    if request_control is not None:
+                        recording_control.text_committed(connection, lecture_id, segments)
                     # An opted-in raw lane may be ahead/behind ASR. Never let
                     # an ASR final race close a still-growing raw recording.
                     raw_started = connection.execute(
@@ -2651,6 +2732,8 @@ def create_app(
                             "UPDATE lectures SET recording_finalized = 1 WHERE id = ?",
                             (lecture_id,),
                         )
+                        if request_control is not None:
+                            recording_control.mark_finished(connection, lecture_id)
             if transcript_finalized:
                 queue_completed_recording(lecture["username"], lecture_id)
             return {
@@ -2661,6 +2744,8 @@ def create_app(
         except (HTTPException, ImportInterrupted):
             raise
         except ClovaTranscriptionError as error:
+            if request_control is not None:
+                recording_control.check_current(lecture_id, request_control.capture_id)
             # A gRPC timeout or disconnect can be ambiguous after audio left
             # this PC. Do not let the browser's generic 5xx retry loop resend
             # and potentially process the same audio repeatedly. The adapter's
@@ -2678,15 +2763,25 @@ def create_app(
         except AlignmentUnavailableError as error:
             with database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                if request_control is not None:
+                    recording_control.check(connection, lecture_id, request_control.capture_id)
                 issue = transcription_issues.save(connection, lecture, chunk_id, payload_hash,
                     start_seconds, overlap_seconds, duration, final_chunk, error.partial_text, now_text())
             raise AlignmentChunkError(issue) from None
+        except ModelRequestCancelledError:
+            if request_control is not None:
+                recording_control.raise_cancelled(lecture_id, request_control.capture_id)
+            raise HTTPException(409, "이 음성의 처리를 중단했습니다.") from None
         except ModelUnavailableError as error:
+            if request_control is not None:
+                recording_control.check_current(lecture_id, request_control.capture_id)
             # Local inference has no provider-side commit. Only the API commits
             # a validated result, so retrying the same chunk ID/context is safe.
             # Do not treat storage/corruption errors as model outages.
             raise local_model_retry_error(error) from None
         except Exception as error:
+            if request_control is not None:
+                recording_control.check_current(lecture_id, request_control.capture_id)
             log.exception("Local transcription failed")
             raise HTTPException(503, "이 PC에서 음성 인식을 실행하지 못했습니다. 서버 상태를 확인하고 다시 시도하세요.", headers={"Retry-After": "5"}) from error
         finally:
@@ -2766,6 +2861,7 @@ def create_app(
         x_overlap_seconds: Annotated[str, Header(max_length=40)] = "0",
         x_final_chunk: Annotated[str, Header(max_length=8)] = "true",
         x_qwen_retry: Annotated[Literal["0", "1"], Header()] = "0",
+        x_recording_capture_id: Annotated[uuid.UUID | None, Header()] = None,
         user: dict = Depends(data_identity),
     ):
         lecture = await run_in_threadpool(owned_lecture, lecture_id, user["username"])
@@ -2793,6 +2889,7 @@ def create_app(
         return await run_in_threadpool(
             process_chunk, lecture, chunk_id, start_seconds, overlap_seconds, final_chunk, bytes(payload),
             allow_alignment_retry=x_qwen_retry == "1",
+            recording_capture_id=None if x_recording_capture_id is None else str(x_recording_capture_id),
         )
 
     def now_text() -> str:

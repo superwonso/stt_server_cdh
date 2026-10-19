@@ -18,6 +18,7 @@ from unittest import mock
 from server import app as app_module
 from server.lease_renewal import LeaseRenewer
 from server.recovery_backup import BackupScheduler, RecoveryBackupManager
+from server.recording_control import RecordingControl
 from server.settings import Settings
 from server.summary_service import SummaryService
 from server.translation_service import TranslationService
@@ -111,10 +112,15 @@ class MaintenanceLifecycleTests(unittest.TestCase):
                 return thread.alive
 
             def join(thread, timeout):
-                # These assertions also cover the import/correction events,
-                # whose request helpers are closures rather than services.
-                self.assertTrue(thread.closure["import_worker_shutdown" if "import" in thread.name
-                                               else "correction_worker_shutdown"].is_set())
+                # Each worker, including the bound-method recording watchdog,
+                # must be signalled before *any* worker is joined.
+                for observed in threads:
+                    if observed.name == "recording-watchdog":
+                        self.assertTrue(observed.target.__self__._shutdown.is_set())
+                    else:
+                        shutdown_name = {"recording-import-worker": "import_worker_shutdown",
+                                         "transcript-correction-worker": "correction_worker_shutdown"}[observed.name]
+                        self.assertTrue(observed.closure[shutdown_name].is_set())
                 for name in ("summary", "translation", "archive", "lease") + (("backup",) if production else ()):
                     self.assertTrue(services[name].signalled, f"{name} was not signalled before the first join")
                 events.append(("join", thread.name, timeout))
@@ -172,6 +178,7 @@ class MaintenanceLifecycleTests(unittest.TestCase):
             self.run_lifespan(fixture.app)
             self.assertEqual(fixture.events.count(("start", "backup")), 1)
             self.assertEqual(fixture.events.count(("start", "lease")), 1)
+            self.assertEqual(fixture.events.count(("start", "recording-watchdog")), 1)
             self.assertTrue(all(not thread.alive for thread in fixture.threads))
 
     def test_explicit_production_opt_out_disables_lease_but_keeps_backup_independent(self):
@@ -195,7 +202,8 @@ class MaintenanceLifecycleTests(unittest.TestCase):
                 self.run_lifespan(fixture.app)
             waits = {event[1]: event[2] for event in fixture.events if event[0] == "join"}
             self.assertEqual(waits, {"transcript-correction-worker": 8, "summary": 5, "translation": 5,
-                                     "recording-import-worker": 0, "archive": 0, "lease": 0, "backup": 0})
+                                     "recording-import-worker": 0, "archive": 0, "lease": 0, "backup": 0,
+                                     "recording-watchdog": 0})
             self.assertEqual(fixture.clock.now, 1018)
             fixture.engines["correction"].close.assert_not_called()
             self.assertNotIn(("close", "archive"), fixture.events)
@@ -237,6 +245,24 @@ class MaintenanceLifecycleTests(unittest.TestCase):
                 self.assertTrue(service.shutdown.is_set())
                 engine.close.assert_called_once_with()
                 later_cleanup.assert_called_once_with()
+
+    def test_recording_watchdog_start_failure_preserves_original_exception_and_cleanup(self):
+        database = mock.Mock()
+        service = RecordingControl(database, mock.Mock())
+        later_cleanup = mock.Mock()
+        failure = RuntimeError("synthetic recording watchdog start failure")
+        with mock.patch.object(service, "expire_due"), mock.patch("threading.Thread.start", side_effect=failure):
+            with self.assertRaises(RuntimeError) as captured:
+                try:
+                    service.start()
+                finally:
+                    service.request_shutdown()
+                    self.assertTrue(service.stop(timeout=0))
+                    later_cleanup()
+        self.assertIs(captured.exception, failure)
+        self.assertIsNone(service._thread)
+        self.assertTrue(service._shutdown.is_set())
+        later_cleanup.assert_called_once_with()
 
     def test_unconfigured_status_is_safe_and_does_not_create_private_backup_files(self):
         # The real managers are used for status only, confined to this fixture.

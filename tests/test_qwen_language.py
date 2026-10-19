@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,8 @@ from server.qwen_language import (
     AUTO_LANGUAGE_HEADERS, KoreanEnglishASRMixin, LanguageHeaderLogitsProcessor,
     _header_paths, load_korean_english_asr,
 )
+from server.model_cancellation import cancellation_scope
+from server.model_protocol import ModelRequestCancelledError
 
 
 PATHS = ((1, 2, 4), (1, 3, 4), (1, 5, 4))
@@ -177,7 +180,8 @@ class QwenLanguageTests(unittest.TestCase):
         self.assertEqual([len(call['text']) for call in model.processor.calls], [2, 1])
         for call in model.model.calls:
             self.assertEqual(call['max_new_tokens'], 256)
-            self.assertEqual(set(call), {'input_ids', 'max_new_tokens', 'logits_processor'})
+            self.assertEqual(set(call), {'input_ids', 'max_new_tokens', 'logits_processor', 'stopping_criteria'})
+            self.assertFalse(call['stopping_criteria'][0](None, None))
         first = model.model.calls[0]['logits_processor'][0]
         second = model.model.calls[1]['logits_processor'][0]
         self.assertIsNot(first, second)
@@ -196,6 +200,25 @@ class QwenLanguageTests(unittest.TestCase):
         self.assertIn('logits_processor', model.model.calls[2])
         self.assertIsNot(model.model.calls[0]['logits_processor'][0],
                          model.model.calls[2]['logits_processor'][0])
+
+    def test_cancelled_generation_stops_all_request_rows_without_decoding_or_next_request_leak(self):
+        from transformers.generation.stopping_criteria import StoppingCriteriaList
+        event = threading.Event()
+        model = TinyASR()
+        original = model.model.generate
+        def cancel_during_generate(**kwargs):
+            criteria = StoppingCriteriaList(kwargs['stopping_criteria'])
+            self.assertFalse(criteria(kwargs['input_ids'], None).any().item())
+            event.set()
+            self.assertTrue(criteria(kwargs['input_ids'], None).all().item())
+            return SimpleNamespace(sequences=kwargs['input_ids'])
+        model.model.generate = cancel_during_generate
+        with patch.object(model.processor, 'batch_decode') as decode:
+            with self.assertRaises(ModelRequestCancelledError), cancellation_scope(event):
+                model._infer_asr_transformers(['', ''], [object(), object()], [None, 'Korean'])
+            decode.assert_not_called()
+        model.model.generate = original
+        self.assertEqual(model._infer_asr_transformers([''], [object()], [None]), ['1,3,4,7,8'])
 
     def test_lazy_loader_retains_from_pretrained_arguments_and_upstream_class(self):
         class FakeUpstream:

@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 import unittest
+import uuid
 from contextlib import contextmanager
 from unittest.mock import patch
 
@@ -21,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from server.model_process import ModelProcessError
 from server.model_protocol import (MAX_REQUEST_BYTES, ModelUnavailableError, dump_json,
-                                   make_request, read_result)
+                                   make_request, read_result, make_cancel_request)
 from server.model_server import create_model_app
 from server.remote_transcriber import RemoteTranscriber
 from server.win_model_transport import (AUTH_HEADER, RESPONSE_HEADER, LoopbackSecurityMiddleware,
@@ -61,12 +62,28 @@ class LoopbackAuthenticationTests(unittest.TestCase):
         return response, nonce
 
     def test_no_endpoint_accepts_an_unauthenticated_request(self):
-        for method, path in (("GET", "/health"), ("GET", "/status"), ("POST", "/transcribe"), ("POST", "/shutdown")):
+        for method, path in (("GET", "/health"), ("GET", "/status"), ("POST", "/transcribe"),
+                             ("POST", f"/requests/{uuid.uuid4()}/cancel"), ("POST", "/shutdown")):
             with self.subTest(path=path):
                 response = self.client.request(method, path)
                 self.assertEqual(response.status_code, 401)
                 self.assertNotIn(TOKEN, response.text)
                 self.assertNotIn("access-control-allow-origin", response.headers)
+        self.assertEqual(self.engine.calls, [])
+        self.assertEqual(self.shutdowns, [])
+
+    def test_cancel_is_signed_request_bound_and_browser_denied_without_starting_a_model(self):
+        rid = str(uuid.uuid4())
+        path = f'/requests/{rid}/cancel'
+        body = dump_json(make_cancel_request(rid), 512)
+        denied, _ = self.signed('POST', path, body=body, headers={'Origin': 'http://127.0.0.1:8765'})
+        self.assertEqual(denied.status_code, 403)
+        wrong, _ = self.signed('POST', path, body=dump_json(make_cancel_request(str(uuid.uuid4())), 512))
+        self.assertEqual(wrong.status_code, 422)
+        accepted, nonce = self.signed('POST', path, body=body)
+        self.assertEqual(accepted.status_code, 200)
+        verify_response(TOKEN, ENDPOINT, nonce, accepted, accepted.content)
+        self.assertEqual(accepted.json(), {**make_cancel_request(rid), 'cancel_requested': True})
         self.assertEqual(self.engine.calls, [])
         self.assertEqual(self.shutdowns, [])
 

@@ -667,5 +667,7 @@ class Database:
             migrate_activity_schema(connection)
             from .transcription_issues import migrate as migrate_transcription_issues
             migrate_transcription_issues(connection)
-            if schema_version < 27:
-                connection.execute("PRAGMA user_version = 27")
+            from .recording_control import migrate as migrate_recording_control
+            migrate_recording_control(connection)
+            if schema_version < 28:
+                connection.execute("PRAGMA user_version = 28")

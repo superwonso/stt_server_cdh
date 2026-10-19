@@ -509,6 +509,21 @@ class ClovaConcurrencyTests(unittest.TestCase):
 
 
 class ClovaStreamingTranscriberTests(unittest.TestCase):
+    def test_cancel_event_after_close_never_reopens_provider_stream(self):
+        factory = FakeFactory([])
+        engine = ClovaStreamingTranscriber(settings(), stub_factory=factory)
+        cancelled = threading.Event()
+        cancelled.set()
+        engine.close_session("synthetic-owner", "synthetic-lecture")
+        with self.assertRaises(ClovaTranscriptionError):
+            engine.transcribe(np.zeros(16000, dtype=np.float32), "ko", final_chunk=False,
+                username="synthetic-owner", lecture_id="synthetic-lecture", start_seconds=0,
+                payload_hash=digest("synthetic"), cancel_event=cancelled)
+        self.assertEqual(engine._operation_tokens, {})
+        self.assertEqual(engine._owner_queues, {})
+        self.assertEqual(engine._sessions, {})
+        self.assertEqual(factory.channels, [])
+
     def test_documented_english_alignment_preserves_spaces_from_response_text(self):
         def plan(seq, _start, _end):
             # NAVER's documented success example omits the two internal spaces

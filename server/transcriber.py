@@ -10,7 +10,8 @@ import webrtcvad
 
 from .settings import Settings
 from .qwen_boundary import reconcile_tokens
-from .model_protocol import AlignmentUnavailableError
+from .model_protocol import AlignmentUnavailableError, ModelRequestCancelledError
+from .model_cancellation import cancellation_scope, check_cancelled
 
 _LOG = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ class LocalTranscriber:
     """One model, loaded on demand; callers serialize inference off the event loop."""
 
     supports_boundary_context = True
+    supports_cancellation = True
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -167,9 +169,11 @@ class LocalTranscriber:
         start_seconds: float = 0.0,
         boundary_context: dict | None = None,
         boundary_output: dict | None = None,
+        cancel_event=None,
     ) -> list[dict]:
         # Metadata is returned to this call's transaction only. Never attach a
         # lecture's context to the shared model instance.
+        check_cancelled(cancel_event)
         if boundary_output is not None:
             boundary_output.clear()
         duration = len(samples) / SAMPLE_RATE
@@ -197,9 +201,11 @@ class LocalTranscriber:
             samples,
             FINAL_MIN_VOICED_FRAMES if final_chunk else MIN_VOICED_FRAMES,
         ):
+            check_cancelled(cancel_event)
             partition([], [])
             return []
         model = self._load()
+        check_cancelled(cancel_event)
         # qwen-asr 0.0.6 documents a 0.5 s minimum but does not pad short
         # arrays itself. Pad for inference only so the stored end time stays exact.
         if len(samples) < 8000:
@@ -208,11 +214,12 @@ class LocalTranscriber:
         if language not in {"ko", "en", None}:
             raise ValueError("Unsupported language")
         try:
-            transcription = model.transcribe(
-                audio=(np.asarray(samples, dtype=np.float32), SAMPLE_RATE),
-                language=model_language,
-                return_time_stamps=True,
-            )[0]
+            with cancellation_scope(cancel_event):
+                transcription = model.transcribe(
+                    audio=(np.asarray(samples, dtype=np.float32), SAMPLE_RATE),
+                    language=model_language,
+                    return_time_stamps=True,
+                )[0]
             text = transcription.text.strip()
             alignment = transcription.time_stamps
             items = list(alignment.items) if alignment is not None else []
@@ -256,7 +263,13 @@ class LocalTranscriber:
                         "end": min(duration, float(items[group[-1]].end_time)),
                         "text": selected_text,
                     })
+            check_cancelled(cancel_event)
             return result
+        except ModelRequestCancelledError:
+            if boundary_output is not None:
+                boundary_output.clear()
+            self._set_state("ready")
+            raise
         except AlignmentUnavailableError as error:
             # This known result-quality failure does not poison the shared GPU
             # worker. No timestamps/frontier/segments were manufactured above.
