@@ -114,16 +114,14 @@ export default function ImportPanel({ onImport, generate }: ImportPanelProps) {
         setPageCount(total);
         setFirstPage(1);
         setLastPage(Math.min(total, 10));
-        setNotice(`총 ${total}쪽이에요. 사용할 범위를 선택해 글을 추출해 주세요.`);
+        setNotice('PDF를 이 기기에서 읽었어요. 사용할 쪽을 선택해 주세요.');
       } else {
         const decoded = decodeTextBytes(await file.arrayBuffer());
         const text = decoded.text;
         if (decoded.warning) setWarnings([decoded.warning]);
         validateSourceText(text);
         setSourceText(text);
-        setNotice(
-          '글은 이 기기에서 읽었어요. 필요한 부분을 확인하고 AI 문항 만들기를 선택할 수 있어요.',
-        );
+        setNotice('글을 이 기기에서 읽었어요. 사용할 부분을 확인해 주세요.');
       }
     } catch (caught) {
       setError(errorMessage(caught));
@@ -236,10 +234,6 @@ export default function ImportPanel({ onImport, generate }: ImportPanelProps) {
         <h2 id="import-heading" className="text-xl font-bold">
           내 자료 가져오기
         </h2>
-        <p className="mt-2 text-sm">
-          엑셀·CSV·JSON 문제표는 이 기기에서 읽어요. PDF·글은 범위를 확인한 뒤 AI로 문제 초안을 만들
-          수 있어요.
-        </p>
       </div>
       <label className="block space-y-2">
         <span className="font-medium">파일 선택 (PDF 64MB · 그 외 20MB 이하)</span>
@@ -256,14 +250,13 @@ export default function ImportPanel({ onImport, generate }: ImportPanelProps) {
         />
       </label>
       {sourceName && <p className="break-all text-sm">선택한 파일: {sourceName}</p>}
-      <p className="text-sm">
-        문제표는 ‘파트 / 문제 / 답’ 열을 권장해요. 다른 열 이름도 직접 연결할 수 있어요. 파일은 이
-        기기에서 읽고, AI 버튼을 누르면 선택한 글만 전송해요. 학습 기록은 서버로 보내지 않아요.
-      </p>
 
       {table && (
         <div className="space-y-4 rounded-xl border p-4">
           <h3 className="font-bold">문제표 열 연결</h3>
+          <p className="text-sm">
+            문제표는 이 기기에서 읽어요. ‘파트 / 문제 / 답’에 해당하는 열을 선택하세요.
+          </p>
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="space-y-1">
               <span className="block">시트</span>

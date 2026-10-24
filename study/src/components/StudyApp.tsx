@@ -725,10 +725,7 @@ function Workspace({
                   <h1 ref={heading} tabIndex={-1}>
                     암기 학습
                   </h1>
-                  <p className="study-muted">
-                    한 번에 일곱 문제씩, 고르고 쓰면서 익혀요.
-                    <br />내 자료로 새로운 문제집을 만들어도 좋아요.
-                  </p>
+                  <p className="study-muted">7문제씩 고르고 쓰며 학습합니다.</p>
                 </div>
                 <div className="study-stats">
                   <div className="study-stat">

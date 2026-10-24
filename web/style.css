@@ -994,6 +994,20 @@ button {
   color: #8a563f;
 }
 
+.ui-help {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.ui-help > summary { cursor: pointer; width: fit-content; min-height: 44px; padding: 12px 0; }
+.ui-help > summary:focus-visible { outline: 2px solid var(--forest-700); outline-offset: 3px; }
+.ui-help p { margin: 8px 0; }
+.recording-help, .provider-first-use { grid-column: 1 / -1; }
+.provider-first-use { font-size: 12px; line-height: 1.65; color: #8a563f; }
+.provider-first-use p { margin: 0; }
+.provider-first-use button { display: inline-block; min-height: 44px; margin: 0 12px 0 0; }
+
 .compact-field input,
 .compact-field select {
   min-height: 44px;

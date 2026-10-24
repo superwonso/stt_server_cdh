@@ -267,6 +267,7 @@ function setup(fetch, { FileUploader = class { detach() {} }, storedServer = '',
   };
   const document = {
     hidden:false,getElementById:element,querySelector:element,createElement,
+    querySelectorAll:selector => selector === '[data-ai-data-info]' ? [element('ai-data-info-test')] : [],
     addEventListener(name,callback) {
       const callbacks = documentListeners.get(name) || [];
       callbacks.push(callback); documentListeners.set(name,callbacks);
@@ -1469,6 +1470,48 @@ test('activation presents and enforces the four-character minimum in the browser
   assert.equal(app.element('password').minLength, 4);
   assert.equal(app.element('password-confirm').minLength, 4);
   assert.match(app.element('password-label').textContent, /4자 이상/);
+});
+
+test('CLOVA first-use disclosure acknowledges only the current account login and server', () => {
+  const app = setup(async () => { throw new Error('disclosure must not make a provider request'); });
+  app.run("transcriptionProviders.clova.configured=true; $('asr-provider').value='clova'; updateProviderGuidance()");
+  assert.equal(app.element('clova-first-use').hidden,false);
+  assert.match(app.element('provider-privacy').textContent,/클라우드 사본은 삭제되지 않습니다/);
+  app.element('clova-details-open').onclick();
+  assert.equal(app.element('recording-help').open,true);
+  assert.equal(app.element('recording-help-title').focused,true);
+  app.element('clova-notice-dismiss').onclick();
+  assert.equal(app.element('clova-first-use').hidden,true);
+  for (const boundary of ["user='other'", "token='another-login'", "apiUrl='https://another.example'"]) {
+    app.run(`${boundary}; updateProviderGuidance()`);
+    assert.equal(app.element('clova-first-use').hidden,false);
+    app.element('clova-notice-dismiss').onclick();
+  }
+  app.run("$('asr-provider').value='qwen'; updateProviderGuidance()");
+  assert.equal(app.element('clova-first-use').hidden,true);
+  assert.equal(app.element('provider-privacy').hidden,true);
+});
+
+test('download scope guidance appears on demand and is cleared when leaving that lesson', () => {
+  const app = setup(async () => response({}));
+  app.run('updateControls()');
+  assert.equal(app.element('recording-download-note').hidden,true);
+  assert.equal(app.element('record-hint').hidden,true);
+  app.run("current={id:'lesson-one',segments:[]}; showRecordingDownloadNote('부분 WAV 안내'); updateControls()");
+  assert.equal(app.element('recording-download-note').hidden,false);
+  assert.equal(app.element('recording-download-note').textContent,'부분 WAV 안내');
+  app.run("current={id:'lesson-two',segments:[]}; updateControls()");
+  assert.equal(app.element('recording-download-note').hidden,true);
+  assert.equal(app.element('recording-download-note').textContent,'');
+});
+
+test('shared AI disclosure opens without submitting an AI request', () => {
+  const app = setup(async () => { throw new Error('help must not submit AI requests'); });
+  app.element('ai-data-info-test').onclick();
+  assert.equal(app.element('ai-data-dialog').open,true);
+  assert.equal(app.element('ai-data-close').focused,true);
+  app.element('ai-data-close').onclick();
+  assert.equal(app.element('ai-data-dialog').open,false);
 });
 
 test('temporary input loss during lecture creation keeps capture open until an explicit stop', async () => {

@@ -118,6 +118,7 @@ let audioUploadError = '', audioUploadErrorScope = '';
 // Explicit choices belong to that language in this account session, never shared storage
 // or an active lecture.
 let micProviderPreferences = {};
+let clovaNoticeAcknowledgedFor = '';
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30000;
 const STORAGE_RETRY_BASE_MS = 5000;
@@ -5330,24 +5331,41 @@ function updateProviderGuidance() {
   const clova = provider === 'clova';
   $('provider-privacy').textContent = CLOVA_PRIVACY_NOTICE;
   $('provider-privacy').hidden = !clova;
+  $('clova-first-use').hidden = !clova || !!current || !user || !token
+    || clovaNoticeAcknowledgedFor === JSON.stringify([user,token,apiUrl]);
   if (system) {
     $('provider-guidance').textContent = '컴퓨터·브라우저 탭 소리는 항상 Qwen-3으로 처리합니다.';
   } else if (clova && !transcriptionProviders.clova.configured && !current) {
-    $('provider-guidance').textContent = 'CLOVA Speech를 사용하려면 서버 컴퓨터에 스트리밍 Secret Key를 먼저 설정해야 합니다.';
+    $('provider-guidance').textContent = 'CLOVA를 사용할 수 없습니다. Qwen-3을 선택하거나 운영자에게 문의해 주세요.';
   } else if (clova) {
-    $('provider-guidance').textContent = '이 수업의 마이크 음성을 사이트 운영자가 설정한 NAVER CLOVA Speech로 처리합니다.';
+    $('provider-guidance').textContent = '';
   } else {
     $('provider-guidance').textContent = $('language').value === 'auto'
       ? 'Qwen-3이 한국어와 영어 중에서 언어를 감지합니다. 외부 음성 인식 서비스로 보내지 않습니다.'
-      : '마이크 음성을 Qwen-3으로 처리합니다. 외부 음성 인식 서비스로 보내지 않습니다.';
+      : 'Qwen-3은 이 서버에서 처리하며, 외부 음성 인식 서비스로 보내지 않습니다.';
   }
+  $('provider-guidance').hidden = !$('provider-guidance').textContent;
 }
+$('clova-details-open').onclick = () => {
+  $('recording-help').open = true;
+  $('recording-help-title').focus();
+};
+$('clova-notice-dismiss').onclick = () => {
+  if (!user || !token || displayedAsrProvider() !== 'clova') return;
+  clovaNoticeAcknowledgedFor = JSON.stringify([user,token,apiUrl]);
+  updateProviderGuidance();
+};
+for (const button of document.querySelectorAll('[data-ai-data-info]')) {
+  button.onclick = () => { $('ai-data-dialog').showModal(); $('ai-data-close').focus(); };
+}
+$('ai-data-close').onclick = () => $('ai-data-dialog').close();
 function updateSourceGuidance() {
   const system = selectedCaptureSource() === 'system';
   if (!current) applyNewLectureProvider();
   $('source-guidance').textContent = system
     ? '데스크톱 Chrome·Edge에서 탭·화면과 오디오 공유를 켜세요. 선택 범위의 알림이나 다른 앱 소리도 함께 들어갈 수 있으며, 화면 영상은 서버로 보내지 않습니다.'
-    : '마이크로 주변의 수업 소리를 받아씁니다.';
+    : '';
+  $('source-guidance').hidden = !system;
   $('source-privacy').hidden = !system;
   updateProviderGuidance();
 }
@@ -5855,10 +5873,11 @@ async function prepareLocalAudioExport({captureId=null,forImport=false,checkConv
   localAudioExportCaptureId=captureId;localAudioExportForImport=forImport;
   $('local-audio-title').textContent=forImport ? '파일 변환할 보관 음성 선택' : '기기에 남은 음성 내려받기';
   $('local-audio-description').textContent=forImport
-    ? '기기에 남은 구간을 선택하면 녹음 파일 가져오기로 보냅니다. “파일 올려 변환”을 누르면 Qwen-3으로 새 수업을 만듭니다. 이미 전송되어 기기에서 지워진 부분은 포함되지 않습니다. 원래 수업과 보류 상태는 유지됩니다.'
-    : '현재 계정의 이 브라우저에 남아 있는 음성만 복사합니다. 녹음·전송을 멈추거나 원본을 삭제하지 않습니다. 이미 서버로 전송되어 기기에서 지워진 구간, 다른 기기의 음성은 포함되지 않으므로 전체 수업 파일이 아닐 수 있습니다.';
+    ? '기기에 남은 구간만 변환할 수 있습니다. 선택 후 “파일 올려 변환”을 눌러 주세요.'
+    : '기기에 남은 구간만 포함됩니다. 파일을 모두 저장하세요.';
+  $('local-audio-help').open = false;
   $('local-audio-instructions').textContent=forImport
-    ? '겹치는 음성은 한 번만 담습니다. 구간을 각각 선택하거나, 여러 구간을 WAV 하나로 합쳐 선택할 수 있습니다. 합칠 때 녹음이 없는 중간 구간은 무음으로 채웁니다.'
+    ? 'Qwen-3으로 새 수업을 만들며 원래 수업과 보류 상태는 유지됩니다. 겹치는 음성은 한 번만 담습니다. 구간을 각각 선택하거나 WAV 하나로 합칠 수 있으며, 합칠 때 녹음이 없는 중간 구간은 무음으로 채웁니다.'
     : '겹친 부분은 한 번만 담고, 비어 있는 구간은 무음으로 채우지 않고 별도 파일로 나눕니다. 준비한 파일을 각각 눌러 저장하세요. 다운로드가 끝날 때까지 이 창을 열어 두세요.';
   const sequence = ++localAudioExportSequence;
   const controller = new AbortController(); localAudioExportController = controller;
@@ -6008,9 +6027,7 @@ function updateControls() {
   $('live-capture-title').textContent = paused
     ? '현재 수업은 일시정지 상태로 안전하게 유지 중이에요.'
     : '지난 기록을 보는 동안에도 현재 수업을 계속 녹음하고 있어요.';
-  $('live-capture-detail').textContent = captureSession?.asrProvider === 'clova'
-    ? '음성은 현재 녹음 수업에만 연결되며, CLOVA 처리를 위해 이 서버를 거쳐 사이트 운영자가 관리하는 NAVER Cloud 계정의 CLOVA Speech 도메인으로 계속 전송됩니다.'
-    : '음성과 받아쓰기 결과는 현재 녹음 수업에만 저장되며, Qwen-3으로 계속 처리됩니다.';
+  $('live-capture-detail').textContent = '음성과 받아쓰기 결과는 녹음 중인 수업에 저장됩니다.';
   $('return-live-capture').disabled = !stableLiveCapture();
   $('lecture-date').disabled = historyNavigationBusy();
   $('library-search-open').disabled = historyNavigationBusy();
@@ -6026,12 +6043,15 @@ function updateControls() {
   $('recording-finalize').disabled = !canFinalizeStoppedRecording();
   $('recording-partial-download').hidden = !current || recordingAudioComplete(current);
   $('recording-partial-download').disabled = !canDownloadPartialRecording();
-  $('recording-download-note').textContent = recordingAudioComplete(current)
-    ? '저장된 전체 WAV와 아직 기기에만 남은 음성은 별도로 내려받습니다. 다운로드는 다른 수업의 녹음을 멈추지 않습니다.'
-    : '텍스트는 현재까지 받은 부분입니다. 서버에 저장된 부분 WAV와 기기에 남은 WAV는 서로 다른 범위이며 각각 보관하세요. 미전송 음성은 서버 파일에 없고, 이미 전송된 앞부분은 기기 파일에 없을 수 있습니다. 다운로드는 수업 종료·전송 대기 삭제를 하지 않습니다.';
+  if (!current || $('recording-download-note').dataset.lectureId !== current.id) {
+    $('recording-download-note').textContent = '';
+    $('recording-download-note').hidden = true;
+  }
   const continueBlock = continuationBlockReason();
   $('continue-recording').disabled = !!continueBlock;
-  $('continuation-state').textContent = current ? continueBlock || '이어 녹음은 원본을 보존한 별도 기록으로 연결합니다. 이전 음성의 전송 오류는 자동으로 재시도하지 않습니다.' : '';
+  $('continuation-state').textContent = current ? continueBlock : '';
+  $('continue-recording').title = continueBlock || '원본을 보존한 별도 기록으로 이어 녹음합니다.';
+  $('held-recovery-help').hidden = !(sendError && activePendingCount());
   $('delete-lecture').disabled = noteToolsBusy || correctionLoading || correctionStarting || !current?.recording_finalized;
   $('delete-close').disabled = deletingLecture;
   $('delete-cancel').disabled = deletingLecture;
@@ -6051,7 +6071,7 @@ function updateControls() {
   $('recording-stop').disabled = !!transcriptionStopPromise;
   const stoppedShown=liveSessions.get(current?.id);
   $('recording-control-note').textContent = stoppedShown?.transcriptionStopped ? recordingStopMessage(stoppedShown.stopReason)
-    : (liveSession || activePendingCount() || sending) ? '새 전사 결과가 3분 동안 없으면 자동 중단됩니다. 받아쓰기 종료는 남은 전사를 기다리고, 녹음·전사 중단은 미처리 음성을 보관합니다.' : '';
+    : (liveSession || activePendingCount() || sending) ? '3분간 전사 결과가 없으면 자동 중단' : '';
   $('recording-control-note').hidden = !$('recording-control-note').textContent;
   $('pause-button').disabled = authenticating || loggingOut || holdingAudio || pausing || resuming || stopping
     || (!recording && !paused && !inputUnavailable);
@@ -6069,8 +6089,8 @@ function updateControls() {
             : queued ? '기존 음성 보관 중 · 새 수업 시작 가능' : current ? '수업 기록을 저장했어요' : '시작할 준비가 됐어요';
   $('record-hint').textContent = inputBlocked ? (inputUnavailableMessage || '이미 받은 음성은 보관 중입니다. 입력 복구 버튼으로 같은 수업을 이어갈 수 있어요.')
     : paused ? '정지한 동안의 소리는 녹음하거나 전송하지 않으며, 재개하면 같은 수업에 이어집니다.'
-      : recording ? (system ? '선택한 탭이나 화면을 재생해 주세요. 화면 영상은 전송하지 않아요.' : clova ? '마이크 음성을 이 서버를 거쳐 운영자가 설정한 NAVER Cloud CLOVA Speech로 보내 받아씁니다.' : '서버가 늦어도 음성을 이 기기에 보관하며 녹음을 계속합니다.')
-        : current ? '새 수업을 시작하거나 기록을 내려받을 수 있어요.' : system ? '시작한 뒤 재생할 탭·화면을 고르고 오디오 공유를 켜세요.' : clova ? '사이트 운영자가 설정한 CLOVA Speech로 마이크 음성을 받아써요.' : '약 8초 뒤 말이 잠시 멈출 때마다 정확하게 기록해요.';
+      : system && !current ? '재생할 탭·화면을 고르고 오디오 공유를 켜세요.' : '';
+  $('record-hint').hidden = !$('record-hint').textContent;
   const localQueueSize = liveQueueBytes > 0 ? ` · ${bytesLabel(liveQueueBytes)}` : '';
   const volatile = volatileAudioStats();
   const volatileFailed = volatile.count > 0 && [...liveSessions.values()]
@@ -6531,6 +6551,7 @@ $('continue-recording').onclick = () => {
   if (expireActiveAuthSession()) return;
   const reason = continuationBlockReason(); if (reason) { notice(reason); return; }
   const parent = {id:current.id,title:lectureTitle(current),language:current.language,asrProvider:current.asr_provider || 'qwen',source:selectedCaptureSource()};
+  notice('원본을 보존한 별도 기록으로 이어 녹음합니다. 이전 전송 오류는 자동 재시도하지 않습니다.');
   void startRecording({continuation:parent});
 };
 async function startRecording({continuation = null} = {}) {
@@ -7929,12 +7950,19 @@ async function skipFailedChunk() {
   }
 }
 $('skip-failed').onclick = () => { void skipFailedChunk(); };
+function showRecordingDownloadNote(message) {
+  if (!current) return;
+  $('recording-download-note').dataset.lectureId = current.id;
+  $('recording-download-note').textContent = message;
+  $('recording-download-note').hidden = false;
+}
 $('download').onclick = () => {
   if (expireActiveAuthSession() || !canExportLoadedTranscript()) return;
   const format = $('export-format').value === 'text' ? 'text' : 'markdown';
   const extension = format === 'text' ? 'txt' : 'md';
   const type = format === 'text' ? 'text/plain;charset=utf-8' : 'text/markdown;charset=utf-8';
   const selected = selectedTranscriptLecture(), partial = transcriptExportIsPartial(), capturedAt = new Date().toISOString();
+  if (partial) showRecordingDownloadNote('현재까지 받은 텍스트입니다. 이후 추가되는 내용은 이 파일에 포함되지 않습니다.');
   // Fix the exact selected version and text synchronously. Further microphone
   // results or background corrections cannot mutate an already-created file.
   const displayed = {...selected,segments:selected.segments.map(segment => ({...segment})),
@@ -8019,6 +8047,7 @@ $('recording-download').onclick = () => { void downloadRecording(); };
 $('recording-finalize').onclick = () => { void downloadRecording({finalize:true}); };
 async function downloadPartialRecording() {
   if (expireActiveAuthSession() || !canDownloadPartialRecording()) return;
+  showRecordingDownloadNote('서버에 저장된 구간만 포함됩니다. 기기에 남은 WAV도 별도로 보관하세요. 다운로드는 녹음·전송을 종료하지 않습니다.');
   const lectureId=current.id, title=lectureTitle(current), owner=user, sessionToken=token, server=apiUrl;
   const generation=requestGeneration, sequence=++noteActionSequence, capturedAt=new Date().toISOString();
   const isCurrent=()=>sequence===noteActionSequence && generation===requestGeneration && owner===user

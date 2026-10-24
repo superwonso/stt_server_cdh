@@ -31,7 +31,9 @@ test('page has no remote assets or inline executable content and declares privac
   assert.ok(!connectSources.some(value => /google(?:apis)?\.com/i.test(value)),
     'the browser must download recordings through the authenticated API server, not Google');
   assert.match(html, /name="referrer" content="no-referrer"/);
-  assert.match(html, /사이트 운영자가 관리하는 NAVER Cloud 계정/);
+  assert.match(html, /CLOVA 이용 시 음성이 NAVER Cloud로 전송됩니다/);
+  assert.match(app, /사이트 운영자가 관리하는 NAVER Cloud 계정/);
+  assert.match(app, /\$\('provider-privacy'\)\.textContent = CLOVA_PRIVACY_NOTICE/);
   assert.doesNotMatch(html, /비용이 청구|추가 과금|중복 과금|과금될/);
   assert.doesNotMatch(app, /비용이 청구|추가 과금|중복 과금|과금될/);
   assert.doesNotMatch(html, /<(?:script|style)(?![^>]*\bsrc=)[^>]*>\s*[^<\s]/i);
@@ -145,9 +147,11 @@ test('audio recovery panel groups live input status with explicit preservation c
   }
   const help = panel[1].match(/<p\b[^>]*class="panel-help"[^>]*>([^<]+)<\/p>/)?.[1];
   assert.ok(help, 'preservation and new-capture instructions must not disappear with the layout');
-  assert.match(help, /현재 녹음.*종료/);
-  assert.match(help, /시작 버튼/);
-  assert.match(help, /삭제하거나 자동 재전송하지 않습니다/);
+  assert.match(help, /음성을 보관하고 새 수업/);
+  assert.match(panel[1], /id="held-recovery-help"[^>]*hidden/);
+  assert.match(panel[1], /현재 녹음.*종료/);
+  assert.match(panel[1], /시작 버튼/);
+  assert.match(panel[1], /삭제하거나 자동 재전송하지 않습니다/);
   assert.match(css, /\.recovery-actions\s*\{[^}]*flex-wrap:\s*wrap\s*;/);
 });
 
@@ -188,8 +192,13 @@ test('AI correction controls keep raw and corrected transcripts explicit without
   assert.match(html, /<button\b[^>]*\bid="transcript-corrected"[^>]*\baria-pressed="false"[^>]*\bdisabled/i);
   assert.match(html, /<p\b[^>]*\bid="correction-detail"[^>]*\brole="status"[^>]*\baria-live="polite"/i);
   assert.match(html, /<button\b[^>]*\bid="correct-transcript"[^>]*\btype="button"[^>]*\bdisabled/i);
-  assert.match(html, /텍스트만 NOVA\(Mindlogic\)로 전송하고 오디오는 보내지 않습니다/);
-  assert.match(html, /모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호는 이 PC에서 먼저 가리지만/);
+  assert.match(html, /선택한 텍스트를 NOVA\(Mindlogic\)로 보냅니다. 녹음은 보내지 않습니다/);
+  assert.match(html, /모든 아라비아 숫자와 형식을 인식한 일부 이메일·전화번호는 전송 전에 가리지만/);
+  assert.match(html, /<dialog id="ai-data-dialog"[^>]*aria-labelledby="ai-data-title"/);
+  for (const id of ['study-note-details','correction-details','summary-details','translation-details','question-details']) {
+    const panel = html.slice(html.indexOf(`id="${id}"`));
+    assert.ok(panel.indexOf('data-ai-data-info') < panel.indexOf('</details>'), `${id} must link to shared disclosure`);
+  }
   assert.doesNotMatch(html, /MINDLOGIC_API_KEY|OPENAI_API_KEY|Bearer\s+[A-Za-z0-9_-]/i);
 });
 
@@ -217,7 +226,7 @@ test('unified study-note details preserve originals and disclose material transm
   assert.match(html,/<button[^>]*id="study-note-refresh"/);
   assert.match(html,/<a[^>]*id="study-note-download"[^>]*download[^>]*hidden/);
   assert.match(html,/상세 설명과 모든 원문 구간을 함께 보관합니다/);
-  assert.match(html,/확정 원문과 연결된 강의자료 텍스트를 NOVA/);
+  assert.match(html,/수업 정리본: 확정 원문과 연결된 강의자료 텍스트/);
   assert.match(html,/녹음은 보내지 않습니다/);
   for (const id of ['correct-transcript','summarize-lecture','translate-lecture']) assert.match(html,new RegExp(`<button[^>]*id="${id}"[^>]*hidden`));
   assert.match(html,/<details id="legacy-ai-results"[^>]*>/);
