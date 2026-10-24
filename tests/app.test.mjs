@@ -1302,6 +1302,80 @@ function openSummaryFixture(app, finalized = true) {
     renderCurrent();`);
 }
 
+test('legacy AI results stay hidden for new lessons and lessons with no saved legacy work', async () => {
+  const methods = [];
+  const app = setup(async (url, options) => {
+    methods.push(options.method || 'GET');
+    return response(url.endsWith('/correction') ? {configured:true,correction:null} : {configured:true,summary:null});
+  });
+  app.run('renderCurrent()');
+  assert.equal(app.element('legacy-ai-results').hidden,true);
+  openSummaryFixture(app);
+  await until(() => app.run('summaryView.loaded'));
+  await app.run('loadCorrection(current.id)');
+  assert.equal(app.element('legacy-ai-results').hidden,true);
+  app.run("current.created_at='2026-10-24T00:00:00Z'; renderCurrent();");
+  assert.equal(app.element('legacy-ai-results').hidden,true);
+  assert.ok(methods.every(method => method === 'GET'));
+});
+
+test('a retained summary reveals legacy results after loading and closes on lesson switch', async () => {
+  const pending = deferred();
+  const app = setup(async () => pending.promise);
+  openSummaryFixture(app);
+  assert.equal(app.element('legacy-ai-results').hidden,true);
+  pending.resolve(response({configured:true,summary:completedSummaryFixture()}));
+  await until(() => app.run('summaryView.loaded'));
+  assert.equal(app.element('legacy-ai-results').hidden,false);
+  assert.equal(app.element('legacy-ai-results').open,false);
+  app.element('legacy-ai-results').open = true;
+  app.run('renderCurrent()');
+  assert.equal(app.element('legacy-ai-results').open,true);
+  app.run('current=null; renderCurrent()');
+  assert.equal(app.element('legacy-ai-results').hidden,true);
+  assert.equal(app.element('legacy-ai-results').open,false);
+});
+
+test('retained correction or translation alone reveals legacy results without generating AI work', async () => {
+  const methods = [];
+  const correctionApp = setup(async (url, options) => {
+    methods.push(options.method || 'GET');
+    return response(url.endsWith('/correction')
+      ? {lecture_id:'summary-lesson',status:'completed',corrected_text:'합성 후보정 결과'}
+      : {configured:true,summary:null});
+  });
+  openSummaryFixture(correctionApp);
+  await until(() => correctionApp.run('summaryView.loaded'));
+  await correctionApp.run('loadCorrection(current.id)');
+  assert.equal(correctionApp.element('legacy-ai-results').hidden,false);
+  const translatedApp = translationApp(async (_url, options) => {
+    methods.push(options.method || 'GET'); return response(translationFixture());
+  });
+  openTranslationFixture(translatedApp);
+  await until(() => translatedApp.run('translationView.loaded'));
+  assert.equal(translatedApp.element('legacy-ai-results').hidden,false);
+  translatedApp.run('showLogin()');
+  assert.equal(translatedApp.element('legacy-ai-results').hidden,true);
+  assert.equal(translatedApp.element('legacy-ai-results').open,false);
+  assert.ok(methods.every(method => method === 'GET'));
+});
+
+test('retained pending and failed legacy jobs remain visible even when a refresh fails', async () => {
+  for (const status of ['queued','processing','failed']) {
+    let unavailable = false;
+    const app = setup(async () => {
+      if (unavailable) throw new Error('synthetic connection failure');
+      return response({configured:true,summary:{lecture_id:'summary-lesson',status,document:null}});
+    });
+    openSummaryFixture(app);
+    await until(() => app.run('summaryView.loaded'));
+    assert.equal(app.element('legacy-ai-results').hidden,false,status);
+    unavailable = true;
+    await app.run('fetchSummary(false)');
+    assert.equal(app.element('legacy-ai-results').hidden,false,status);
+  }
+});
+
 test('AI disclosures start closed and keep the user choice during updates without creating work', async () => {
   const methods = [];
   const app = setup(async (_url, options) => {
@@ -1385,6 +1459,7 @@ test('late summary responses are discarded on every account, token, server, and 
     await tick(); await tick();
     assert.equal(app.run('summaryView.row'),null);
     assert.equal(app.element('summary-content').children.length,0);
+    assert.equal(app.element('legacy-ai-results').hidden,true);
   }
 });
 

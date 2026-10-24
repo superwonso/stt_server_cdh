@@ -229,7 +229,7 @@ test('unified study-note details preserve originals and disclose material transm
   assert.match(html,/수업 정리본: 확정 원문과 연결된 강의자료 텍스트/);
   assert.match(html,/녹음은 보내지 않습니다/);
   for (const id of ['correct-transcript','summarize-lecture','translate-lecture']) assert.match(html,new RegExp(`<button[^>]*id="${id}"[^>]*hidden`));
-  assert.match(html,/<details id="legacy-ai-results"[^>]*>/);
+  assert.match(html,/<details id="legacy-ai-results"[^>]*\bhidden>/);
   assert.match(html,/id="course-open"/);
   assert.match(html,/id="study-material-details"/);
   assert.match(css,/\.lesson-study-note \.summary-actions > \* \{ width: 100%/);

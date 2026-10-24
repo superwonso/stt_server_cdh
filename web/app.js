@@ -2797,6 +2797,8 @@ function clearCorrectionPoll() {
 }
 function resetCorrectionState(lectureId = '') {
   resetLearningWorkspace();
+  $('legacy-ai-results').hidden = true;
+  $('legacy-ai-results').open = false;
   $('correction-details').open = false;
   resetStudyNoteView();
   resetQuestionWorkspace();
@@ -2919,6 +2921,19 @@ function updateCorrectionControls(noteToolsBusy = isBusy() || importIsActive() |
   $('correct-transcript').disabled = !hasTranscript || !sourceReady
     || (noteToolsBusy && !liveAction) || running || ready;
 }
+function renderLegacyAiResults() {
+  // Lectures have no integration-date marker. Retained legacy jobs, including
+  // pending/failed jobs, identify old work without guessing from creation dates.
+  const savedJob = row => !!current?.id && row?.lecture_id === current.id
+    && ['queued','processing','completed','failed'].includes(row.status);
+  const hasCorrection = correctionLectureId === current?.id
+    && (savedJob(correction) || (!correction?.lecture_id && correctionIsReady()));
+  const visible = !!(user && token && current?.id && (hasCorrection
+    || (summaryIsCurrent(summaryView) && savedJob(summaryView.row))
+    || (translationIsCurrent(translationView) && savedJob(translationView.row))));
+  $('legacy-ai-results').hidden = !visible;
+  if (!visible) $('legacy-ai-results').open = false;
+}
 function renderCorrection() {
   const hasTranscript = !!current?.segments?.length;
   const ready = correctionIsReady();
@@ -2961,6 +2976,7 @@ function renderCorrection() {
   $('correction-detail').setAttribute('role',['failed','credit-exhausted'].includes(status) ? 'alert' : 'status');
   $('correct-transcript').textContent = action;
   updateCorrectionControls();
+  renderLegacyAiResults();
 }
 function applyCorrectionResponse(value, lectureId) {
   const previousStatus = correction?.status;
@@ -4660,6 +4676,7 @@ function renderSummary() {
     : documentValue ? '요약 완료' : view.row?.status === 'failed' ? '요약 다시 요청' : '수업 요약 만들기';
   $('summary-download').disabled = !documentValue;
   renderSummaryDocument(documentValue);
+  renderLegacyAiResults();
   if (eligible && !view.loaded && !view.busy && !view.error) void fetchSummary(false);
 }
 async function fetchSummary(create = false) {
@@ -4824,6 +4841,7 @@ function renderTranslation() {
     $(`translation-${mode}`).setAttribute('aria-pressed',String(view.mode === mode));
   }
   renderTranslationContent(segments);
+  renderLegacyAiResults();
   if (eligible && !view.loaded && !view.busy && !view.error) void fetchTranslation(false);
 }
 async function fetchTranslation(create = false) {
