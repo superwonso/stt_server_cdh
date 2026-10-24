@@ -1082,6 +1082,7 @@ button {
 
 .level-track {
   height: 4px;
+  margin-top: 14px;
   margin-left: 20px;
   overflow: hidden;
   border-radius: 99px;

@@ -5090,7 +5090,7 @@ function renderTimetableSuggestions() {
   const state = timetableCatalog.snapshot();
   for (const id of ['lecture-timetable','metadata-timetable']) fillTimetableSelect($(id),document,state);
   const help = state.status === 'unavailable' ? '직접 입력할 수 있어요. 목록 새로고침으로 다시 확인하세요.'
-    : state.subjects.length ? '시간표의 과목명을 골라 입력할 수 있어요. 직접 입력도 가능합니다.'
+    : state.subjects.length ? '시간표에서 고르거나 직접 입력하세요.'
     : state.status === 'loading' ? '내 시간표를 확인하고 있어요.' : '리마인더에 시간표를 등록하면 여기서도 과목을 고를 수 있어요.';
   $('lecture-timetable-help').textContent = help; $('metadata-timetable-help').textContent = help;
   updateTimetablePickerAvailability(); renderMetadataSuggestions();
